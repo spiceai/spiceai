@@ -246,6 +246,20 @@ impl FlightClient {
         self
     }
 
+    /// Overrides default maximum message size for encoding and decoding.
+    #[must_use]
+    pub fn with_max_message_size(
+        mut self,
+        max_encoding_message_size: usize,
+        max_decoding_message_size: usize,
+    ) -> Self {
+        self.flight_client = self
+            .flight_client
+            .max_encoding_message_size(max_encoding_message_size)
+            .max_decoding_message_size(max_decoding_message_size);
+        self
+    }
+
     /// Queries the flight service for the schema of the path.
     ///
     /// # Arguments

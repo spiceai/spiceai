@@ -56,6 +56,9 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight: Option<Flight>,
+
     /// Configures where the runtime will store temporary files needed for operations like
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +182,30 @@ impl Default for TelemetryConfig {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
             properties: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Flight {
+    pub max_message_size: Option<String>,
+}
+
+impl Flight {
+    pub fn max_message_size_bytes(&self) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
+        if let Some(size_str) = &self.max_message_size {
+            let size_in_bytes = usize::try_from(
+                byte_unit::Byte::parse_str(size_str, true)
+                    .map_err(|e| {
+                        format!("Failed to parse 'max_message_size' value '{size_str}': {e}")
+                    })?
+                    .as_u64(),
+            )
+            .unwrap_or_default();
+            Ok(Some(size_in_bytes))
+        } else {
+            Ok(None)
         }
     }
 }

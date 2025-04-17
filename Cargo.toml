@@ -64,6 +64,7 @@ base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 bytes = "1.10.0"
+byte-unit = "5.1.4"
 charset = "0.1.5"
 chrono = "0.4.38"
 clap = { version = "4.5.36", features = ["derive", "env"] }

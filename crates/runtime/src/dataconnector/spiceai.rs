@@ -72,6 +72,14 @@ pub enum Error {
         value: Arc<str>,
         source: InvalidMetadataValue,
     },
+
+    #[snafu(display(
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#parameters"
+    ))]
+    InvalidParameterValue {
+        parameter: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -188,9 +196,12 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let credentials = Credentials::new("", api_key.clone());
 
-            let flight_client = FlightClient::try_new(url, credentials, None)
+            let mut flight_client = FlightClient::try_new(url, credentials, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
+
+            flight_client = configure_max_message_size(flight_client, &params)?;
+
             let flight_factory = FlightFactory::new(
                 "spice.ai",
                 flight_client,
@@ -209,6 +220,29 @@ impl DataConnectorFactory for SpiceAIFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+}
+
+/// Configures flight client's message size based on app parameters
+fn configure_max_message_size(
+    mut flight_client: FlightClient,
+    params: &ConnectorParams,
+) -> Result<FlightClient> {
+    if let Some(app) = params.app.as_ref() {
+        if let Some(flight) = app.runtime.flight.as_ref() {
+            if let Some(max_message_size) =
+                flight
+                    .max_message_size_bytes()
+                    .map_err(|err| Error::InvalidParameterValue {
+                        parameter: "max_message_size".to_string(),
+                        source: err,
+                    })?
+            {
+                flight_client =
+                    flight_client.with_max_message_size(max_message_size, max_message_size);
+            }
+        }
+    }
+    Ok(flight_client)
 }
 
 #[async_trait]

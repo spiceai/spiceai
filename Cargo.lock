@@ -11732,6 +11732,7 @@ dependencies = [
 name = "spicepod"
 version = "1.2.0-unstable"
 dependencies = [
+ "byte-unit",
  "fundu",
  "regex",
  "schemars",
