@@ -85,7 +85,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
     ]);
 
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_API_KEY");
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
     for query in &metrics.metrics {
         let query_name = query.query_name.clone();

@@ -32,7 +32,7 @@ use telemetry::exporter::TelemetryExporterBuilder;
 pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
 use telemetry::reader::InitialReader;
 
-const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
+const ENDPOINT_CONST: &str = "https://dev-telemetry.spiceai.io";
 
 pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
     std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
@@ -83,9 +83,13 @@ impl Telemetry {
         }
 
         if let Some(api_key) = &self.api_key {
+            println!("Emitting to exporter at {}", *ENDPOINT);
             let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
                 TelemetryExporterBuilder::new()
-                    .with_api_key(api_key.clone())
+                    .with_credentials(flight_client::Credentials::Exact {
+                        token: api_key.clone().into(),
+                        bearer: false,
+                    })
                     .with_service_name("benchmarks_telemetry".into())
                     .with_endpoint(Arc::clone(&ENDPOINT))
                     .build()
