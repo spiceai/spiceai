@@ -209,7 +209,10 @@ pub fn truncate_numeric_column_length(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
-/// Converts a record batch with a single row into ParamValues
+/// Converts a record batch with a single row into `ParamValues`
+///
+/// # Errors
+/// Returns an error when a value in an array cannot be converted into a scalar.
 pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
     let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
 
@@ -445,18 +448,16 @@ mod test {
                 for (key, expected_value) in expected_map {
                     let result_value = result_map
                         .get(&key)
-                        .expect(&format!("Key {} not found in result map", key));
+                        .unwrap_or_else(|| panic!("Key {key} not found in result map"));
                     assert_eq!(
                         result_value, &expected_value,
-                        "ScalarValue mismatch for key {}",
-                        key
+                        "ScalarValue mismatch for key {key}",
                     );
                 }
             }
-            (result, expected) => panic!(
-                "Mismatched ParamValues variants: got {:?}, expected {:?}",
-                result, expected
-            ),
+            (result, expected) => {
+                panic!("Mismatched ParamValues variants: got {result:?}, expected {expected:?}",)
+            }
         }
     }
 
