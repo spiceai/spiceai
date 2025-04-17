@@ -261,6 +261,8 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
 #[cfg(test)]
 mod test {
 
+    use std::collections::HashMap;
+
     use arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
@@ -416,5 +418,158 @@ mod test {
         let expected_batch = parse_json_to_batch(expected_batch_json_data, schema);
 
         assert_eq!(processed_batch, expected_batch);
+    }
+
+    fn create_record_batch(
+        schema: Vec<(&str, DataType)>,
+        columns: Vec<Arc<dyn arrow::array::Array>>,
+    ) -> RecordBatch {
+        let fields = schema
+            .into_iter()
+            .map(|(name, dt)| Field::new(name, dt, true))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn assert_param_values_eq(result: ParamValues, expected: ParamValues) {
+        match (result, expected) {
+            (ParamValues::List(result_vec), ParamValues::List(expected_vec)) => {
+                assert_eq!(result_vec.len(), expected_vec.len(), "List lengths differ");
+                for (r, e) in result_vec.iter().zip(expected_vec.iter()) {
+                    assert_eq!(r, e, "ScalarValue mismatch");
+                }
+            }
+            (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
+                assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
+                for (key, expected_value) in expected_map {
+                    let result_value = result_map
+                        .get(&key)
+                        .expect(&format!("Key {} not found in result map", key));
+                    assert_eq!(
+                        result_value, &expected_value,
+                        "ScalarValue mismatch for key {}",
+                        key
+                    );
+                }
+            }
+            (result, expected) => panic!(
+                "Mismatched ParamValues variants: got {:?}, expected {:?}",
+                result, expected
+            ),
+        }
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("$2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let expected = ParamValues::List(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_named_parameters() {
+        let batch = create_record_batch(
+            vec![("param1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(100)])),
+                Arc::new(StringArray::from(vec![Some("world")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let mut expected_map = HashMap::new();
+        expected_map.insert("param1".to_string(), ScalarValue::Int32(Some(100)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("world".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_mixed_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10)])),
+                Arc::new(StringArray::from(vec![Some("test")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let mut expected_map = HashMap::new();
+        expected_map.insert("1".to_string(), ScalarValue::Int32(Some(10)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("test".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters_out_of_order() {
+        let batch = create_record_batch(
+            vec![("$2", DataType::Int32), ("$1", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(200)])),
+                Arc::new(StringArray::from(vec![Some("first")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let expected = ParamValues::List(vec![
+            ScalarValue::Utf8(Some("first".to_string())),
+            ScalarValue::Int32(Some(200)),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_list() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32)],
+            vec![Arc::new(Int32Array::from(vec![Some(1)]))],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let expected = ParamValues::List(vec![ScalarValue::Int32(Some(1))]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_named() {
+        let batch = create_record_batch(
+            vec![("x", DataType::Utf8)],
+            vec![Arc::new(StringArray::from(vec![Some("value")]))],
+        );
+
+        let result = record_to_param_values(&batch).unwrap();
+        let mut expected_map = HashMap::new();
+        expected_map.insert(
+            "x".to_string(),
+            ScalarValue::Utf8(Some("value".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
     }
 }
