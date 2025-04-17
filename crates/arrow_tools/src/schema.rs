@@ -67,6 +67,10 @@ pub fn verify_schema(
         let a_data_type = a.data_type();
         let b_data_type = b.data_type();
 
+        if is_null_placeholder(a) || is_null_placeholder(b) {
+            continue;
+        }
+
         if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
@@ -78,6 +82,10 @@ pub fn verify_schema(
     }
 
     Ok(())
+}
+
+fn is_null_placeholder(field: &Arc<Field>) -> bool {
+    field.name().starts_with("$") && field.data_type() == &DataType::Null
 }
 
 #[must_use]

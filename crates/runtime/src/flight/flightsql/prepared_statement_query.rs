@@ -110,8 +110,6 @@ pub(crate) async fn get_flight_info(
 
     let info = FlightInfo::new()
         .with_endpoint(endpoint)
-        .try_with_schema(&arrow_schema)
-        .map_err(to_tonic_err)?
         .with_descriptor(fd);
 
     Ok(Response::new(info))
