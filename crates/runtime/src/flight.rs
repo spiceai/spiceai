@@ -30,9 +30,11 @@ use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaRes
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use cache::QueryResultsCacheStatus;
+use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
+use flightsql::prepared_statement_query::PreparedStatement;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
@@ -72,6 +74,7 @@ pub struct Service {
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    prepared_statements: Arc<RwLock<HashMap<String, PreparedStatement>>>,
 }
 
 #[tonic::async_trait]
@@ -178,6 +181,7 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
+        parameters: Option<ParamValues>,
     ) -> Result<
         (
             BoxStream<'static, Result<FlightData, Status>>,
@@ -185,7 +189,14 @@ impl Service {
         ),
         Status,
     > {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
+
+        let query = match parameters {
+            Some(parameters) => query.parameters(parameters),
+            None => query,
+        };
+
+        let query = query.build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
 
@@ -328,6 +339,7 @@ pub async fn start(
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        prepared_statements: Arc::new(RwLock::new(HashMap::new())),
     };
     let svc = FlightServiceServer::new(service);
 

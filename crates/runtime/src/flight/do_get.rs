@@ -82,7 +82,7 @@ async fn do_get_simple(
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
             let (output, cache_status) =
-                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql, None)).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 
