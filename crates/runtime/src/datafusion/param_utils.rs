@@ -93,39 +93,18 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn scalar_to_string(scalar: &ScalarValue) -> String {
-        match scalar {
-            ScalarValue::Int64(Some(i)) => format!("Int64({})", i),
-            ScalarValue::Int64(None) => "Int64(None)".to_string(),
-            ScalarValue::Float64(Some(f)) => format!("Float64({})", f),
-            ScalarValue::Float64(None) => "Float64(None)".to_string(),
-            ScalarValue::Utf8(Some(s)) => format!("Utf8(\"{}\")", s),
-            ScalarValue::Utf8(None) => "Utf8(None)".to_string(),
-            ScalarValue::Boolean(Some(b)) => format!("Boolean({})", b),
-            ScalarValue::Boolean(None) => "Boolean(None)".to_string(),
-            _ => unimplemented!(),
-        }
-    }
-
-    fn param_values_to_string(params: ParamValues) -> String {
-        match params {
-            ParamValues::List(vec) => {
-                let vals: Vec<String> = vec.iter().map(scalar_to_string).collect();
-                format!("List([{}])", vals.join(", "))
-            }
-            ParamValues::Map(map) => {
-                let mut items: Vec<String> = map
-                    .iter()
-                    .map(|(k, v)| format!("\"{}\": {}", k, scalar_to_string(v)))
-                    .collect();
-                items.sort(); // Ensure consistent ordering
-                format!("Map({{{}}})", items.join(", "))
-            }
-        }
-    }
-
     fn assert_eq_param_values(a: ParamValues, b: ParamValues) {
-        assert_eq!(param_values_to_string(a), param_values_to_string(b),);
+        match (&a, &b) {
+            (ParamValues::Map(map_a), ParamValues::Map(map_b)) => {
+                assert_eq!(map_a, map_b);
+            }
+            (ParamValues::List(vec_a), ParamValues::List(vec_b)) => {
+                assert_eq!(vec_a, vec_b);
+            }
+            _ => {
+                panic!("ParamValues are different types: {a:?} and {b:?}");
+            }
+        }
     }
 
     #[test]
