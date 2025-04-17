@@ -20,7 +20,7 @@ use arrow::array::RecordBatch;
 use arrow_flight::{
     FlightData, PutResult,
     flight_service_server::FlightService,
-    sql::{Any, Command, server::PeekableFlightDataStream},
+    sql::{Any, Command},
     utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;

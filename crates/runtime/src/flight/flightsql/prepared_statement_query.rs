@@ -24,15 +24,13 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementQuery, ProstMessageExt},
 };
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_schema::{ArrowError, SchemaRef};
-use bytes::Bytes;
+use arrow_schema::SchemaRef;
 use datafusion::{
     common::ParamValues, error::DataFusionError, parquet::data_type::AsBytes, scalar::ScalarValue,
 };
 use prost::Message;
 use tokio_stream::{StreamExt, adapters::Peekable, empty};
 use tonic::{Request, Response, Status, Streaming};
-use uuid::Uuid;
 
 use crate::{
     flight::{
@@ -132,39 +130,19 @@ pub(crate) async fn do_get(
     let handle =
         String::from_utf8(query.prepared_statement_handle.to_vec()).map_err(error_to_status)?;
 
-    match &flight_svc.prepared_statements.read().await.get(&handle) {
-        Some(PreparedStatement { query, parameters }) => {
-            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
-                datafusion,
-                query,
-                parameters.clone(),
-            ))
-            .await?;
-            let timed_output = TimedStream::new(output, move || start);
+    let (sql, parameters) = match &flight_svc.prepared_statements.read().await.get(&handle) {
+        Some(PreparedStatement { query, parameters }) => (query.clone(), parameters.clone()),
+        None => (handle, None),
+    };
 
-            let mut response =
-                Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-            attach_cache_metadata(&mut response, from_cache);
-            Ok(response)
-        }
-        None => todo!(),
-    }
+    let (output, from_cache) =
+        Box::pin(Service::sql_to_flight_stream(datafusion, &sql, parameters)).await?;
+    let timed_output = TimedStream::new(output, move || start);
 
-    // match std::str::from_utf8(&query.prepared_statement_handle) {
-    //     Ok(sql) => {
-    //         let (output, from_cache) =
-    //             Box::pin(Service::sql_to_flight_stream(datafusion, sql, None)).await?;
-    //         let timed_output = TimedStream::new(output, move || start);
-
-    //         let mut response =
-    //             Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    //         attach_cache_metadata(&mut response, from_cache);
-    //         Ok(response)
-    //     }
-    //     Err(e) => Err(Status::invalid_argument(format!(
-    //         "Invalid prepared statement handle: {e}"
-    //     ))),
-    // }
+    let mut response =
+        Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
+    attach_cache_metadata(&mut response, from_cache);
+    Ok(response)
 }
 
 pub(crate) async fn do_put_query(
@@ -179,8 +157,7 @@ pub(crate) async fn do_put_query(
     let schema = decode_schema(&mut decoder).await?;
 
     let mut parameters = Vec::new();
-    let mut encoder =
-        StreamWriter::try_new(&mut parameters, &schema).map_err(arrow_error_to_status)?;
+    let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;
     let mut total_rows = 0;
     while let Some(msg) = decoder.try_next().await? {
         match msg.payload {
@@ -192,9 +169,7 @@ pub(crate) async fn do_put_query(
             }
             DecodedPayload::RecordBatch(record_batch) => {
                 total_rows += record_batch.num_rows();
-                encoder
-                    .write(&record_batch)
-                    .map_err(arrow_error_to_status)?;
+                encoder.write(&record_batch).map_err(error_to_status)?;
             }
         }
     }
@@ -210,7 +185,7 @@ pub(crate) async fn do_put_query(
         Some(parameters.as_bytes())
     };
 
-    let parameters = decode_param_values(parameters).map_err(arrow_error_to_status)?;
+    let parameters = decode_param_values(parameters).map_err(error_to_status)?;
 
     let handle =
         String::from_utf8(query.prepared_statement_handle.to_vec()).map_err(error_to_status)?;
@@ -299,9 +274,5 @@ fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusion
 }
 
 fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
-    Status::internal(format!("{err:?}"))
-}
-
-fn arrow_error_to_status(err: ArrowError) -> Status {
     Status::internal(format!("{err:?}"))
 }
