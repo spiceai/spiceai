@@ -143,6 +143,9 @@ pub(crate) async fn do_get(
     Ok(response)
 }
 
+/// Bind the parameters from the [`FlightData`] to the prepared statement
+///
+/// See [Sequence Diagrams](https://arrow.apache.org/docs/format/FlightSql.html#sequence-diagrams)
 pub(crate) async fn do_put_query(
     flight_svc: &Service,
     query: CommandPreparedStatementQuery,
