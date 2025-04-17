@@ -179,13 +179,7 @@ pub(crate) async fn do_put_query(
         ));
     }
 
-    let parameters = if parameters.is_empty() {
-        None
-    } else {
-        Some(parameters.as_bytes())
-    };
-
-    let parameters = decode_param_values(parameters).map_err(error_to_status)?;
+    let parameters = decode_param_values(parameters.as_bytes()).map_err(error_to_status)?;
 
     let handle =
         String::from_utf8(query.prepared_statement_handle.to_vec()).map_err(error_to_status)?;
@@ -222,17 +216,17 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
 
 // Decode parameter ipc stream as ParamValues
 fn decode_param_values(
-    parameters: Option<&[u8]>,
-) -> Result<Option<ParamValues>, arrow::error::ArrowError> {
-    parameters
-        .map(|parameters| {
-            let decoder = StreamReader::try_new(parameters, None)?;
-            let schema = decoder.schema();
-            let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
-            let batch = concat_batches(&schema, batches.iter())?;
-            Ok(record_to_param_values(&batch)?)
-        })
-        .transpose()
+    parameters: &[u8],
+) -> Result<Option<ParamValues>, datafusion::error::DataFusionError> {
+    if !parameters.is_empty() {
+        let decoder = StreamReader::try_new(parameters, None)?;
+        let schema = decoder.schema();
+        let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let batch = concat_batches(&schema, batches.iter())?;
+        Ok(Some(record_to_param_values(&batch)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
