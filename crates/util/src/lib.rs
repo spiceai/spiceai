@@ -61,6 +61,7 @@ pub async fn shutdown_signal() {
     shutdown_signal_impl().await;
 }
 
+/// Waits for an additional Ctrl-C after the initial shutdown signal to trigger a forced shutdown.
 pub async fn force_shutdown_signal() {
     shutdown_signal().await;
 
@@ -80,7 +81,7 @@ pub async fn force_shutdown_signal() {
                 .ok()
                 .and_then(|mut tx_opt| tx_opt.take())
             {
-                tracing::debug!("Received Ctrl-C again, shutting down immediately.");
+                tracing::debug!("Received Ctrl-C after the initial shutdown signal");
                 tx.send(()).ok();
             }
         }
