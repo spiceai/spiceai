@@ -86,11 +86,7 @@ pub(crate) async fn get_flight_info(
     let PreparedStatement { query, .. } =
         serde_json::from_slice(&handle.prepared_statement_handle).map_err(error_to_status)?;
 
-    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &query)
-        .await
-        .map_err(to_tonic_err)?;
-
-    tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?}");
+    tracing::trace!("get_flight_info_prepared_statement");
 
     let fd = request.into_inner();
 
