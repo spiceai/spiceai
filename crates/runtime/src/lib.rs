@@ -552,7 +552,7 @@ impl Runtime {
         let shutdown_signal_future = async {
             let graceful_shutdown = async {
                 shutdown_signal().await;
-                tracing::debug!("Shutdown signal received.");
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
                 self.shutdown().await;
                 Ok(())
             };
