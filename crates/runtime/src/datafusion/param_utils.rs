@@ -91,10 +91,13 @@ mod tests {
     use super::*;
     use datafusion::scalar::ScalarValue;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        f64::consts::{E, PI},
+    };
 
-    fn assert_eq_param_values(a: ParamValues, b: ParamValues) {
-        match (&a, &b) {
+    fn assert_eq_param_values(a: &ParamValues, b: &ParamValues) {
+        match (a, b) {
             (ParamValues::Map(map_a), ParamValues::Map(map_b)) => {
                 assert_eq!(map_a, map_b);
             }
@@ -110,7 +113,7 @@ mod tests {
     #[test]
     fn test_json_array() {
         let json = json!([1, "hello", true, null]);
-        let got = convert_json_to_param_values(json).unwrap();
+        let got = convert_json_to_param_values(json).expect("convert to param values");
         let want = ParamValues::List(vec![
             ScalarValue::Int64(Some(1)),
             ScalarValue::Utf8(Some("hello".to_string())),
@@ -118,13 +121,13 @@ mod tests {
             ScalarValue::Utf8(None),
         ]);
 
-        assert_eq_param_values(got, want);
+        assert_eq_param_values(&got, &want);
     }
 
     #[test]
     fn test_json_object() {
         let json = json!({"x": 42, "y": "world", "z": false});
-        let got = convert_json_to_param_values(json).unwrap();
+        let got = convert_json_to_param_values(json).expect("convert to param values");
         let mut want = HashMap::new();
         want.insert("x".to_string(), ScalarValue::Int64(Some(42)));
         want.insert(
@@ -132,7 +135,7 @@ mod tests {
             ScalarValue::Utf8(Some("world".to_string())),
         );
         want.insert("z".to_string(), ScalarValue::Boolean(Some(false)));
-        assert_eq_param_values(got, ParamValues::Map(want));
+        assert_eq_param_values(&got, &ParamValues::Map(want));
     }
 
     #[test]
@@ -159,44 +162,44 @@ mod tests {
     #[test]
     fn test_empty_array() {
         let json = json!([]);
-        let result = convert_json_to_param_values(json).unwrap();
-        assert_eq_param_values(result, ParamValues::List(vec![]));
+        let result = convert_json_to_param_values(json).expect("convert to param values");
+        assert_eq_param_values(&result, &ParamValues::List(vec![]));
     }
 
     #[test]
     fn test_empty_object() {
         let json = json!({});
-        let result = convert_json_to_param_values(json).unwrap();
-        assert_eq_param_values(result, ParamValues::Map(HashMap::new()));
+        let result = convert_json_to_param_values(json).expect("convert to param values");
+        assert_eq_param_values(&result, &ParamValues::Map(HashMap::new()));
     }
 
     #[test]
     fn test_array_with_nulls() {
         let json = json!([null, null]);
-        let result = convert_json_to_param_values(json).unwrap();
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
-            result,
-            ParamValues::List(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
+            &result,
+            &ParamValues::List(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
         );
     }
 
     #[test]
     fn test_object_with_nulls() {
         let json = json!({"a": null, "b": null});
-        let result = convert_json_to_param_values(json).unwrap();
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         let mut expected_map = HashMap::new();
         expected_map.insert("a".to_string(), ScalarValue::Utf8(None));
         expected_map.insert("b".to_string(), ScalarValue::Utf8(None));
-        assert_eq_param_values(result, ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
     }
 
     #[test]
     fn test_array_with_floats() {
         let json = json!([1.5, 2.0]);
-        let result = convert_json_to_param_values(json).unwrap();
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
-            result,
-            ParamValues::List(vec![
+            &result,
+            &ParamValues::List(vec![
                 ScalarValue::Float64(Some(1.5)),
                 ScalarValue::Float64(Some(2.0)),
             ]),
@@ -205,21 +208,21 @@ mod tests {
 
     #[test]
     fn test_object_with_floats() {
-        let json = json!({"pi": 3.14, "e": 2.718});
-        let result = convert_json_to_param_values(json).unwrap();
+        let json = json!({"pi": PI, "e": E});
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         let mut expected_map = HashMap::new();
-        expected_map.insert("pi".to_string(), ScalarValue::Float64(Some(3.14)));
-        expected_map.insert("e".to_string(), ScalarValue::Float64(Some(2.718)));
-        assert_eq_param_values(result, ParamValues::Map(expected_map));
+        expected_map.insert("pi".to_string(), ScalarValue::Float64(Some(PI)));
+        expected_map.insert("e".to_string(), ScalarValue::Float64(Some(E)));
+        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
     }
 
     #[test]
     fn test_array_with_strings_and_bools() {
         let json = json!(["test", true, false]);
-        let result = convert_json_to_param_values(json).unwrap();
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
-            result,
-            ParamValues::List(vec![
+            &result,
+            &ParamValues::List(vec![
                 ScalarValue::Utf8(Some("test".to_string())),
                 ScalarValue::Boolean(Some(true)),
                 ScalarValue::Boolean(Some(false)),
@@ -230,14 +233,14 @@ mod tests {
     #[test]
     fn test_object_with_strings_and_bools() {
         let json = json!({"name": "Alice", "is_active": true});
-        let result = convert_json_to_param_values(json).unwrap();
+        let result = convert_json_to_param_values(json).expect("convert to param values");
         let mut expected_map = HashMap::new();
         expected_map.insert(
             "name".to_string(),
             ScalarValue::Utf8(Some("Alice".to_string())),
         );
         expected_map.insert("is_active".to_string(), ScalarValue::Boolean(Some(true)));
-        assert_eq_param_values(result, ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
     }
 
     #[test]
