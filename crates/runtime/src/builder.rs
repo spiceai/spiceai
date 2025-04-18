@@ -130,11 +130,6 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_runtime_status(mut self, runtime_status: Arc<status::RuntimeStatus>) -> Self {
-        self.runtime_status = Some(runtime_status);
-        self
-    }
-
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
