@@ -75,16 +75,13 @@ pub(crate) async fn do_action_create_prepared_statement(
 }
 
 pub(crate) async fn get_flight_info(
-    flight_svc: &Service,
+    _flight_svc: &Service,
     handle: sql::CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let _start =
         metrics::track_flight_request("get_flight_info", Some("prepared_statement_query")).await;
     set_flightsql_protocol().await;
-
-    let PreparedStatement { query, .. } =
-        serde_json::from_slice(&handle.prepared_statement_handle).map_err(error_to_status)?;
 
     tracing::trace!("get_flight_info_prepared_statement");
 
@@ -137,7 +134,7 @@ pub(crate) async fn do_put_query(
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     let streaming_flight = streaming_flight
-        .map(|flight_data| flight_data.map_err(|e| arrow_flight::error::FlightError::Tonic(e)));
+        .map(|flight_data| flight_data.map_err(arrow_flight::error::FlightError::Tonic));
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
     let schema = decode_schema(&mut decoder).await?;
@@ -204,14 +201,14 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
 fn decode_param_values(
     parameters: &[u8],
 ) -> Result<Option<ParamValues>, datafusion::error::DataFusionError> {
-    if !parameters.is_empty() {
+    if parameters.is_empty() {
+        Ok(None)
+    } else {
         let decoder = StreamReader::try_new(parameters, None)?;
         let schema = decoder.schema();
         let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
         let batch = concat_batches(&schema, batches.iter())?;
         Ok(Some(record_to_param_values(&batch)?))
-    } else {
-        Ok(None)
     }
 }
 

@@ -86,12 +86,11 @@ pub(crate) async fn handle(
     };
 
     if let Ok(message) = Any::decode(&*fd.cmd) {
-        match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
-            Command::CommandPreparedStatementQuery(query) => {
-                return prepared_statement_query::do_put_query(flight_svc, query, streaming_flight)
-                    .await;
-            }
-            _ => {}
+        if let Command::CommandPreparedStatementQuery(query) =
+            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
+        {
+            return prepared_statement_query::do_put_query(flight_svc, query, streaming_flight)
+                .await;
         }
     }
 

@@ -14,22 +14,22 @@ pub enum Error {
     JsonArrayOrObjectRequired,
 }
 
-/// Converts a serde_json::Value into a datafusion::common::ParamValues.
+/// Converts a `serde_json::Value` into a `datafusion::common::ParamValues`.
 ///
 /// # Arguments
 /// * `json` - The JSON value to convert.
 ///
 /// # Returns
-/// * `Result<ParamValues, String>` - The converted ParamValues or an error message.
+/// * `Result<ParamValues, String>` - The converted `ParamValues` or an error message.
 ///
 /// # Supported JSON Formats
-/// - Array: Converted to positional parameters (ParamValues::Positional).
-/// - Object: Converted to named parameters (ParamValues::Named).
+/// - Array: Converted to positional parameters (`ParamValues::Positional`).
+/// - Object: Converted to named parameters (`ParamValues::Named`).
 /// - Primitive types (null, bool, number, string) are supported within arrays or objects.
 ///
 /// # Errors
 /// - Returns an error if the top-level JSON is not an array or object.
-/// - Returns an error if any value cannot be converted to a ScalarValue.
+/// - Returns an error if any value cannot be converted to a `ScalarValue`.
 pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
     match json {
         Value::Array(arr) => {
@@ -52,19 +52,19 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
     }
 }
 
-/// Helper function to convert a single serde_json::Value to a DataFusion ScalarValue.
+/// Helper function to convert a single `serde_json::Value` to a `datafusion_common::scalar::ScalarValue`.
 ///
 /// # Arguments
 /// * `json` - The JSON value to convert.
 ///
 /// # Returns
-/// * `Result<ScalarValue, String>` - The converted ScalarValue or an error message.
+/// * `Result<ScalarValue, String>` - The converted `ScalarValue` or an error message.
 ///
 /// # Supported JSON Types
-/// - Null -> ScalarValue::Utf8(None)
-/// - Bool -> ScalarValue::Boolean(Some(bool))
-/// - Number -> ScalarValue::Int64(Some(i64)) if integer, else ScalarValue::Float64(Some(f64))
-/// - String -> ScalarValue::Utf8(Some(String))
+/// - Null -> `ScalarValue::Utf8(None)`
+/// - Bool -> `ScalarValue::Boolean(Some(bool))`
+/// - Number -> `ScalarValue::Int64(Some(i64))` if integer, else `ScalarValue::Float64(Some(f64))`
+/// - String -> `ScalarValue::Utf8(Some(String))`
 /// - Arrays and objects return an error (handled at a higher level).
 fn json_to_scalar(json: &Value) -> Result<ScalarValue, Error> {
     match json {
