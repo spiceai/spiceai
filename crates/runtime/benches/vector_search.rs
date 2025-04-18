@@ -17,15 +17,15 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bench_search::{
-    setup::{self, load_query_relevance_data, load_search_queries, setup_benchmark, Query},
     SearchBenchmarkResultBuilder,
+    setup::{self, Query, load_query_relevance_data, load_search_queries, setup_benchmark},
 };
 use clap::Parser;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use runtime::{
     dataupdate::DataUpdate,
     embeddings::vector_search::{
-        self, parse_explicit_primary_keys, SearchRequest, VectorSearch, VectorSearchResult,
+        self, SearchRequest, VectorSearch, VectorSearchResult, parse_explicit_primary_keys,
     },
     request::{Protocol, RequestContext, UserAgent},
 };

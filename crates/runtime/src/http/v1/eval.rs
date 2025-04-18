@@ -16,9 +16,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use axum::{
+    Extension,
     extract::Path,
     response::{IntoResponse, Json, Response},
-    Extension,
 };
 use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
@@ -28,15 +28,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    datafusion::DataFusion,
-    model::{handle_eval_run, sql_query_for, EvalScorerRegistry, LLMModelStore},
     Runtime,
+    datafusion::DataFusion,
+    model::{EvalScorerRegistry, LLMModelStore, handle_eval_run, sql_query_for},
 };
 
 #[cfg(feature = "openapi")]
 use crate::model::EvalRunResponse;
 
-use super::{sql_to_http_response, ArrowFormat};
+use super::{ResponseMimeType, sql_to_http_response};
 
 /// Input parameters to start an evaluation run for a given model.
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 sql_query_for(&id).as_str(),
-                ArrowFormat::from_accept_header(accept.as_ref()),
+                ResponseMimeType::from_accept_header(accept.as_ref()),
             )
             .await
         }

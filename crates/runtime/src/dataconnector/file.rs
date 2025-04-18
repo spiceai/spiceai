@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use crate::dataconnector::ConnectorComponent;
+use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -35,10 +35,11 @@ use url::Url;
 
 use super::ConnectorParams;
 use super::{
-    listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
-    InvalidConfigurationSnafu, ParameterSpec, Parameters,
+    DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
+    ParameterSpec, Parameters, listing::ListingTableConnector,
 };
 
+#[derive(Debug)]
 pub struct File {
     params: Parameters,
 }
@@ -49,7 +50,7 @@ impl std::fmt::Display for File {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FileFactory {}
 
 impl FileFactory {
@@ -102,9 +103,17 @@ impl ListingTableConnector for File {
     /// Creates a valid file [`url::Url`], from the dataset, supporting both
     ///   1. Relative paths
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let path = get_path(dataset).to_string_lossy().into_owned();
-
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        path: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let path = match path {
+            Some(p) => PathBuf::from(p.trim_start_matches("file:"))
+                .to_string_lossy()
+                .into_owned(),
+            None => get_path(dataset).to_string_lossy().into_owned(),
+        };
         // Convert relative path to absolute path
         let url_str = if path.starts_with('/') {
             format!("file:{path}")
@@ -116,7 +125,7 @@ impl ListingTableConnector for File {
                     message: "Could not identify current directory for a relative file path. Does the running user have the right filesystem permissions?".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                 })?
-                .join(path)
+                .join(&path)
                 .to_string_lossy()
                 .to_string();
 
@@ -127,7 +136,7 @@ impl ListingTableConnector for File {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "file".to_string(),
-                message: "The specified file path created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file".to_string(),
+                message: format!("The specified file path {path} created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file"),
                 connector_component: ConnectorComponent::from(dataset),
             })
     }
@@ -226,10 +235,10 @@ fn get_path(dataset: &Dataset) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::Dataset;
+    use crate::component::dataset::DatasetBuilder;
 
-    #[test]
-    fn test_get_path() {
+    #[tokio::test]
+    async fn test_get_path() {
         let test_cases = vec![
             ("file:/path/to/file.csv", PathBuf::from("/path/to/file.csv")),
             ("file://path/to/file.csv", PathBuf::from("path/to/file.csv")),
@@ -244,10 +253,52 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let dataset = Dataset::try_new(input.to_string(), "foo").expect("valid dataset");
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+
+            let dataset = DatasetBuilder::try_new(input.to_string(), "foo")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
 
             let result = get_path(&dataset);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_object_store_url() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let dataset = DatasetBuilder::try_new("file:/tmp/".into(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let connector = File {
+            params: Parameters::new(([]).to_vec(), "test", &[]),
+        };
+
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/");
+
+        // object store override path with `file:` prefix
+        let url = connector
+            .get_object_store_url(&dataset, Some("file:/tmp/1/"))
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/1/");
+
+        // object store override without `file:` prefix
+        let url = connector
+            .get_object_store_url(&dataset, Some("/tmp/2/"))
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/2/");
     }
 }

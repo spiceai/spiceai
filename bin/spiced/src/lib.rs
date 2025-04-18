@@ -27,16 +27,16 @@ use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryCon
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime::Tokio;
-use opentelemetry_sdk::Resource;
 use otel_arrow::OtelArrowExporter;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
-use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
@@ -246,6 +246,7 @@ pub async fn run(args: Args) -> Result<()> {
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let rt = Arc::new(rt);
+
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,

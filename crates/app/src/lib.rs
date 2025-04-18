@@ -21,19 +21,19 @@ use std::{collections::HashMap, path::PathBuf};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
+    Spicepod,
     component::{
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
         eval::Eval,
-        extension::Extension,
         model::Model,
         runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
         secret::Secret,
         tool::Tool,
         view::View,
     },
-    Spicepod,
+    extension::Extension,
 };
 
 pub mod runtime;
@@ -218,6 +218,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_runtime(mut self, runtime: Runtime) -> AppBuilder {
         self.runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_shutdown_timeout(mut self, timeout: impl Into<String>) -> AppBuilder {
+        self.runtime.shutdown_timeout = Some(timeout.into());
         self
     }
 

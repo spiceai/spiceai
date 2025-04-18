@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, fmt, sync::Arc};
 
-use crate::mssql::{convert::rows_to_arrow, ConnectionPoolSnafu, QuerySnafu};
+use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
@@ -24,16 +24,18 @@ use datafusion::{
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
     sql::{
+        TableReference,
         sqlparser::ast::DataType,
         unparser::{
-            dialect::{CustomDialect, CustomDialectBuilder},
             Unparser,
+            dialect::{CustomDialect, CustomDialectBuilder},
         },
-        TableReference,
     },
 };
 use futures::StreamExt;
@@ -92,7 +94,8 @@ impl SqlServerExecPlan {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }

@@ -32,7 +32,7 @@ impl Scorer for Includes {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         let actual_str: Vec<_> = match actual {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
             DatasetOutput::Choices(c) => c
@@ -43,13 +43,13 @@ impl Scorer for Includes {
 
         let ideal_strs = match ideal {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
-            DatasetOutput::Choices(ref c) => c
+            DatasetOutput::Choices(c) => c
                 .iter()
                 .map(|c| c.message.content.clone().unwrap_or_default())
                 .collect(),
         };
         if ideal_strs.len() != actual_str.len() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         let is_match = actual_str
@@ -57,11 +57,7 @@ impl Scorer for Includes {
             .zip(ideal_strs.iter())
             .all(|(a, i)| a.contains(i));
 
-        if is_match {
-            1.0
-        } else {
-            0.0
-        }
+        if is_match { Ok(1.0) } else { Ok(0.0) }
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -84,7 +80,7 @@ mod tests {
             paste! {
                 #[tokio::test]
                 async fn [<test_ $test_case_name>]() {
-                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::AssistantResponse($actual.to_string()), &DatasetOutput::AssistantResponse($ideal.to_string())).await;
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::AssistantResponse($actual.to_string()), &DatasetOutput::AssistantResponse($ideal.to_string())).await.expect("Includes' 'score' returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",
@@ -138,7 +134,7 @@ mod tests {
                         }
                     }).collect();
 
-                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::Choices(actual_choices), &DatasetOutput::Choices(ideal_choices)).await;
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::Choices(actual_choices), &DatasetOutput::Choices(ideal_choices)).await.expect("Includes' 'score' returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",

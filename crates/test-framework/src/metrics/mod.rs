@@ -24,15 +24,15 @@ use std::{
 use anyhow::Result;
 use arrow::{
     array::{
-        ArrayRef, Float64Array, Float64Builder, Int32Array, Int64Array, RecordBatch, StringArray,
-        StringBuilder, UInt64Array, UInt64Builder,
+        ArrayRef, Float64Array, Float64Builder, RecordBatch, StringArray, StringBuilder,
+        UInt64Array, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
     util::pretty::print_batches,
 };
 use uuid::Uuid;
 
-use crate::{git, TestType};
+use crate::{TestType, git};
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
 
@@ -66,18 +66,17 @@ pub struct QueryMetric<T: ExtendedMetrics> {
     pub query_status: QueryStatus,
     pub started_at: usize,
     pub finished_at: usize,
-    pub min_duration_ms: i64,
-    pub max_duration_ms: i64,
+    pub min_duration_ms: u64,
+    pub max_duration_ms: u64,
     pub iterations: usize,
-    pub median_duration_ms: i64,
-    pub percentile_99_duration_ms: i64,
-    pub percentile_95_duration_ms: i64,
-    pub percentile_90_duration_ms: i64,
+    pub median_duration_ms: u64,
+    pub percentile_99_duration_ms: u64,
+    pub percentile_95_duration_ms: u64,
+    pub percentile_90_duration_ms: u64,
     pub extended_metrics: Option<T>,
 }
 
 impl<T: ExtendedMetrics> QueryMetric<T> {
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new_from_durations(
         name: &str,
         durations: &Vec<Duration>,
@@ -96,13 +95,13 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             query_status,
             started_at,
             finished_at,
-            min_duration_ms: durations.min_duration()?.as_millis() as i64,
-            max_duration_ms: durations.max_duration()?.as_millis() as i64,
+            min_duration_ms: durations.min_duration()?.as_millis().try_into()?,
+            max_duration_ms: durations.max_duration()?.as_millis().try_into()?,
             iterations,
-            median_duration_ms: durations.median()?.as_millis() as i64,
-            percentile_99_duration_ms: durations.percentile(99.0)?.as_millis() as i64,
-            percentile_95_duration_ms: durations.percentile(95.0)?.as_millis() as i64,
-            percentile_90_duration_ms: durations.percentile(90.0)?.as_millis() as i64,
+            median_duration_ms: durations.median()?.as_millis().try_into()?,
+            percentile_99_duration_ms: durations.percentile(99.0)?.as_millis().try_into()?,
+            percentile_95_duration_ms: durations.percentile(95.0)?.as_millis().try_into()?,
+            percentile_90_duration_ms: durations.percentile(90.0)?.as_millis().try_into()?,
             extended_metrics: None,
         })
     }
@@ -293,6 +292,7 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
 pub struct QueryMetrics<T: ExtendedMetrics, R: ExtendedMetrics> {
     pub run_id: Uuid,
     pub run_name: String,
+    pub spiced_version: String,
     pub commit_sha: String,
     pub branch_name: String,
     pub test_type: TestType,
@@ -337,6 +337,14 @@ macro_rules! extract_metric_values {
             .collect::<Vec<_>>()
     };
 
+    // as u32
+    ($metrics:expr, $field:ident, as_u32) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field as u64)
+            .collect::<Vec<_>>()
+    };
+
     // as i64
     ($metrics:expr, $field:ident, as_i64) => {
         $metrics
@@ -373,6 +381,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
+            Field::new("spiced_version", DataType::Utf8, false),
             Field::new("run_name", DataType::Utf8, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
@@ -397,25 +406,23 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
-            Field::new("started_at", DataType::Int64, false),
-            Field::new("finished_at", DataType::Int64, false),
+            Field::new("spiced_version", DataType::Utf8, false),
+            Field::new("started_at", DataType::UInt64, false),
+            Field::new("finished_at", DataType::UInt64, false),
             Field::new("query_name", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, false),
-            Field::new("min_duration_ms", DataType::Int64, false),
-            Field::new("max_duration_ms", DataType::Int64, false),
-            Field::new("iterations", DataType::Int32, false),
+            Field::new("min_duration_ms", DataType::UInt64, false),
+            Field::new("max_duration_ms", DataType::UInt64, false),
+            Field::new("iterations", DataType::UInt64, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
+            Field::new("median_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_99_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_95_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_90_duration_ms", DataType::UInt64, false),
         ];
 
         base_fields.extend(extended_fields);
-
-        base_fields.extend(vec![
-            Field::new("median_duration_ms", DataType::Int64, false),
-            Field::new("percentile_99_duration_ms", DataType::Int64, false),
-            Field::new("percentile_95_duration_ms", DataType::Int64, false),
-            Field::new("percentile_90_duration_ms", DataType::Int64, false),
-        ]);
 
         Arc::new(Schema::new(base_fields))
     }
@@ -439,12 +446,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for String: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for String: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -454,12 +461,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for UInt64: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for UInt64: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -469,12 +476,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for Float64: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for Float64: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -499,14 +506,15 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     #[allow(clippy::cast_possible_wrap)]
     pub fn build_records(&self) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
+        let spiced_version = vec![self.spiced_version.clone(); self.metrics.len()];
 
-        let started_at = extract_metric_values!(self.metrics, started_at, as_i64);
-        let finished_at = extract_metric_values!(self.metrics, finished_at, as_i64);
+        let started_at = extract_metric_values!(self.metrics, started_at, as_u64);
+        let finished_at = extract_metric_values!(self.metrics, finished_at, as_u64);
         let query_name = extract_metric_values!(self.metrics, query_name, clone);
         let query_status = extract_metric_values!(self.metrics, query_status, to_string);
         let min_duration_ms = extract_metric_values!(self.metrics, min_duration_ms);
         let max_duration_ms = extract_metric_values!(self.metrics, max_duration_ms);
-        let iterations = extract_metric_values!(self.metrics, iterations, as_i32);
+        let iterations = extract_metric_values!(self.metrics, iterations, as_u64);
         let median_duration_ms = extract_metric_values!(self.metrics, median_duration_ms);
         let percentile_99_duration_ms =
             extract_metric_values!(self.metrics, percentile_99_duration_ms);
@@ -520,15 +528,20 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
-            Arc::new(Int64Array::from(started_at)),
-            Arc::new(Int64Array::from(finished_at)),
+            Arc::new(StringArray::from(spiced_version)),
+            Arc::new(UInt64Array::from(started_at)),
+            Arc::new(UInt64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
             Arc::new(StringArray::from(query_status)),
-            Arc::new(Int64Array::from(min_duration_ms)),
-            Arc::new(Int64Array::from(max_duration_ms)),
-            Arc::new(Int32Array::from(iterations)),
+            Arc::new(UInt64Array::from(min_duration_ms)),
+            Arc::new(UInt64Array::from(max_duration_ms)),
+            Arc::new(UInt64Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
+            Arc::new(UInt64Array::from(median_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_99_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_95_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_90_duration_ms)),
         ];
 
         let extended_metrics_fields = T::fields();
@@ -549,18 +562,11 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     None => {
                         return Err(anyhow::anyhow!(
                             "No builder found for extended metric field: {field}"
-                        ))
+                        ));
                     }
                 }
             }
         }
-
-        columns.extend(vec![
-            Arc::new(Int64Array::from(median_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_99_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_95_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_90_duration_ms)) as ArrayRef,
-        ]);
 
         Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])
     }
@@ -569,6 +575,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
     pub fn build_run(&self, status: QueryStatus) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string()];
+        let spiced_version = vec![self.spiced_version.to_string()];
         let run_name = vec![self.run_name.clone()];
         let commit_sha = vec![self.commit_sha.clone()];
         let branch_name = vec![self.branch_name.clone()];
@@ -602,6 +609,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
+            Arc::new(StringArray::from(spiced_version)),
             Arc::new(StringArray::from(run_name)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
@@ -630,7 +638,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     None => {
                         return Err(anyhow::anyhow!(
                             "No builder found for extended metric field: {field}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -650,23 +658,25 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
     fn start_time(&self) -> SystemTime;
     fn end_time(&self) -> SystemTime;
     fn name(&self) -> String;
+    fn spiced_version(&self) -> Result<&str>;
     fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
     fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T, R>> {
         Ok(QueryMetrics {
             run_id: uuid::Uuid::new_v4(),
             run_name: self.name(),
+            spiced_version: self.spiced_version()?.to_string(),
             commit_sha: git::get_commit_sha(),
             branch_name: git::get_branch_name(),
             test_type,
             started_at: usize::try_from(
                 self.start_time()
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_millis(),
             )?,
             finished_at: usize::try_from(
                 self.end_time()
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_millis(),
             )?,
             metrics: self.metrics()?,
             memory_usage: None,

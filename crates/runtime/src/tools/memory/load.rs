@@ -19,14 +19,14 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 
 use super::memory_table_name;

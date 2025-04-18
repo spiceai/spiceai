@@ -18,7 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
-    sql::{unparser::dialect, TableReference},
+    sql::{TableReference, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
@@ -45,6 +45,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SnowflakeTableFactory {
     pool: Arc<SnowflakeConnectionPool>,
+}
+
+impl std::fmt::Debug for SnowflakeTableFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnowflakeTableFactory")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SnowflakeTableFactory {

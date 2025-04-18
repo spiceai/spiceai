@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
+use std::collections::HashMap;
+
+use runtime::Runtime;
 use runtime::extension::ExtensionFactory;
-use runtime::{status, Runtime};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -42,24 +43,22 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );
 
+            let cloned_rt = Arc::clone(&rt);
+
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
+                            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                                panic!("Timeout waiting for components to load");
+                            }
+            () = cloned_rt.load_components() => {}
+                        }
 
             let mut result = rt
                 .datafusion()
@@ -96,13 +95,10 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                 .with_catalog(catalog)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .with_autoload_extensions(HashMap::from([(
                         "spice_cloud".to_string(),
                         Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
@@ -110,13 +106,14 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                     .build()
                     .await,
             );
+            let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
+                            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                                panic!("Timeout waiting for components to load");
+                            }
+            () = cloned_rt.load_components() => {}
+                        }
 
             let mut result = rt
                 .datafusion()

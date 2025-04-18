@@ -17,8 +17,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{model::try_to_chat_model, Result, Runtime, UnableToInitializeLlmSnafu};
-use llms::chat::{try_map_boxed_error_to_box, Chat};
+use crate::{Result, Runtime, UnableToInitializeLlmSnafu, model::try_to_chat_model};
+use llms::chat::{Chat, try_map_boxed_error_to_box};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
@@ -29,7 +29,7 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<Box<dyn Chat>> {
+    ) -> Result<Arc<dyn Chat>> {
         let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()

@@ -19,11 +19,12 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
-use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params};
+
+use runtime::Runtime;
+use spicepod::{component::dataset::Dataset, param::Params};
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("snowflake:{path}"), name.to_string());
@@ -80,21 +81,21 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await;
 
-            let mut rt = Runtime::builder()
-                .with_datafusion(df)
-                .with_app(app)
-                .build()
-                .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{de::Error, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error};
 
 use crate::component::embeddings::EmbeddingChunkConfig;
 
@@ -156,35 +156,44 @@ mod tests {
     #[test]
     fn test_deserialize_row_ids_errors() {
         match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
+            r"
                 from: foo
                 row_id:
                   - foo: bar
             ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"),
-            };
+        ) {
+            Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"
+            ),
+        };
 
         match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
+            r"
                 from: foo
                 row_id: {foo: bar, extra: value}
             ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"),
-            };
+        ) {
+            Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"
+            ),
+        };
 
         match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
+            r"
                 from: foo
                 row_id: [foo, bar
             ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"),
-            };
+        ) {
+            Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"
+            ),
+        };
     }
 
     #[test]

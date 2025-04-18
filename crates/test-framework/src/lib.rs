@@ -26,6 +26,7 @@ pub mod snapshot;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod spicetest;
+pub mod telemetry;
 pub mod utils;
 
 use std::fmt::Display;
@@ -36,6 +37,8 @@ pub use arrow;
 pub use flight_client;
 pub use futures;
 pub use octocrab;
+pub use opentelemetry;
+pub use opentelemetry_sdk;
 pub use rustls;
 pub use serde_yaml;
 pub use spicepod;

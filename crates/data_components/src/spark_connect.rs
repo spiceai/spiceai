@@ -28,8 +28,9 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -42,7 +43,7 @@ use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engin
 use futures::Stream;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
-    client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
+    DataFrame, SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
 };
 
 use std::error::Error;
@@ -247,7 +248,8 @@ impl SparkConnectExecutionPlan {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }

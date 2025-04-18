@@ -16,23 +16,23 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::DataFusion, status::ComponentStatus, LogErrors, Runtime,
+    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    datafusion::DataFusion, status::ComponentStatus,
 };
 use app::App;
 use axum::{
+    Extension, Json,
     extract::Path,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{convert_entry_to_csv, dataset_status, Format};
+use super::{Format, convert_entry_to_csv, dataset_status};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -136,6 +136,7 @@ postgres:aidemo_messages,general,false,false
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Response {
@@ -156,7 +157,7 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
+    let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()

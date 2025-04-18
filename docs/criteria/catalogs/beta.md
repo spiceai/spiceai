@@ -39,6 +39,7 @@ This section is required if the Catalog does not use an existing Data Connector.
 
 - [ ] An end-to-end test is created that loads the TPC-H dataset at scale factor 1 using a Catalog, instead of specifying individual datasets.
   - [ ] TPC-H queries pass with a success rate equal to the native connector. For Catalogs without an existing Data Connector, queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
+  - [ ] The TPC-H end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the catalog.
 - [ ] The Catalog can load the schema of a dataset without performing a data query at dataset registration time.
 - [ ] Known [Major](../definitions.md) bugs are resolved for the Catalog.
 - [ ] Known [Minor](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve TPC-H success.

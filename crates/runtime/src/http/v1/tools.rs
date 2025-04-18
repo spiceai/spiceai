@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use axum::{
+    Extension, Json,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};

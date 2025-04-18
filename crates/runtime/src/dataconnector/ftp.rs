@@ -23,12 +23,13 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::{listing, ConnectorComponent, ConnectorParams};
+use super::{ConnectorComponent, ConnectorParams, listing};
 use super::{
-    listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
-    ParameterSpec, Parameters,
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    listing::ListingTableConnector,
 };
 
+#[derive(Debug)]
 pub struct FTP {
     params: Parameters,
 }
@@ -39,7 +40,7 @@ impl std::fmt::Display for FTP {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FTPFactory {}
 
 impl FTPFactory {
@@ -101,13 +102,18 @@ impl ListingTableConnector for FTP {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
         let mut ftp_url =
-            Url::parse(&dataset.from)
+            Url::parse(url)
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/ftp", dataset.from),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 

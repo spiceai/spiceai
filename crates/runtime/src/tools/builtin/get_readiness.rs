@@ -16,8 +16,8 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::tools::SpiceModelTool;
 use crate::Runtime;
+use crate::tools::SpiceModelTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;

@@ -5,6 +5,10 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
 {
   "messages": [
     {
+      "content": "\n    When writing SQL queries, do not put double quotes around schema-qualified table names. For example:\n\n    Correct: SELECT * FROM schema.table\n    Correct: SELECT * FROM database.schema.table\n    Incorrect: SELECT * FROM \"schema.table\"\n    Incorrect: SELECT * FROM \"database.schema.table\"\n\n    Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.\n\n    Prefer quoting column names. For example:\n    Correct: `SELECT COUNT(*) AS \"total_records\" FROM \"spice\".\"public\".\"taxi_trips\"`\n    Incorrect: `SELECT COUNT(*) AS total_records FROM \"spice\".\"public\".\"taxi_trips\"`\n    ",
+      "role": "system"
+    },
+    {
       "role": "assistant",
       "tool_calls": [
         {
@@ -35,6 +39,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
   "tools": [
     {
       "function": {
+        "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
         "name": "document_similarity",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -100,19 +105,21 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Get the readiness status of the Spice.ai runtime",
         "name": "get_readiness"
       },
       "type": "function"
     },
     {
       "function": {
+        "description": "List available datasets",
         "name": "list_datasets"
       },
       "type": "function"
     },
     {
       "function": {
-        "description": "Sample random rows from a table.",
+        "description": "Get a random sample of rows from a Spice.ai dataset",
         "name": "random_sample",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -140,7 +147,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Generate synthetic data by sampling distinct column values from a table.",
+        "description": "Sample distinct column values from a Spice.ai dataset",
         "name": "sample_distinct_columns",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -178,6 +185,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
         "name": "sql",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -198,6 +206,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Get the schema of the Spice.ai dataset",
         "name": "table_schema",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -210,6 +219,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "type": "string"
             }
           },
+          "description": "A tool to retrieve the schema of one or more available SQL tables.",
           "properties": {
             "output": {
               "allOf": [
@@ -221,7 +231,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "description": "If `full` return metadata and semantic details about the columns."
             },
             "tables": {
-              "description": "Which subset of tables to return results for. Default to all tables.",
+              "description": "Which tables to return the schema of.",
               "items": {
                 "type": "string"
               },
@@ -239,7 +249,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Sample the top N rows from a table based on a specified ordering",
+        "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
         "name": "top_n_sample",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",

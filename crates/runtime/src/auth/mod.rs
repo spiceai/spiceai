@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 use crate::{
-    secrets::{ParamStr, Secrets},
     App,
+    secrets::{ParamStr, Secrets},
 };
-use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth, GrpcAuth, HttpAuth};
+use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, api_key::ApiKeyAuth};
 use secrecy::ExposeSecret;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
 use std::sync::Arc;

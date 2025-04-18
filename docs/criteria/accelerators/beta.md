@@ -30,6 +30,8 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
 - [ ] All known [Major Bugs](../definitions.md) are resolved
+- [ ] The accelerator supports reading datasets with the same max column count as the accelerator source.
+  - For example, if the accelerator source supports tables with 1000 columns, the accelerator should support accelerating this table and querying against it.
 
 ### Test Coverage
 
@@ -45,6 +47,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 - [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](../definitions.md)
 - [ ] Integration tests to cover "On Conflict" behaviors.
+- [ ] An integration or benchmark test validating the maximum column count use case is added.
 
 #### TPC-H
 
@@ -53,6 +56,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-H SF10 and TPC-H SF100 data into this accelerator in all [Access Modes](../definitions.md).
 - [ ] The accelerator can load TPC-H SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] The accelerator can load TPC-H SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The TPC-H end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the accelerator.
 
 #### TPC-DS
 
@@ -61,6 +65,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-DS SF10 and TPC-DS SF100 data into this accelerator in all [Access Modes](../definitions.md).
 - [ ] The accelerator can load TPC-DS SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] The accelerator can load TPC-DS SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The TPC-DS end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the accelerator.
 
 #### ClickBench
 

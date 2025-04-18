@@ -15,24 +15,24 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{array, Array, RecordBatch},
+    array::{Array, RecordBatch, array},
     datatypes::Schema,
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::{
-    tls::new_tls_flight_channel, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, tls::new_tls_flight_channel,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc, vec};
 
 use arrow_flight::{
+    FlightEndpoint, IpcMessage,
     error::FlightError,
     flight_service_client::FlightServiceClient,
-    sql::{client::FlightSqlServiceClient, CommandGetTables},
-    FlightEndpoint, IpcMessage,
+    sql::{CommandGetTables, client::FlightSqlServiceClient},
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -43,13 +43,16 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
-        ExecutionMode, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        project_schema,
+        stream::RecordBatchStreamAdapter,
     },
     sql::TableReference,
 };
 use tonic::codegen::Bytes;
-use tonic::transport::{channel, Channel};
+use tonic::transport::{Channel, channel};
 
 use crate::Read;
 
@@ -57,34 +60,46 @@ pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
+    #[snafu(display(
+        "Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"
+    ))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
-    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Query execution failed (flightsql).\n{source}"))]
     UnableToQueryArrowFlight { source: FlightError },
 
-    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToRetrieveSchemaFromIpcMessage {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToRetrieveSchemaArrow {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToRetrieveSchemaFlight {
         source: FlightError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\nEnsure the table exists and try again."))]
+    #[snafu(display(
+        "Failed to detect table '{table_name}' schema (flightsql).\nEnsure the table exists and try again."
+    ))]
     UnableToRetrieveSchema { table_name: String },
 }
 
@@ -421,7 +436,8 @@ impl FlightSqlExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }
@@ -507,10 +523,8 @@ impl ExecutionPlan for FlightSqlExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            query_to_stream(self.client.clone(), sql.as_str()),
-        );
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
 
         Ok(Box::pin(stream_adapter))
     }
@@ -519,13 +533,11 @@ impl ExecutionPlan for FlightSqlExec {
 #[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     mut client: FlightSqlServiceClient<Channel>,
-    sql: &str,
+    sql: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let sql = sql.to_string();
-
     stream! {
         let flight_info = client
-            .execute(sql.to_string(), None)
+            .execute(sql, None)
             .await
             .map_err(to_execution_error)?;
 

@@ -19,15 +19,15 @@ limitations under the License.
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Builder,
     Int64Builder, ListArray, ListBuilder, StringBuilder, StructArray, TimestampNanosecondBuilder,
-    UInt32Builder, UInt64Builder, UInt8Builder,
+    UInt8Builder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
 use opentelemetry::InstrumentationScope;
-use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
-use opentelemetry_sdk::metrics::MetricError;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 

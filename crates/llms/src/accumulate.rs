@@ -120,13 +120,13 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
 
     // Update `content`.
     match (&mut acc.message.content, content) {
-        (Some(ref mut a), Some(b)) => *a += b,
+        (Some(a), Some(b)) => *a += b,
         (None, Some(b)) => acc.message.content = Some(b.clone()),
         _ => (),
     }
     // Update `refusal`.
     match (&mut acc.message.refusal, refusal) {
-        (Some(ref mut a), Some(b)) => *a += b,
+        (Some(a), Some(b)) => *a += b,
         (None, Some(b)) => acc.message.refusal = Some(b.clone()),
         _ => (),
     }

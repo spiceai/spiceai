@@ -15,39 +15,42 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use ::tools::rename::with_name;
 use ::tools::SpiceModelTool;
+use ::tools::rename::with_name;
 use async_stream::stream;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
-use tools::factory::ToolFactory;
+use tools::{factory::ToolFactory, sync::Mutex, task::JoinHandle, time::Instant};
 
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
 };
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{sqlparser, TableReference};
+use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 use builder::RuntimeBuilder;
-use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
+use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::future::join_all;
 use futures::Stream;
+use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
-use crate::tools::{catalog::SpiceToolCatalog, factory::default_available_catalogs, Tooling};
+use crate::tools::{
+    SpiceModelTool, Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs,
+    with_name,
+};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -56,8 +59,11 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
-use tokio::sync::{oneshot::error::RecvError, RwLock};
+
+use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
+use tools::factory::default_available_catalogs;
+use tools::{Tooling, catalog::SpiceToolCatalog};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
@@ -107,7 +113,9 @@ pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
-    #[snafu(display("Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToExecuteTask { source: tokio::task::JoinError },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
@@ -156,13 +164,19 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"))]
+    #[snafu(display(
+        "Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+    ))]
     UnknownDataConnector { data_connector: String },
 
-    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"))]
+    #[snafu(display(
+        "Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+    ))]
     UnknownCatalogConnector { catalog_connector: String },
 
-    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
+    #[snafu(display(
+        "The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+    ))]
     OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
@@ -200,19 +214,27 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
-    #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
+    #[snafu(display(
+        "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
+    ))]
     NeedToSpecifySQLView { name: String },
 
-    #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
+    #[snafu(display(
+        "An accelerated table was configured as read_write without setting replication.enabled = true"
+    ))]
     AcceleratedReadWriteTableWithoutReplication,
 
-    #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
+    ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+    ))]
     AcceleratorEngineNotAvailable { name: String },
 
     #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
@@ -282,8 +304,20 @@ pub enum Error {
     #[snafu(display("Unable to create directory: {source}"))]
     UnableToCreateDirectory { source: std::io::Error },
 
+    #[snafu(display("Unable to build dataset: {dataset}: {source}"))]
+    UnableToBuildDataset {
+        dataset: String,
+        source: crate::component::dataset::Error,
+    },
+
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
+
+    #[snafu(display("{source}"))]
+    ComponentsInitializationFailed { source: tokio::task::JoinError },
+
+    #[snafu(display("Initialization has been cancelled"))]
+    ComponentsInitializationCancelled,
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -291,9 +325,10 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
+const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
-// Allow 30 seconds for server components to shutdown
-const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+// Allow 30 seconds for tasks for graceful shutdown
+const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -324,7 +359,8 @@ pub struct Runtime {
 
     status: Arc<status::RuntimeStatus>,
 
-    server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
 
 impl Runtime {
@@ -362,9 +398,12 @@ impl Runtime {
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
     }
+    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+        Arc::clone(&self.accelerator_engine_registry)
+    }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
-    pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
+    pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
 
         if let Some(extension) = extensions.get(name) {
@@ -376,12 +415,12 @@ impl Runtime {
             let mut extensions = self.extensions.write().await;
             let mut extension = autoload_factory.create();
             let extension_name = extension.name().to_string();
-            if let Err(err) = extension.initialize(self).await {
+            if let Err(err) = extension.initialize(self.as_ref()).await {
                 tracing::error!("Unable to initialize extension {extension_name}: {err}");
                 return None;
             }
 
-            if let Err(err) = extension.on_start(self).await {
+            if let Err(err) = extension.on_start(Arc::clone(&self)).await {
                 tracing::error!("Unable to start extension {extension_name}: {err}");
                 return None;
             }
@@ -405,7 +444,8 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
-        self.register_metrics_table(self.prometheus_registry.is_some())
+        Arc::clone(&self)
+            .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
         // Start Http server
@@ -413,15 +453,17 @@ impl Runtime {
         let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
+        let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_server_component(HTTP_SERVER, None, async move {
+            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
                     http_auth,
+                    Some(http_shutdown),
                 )
                 .await
                 .context(UnableToStartHttpServerSnafu)
@@ -434,7 +476,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
 
         let metrics_future = self
-            .start_server_component(METRICS_SERVER, None, async move {
+            .start_runtime_task(METRICS_SERVER, None, async move {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
@@ -449,7 +491,7 @@ impl Runtime {
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
         let flight_future = self
-            .start_server_component(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
@@ -471,7 +513,7 @@ impl Runtime {
         let grpc_auth = endpoint_auth.grpc_auth.clone();
 
         let opentelemetry_future = self
-            .start_server_component(
+            .start_runtime_task(
                 OPENTELEMETRY_SERVER,
                 Some(opentelemetry_graceful_shutdown.clone()),
                 async move {
@@ -502,7 +544,7 @@ impl Runtime {
         // Start Spicepod watcher
         let self_ref = Arc::clone(&self);
         let pods_watcher_future = self
-            .start_server_component(PODS_WATCHER, None, async move {
+            .start_runtime_task(PODS_WATCHER, None, async move {
                 self_ref
                     .start_pods_watcher()
                     .await
@@ -515,7 +557,6 @@ impl Runtime {
             shutdown_signal().await;
             tracing::debug!("Shutdown signal received.");
             self.shutdown().await;
-            tracing::info!("Goodbye!");
             Ok(())
         };
 
@@ -540,7 +581,7 @@ impl Runtime {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -574,7 +615,7 @@ impl Runtime {
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
         for view in valid_views {
             self.status
                 .update_view(&view.name, ComponentStatus::Initializing);
@@ -585,10 +626,11 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
+    #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
-        self.start_extensions().await;
+        Arc::clone(&self).start_extensions().await;
 
         // Must be loaded before datasets
         self.load_embeddings().await;
@@ -634,12 +676,15 @@ impl Runtime {
         let evals = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
-                let app_lock = self_clone.app.read().await;
+                let app_ref = Arc::clone(&self_clone).app();
+                let app_lock = app_ref.read().await;
 
                 if !cfg!(feature = "models")
                     && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
                 {
-                    tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+                    tracing::error!(
+                        "Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+                    );
                 }
 
                 #[cfg(feature = "models")]
@@ -647,27 +692,80 @@ impl Runtime {
                     self_clone.load_eval_scorer().await;
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
-                    if !an_eval_exists {
-                        tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
-                    } else if let Err(err) = self_clone.load_eval_tables().await {
-                        tracing::warn!("Creating internal eval run table: {err}");
+                    if an_eval_exists {
+                        drop(app_lock);
+                        if let Err(err) = self_clone.load_eval_tables().await {
+                            tracing::warn!("Failed to create internal eval tables: {err}");
+                        }
+                    } else {
+                        tracing::trace!(
+                            "No eval spice components defined. Therefore not loading eval tables into database."
+                        );
                     }
                 }
             }
         });
 
-        // Wait for all tasks to complete
-        let load_result = tokio::try_join!(
+        let components = vec![
             task_history,
             results_cache,
             datasets,
             catalogs,
-            models,
-            evals
-        );
+            models_and_evals,
+        ];
 
-        if let Err(err) = load_result {
-            tracing::error!("Could not start the Spice runtime: {err}");
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
+        let cancel_loading = CancellationToken::new();
+
+        // Wait for all components to load returning the first error
+        // or canceling spawned tokio tasks if the runtime is shutting down
+        let load_result = self
+            .start_runtime_task(
+                COMPONENTS_INITIAL_LOAD,
+                Some(cancel_loading.clone()),
+                async move {
+                    let abort_handlers = components
+                        .iter()
+                        .map(JoinHandle::abort_handle)
+                        .collect::<Vec<_>>();
+
+                    tokio::select! {
+                        load_result = try_join_all(components) => {
+                            load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
+                        }
+                        () = cancel_loading.cancelled() => {
+                            for handle in abort_handlers {
+                                handle.abort();
+                            }
+                            ComponentsInitializationCancelledSnafu.fail()
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if let Err(err) = load_result.await {
+            if !matches!(err, Error::ComponentsInitializationCancelled) {
+                tracing::error!("Could not start the Spice runtime: {err}");
+            }
+        } else {
+            // Create a background task to report once all components are marked as `Ready`
+            let status = self.status();
+            tokio::spawn({
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                        if status.is_shutdown() {
+                            break;
+                        }
+                        if status.is_ready() {
+                            tracing::info!("All components are loaded. Spice runtime is ready!");
+                            break;
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -677,17 +775,28 @@ impl Runtime {
             return;
         }
 
-        tracing::info!("Shutting down runtime...");
         self.status.mark_shutdown();
 
+        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
+            })
+        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
+        tracing::info!(
+            "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
+        );
+
+        let start_time = Instant::now();
+
         // shutdown all running components except the HTTP and Metrics servers
-        let mut running_components = self.server_components.write().await;
+        let mut runtime_tasks = self.runtime_tasks.write().await;
 
         // HTTP and METRICS servers must be shutdown last
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
-        for (name, handle) in running_components.drain() {
+        for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
                 HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
@@ -696,9 +805,13 @@ impl Runtime {
 
         let shutdown_futures: Vec<_> = first_shutdown_group
             .into_iter()
-            .map(|(name, handle)| {
-                tracing::debug!("Shutting down {name}");
-                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            .filter_map(|(name, handle)| {
+                if handle.is_finished() {
+                    None
+                } else {
+                    tracing::debug!("Shutting down {name}");
+                    Some(handle.cancel(shutdown_timeout))
+                }
             })
             .collect();
 
@@ -708,26 +821,32 @@ impl Runtime {
         self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
-        dataaccelerator::unregister_all().await;
+        self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
+
         document_parse::unregister_all().await;
+
+        // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
+        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        let elapsed = start_time.elapsed();
+        let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
         // Shutdown HTTP & Metrics servers last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+                handle.cancel(remaining_timeout)
             })
             .collect();
 
         join_all(shutdown_futures).await;
 
-        tracing::debug!("Shutdown complete.");
+        tracing::debug!("Shutdown completed");
     }
 
-    /// Spawns and registers a server component with optional cancellation support.
-    async fn start_server_component<F>(
+    /// Spawns and registers a runtime task with optional cancellation support.
+    async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
@@ -738,7 +857,7 @@ impl Runtime {
     {
         let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        self.server_components
+        self.runtime_tasks
             .write()
             .await
             .insert(component_name.to_string(), handle);

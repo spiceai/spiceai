@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use ::datafusion::sql::{parser, sqlparser::ast, TableReference};
+use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
 use std::collections::HashSet;
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {

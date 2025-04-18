@@ -25,11 +25,12 @@
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
-Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
+Spice provides four industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
 
-1. **SQL Query APIs**: Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
-2. **OpenAI-Compatible APIs**: HTTP APIs compatible the OpenAI SDK, AI SDK with local model serving (CUDA/Metal accelerated) and gateway to hosted models.
-3. **Iceberg Catalog REST APIs**: A unified Iceberg Catalog API.
+1. **SQL Query APIs**: Supports HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
+2. **OpenAI-Compatible APIs**: Provides HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
+3. **Iceberg Catalog REST APIs**: Offers a unified API for Iceberg Catalog.
+4. **MCP HTTP+SSE APIs**: Enables integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
 
 🎯 Goal: Developers can focus on building data apps and AI agents confidently, knowing they are grounded in data.
 
@@ -100,7 +101,7 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Unified Data + AI Runtime** | ✅                                   | ―                  | ―          | ―                | ―                             |
 | **Federated Data Query**      | ✅                                   | ―                  | ―          | ―                | ―                             |
 | **Accelerated Data Access**   | ✅                                   | ―                  | ―          | ―                | ―                             |
-| **Tools/Functions**           | ✅                                   | ✅                 | ✅         | Limited          | Limited                       |
+| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                    | ✅                 | ✅         | Limited          | Limited                       |
 | **LLM Memory**                | ✅                                   | ✅                 | ―          | ✅               | ―                             |
 | **Evaluations (Evals)**       | ✅                                   | Limited            | ―          | Limited          | ―                             |
 | **Search**                    | ✅ (VSS)                             | ✅                 | ✅         | Limited          | Limited                       |
@@ -118,7 +119,7 @@ Limited = Partial or restricted support
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://spiceai.org/docs/features/monitoring)
+- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability & Monitoring Features Documentation](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
 
@@ -180,7 +181,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mongodb`                          | MongoDB                               | Coming Soon       |                              |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
-[databricks]: https://github.com/spiceai/cookbook/tree/trunk/databricks/delta_lake
+[databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
@@ -525,7 +526,7 @@ Spice.ai is designed to be extensible with extension points documented at [EXTEN
 
 ### 🔨 Upcoming Features
 
-🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
+🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
 
 ### 🤝 Connect with us
 
@@ -535,6 +536,6 @@ We greatly appreciate and value your support! You can help Spice in a number of 
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-- Follow our blog at [blog.spiceai.org](https://blog.spiceai.org)
+- Follow our blog at [spiceai.org/blog](https://spiceai.org/blog)
 
 ⭐️ star this repo! Thank you for your support! 🙏

@@ -16,12 +16,12 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{datafusion::is_spice_internal_schema, DataFusion};
+use crate::{DataFusion, datafusion::is_spice_internal_schema};
 use axum::{
+    Extension, Json,
     extract::{Path, Query},
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use error::IcebergResponseError;
 use namespace::{Namespace, NamespacePath};

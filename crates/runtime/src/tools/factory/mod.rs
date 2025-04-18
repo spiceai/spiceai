@@ -24,8 +24,8 @@ use crate::Runtime;
 use super::mcp::factory::McpCatalogFactory;
 
 use super::{
-    builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
-    memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
+    SpiceModelTool, Tooling, builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
+    memory::catalog::MemoryToolCatalog,
 };
 
 pub enum ToolFactory {

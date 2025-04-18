@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 use crate::{
-    datafusion::SPICE_RUNTIME_SCHEMA, task_history, Error, Result, Runtime,
-    UnableToCreateBackendSnafu,
+    Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
+    task_history,
 };
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
+use std::sync::Arc;
 
 impl Runtime {
-    pub async fn init_task_history(&self) -> Result<()> {
+    pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
         let app = self.app.read().await;
 
         if let Some(app) = app.as_ref() {
@@ -57,6 +58,7 @@ impl Runtime {
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,
+            Arc::clone(&self),
         )
         .await
         {

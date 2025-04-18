@@ -23,8 +23,8 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
 use datafusion_table_providers::sql::db_connection_pool::{
-    postgrespool::{self, PostgresConnectionPool},
     Error as DbConnectionPoolError,
+    postgrespool::{self, PostgresConnectionPool},
 };
 use snafu::prelude::*;
 use std::any::Any;
@@ -45,6 +45,12 @@ pub enum Error {
 
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
+}
+
+impl std::fmt::Debug for Postgres {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Postgres").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default, Copy, Clone)]

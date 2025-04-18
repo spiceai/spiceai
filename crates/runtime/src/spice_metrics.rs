@@ -24,14 +24,15 @@ use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::refresh::Refresh;
+use crate::Runtime;
 use crate::accelerated_table::Retention;
-use crate::component::dataset::acceleration::Acceleration;
+use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
+use crate::component::dataset::acceleration::Acceleration;
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
+use crate::internal_table::{Error as InternalTableError, create_internal_accelerated_table};
 use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
@@ -87,7 +88,10 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
     }
 }
 
-pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), Error> {
+pub async fn register_metrics_table(
+    datafusion: &Arc<DataFusion>,
+    runtime: Arc<Runtime>,
+) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
     let retention = Retention::new(
@@ -109,6 +113,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
         Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),
+        runtime,
     )
     .await
     .context(UnableToCreateMetricsTableSnafu)?;

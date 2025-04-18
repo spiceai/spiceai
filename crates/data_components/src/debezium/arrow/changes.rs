@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     arrow::struct_builder::StructBuilder,
-    cdc::{changes_schema, ChangeBatch},
+    cdc::{ChangeBatch, changes_schema},
     debezium::{
         arrow::downcast_builder,
         change_event::{ChangeEvent, Op},

@@ -22,7 +22,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
-    sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
+    sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
@@ -30,12 +30,12 @@ use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::{
-        acceleration::{Engine, Mode},
         Dataset,
+        acceleration::{Engine, Mode},
     },
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path,
 };
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
@@ -57,7 +57,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    #[snafu(display(
+        "The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."
+    ))]
     InvalidFileExtension {
         valid_extensions: String,
         extension: String,
@@ -82,6 +84,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
+}
+
+impl Default for SqliteAccelerator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqliteAccelerator {
@@ -157,12 +165,6 @@ impl SqliteAccelerator {
             .context(AccelerationCreationFailedSnafu)?;
 
         Ok(pool)
-    }
-}
-
-impl Default for SqliteAccelerator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -260,33 +262,33 @@ impl DataAccelerator for SqliteAccelerator {
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases =
-                        datasets
-                            .iter()
-                            .filter_map(|other_dataset| {
-                                if other_dataset.acceleration.as_ref().is_some_and(|a| {
-                                    a.engine == Engine::Sqlite && a.mode == Mode::File
-                                }) {
-                                    if **other_dataset == *this_dataset {
-                                        None
-                                    } else {
-                                        let other_path = self.file_path(other_dataset);
-                                        other_path.ok().filter(|p| p != &self_path)
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                let datasets = Arc::clone(&this_dataset.runtime)
+                    .get_initialized_datasets(&this_dataset.app, crate::LogErrors(false))
+                    .await;
+                let self_path = self.file_path(this_dataset)?;
+                let attach_databases = datasets
+                    .iter()
+                    .filter_map(|other_dataset| {
+                        if other_dataset
+                            .acceleration
+                            .as_ref()
+                            .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
+                        {
+                            if **other_dataset == *this_dataset {
+                                None
+                            } else {
+                                let other_path = self.file_path(other_dataset);
+                                other_path.ok().filter(|p| p != &self_path)
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
-                    }
+                if !attach_databases.is_empty() {
+                    cmd.options
+                        .insert("attach_databases".to_string(), attach_databases.join(";"));
                 }
             }
         }
@@ -335,15 +337,15 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
 
+    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::component::dataset::Dataset;
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]
@@ -446,11 +448,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_file_initialization() {
-        let mut dataset = Dataset::try_new(
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(
             "sqlite_file_accelerator_init".to_string(),
             "sqlite_file_accelerator_init",
         )
-        .expect("dataset should be created");
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,

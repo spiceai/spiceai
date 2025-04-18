@@ -16,16 +16,15 @@ limitations under the License.
 
 // use std::{collections::HashMap, sync::Arc};
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
-// use datafusion::catalog::TableProvider;
 use duckdb::Connection;
 use snafu::prelude::*;
 
 use async_trait::async_trait;
 use runtime::{
-    extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     Runtime,
+    extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
 };
 
 #[derive(Debug, Snafu)]
@@ -71,7 +70,7 @@ impl Extension for TpcExtension {
         Ok(())
     }
 
-    async fn on_start(&self, _runtime: &Runtime) -> Result<()> {
+    async fn on_start(&self, _runtime: Arc<Runtime>) -> Result<()> {
         if !self.manifest.enabled {
             return Ok(());
         }
@@ -114,7 +113,9 @@ impl Extension for TpcExtension {
             .boxed()
             .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
 
-        tracing::info!("Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}");
+        tracing::info!(
+            "Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}"
+        );
 
         let gen_func = match benchmark.as_str() {
             "tpch" => String::from("dbgen"),
@@ -124,7 +125,7 @@ impl Extension for TpcExtension {
                     source: Box::new(Error::InvalidBenchmark {
                         benchmark: benchmark.clone(),
                     }),
-                })
+                });
             }
         };
 

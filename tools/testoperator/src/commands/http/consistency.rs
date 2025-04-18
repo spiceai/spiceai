@@ -21,15 +21,15 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 use test_framework::{
+    TestType,
     anyhow::{self, anyhow},
     arrow::util::pretty::print_batches,
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
-        http::consistency::{self, ConsistencyConfig},
         SpiceTest,
+        http::consistency::{self, ConsistencyConfig},
     },
-    TestType,
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -74,7 +74,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     let records = results.build_records()?;
     print_batches(&records)?;
 
-    let (p50, p95): (Vec<i64>, Vec<i64>) = results
+    let (p50, p95): (Vec<u64>, Vec<u64>) = results
         .metrics
         .iter()
         .map(|minute| (minute.median_duration_ms, minute.percentile_95_duration_ms))

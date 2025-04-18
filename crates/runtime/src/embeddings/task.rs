@@ -29,14 +29,15 @@ use tracing::{Instrument, Span};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
 
+#[derive(Debug)]
 pub struct TaskEmbed {
     name: String,
-    inner: Box<dyn Embed>,
+    inner: Arc<dyn Embed>,
     vector_size: i32,
 }
 
 impl TaskEmbed {
-    pub async fn new(name: &str, inner: Box<dyn Embed>) -> EmbedResult<Self> {
+    pub async fn new(name: &str, inner: Arc<dyn Embed>) -> EmbedResult<Self> {
         let size = match inner.size() {
             size if size > -1 => size,
             _ => {

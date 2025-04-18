@@ -81,6 +81,8 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 
 - [ ] All [Alpha release criteria](./alpha.md) pass for this connector.
 - [ ] [Core Connector Data Types](../definitions.md) are supported.
+- [ ] The connector supports reading datasets with the same max column count as the connector source.
+  - For example, if the connector source supports tables with 1000 columns, the connector should support adding this table as a dataset and querying against it.
 
 #### Documentation
 
@@ -99,6 +101,7 @@ Documentation criteria should be re-checked on every release, to ensure the docu
 #### Testing
 
 - [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.
+- [ ] An integration or benchmark test validating the maximum column count use case is added.
 
 ### Conditional Criteria
 
@@ -140,6 +143,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] The connector can load TPC-H at the [designated scale factor](#beta-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-H are raised as issues.
 - [ ] TPC-H queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
+- [ ] The TPC-H end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the connector.
 
 #### Data Correctness
 

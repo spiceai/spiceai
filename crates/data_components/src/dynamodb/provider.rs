@@ -18,16 +18,16 @@ use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
 use arrow::{
     datatypes::{Field, SchemaRef},
-    json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
+    json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
+    Client,
     operation::{
         describe_table::DescribeTableError,
-        scan::{builders::ScanFluentBuilder, ScanError},
+        scan::{ScanError, builders::ScanFluentBuilder},
     },
     types::{AttributeValue, TableStatus},
-    Client,
 };
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -37,8 +37,9 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchReceiverStream, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchReceiverStream,
     },
     prelude::Expr,
 };
@@ -196,11 +197,7 @@ fn projection_expression(projection: Option<&Vec<usize>>, schema: &SchemaRef) ->
         .join(", ");
 
     // If we couldn't find any valid field names, return None
-    if expr.is_empty() {
-        None
-    } else {
-        Some(expr)
-    }
+    if expr.is_empty() { None } else { Some(expr) }
 }
 
 #[async_trait]
@@ -257,7 +254,8 @@ impl DynamoDBTableProviderExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }

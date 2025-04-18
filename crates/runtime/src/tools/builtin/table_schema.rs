@@ -34,8 +34,8 @@ use spicepod::semantic::Column;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 use snafu::ResultExt;
 use tracing_futures::Instrument;

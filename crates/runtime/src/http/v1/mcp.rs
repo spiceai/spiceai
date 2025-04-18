@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use futures::{stream::Stream, StreamExt, TryStreamExt};
-use mcp_server::{router::RouterService, ByteTransport, Server};
+use futures::{StreamExt, TryStreamExt, stream::Stream};
+use mcp_server::{ByteTransport, Server, router::RouterService};
 
 use tokio_util::codec::FramedRead;
 
@@ -26,13 +26,13 @@ use tokio::{
 };
 
 use axum::{
+    Extension,
     extract::Query,
     response::sse::{Event, Sse},
-    Extension,
 };
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{tools::mcp::server::RuntimeServer, Runtime};
+use crate::{Runtime, tools::mcp::server::RuntimeServer};
 
 const FOUR_KB: usize = 1 << 12;
 

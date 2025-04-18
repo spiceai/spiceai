@@ -24,8 +24,8 @@ use std::{
 use crate::request::{Protocol, RequestContext};
 use app::App;
 use governor::{
-    state::{InMemoryState, NotKeyed},
     RateLimiter,
+    state::{InMemoryState, NotKeyed},
 };
 use http::HeaderValue;
 use runtime_auth::AuthRequestContext;

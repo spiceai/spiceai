@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::time::SystemTime;
+
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
 
 impl DatasetCheckpoint {
     pub(super) async fn init_postgres(pool: &PostgresConnectionPool) -> Result<()> {
@@ -49,6 +51,29 @@ impl DatasetCheckpoint {
             .await
             .map_err(|e| e.to_string())?;
         Ok(row.is_some())
+    }
+
+    pub(super) async fn last_checkpoint_time_postgres(
+        &self,
+        pool: &PostgresConnectionPool,
+    ) -> Result<Option<SystemTime>> {
+        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+
+        let query = format!(
+            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let stmt = conn.conn.prepare(&query).await.map_err(|e| e.to_string())?;
+        let rows = conn
+            .conn
+            .query(&stmt, &[&self.dataset_name])
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+
+        let checkpoint_time: Option<SystemTime> = row.get(0);
+        Ok(checkpoint_time)
     }
 
     pub(super) async fn checkpoint_postgres(

@@ -59,7 +59,7 @@ func recurseThroughTree(c chan TaskHistoryRow, node *TreeNode, indent string, is
 	if indent == "" {
 		connector = ""
 	}
-	c <- TaskHistoryRow{fmt.Sprintf("%s%s%s", indent, connector, node.TaskHistory.SpanID), node.TaskHistory}
+	c <- TaskHistoryRow{fmt.Sprintf("%s%s%s", indent, connector, node.TaskHistory.Task), node.TaskHistory}
 
 	// Recurse for children
 	newIndent := indent + "│ "

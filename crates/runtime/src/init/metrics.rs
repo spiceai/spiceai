@@ -15,20 +15,24 @@ limitations under the License.
 */
 
 use crate::{
-    spice_metrics::{self, get_metrics_table_reference},
     Result, Runtime, UnableToStartLocalMetricsSnafu,
+    spice_metrics::{self, get_metrics_table_reference},
 };
 use snafu::prelude::*;
+use std::sync::Arc;
 
 impl Runtime {
-    pub(crate) async fn register_metrics_table(&self, metrics_enabled: bool) -> Result<()> {
+    pub(crate) async fn register_metrics_table(
+        self: Arc<Self>,
+        metrics_enabled: bool,
+    ) -> Result<()> {
         if metrics_enabled {
             let table_reference = get_metrics_table_reference();
             let metrics_table = self.df.get_table(&table_reference).await;
 
             if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
-                spice_metrics::register_metrics_table(&self.df)
+                spice_metrics::register_metrics_table(&self.df, Arc::clone(&self))
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }

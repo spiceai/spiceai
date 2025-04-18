@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use datafusion::arrow::datatypes::SchemaRef;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
@@ -54,6 +57,38 @@ impl DatasetCheckpoint {
             .map_err(|e| e.to_string())?;
 
         Ok(rows.next().map_err(|e| e.to_string())?.is_some())
+    }
+
+    pub(super) fn last_checkpoint_time_duckdb(
+        &self,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<SystemTime>> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(|e| e.to_string())?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query([&self.dataset_name])
+            .map_err(|e| e.to_string())?;
+
+        let checkpoint_time_micros: Option<u64> = rows
+            .next()
+            .map_err(|e| e.to_string())?
+            .map(|row| row.get(0))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+
+        if let Some(checkpoint_time_micros) = checkpoint_time_micros {
+            let duration = Duration::from_micros(checkpoint_time_micros);
+            Ok(Some(UNIX_EPOCH + duration))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(super) fn checkpoint_duckdb(
@@ -353,5 +388,68 @@ mod tests {
         } else {
             panic!("Unexpected acceleration connection type");
         }
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_last_checkpoint_time() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        // Initially, there should be no checkpoint time
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("Unexpected checkpoint failure")
+                .is_none()
+        );
+
+        // Create a test schema
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Create the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref)
+            .await
+            .expect("Failed to create checkpoint");
+
+        // Now there should be a checkpoint time
+        let checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get checkpoint time")
+            .expect("Checkpoint time should exist");
+
+        // Verify the checkpoint time is recent
+        let now = SystemTime::now();
+        let time_diff = now
+            .duration_since(checkpoint_time)
+            .expect("Time difference should be positive");
+        assert!(time_diff.as_secs() < 5, "Checkpoint time should be recent");
+
+        // Sleep for a short time to ensure the timestamp changes
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Update the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref)
+            .await
+            .expect("Failed to update checkpoint");
+
+        // Get the new checkpoint time
+        let new_checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get new checkpoint time")
+            .expect("New checkpoint time should exist");
+
+        // Verify the new checkpoint time is more recent than the old one
+        assert!(
+            new_checkpoint_time > checkpoint_time,
+            "New checkpoint time should be more recent"
+        );
     }
 }

@@ -18,18 +18,17 @@ use super::get_app_and_start_request;
 use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
-    anyhow,
+    TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
-        datasets::{EndCondition, NotStarted},
         SpiceTest,
+        datasets::{EndCondition, NotStarted},
     },
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
-    TestType,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -116,16 +115,16 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
-    for (query, _) in queries {
-        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
+    for query in queries {
+        let Some(baseline_percentile) = baseline_percentiles.get(&query.name.to_string()) else {
             // Query Failed, no percentile statistics recorded
             continue;
         };
 
-        let Some(duration) = test_durations.get(query) else {
+        let Some(duration) = test_durations.get(&query.name.to_string()) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
-                query
+                query.name
             ));
         };
 
@@ -147,11 +146,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         if red {
             println!(
                 "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             test_passed = false;
         } else if yellow {
             println!(
                 "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             yellow_measurements += 1;
         }

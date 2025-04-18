@@ -21,9 +21,9 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
+use arrow_odbc::arrow_schema_from;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
@@ -31,20 +31,20 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
     DbConnectionPool,
+    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
 };
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
+use odbc_api::Cursor;
+use odbc_api::CursorImpl;
 use odbc_api::handles::SqlResult;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
-use odbc_api::Cursor;
-use odbc_api::CursorImpl;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
-use snafu::prelude::*;
 use snafu::Snafu;
+use snafu::prelude::*;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
@@ -148,7 +148,7 @@ where
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let schema = Arc::new(
-            arrow_schema_from(&mut prepared)
+            arrow_schema_from(&mut prepared, false)
                 .boxed()
                 .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
         );
@@ -195,7 +195,7 @@ where
             let cxn = handle.block_on(async { conn.lock().await });
 
             let mut prepared = cxn.prepare(&sql)?;
-            let schema = Arc::new(arrow_schema_from(&mut prepared)?);
+            let schema = Arc::new(arrow_schema_from(&mut prepared, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
             let mut statement = prepared.into_statement();
@@ -287,6 +287,7 @@ fn build_odbc_reader<C: Cursor>(
 ) -> Result<OdbcReader<C>, Error> {
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
+    builder.trim_fixed_sized_characters(true);
 
     let bind_as_usize = |k: &str, default: Option<usize>, f: &mut dyn FnMut(usize)| {
         params
@@ -338,8 +339,8 @@ fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> R
 
 #[cfg(test)]
 mod tests {
-    use odbc_api::handles::OutputStringBuffer;
     use odbc_api::IntoParameter;
+    use odbc_api::handles::OutputStringBuffer;
 
     use crate::odbcpool::ODBCPool;
     use std::str;

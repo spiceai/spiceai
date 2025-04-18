@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use http::{header::USER_AGENT, HeaderMap};
+use http::{HeaderMap, header::USER_AGENT};
 
 pub static RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub static RUNTIME_NAME: &str = "spiced";

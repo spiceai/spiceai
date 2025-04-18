@@ -16,7 +16,7 @@ limitations under the License.
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use snafu::prelude::*;
-use spicepod::component::{catalog as spicepod_catalog, params::Params};
+use spicepod::{component::catalog as spicepod_catalog, param::Params};
 use std::collections::HashMap;
 
 use super::{find_first_delimiter, validate_identifier};

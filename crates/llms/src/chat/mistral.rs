@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::chat::message_to_mistral;
 
-use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -32,10 +32,10 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
-    Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
-    ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    AdapterPaths, AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse,
+    ChunkChoice, Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
     Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
     TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
@@ -49,11 +49,11 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -158,13 +158,8 @@ impl MistralLlama {
             config.map(Into::into).unwrap_or_default(),
             tokenizer_config.map(Into::into),
             model_weights.iter().map(Into::into).collect(),
-            None,
-            None,
-            None,
-            None,
-            None,
+            AdapterPaths::None,
             generation_config.map(Into::into),
-            None,
             None,
             None,
             None,
@@ -183,6 +178,8 @@ impl MistralLlama {
             chat_template_literal.map(ToString::to_string),
             None,
             model_parts.first().map(ToString::to_string),
+            false, // enable KV cache,
+            None,
         )
         .build(None) // Infer loader type
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
@@ -218,12 +215,16 @@ impl MistralLlama {
         // Default to use file over string literal.
         if let Some(filename) = chat_template.as_ref() {
             if chat_template_literal.is_some() {
-                tracing::warn!("For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file.");
-            };
+                tracing::warn!(
+                    "For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file."
+                );
+            }
         } else {
-            tracing::debug!("For GGUF model, no chat template file provided. Using the provided chat template literal.");
+            tracing::debug!(
+                "For GGUF model, no chat template file provided. Using the provided chat template literal."
+            );
             chat_template = chat_template_literal.map(Into::into);
-        };
+        }
 
         let gguf_file: Vec<String> = paths
             .get_weight_filenames()
@@ -237,6 +238,8 @@ impl MistralLlama {
             model_id.to_string(),
             gguf_file,
             GGUFSpecificConfig::default(),
+            false,
+            None,
         )
         .build()
         .load_model_from_path(
@@ -265,6 +268,8 @@ impl MistralLlama {
             None,
             String::new(),
             model_id.to_string(),
+            false,
+            None,
         )
         .build()
         .load_model_from_path(
@@ -312,6 +317,8 @@ impl MistralLlama {
                 model_parts[0].to_string(),
                 vec![gguf.to_string_lossy().to_string()],
                 GGUFSpecificConfig::default(),
+                false,
+                None,
             )
             .build())
         } else {
@@ -329,6 +336,8 @@ impl MistralLlama {
                 None,
                 None,
                 Some(model_parts[0].to_string()),
+                false,
+                None,
             );
 
             builder
@@ -368,6 +377,8 @@ impl MistralLlama {
                         NonZeroUsize::new(5).expect("unreachable 5 > 0"),
                     ),
                 },
+                false,
+                None,
             )
             .build(),
             counter: AtomicUsize::new(0),
@@ -393,7 +404,7 @@ impl MistralLlama {
             id: self.counter.fetch_add(1, Ordering::SeqCst),
             constraint: Constraint::None,
             suffix: None,
-            adapters: None,
+            web_search_options: None,
             tools,
             tool_choice,
             logits_processors: None,
@@ -464,7 +475,12 @@ impl MistralLlama {
                 // mistralrs does not return "tool_calls" as a finish_reason correctly (like OpenAI spec).
                 // This is a workaround to set it correctly.
                 resp.choices.iter_mut().for_each(|c| {
-                    if c.finish_reason == "stop" && !c.message.tool_calls.is_empty() {
+                    if c.finish_reason == "stop"
+                        && c.message
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|cc| !cc.is_empty())
+                    {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });

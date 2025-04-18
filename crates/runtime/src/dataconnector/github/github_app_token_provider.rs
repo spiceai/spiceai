@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use data_components::token_provider::{Error, Result, TokenProvider};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
@@ -46,7 +46,9 @@ pub enum GitHubAppError {
     ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
-    #[snafu(display("Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"))]
+    #[snafu(display(
+        "Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+    ))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 }
 

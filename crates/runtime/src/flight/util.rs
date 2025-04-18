@@ -17,8 +17,8 @@ limitations under the License.
 use arrow_flight::flight_service_server::FlightService;
 use cache::QueryResultsCacheStatus;
 use tonic::{
-    metadata::{Ascii, MetadataValue},
     Response,
+    metadata::{Ascii, MetadataValue},
 };
 
 use crate::{

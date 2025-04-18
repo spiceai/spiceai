@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
-use tokio::sync::{oneshot, Mutex};
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use tokio::sync::{Mutex, oneshot};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,

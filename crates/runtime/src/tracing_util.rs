@@ -19,8 +19,8 @@ use rand::RngCore;
 
 use crate::{
     component::dataset::{
-        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
         Dataset,
+        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
     },
     dataconnector::DataConnector,
 };
@@ -101,6 +101,7 @@ pub fn random_trace_id() -> TraceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::acceleration::Engine;
     use crate::dataconnector::DataConnectorResult;
     use async_trait::async_trait;
@@ -108,6 +109,7 @@ mod tests {
     use std::any::Any;
     use std::time::Duration;
 
+    #[derive(Debug)]
     struct TestDataConnector {}
 
     #[async_trait]
@@ -124,10 +126,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_dataset_registered_trace_no_acceleration() {
-        let ds = Dataset::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
-            .expect("to create dataset");
+    #[tokio::test]
+    async fn test_dataset_registered_trace_no_acceleration() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let ds = DatasetBuilder::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
         let info = dataset_registered_trace(&test_data_connector, &ds, false);
@@ -137,24 +145,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dataset_registered_trace_default_acceleration_cache() {
+    #[tokio::test]
+    async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
             enabled: true,
             ..Default::default()
         };
 
-        let mut ds = Dataset::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
-            .expect("to create dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let mut ds = DatasetBuilder::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
         ds.acceleration = Some(acceleration);
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
         let info = dataset_registered_trace(&test_data_connector, &ds, true);
-        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled.");
+        assert_eq!(
+            info,
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
+        );
     }
 
-    #[test]
-    fn test_dataset_registered_trace_with_acceleration_complex() {
+    #[tokio::test]
+    async fn test_dataset_registered_trace_with_acceleration_complex() {
         let acceleration = Acceleration {
             enabled: true,
             engine: Engine::DuckDB,
@@ -167,12 +184,22 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ds = Dataset::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
-            .expect("to create dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut ds = DatasetBuilder::try_new("s3://taxi_trips/2024/".to_string(), "taxi_trips")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
         ds.acceleration = Some(acceleration);
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
         let info = dataset_registered_trace(&test_data_connector, &ds, false);
-        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result).");
+        assert_eq!(
+            info,
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+        );
     }
 }

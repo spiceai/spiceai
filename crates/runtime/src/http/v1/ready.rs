@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use crate::status::RuntimeStatus;
 use axum::{
+    Extension,
     http::status,
     response::{IntoResponse, Response},
-    Extension,
 };
 
 /// Check Readiness

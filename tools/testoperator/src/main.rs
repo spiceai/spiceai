@@ -19,6 +19,7 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
+mod metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,

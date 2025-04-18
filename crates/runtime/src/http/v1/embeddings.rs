@@ -21,9 +21,9 @@ use async_openai::types::CreateEmbeddingRequest;
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateEmbeddingResponse;
 use axum::{
+    Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use tokio::sync::RwLock;
 

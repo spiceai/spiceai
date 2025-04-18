@@ -16,19 +16,19 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
-use app::{spicepod::component::runtime::TracingConfig, App};
+use app::{App, spicepod::component::runtime::TracingConfig};
 use futures::future::BoxFuture;
 use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{
+    Resource,
     export::trace::{ExportResult, SpanData, SpanExporter},
     trace::TracerProvider,
-    Resource,
 };
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
 use std::time::Duration;
 use tracing::Subscriber;
-use tracing_subscriber::{filter, fmt, layer::Layer, prelude::*, registry::LookupSpan, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
 
 pub enum LogVerbosity {
     Default,
@@ -54,12 +54,46 @@ impl LogVerbosity {
         LogVerbosity::Default
     }
 }
+
+const INTERNAL_COMPONENTS: &[&str] = &[
+    "task_history",
+    "spiced",
+    "runtime",
+    "secrets",
+    "data_components",
+    "cache",
+    "extensions",
+    "spice_cloud",
+    "llms",
+    "tpc_extension",
+];
+
+const OFF_FILTERS: &str =
+    "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off";
+
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
+        fn internal_components(level: &str) -> String {
+            INTERNAL_COMPONENTS
+                .iter()
+                .map(|component| format!("{component}={level}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
         match v {
-            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,tpc_extension=INFO,reqwest_retry::middleware=off,opentelemetry_sdk=off,WARN"),
-            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,llms=DEBUG,tpc_extension=DEBUG,INFO"),
-            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,llms=TRACE,tpc_extension=TRACE,DEBUG"),
+            LogVerbosity::Default => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},WARN",
+                internal_components("INFO")
+            )),
+            LogVerbosity::Verbose => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},INFO",
+                internal_components("DEBUG")
+            )),
+            LogVerbosity::VeryVerbose => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},DEBUG",
+                internal_components("TRACE")
+            )),
             LogVerbosity::Specific(filter) => EnvFilter::new(filter),
         }
     }
@@ -109,7 +143,7 @@ async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
-) -> Result<impl Layer<S>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<impl Layer<S> + use<S>, Box<dyn std::error::Error + Send + Sync>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {

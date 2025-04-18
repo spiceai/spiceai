@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{borrow::Cow, collections::HashMap};
 
-use crate::tools::{utils::parameters, SpiceModelTool};
+use crate::{
+    Runtime,
+    tools::{SpiceModelTool, utils::parameters},
+};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -57,7 +60,7 @@ impl SpiceModelTool for WebSearchTool {
 
     fn description(&self) -> Option<Cow<'_, str>> {
         match &self.description {
-            Some(ref desc) => Some(desc.into()),
+            Some(desc) => Some(desc.into()),
             None => Some(self.engine.engine_type().description().into()),
         }
     }

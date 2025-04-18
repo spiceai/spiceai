@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use iceberg::{
-    table::Table, Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent,
-    Result as IcebergResult, TableCommit, TableCreation, TableIdent,
+    Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent, Result as IcebergResult,
+    TableCommit, TableCreation, TableIdent, table::Table,
 };
 use iceberg_catalog_rest::{RestCatalog as IcebergRestCatalog, RestCatalogConfig};
 

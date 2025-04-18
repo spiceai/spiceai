@@ -25,13 +25,13 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use arrow_flight::{
+    FlightDescriptor,
     flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt},
-    FlightDescriptor,
 };
 use prost::Message;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, tls::TlsConfig, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -69,9 +69,11 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         let tls_config = TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
 
         let registry = prometheus::Registry::new();
+        let app = app::AppBuilder::new("test_app").build();
 
         let rt = Arc::new(Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
             .await);
 

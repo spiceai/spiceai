@@ -19,18 +19,18 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use runtime::{dataupdate::DataUpdate, Runtime};
+use runtime::{Runtime, dataupdate::DataUpdate};
 
 use crate::{
-    utils::{get_branch_name, get_commit_sha, init_tracing},
     SearchBenchmarkConfiguration,
+    utils::{get_branch_name, get_commit_sha, init_tracing},
 };
 
 use app::AppBuilder;
 use spicepod::component::{
-    dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
+    dataset::{Dataset, Mode, acceleration::Acceleration, replication::Replication},
     embeddings::{EmbeddingChunkConfig, Embeddings},
-    runtime::ResultsCache,
+    runtime::{CacheKeyType, ResultsCache},
 };
 
 use super::SearchBenchmarkResultBuilder;
@@ -72,7 +72,8 @@ pub(crate) async fn setup_benchmark(
         None => app_builder.build(),
     };
 
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    let rt = Runtime::builder().with_app(app).build().await;
+    let cloned_rt = Arc::new(rt.clone());
 
     // include embeddings initial loading time to indexing time
     benchmark_result.start_index();
@@ -81,7 +82,7 @@ pub(crate) async fn setup_benchmark(
         () = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
-        () = Arc::clone(&rt).load_components() => {}
+        () = cloned_rt.load_components() => {}
     }
 
     Ok((rt, benchmark_result))
@@ -241,6 +242,7 @@ async fn build_bench_app(
             cache_max_size: None,
             item_ttl: None,
             eviction_policy: None,
+            cache_key_type: CacheKeyType::default(),
         })
         .with_embedding(create_embeddings_model(embeddings_model));
 

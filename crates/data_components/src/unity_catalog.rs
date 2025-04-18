@@ -24,16 +24,24 @@ pub mod provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"))]
+    #[snafu(display(
+        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"
+    ))]
     ConnectionError { source: reqwest::Error },
 
-    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"))]
+    #[snafu(display(
+        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"
+    ))]
     UnexpectedStatusCode { status: reqwest::StatusCode },
 
-    #[snafu(display("Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
+    #[snafu(display(
+        "Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+    ))]
     URLParseError {
         url: String,
         source: url::ParseError,
@@ -44,10 +52,14 @@ pub enum Error {
     ))]
     InvalidCatalogURL { url: String },
 
-    #[snafu(display("Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."
+    ))]
     CatalogDoesntExist { catalog_id: String },
 
-    #[snafu(display("Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."))]
+    #[snafu(display(
+        "Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."
+    ))]
     SchemaDoesntExist { schema: String, catalog_id: String },
 }
 

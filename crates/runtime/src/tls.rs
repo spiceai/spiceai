@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
     ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
 };
 use rustls_pemfile::{certs, private_key};
 use secrecy::{ExposeSecret, SecretBox};

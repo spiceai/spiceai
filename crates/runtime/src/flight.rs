@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use crate::auth::EndpointAuth;
-use crate::datafusion::error::{find_datafusion_root, SpiceExternalError};
-use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::DataFusion;
+use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
+use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
 use crate::tls::TlsConfig;
@@ -31,21 +31,21 @@ use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use cache::QueryResultsCacheStatus;
 use datafusion::error::DataFusionError;
-use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
+use datafusion::sql::sqlparser::parser::ParserError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
-use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
+use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
@@ -63,9 +63,9 @@ mod middleware;
 mod util;
 
 use arrow_flight::{
-    flight_service_server::{FlightService, FlightServiceServer},
     FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PutResult,
     SchemaAsIpc, Ticket,
+    flight_service_server::{FlightService, FlightServiceServer},
 };
 
 pub struct Service {

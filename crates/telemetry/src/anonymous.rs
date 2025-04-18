@@ -15,34 +15,34 @@ limitations under the License.
 */
 
 use std::{
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
-use crate::exporter::AnonymousTelemetryExporter;
+use crate::{exporter::TelemetryExporterBuilder, reader::InitialReader};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
+    Resource,
     metrics::{
-        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader, InstrumentKind,
-        ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
+        PeriodicReader, SdkMeterProvider, data::ResourceMetrics, exporter::PushMetricExporter,
+        reader::MetricReader,
     },
     runtime::Tokio,
-    Resource,
 };
 use otel_arrow::OtelArrowExporter;
 use sha2::{Digest, Sha256};
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
-/// How often to send telemetry data to the endpoint
-const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
-const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
-
-static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
     std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
         .unwrap_or_else(|_| ENDPOINT_CONST.into())
         .into()
 });
+
+/// How often to send telemetry data to the endpoint
+const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
+const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
 
 fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
@@ -72,8 +72,17 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
     let resource = resource(spicepod_name, telemetry_properties);
 
-    let oss_telemetry_exporter =
-        OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
+    let Ok(exporter) = TelemetryExporterBuilder::new()
+        .with_endpoint(Arc::clone(&ENDPOINT))
+        .with_service_name("oss_telemetry".into())
+        .build()
+        .await
+    else {
+        tracing::trace!("Failed to setup telemetry exporter - skipping telemetry");
+        return;
+    };
+
+    let oss_telemetry_exporter = OtelArrowExporter::new(exporter);
 
     let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
@@ -92,7 +101,9 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
         .set(Arc::new(provider))
         .is_err()
     {
-        tracing::trace!("Failed to set global meter provider for the anonymous telemetry, already set by another codepath?");
+        tracing::trace!(
+            "Failed to set global meter provider for the anonymous telemetry, already set by another codepath?"
+        );
     }
 
     // Send an initial telemetry event to indicate the start of telemetry collection
@@ -115,39 +126,4 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
         });
 
     tracing::trace!("Started anonymous telemetry collection to {}", *ENDPOINT);
-}
-
-#[derive(Debug, Clone)]
-struct InitialReader {
-    reader: Arc<ManualReader>,
-}
-
-impl InitialReader {
-    pub fn new() -> Self {
-        Self {
-            reader: Arc::new(ManualReader::builder().build()),
-        }
-    }
-}
-
-impl MetricReader for InitialReader {
-    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
-        self.reader.register_pipeline(pipeline);
-    }
-
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.collect(rm)
-    }
-
-    fn force_flush(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.force_flush()
-    }
-
-    fn shutdown(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.shutdown()
-    }
-
-    fn temporality(&self, kind: InstrumentKind) -> Temporality {
-        self.reader.temporality(kind)
-    }
 }

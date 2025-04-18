@@ -19,13 +19,13 @@ use async_openai::{
         ResponseFormat, ResponseFormatJsonSchema,
     },
 };
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::chat::nsql::create_prompt;
 
-use super::SqlGeneration;
+use super::{QueryGenerationContext, SqlGeneration};
 
 /// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonSchema`].
 pub struct StructuredOutputSqlGeneration;
@@ -36,14 +36,16 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
         &self,
         model_id: &str,
         query: &str,
+        context: &QueryGenerationContext,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = create_prompt(query);
+        let prompt = create_prompt(query, context);
 
-        let messages: Vec<ChatCompletionRequestMessage> =
-            vec![ChatCompletionRequestSystemMessageArgs::default()
+        let messages: Vec<ChatCompletionRequestMessage> = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
                 .build()?
-                .into()];
+                .into(),
+        ];
 
         let mut structured_output_schema = serde_json::to_value(schema_for!(StructuredNsqlOutput))
             .map_err(|e| {

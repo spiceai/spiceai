@@ -26,8 +26,9 @@ use datafusion::{
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
     sql::TableReference,
 };
@@ -152,7 +153,10 @@ impl FlightStreamExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(schema)),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Unbounded,
+                EmissionType::Incremental,
+                Boundedness::Unbounded {
+                    requires_infinite_memory: false,
+                },
             ),
         }
     }

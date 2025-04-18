@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::{error::OpenAIError, Client};
+use async_openai::{Client, error::OpenAIError};
 use types::validate_model_variant;
 
 mod chat;

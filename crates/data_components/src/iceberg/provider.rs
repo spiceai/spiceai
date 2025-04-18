@@ -40,16 +40,24 @@ pub enum Error {
     ))]
     Unknown { source: iceberg::Error },
 
-    #[snafu(display("The data in the Iceberg table is invalid. The table may be corrupted or incomplete.\n{source}"))]
+    #[snafu(display(
+        "The data in the Iceberg table is invalid. The table may be corrupted or incomplete.\n{source}"
+    ))]
     DataInvalid { source: iceberg::Error },
 
-    #[snafu(display("This Iceberg feature is not yet supported.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"))]
+    #[snafu(display(
+        "This Iceberg feature is not yet supported.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
+    ))]
     FeatureUnsupported { source: iceberg::Error },
 
-    #[snafu(display("The namespace '{namespace}' does not exist in the Iceberg catalog, verify the namespace name and try again."))]
+    #[snafu(display(
+        "The namespace '{namespace}' does not exist in the Iceberg catalog, verify the namespace name and try again."
+    ))]
     NamespaceDoesNotExist { namespace: String },
 
-    #[snafu(display("Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."))]
+    #[snafu(display(
+        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."
+    ))]
     FailedToConnect { url: String, source: iceberg::Error },
 
     #[snafu(display(

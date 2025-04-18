@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{init_tracing, utils::test_request_context, RecordBatch};
+use crate::{RecordBatch, init_tracing, utils::test_request_context};
 
 use anyhow::anyhow;
 use app::AppBuilder;
@@ -22,14 +22,14 @@ use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use runtime::Runtime;
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use std::sync::Arc;
 use tracing::instrument;
 
 use crate::{
+    configure_test_datafusion,
     docker::{ContainerRunnerBuilder, RunningContainer},
-    get_test_datafusion,
 };
 
 #[instrument]
@@ -136,23 +136,20 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .with_dataset(abfs_dataset)
         .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
+        .build()
+        .await;
 
-    let rt = Arc::new(
-        Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .build()
-            .await,
-    );
+    let cloned_rt = Arc::new(rt.clone());
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow!("Timed out waiting for datasets to load".to_string()));
         }
-        () = Arc::clone(&rt).load_components() => {}
+        () = cloned_rt.load_components() => {}
     }
 
     let queries = vec![

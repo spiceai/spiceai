@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::queries::{QueryOverrides, QuerySet};
@@ -36,6 +36,9 @@ pub struct DatasetTestArgs {
 
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -59,14 +62,20 @@ pub enum QueryOverridesArg {
     Spark,
     #[serde(rename = "odbc-athena")]
     ODBCAthena,
+    #[serde(rename = "odbc-databricks")]
+    ODBCDatabricks,
     #[serde(rename = "duckdb")]
     Duckdb,
+    #[serde(rename = "duckdb-zero-results")]
+    DuckdbZeroResults,
     #[serde(rename = "snowflake")]
     Snowflake,
     #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
     #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
+    #[serde(rename = "spicecloud")]
+    Spicecloud,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -88,10 +97,13 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
+            QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
+            QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
             QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
+            QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
         }
     }
 }

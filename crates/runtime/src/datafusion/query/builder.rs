@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::datafusion::DataFusion;
 
-use super::{tracker::QueryTracker, Query};
+use super::{Query, tracker::QueryTracker};
 
 pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,

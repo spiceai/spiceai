@@ -14,20 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
+use anyhow::anyhow;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{Runtime, component::dataset::DatasetBuilder};
 use secrecy::ExposeSecret;
-use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
-use spicepod::component::params::Params;
+use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
+use spicepod::param::Params;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::utils::test_request_context;
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params, get_random_port},
     utils::runtime_ready_check,
 };
@@ -35,17 +37,13 @@ use crate::{
 #[tokio::test]
 async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port();
+            let port: usize = get_random_port()?;
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
-
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
 
             let mut dataset =
                 Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal");
@@ -70,15 +68,39 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );
 
+            let app_ref = rt.app();
+            let app_lock = app_ref.read().await;
+            let Some(app) = app_lock.as_ref() else {
+                return Err(anyhow!("Failed to obtain app from runtime"));
+            };
+
+            let cloned_rt = Arc::clone(&rt);
+            let runtime_datasets = app
+                .datasets
+                .clone()
+                .into_iter()
+                .map(DatasetBuilder::try_from)
+                .map(move |ds_builder| {
+                    ds_builder
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .and_then(|ds_builder| {
+                            ds_builder
+                                .with_app(Arc::clone(app))
+                                .with_runtime(Arc::clone(&cloned_rt))
+                                .build()
+                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -86,11 +108,11 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Wait for the checkpoint to be created
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Verify checkpoints are created before shutting down runtime
+            wait_for_checkpoints(runtime_datasets, 120).await?;
+
+            rt.shutdown().await;
             drop(rt);
-            runtime::dataaccelerator::unregister_all().await;
-            runtime::dataaccelerator::register_all().await;
 
             let db_conn = pool.connect().await.expect("connection can be established");
             let result = db_conn

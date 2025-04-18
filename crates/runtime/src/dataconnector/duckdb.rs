@@ -19,10 +19,10 @@ use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use datafusion_table_providers::UnsupportedTypeAction;
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::any::Any;
@@ -47,6 +47,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDB {
     duckdb_factory: DuckDBTableFactory,
+}
+
+impl std::fmt::Debug for DuckDB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuckDB").finish_non_exhaustive()
+    }
 }
 
 impl DuckDB {

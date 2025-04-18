@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::component::HttpComponent;
 use super::HttpConfig;
+use super::component::HttpComponent;
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+    MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms,
 };
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
@@ -191,6 +191,15 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
     }
 
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {

@@ -17,18 +17,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{
-        metrics, to_tonic_err,
+        Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
-        Service,
     },
     timing::TimedStream,
 };
@@ -69,7 +68,7 @@ pub(crate) async fn get_flight_info(
         Err(e) => {
             return Err(Status::invalid_argument(format!(
                 "Invalid prepared statement handle: {e}"
-            )))
+            )));
         }
     };
 

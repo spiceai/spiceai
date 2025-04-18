@@ -26,7 +26,7 @@ use crate::{
 };
 use app::AppBuilder;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::runtime::CorsConfig;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -102,7 +102,7 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 .headers()
                 .get("access-control-allow-methods")
                 .expect("cors header is present");
-            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH");
+            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH,OPTIONS");
 
             Ok(())
         }).await

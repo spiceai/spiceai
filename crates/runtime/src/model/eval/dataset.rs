@@ -139,10 +139,12 @@ impl TryFrom<&DatasetInput> for CreateChatCompletionRequest {
                 .messages(m.clone())
                 .build(),
             DatasetInput::UserInput(content) => CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestUserMessageArgs::default()
-                    .content(content.clone())
-                    .build()?
-                    .into()])
+                .messages(vec![
+                    ChatCompletionRequestUserMessageArgs::default()
+                        .content(content.clone())
+                        .build()?
+                        .into(),
+                ])
                 .build(),
         }
     }
@@ -242,7 +244,11 @@ impl DatasetInput {
                     return Err(Error::InvalidInputFormatReport { reason: "Failed to convert valid list-type input element into a known model input format.".to_string() });
                 }
                 Err(e) => {
-                    return Err(Error::InvalidInputFormatReport { reason: format!("Failed to convert JSON format of input into a known model input format.\n{e}") });
+                    return Err(Error::InvalidInputFormatReport {
+                        reason: format!(
+                            "Failed to convert JSON format of input into a known model input format.\n{e}"
+                        ),
+                    });
                 }
             };
         }
@@ -345,7 +351,11 @@ impl DatasetOutput {
                     return Err(Error::InvalidOutputFormatReport { reason: "Failed to convert valid list-type elements into a known model output format.".to_string() });
                 }
                 Err(e) => {
-                    return Err(Error::InvalidOutputFormatReport { reason: format!("Failed to convert JSON format of an element into a known model output format.\n{e}") });
+                    return Err(Error::InvalidOutputFormatReport {
+                        reason: format!(
+                            "Failed to convert JSON format of an element into a known model output format.\n{e}"
+                        ),
+                    });
                 }
             };
         }

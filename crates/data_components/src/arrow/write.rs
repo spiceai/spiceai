@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex};
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
-use datafusion::datasource::{provider_as_source, TableProvider, TableType};
+use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -232,13 +232,13 @@ impl TableProvider for MemTable {
 
         let primary_key = self.get_and_ensure_only_primary_keys()?;
 
-        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            sink,
-            Arc::clone(&self.schema),
-            None,
-        )))
+        let sink = Arc::new(MemSink::new(
+            self.batches.clone(),
+            overwrite,
+            primary_key,
+            self.schema(),
+        ));
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
@@ -254,6 +254,7 @@ struct MemSink {
 
     /// Optional primary key columns. If present, primary key values must be unique, ordered ascendingly.
     primary_key: Option<Vec<usize>>,
+    schema: SchemaRef,
 }
 
 impl Debug for MemSink {
@@ -280,6 +281,7 @@ impl MemSink {
         batches: Vec<PartitionData>,
         overwrite: InsertOp,
         primary_key: Option<Vec<usize>>,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             batches,
@@ -289,6 +291,7 @@ impl MemSink {
                 z.sort_unstable();
                 z
             }),
+            schema,
         }
     }
 }
@@ -441,7 +444,9 @@ fn filter_existing(
             if let Some(k) = k {
                 keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
             } else {
-                unreachable!("Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion.");
+                unreachable!(
+                    "Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion."
+                );
             }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
@@ -478,6 +483,10 @@ impl DataSink for MemSink {
 
     fn metrics(&self) -> Option<MetricsSet> {
         None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn write_all(

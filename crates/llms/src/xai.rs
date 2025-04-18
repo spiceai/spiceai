@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_openai::{
+    Client,
     config::OpenAIConfig,
     error::OpenAIError,
     types::{
@@ -22,13 +23,12 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionResponseStream, CreateChatCompletionRequest,
         CreateChatCompletionResponse,
     },
-    Client,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::chat::{nsql::SqlGeneration, Chat, Error};
+use crate::chat::{Chat, Error, nsql::SqlGeneration};
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 static DEFAULT_MODEL: &str = "grok-beta";
@@ -61,7 +61,7 @@ impl Xai {
             if let ChatCompletionRequestMessage::Assistant(
                 ChatCompletionRequestAssistantMessage {
                     content,
-                    tool_calls: Some(ref mut tool_calls),
+                    tool_calls: Some(tool_calls),
                     ..
                 },
             ) = m

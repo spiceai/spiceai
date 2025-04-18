@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{query::QueryBuilder, DataFusion},
+    datafusion::{DataFusion, query::QueryBuilder},
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
@@ -52,6 +52,7 @@ use csv::Writer;
 use headers_accept::Accept;
 use http::HeaderValue;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
@@ -59,8 +60,8 @@ use futures::TryStreamExt;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
-        path::{Parameter, ParameterBuilder, ParameterIn},
         Required,
+        path::{Parameter, ParameterBuilder, ParameterIn},
     },
     schema,
 };
@@ -80,24 +81,46 @@ pub enum Format {
 #[cfg(feature = "openapi")]
 impl utoipa::IntoParams for Format {
     fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
-        vec![ParameterBuilder::new()
-            .description(Some(""))
-            .name("format")
-            .required(Required::True)
-            .parameter_in(parameter_in_provider().unwrap_or_default())
-            .schema(Some(schema!(Format)))
-            .build()]
+        vec![
+            ParameterBuilder::new()
+                .description(Some(""))
+                .name("format")
+                .required(Required::True)
+                .parameter_in(parameter_in_provider().unwrap_or_default())
+                .schema(Some(schema!(Format)))
+                .build(),
+        ]
     }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
-pub enum ArrowFormat {
+pub enum ResponseMimeType {
     #[default]
     Json,
     Csv,
     Plain,
+    VndNsqlJsonV1,
+    VndSqlJsonV1,
+}
+
+/// Represents additional metadata to produce a response, such as the SQL query used, etc.
+#[derive(Debug)]
+pub struct ResponseMetadata {
+    pub sql: Option<String>,
+}
+
+impl ResponseMetadata {
+    /// Creates an empty `ResponseMetadata`
+    pub fn empty() -> Self {
+        Self { sql: None }
+    }
+
+    pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
+        self.sql = Some(sql.into());
+        self
+    }
 }
 
 /// Gets all possible media types from a `Accept` header.
@@ -105,18 +128,20 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
     accept.0.media_types().map(ToString::to_string).collect()
 }
 
-impl ArrowFormat {
-    pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ArrowFormat {
-        accept.map_or(ArrowFormat::default(), |header| {
+impl ResponseMimeType {
+    pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
+        accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
                 .iter()
                 .find_map(|h| match h.as_str() {
-                    "application/json" => Some(ArrowFormat::Json),
-                    "text/csv" => Some(ArrowFormat::Csv),
-                    "text/plain" => Some(ArrowFormat::Plain),
+                    "application/json" => Some(ResponseMimeType::Json),
+                    "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
+                    "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
+                    "text/csv" => Some(ResponseMimeType::Csv),
+                    "text/plain" => Some(ResponseMimeType::Plain),
                     _ => None,
                 })
-                .unwrap_or(ArrowFormat::default())
+                .unwrap_or(ResponseMimeType::default())
         })
     }
 }
@@ -139,31 +164,54 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
-    let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
-
-    let (data, results_cache_status) = match query.run().await {
-        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => (batches, query_result.results_cache_status),
-            Err(e) => {
-                tracing::debug!("Error executing query: {e}");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Error processing batch: {e}"),
-                )
-                    .into_response();
-            }
-        },
+pub async fn sql_to_http_response(
+    df: Arc<DataFusion>,
+    sql: &str,
+    format: ResponseMimeType,
+) -> Response {
+    let (data, results_cache_status) = match run_sql(df, sql).await {
+        Ok((data, results_cache_status)) => (data, results_cache_status),
         Err(e) => {
             tracing::debug!("Error executing query: {e}");
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
 
+    to_http_response(
+        data,
+        results_cache_status,
+        format,
+        ResponseMetadata::empty(),
+    )
+    .await
+}
+
+// Runs query and returns the results as a vector of `RecordBatch`.
+pub async fn run_sql(
+    df: Arc<DataFusion>,
+    sql: &str,
+) -> Result<(Vec<RecordBatch>, QueryResultsCacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    let query_res = QueryBuilder::new(sql, df).build().run().await?;
+    Ok((
+        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
+        query_res.results_cache_status,
+    ))
+}
+
+// Converts query result to HTTP response (as JSON).
+pub async fn to_http_response(
+    data: Vec<RecordBatch>,
+    cache_status: QueryResultsCacheStatus,
+    format: ResponseMimeType,
+    meta: ResponseMetadata,
+) -> Response {
     let res = match format {
-        ArrowFormat::Json => arrow_to_json(&data),
-        ArrowFormat::Csv => arrow_to_csv(&data),
-        ArrowFormat::Plain => arrow_to_plain(&data),
+        ResponseMimeType::Json => arrow_to_json(&data),
+        ResponseMimeType::Csv => arrow_to_csv(&data),
+        ResponseMimeType::Plain => arrow_to_plain(&data),
+        ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
+            arrow_to_vnd_sql_json_v1(&data, meta)
+        }
     };
 
     let body = match res {
@@ -175,7 +223,7 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowF
 
     let mut headers = HeaderMap::new();
 
-    attach_cache_headers(&mut headers, results_cache_status);
+    attach_cache_headers(&mut headers, cache_status);
 
     (StatusCode::OK, headers, body).into_response()
 }
@@ -241,4 +289,83 @@ fn arrow_to_plain(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     pretty_format_batches(data).map(|d| format!("{d}")).boxed()
+}
+
+/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json / application/vnd.spiceai.nsql.v1+json format
+fn arrow_to_vnd_sql_json_v1(
+    data: &[RecordBatch],
+    meta: ResponseMetadata,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    // Convert manually instead of reusing arrow_to_json
+    // to avoid an extra serialization-deserialization cycle
+    writer
+        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
+        .boxed()?;
+    writer.finish().boxed()?;
+
+    // Calculate total row count across all batches
+    let row_count = data.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+    let schema_json = if let Some(batch) = data.first() {
+        // Use built-in Arrow JSON schema representation: https://github.com/apache/arrow/blob/main/docs/source/format/Integration.rst#json-test-data-format
+        serde_json::to_value(batch.schema())?
+    } else {
+        serde_json::json!({})
+    };
+
+    let mut result = json!({
+        "row_count": row_count,
+        "schema": schema_json,
+        "data": serde_json::from_slice::<serde_json::Value>(&writer.into_inner()).boxed()?,
+    });
+
+    if let Some(sql) = meta.sql {
+        result["sql"] = serde_json::Value::String(sql);
+    }
+
+    serde_json::to_string(&result).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_arrow_to_vnd_json_v1() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Utf8, false),
+            Field::new("total_sales", DataType::Int64, false),
+        ]));
+
+        let customer_ids = StringArray::from(vec!["12345", "67890"]);
+        let total_sales = Int64Array::from(vec![150_000, 125_000]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(customer_ids), Arc::new(total_sales)])
+                .expect("to create batch");
+
+        // Test conversion without SQL
+        let result_without_sql =
+            arrow_to_vnd_sql_json_v1(&[batch.clone()], ResponseMetadata::empty())
+                .expect("to convert");
+        insta::assert_json_snapshot!(
+            "vnd_json_v1_without_sql",
+            serde_json::from_str::<serde_json::Value>(&result_without_sql).expect("to parse")
+        );
+
+        // Test conversion with SQL
+        let metadata = ResponseMetadata::empty()
+            .with_sql("SELECT customer_id, total_sales FROM sales_summary LIMIT 2;");
+        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], metadata).expect("to convert");
+        insta::assert_json_snapshot!(
+            "vnd_json_v1_with_sql",
+            serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
+        );
+    }
 }

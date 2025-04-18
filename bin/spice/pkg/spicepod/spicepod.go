@@ -31,24 +31,24 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 		if os.IsNotExist(err) && spicepodDir != "." {
 			err = os.Mkdir(name, 0766)
 			if err != nil {
-				return "", fmt.Errorf("Error creating directory: %w", err)
+				return "", fmt.Errorf("error creating directory: %w", err)
 			}
 			fs, err = os.Stat(name)
 			if err != nil {
-				return "", fmt.Errorf("Error checking if directory exists: %w", err)
+				return "", fmt.Errorf("error checking if directory exists: %w", err)
 			}
 		} else if spicepodDir != "." {
-			return "", fmt.Errorf("Error checking if directory exists: %w", err)
+			return "", fmt.Errorf("error checking if directory exists: %w", err)
 		} else {
 			fs, err = os.Stat(spicepodDir)
 			if err != nil {
-				return "", fmt.Errorf("Error checking if directory exists: %w", err)
+				return "", fmt.Errorf("error checking if directory exists: %w", err)
 			}
 		}
 	}
 
 	if !fs.IsDir() {
-		return "", fmt.Errorf("Error: %s exists and is not a directory", name)
+		return "", fmt.Errorf("error: %s exists and is not a directory", name)
 	}
 
 	skeletonPod := &spec.SpicepodSpec{
@@ -61,13 +61,13 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 
 	skeletonPodContentBytes, err := yaml.Marshal(skeletonPod)
 	if err != nil {
-		return "", fmt.Errorf("Error marshalling spicepod: %w", err)
+		return "", fmt.Errorf("error marshalling spicepod: %w", err)
 	}
 
 	spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
 	err = os.WriteFile(spicepodPath, skeletonPodContentBytes, 0744)
 	if err != nil {
-		return "", fmt.Errorf("Error writing spicepod.yaml: %w", err)
+		return "", fmt.Errorf("error writing spicepod.yaml: %w", err)
 	}
 
 	return spicepodPath, nil

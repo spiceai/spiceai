@@ -17,7 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose, Engine};
+use base64::{Engine, engine::general_purpose};
 use reqwest;
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};

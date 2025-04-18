@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_clickbench_sqlite_file
+name: s3_sqlite_file
 datasets:
   - from: s3://benchmarks/clickbench/hits/
     name: hits

@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
+use std::time::SystemTime;
+
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result};
+use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
@@ -89,6 +92,35 @@ impl DatasetCheckpoint {
             .map_err(|e| e.to_string().into())
     }
 
+    pub(super) async fn last_checkpoint_time_sqlite(
+        &self,
+        pool: &SqliteConnectionPool,
+    ) -> Result<Option<SystemTime>> {
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
+        let dataset_name = self.dataset_name.clone();
+
+        let query = format!(
+            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let checkpoint_time: Option<DateTime<Utc>> = conn
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([&dataset_name])?;
+                Ok(rows.next()?.map(|row| row.get(0)))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .transpose()
+            .map_err(|e| e.to_string())?;
+
+        let checkpoint_time = checkpoint_time.map(Into::into);
+        Ok(checkpoint_time)
+    }
+
     pub(super) async fn checkpoint_sqlite(
         &self,
         pool: &SqliteConnectionPool,
@@ -158,7 +190,7 @@ mod tests {
     use crate::dataaccelerator::spice_sys::AccelerationConnection;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion_table_providers::sql::db_connection_pool::{
-        sqlitepool::SqliteConnectionPoolFactory, Mode,
+        Mode, sqlitepool::SqliteConnectionPoolFactory,
     };
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
@@ -395,6 +427,69 @@ mod tests {
         assert_ne!(
             created_at, updated_at,
             "created_at and updated_at should be different"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_last_checkpoint_time() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        // Initially, there should be no checkpoint time
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("Unexpected checkpoint failure")
+                .is_none()
+        );
+
+        // Create a test schema
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Create the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref)
+            .await
+            .expect("Failed to create checkpoint");
+
+        // Now there should be a checkpoint time
+        let checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get checkpoint time")
+            .expect("Checkpoint time should exist");
+
+        // Verify the checkpoint time is recent
+        let now = SystemTime::now();
+        let time_diff = now
+            .duration_since(checkpoint_time)
+            .expect("Time difference should be positive");
+        assert!(time_diff.as_secs() < 5, "Checkpoint time should be recent");
+
+        // Sleep for a short time to ensure the timestamp changes
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Update the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref)
+            .await
+            .expect("Failed to update checkpoint");
+
+        // Get the new checkpoint time
+        let new_checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get new checkpoint time")
+            .expect("New checkpoint time should exist");
+
+        // Verify the new checkpoint time is more recent than the old one
+        assert!(
+            new_checkpoint_time > checkpoint_time,
+            "New checkpoint time should be more recent"
         );
     }
 }

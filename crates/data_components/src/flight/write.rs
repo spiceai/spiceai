@@ -21,11 +21,11 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{dml::InsertOp, Expr},
+    logical_expr::{Expr, dml::InsertOp},
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan,
         insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
     },
     sql::TableReference,
 };
@@ -101,8 +101,8 @@ impl TableProvider for FlightTableWriter {
                 self.flight_client.clone(),
                 self.table_reference.clone(),
                 overwrite,
+                self.schema(),
             )),
-            self.schema(),
             None,
         )) as _)
     }
@@ -113,6 +113,7 @@ struct FlightDataSink {
     flight_client: FlightClient,
     table_reference: TableReference,
     _overwrite: InsertOp,
+    schema: SchemaRef,
 }
 
 #[async_trait]
@@ -123,6 +124,10 @@ impl DataSink for FlightDataSink {
 
     fn metrics(&self) -> Option<MetricsSet> {
         None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn write_all(
@@ -153,11 +158,13 @@ impl FlightDataSink {
         flight_client: FlightClient,
         table_reference: TableReference,
         overwrite: InsertOp,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             flight_client,
             table_reference,
             _overwrite: overwrite,
+            schema,
         }
     }
 }

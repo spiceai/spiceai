@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{build_fragments, ListingTableConnector};
+use super::listing::{ListingTableConnector, build_fragments};
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     ParameterSpec, Parameters,
@@ -51,10 +51,13 @@ pub enum Error {
     ))]
     InvalidEndpoint { endpoint: String },
 
-    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    #[snafu(display(
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
+#[derive(Debug)]
 pub struct AzureBlobFS {
     params: Parameters,
 }
@@ -243,13 +246,19 @@ impl ListingTableConnector for AzureBlobFS {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
+
         let mut azure_url =
-            Url::parse(&dataset.from)
+            Url::parse(url)
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from", &dataset.from),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

@@ -24,28 +24,27 @@ use std::{
 };
 
 use crate::{
-    init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{test_request_context, wait_until_true},
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow_flight::{
-    encode::FlightDataEncoderBuilder, error::FlightError, FlightClient, FlightDescriptor, PutResult,
+    FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
 use futures::{
-    stream::{self, TryStreamExt},
     Stream,
+    stream::{self, TryStreamExt},
 };
 use governor::Quota;
 use rand::Rng;
 use runtime::{
-    accelerated_table::refresh::Refresh, auth::EndpointAuth,
+    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
     flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
-    Runtime,
 };
-use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 use tokio::{
     sync::RwLock,
@@ -416,14 +415,16 @@ async fn start_spice_test_app(
 
     let registry = prometheus::Registry::new();
 
-    let mut rt_builder =
-        Runtime::builder().with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry);
+    let mut rt_builder = Runtime::builder()
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+        .with_datafusion_configuration_fn(configure_test_datafusion);
 
     if let Some(rate_limits) = rate_limits {
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let rt = rt_builder.build().await;
+    let app = app::AppBuilder::new("test_app").build();
+    let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let df = rt.datafusion();
 
@@ -433,6 +434,7 @@ async fn start_spice_test_app(
         &df,
         test_record_batch.schema(),
         TableReference::parse_str("public.my_table"),
+        Arc::clone(&rt),
     )
     .await?;
 
@@ -443,7 +445,7 @@ async fn start_spice_test_app(
     }
 
     // Start the servers
-    tokio::spawn(async move { Box::pin(Arc::new(rt).start_servers(api_config, None, auth)).await });
+    tokio::spawn(async move { Box::pin(rt.start_servers(api_config, None, auth)).await });
 
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
@@ -454,10 +456,31 @@ async fn start_spice_test_app(
     })
     .await;
 
-    let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
-        .connect()
-        .await
-        .map_err(anyhow::Error::from)?;
+    // HTTP server readiness doesn't essentially mean the flight server is ready
+    // Validate the flight server readiness by sending a handshake request
+    let start_time = std::time::Instant::now();
+    let channel = loop {
+        if start_time.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(anyhow::anyhow!(
+                "Flight server not ready within 30 seconds timeout"
+            ));
+        }
+
+        // Attempt to connect
+        match Channel::from_shared(format!("http://localhost:{flight_port}"))
+            .map_err(anyhow::Error::from)?
+            .connect()
+            .await
+        {
+            Ok(channel) => {
+                break channel;
+            }
+            Err(_) => {
+                // Wait before next attempt
+                sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    };
 
     Ok((channel, df))
 }
@@ -504,6 +527,7 @@ async fn register_test_table(
     datafusion: &Arc<DataFusion>,
     schema: SchemaRef,
     table_name: TableReference,
+    runtime: Arc<Runtime>,
 ) -> Result<(), anyhow::Error> {
     let table = create_internal_accelerated_table(
         datafusion.runtime_status(),
@@ -514,6 +538,7 @@ async fn register_test_table(
         Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),
+        runtime,
     )
     .await
     .map_err(anyhow::Error::from)?;

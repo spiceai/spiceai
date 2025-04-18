@@ -25,8 +25,8 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -59,10 +59,13 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
 
         let registry = prometheus::Registry::new();
 
-        let rt = Arc::new(Runtime::builder()
+        let app = app::AppBuilder::new("test_app").build();
+
+        let rt = Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
-            .await);
+            .await;
 
         let api_key_auth =
             Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")])) as Arc<dyn HttpAuth + Send + Sync>;

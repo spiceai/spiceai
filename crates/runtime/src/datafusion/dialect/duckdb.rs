@@ -17,6 +17,7 @@ limitations under the License.
 use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
+use datafusion::sql::sqlparser::tokenizer::Span;
 use itertools::Itertools;
 
 /// Converts the `cosine_distance` UDF into `DuckDB` `array_cosine_distance` function:
@@ -66,6 +67,7 @@ pub(crate) fn cosine_distance_to_sql(
         name: ObjectName(vec![Ident {
             value: "array_cosine_distance".to_string(),
             quote_style: None,
+            span: Span::empty(),
         }]),
         args: ast::FunctionArguments::List(ast::FunctionArgumentList {
             duplicate_treatment: None,
@@ -80,6 +82,7 @@ pub(crate) fn cosine_distance_to_sql(
         over: None,
         within_group: vec![],
         parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
     });
 
     Ok(Some(ast_fn))
@@ -92,7 +95,7 @@ mod tests {
         logical_expr::expr::ScalarFunction,
         prelude::lit,
         scalar::ScalarValue,
-        sql::{unparser::Unparser, TableReference},
+        sql::{TableReference, unparser::Unparser},
     };
 
     use crate::datafusion::dialect::new_duckdb_dialect;

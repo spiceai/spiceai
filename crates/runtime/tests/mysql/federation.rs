@@ -28,10 +28,11 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
-use mysql_async::{prelude::Queryable, Params, Row};
+use mysql_async::{Params, Row, prelude::Queryable};
+
 use runtime::Runtime;
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
 const MYSQL_PORT: u16 = 13306;
@@ -94,25 +95,21 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
-                    .build()
-                    .await,
-            );
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
+                            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                                return Err("Timed out waiting for datasets to load".to_string());
+                            }
+            () = cloned_rt.load_components() => {}
+                        }
 
             let queries: QueryTests = vec![
                 (
@@ -202,21 +199,20 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
             .build();
 
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
 
-        let rt = Arc::new(Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await);
+        let cloned_rt = Arc::new(rt.clone());
         // Set a timeout for the test
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = Arc::clone(&rt).load_components() => {}
+            () = cloned_rt.load_components() => {}
         }
 
         runtime_ready_check(&rt).await;

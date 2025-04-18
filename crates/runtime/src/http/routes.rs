@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
+use crate::Runtime;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
-    datasets::{DatasetFilter, DatasetQueryParams},
     Format,
+    datasets::{DatasetFilter, DatasetQueryParams},
 };
 use crate::request::Protocol;
-use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
@@ -34,8 +36,8 @@ use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
 use utoipa::{
-    openapi::{path::Operation, HttpMethod},
     OpenApi,
+    openapi::{HttpMethod, path::Operation},
 };
 
 #[cfg(feature = "dev")]
@@ -47,13 +49,13 @@ use super::{metrics, v1};
 use super::v1::mcp::McpState;
 
 use axum::{
+    Extension,
     body::Body,
     extract::MatchedPath,
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post, Router},
-    Extension,
+    routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
@@ -179,8 +181,11 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
-            .route("/v1/nsql", post(v1::nsql::post))
-            .route("/v1/chat/completions", post(v1::chat::post))
+            .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
+            .route(
+                "/v1/chat/completions",
+                post(v1::chat::post).layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
@@ -301,7 +306,8 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
+    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(allowed_origins)
 }
 

@@ -17,18 +17,17 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    component::view::View, metrics, status,
-    topological_ordering::construct_effected_in_topological_order, view, LogErrors, Result,
-    Runtime, UnableToAttachViewSnafu,
+    LogErrors, Result, Runtime, UnableToAttachViewSnafu, component::view::View, metrics, status,
+    topological_ordering::construct_effected_in_topological_order, view,
 };
 use app::App;
-use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect, TableReference};
+use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 use itertools::Itertools;
 use snafu::prelude::*;
 
 impl Runtime {
-    pub(crate) fn load_views(&self, app: &Arc<App>) {
-        let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
+    pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
+        let views: Vec<View> = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
         for view in &views {
             if let Err(e) = self.load_view(view) {
@@ -38,8 +37,13 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    pub(crate) fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
-        let datasets = Self::get_valid_datasets(app, log_errors)
+    pub(crate) fn get_valid_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<View> {
+        let datasets = self
+            .get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
             .collect::<HashSet<_>>();
@@ -110,18 +114,22 @@ impl Runtime {
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed.
-    pub(crate) fn apply_view_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
-        let valid_views = Self::get_valid_views(new_app, LogErrors(true));
-        let existing_views = Self::get_valid_views(current_app, LogErrors(false));
+    pub(crate) fn apply_view_diff(self: Arc<Self>, current_app: &Arc<App>, new_app: &Arc<App>) {
+        let valid_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
+        let existing_views = Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
 
         let views_that_changed = valid_views
             .iter()
             .filter_map(|v| {
-                let old_v = existing_views.iter().find(|vv| v.name == vv.name)?;
-                if old_v == v {
-                    None
-                } else {
-                    Some(v.name.clone())
+                match existing_views.iter().find(|vv| v.name == vv.name) {
+                    Some(old_v) => {
+                        if old_v == v {
+                            None // No change, don't include
+                        } else {
+                            Some(v.name.clone()) // Changed, include the name
+                        }
+                    }
+                    None => Some(v.name.clone()), // New view, include the name
                 }
             })
             .collect_vec();

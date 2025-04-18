@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::config::{AzureConfig, Config, OPENAI_API_BASE};
-use async_openai::{config::OpenAIConfig, Client};
+use async_openai::{Client, config::OpenAIConfig};
 
 pub mod chat;
 pub mod embed;
@@ -29,6 +29,7 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
+#[derive(Debug)]
 pub struct Openai<C: Config> {
     client: Client<C>,
     model: String,

@@ -16,6 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
 use bytes::Bytes;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::chunking::{
@@ -49,6 +50,14 @@ pub struct OpenaiEmbed<C: Config> {
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
 }
 
+impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenaiEmbed")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<C: Config> OpenaiEmbed<C> {
     #[must_use]
     pub fn new(inner: Openai<C>) -> Self {
@@ -74,7 +83,7 @@ impl<C: Config> OpenaiEmbed<C> {
 }
 
 #[async_trait]
-impl<C: Config + Sync + Send> Embed for OpenaiEmbed<C> {
+impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,

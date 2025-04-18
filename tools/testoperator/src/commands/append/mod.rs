@@ -22,6 +22,7 @@ use crate::{
 };
 use std::time::Duration;
 use test_framework::{
+    TestType,
     anyhow::{self, Context},
     app::App,
     arrow::{self, array::AsArray, util::pretty::print_batches},
@@ -31,10 +32,9 @@ use test_framework::{
     queries::{QueryOverrides, QuerySet, TableWithRowCount},
     spiced::SpicedInstance,
     spicepod::component::dataset::acceleration::RefreshMode,
-    spicetest::{append::NotStarted, SpiceTest},
+    spicetest::{SpiceTest, append::NotStarted},
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
-    TestType,
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {

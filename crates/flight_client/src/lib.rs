@@ -15,29 +15,32 @@ limitations under the License.
 */
 
 use std::borrow::Cow;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::task::Poll;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::FlightData;
+use arrow_flight::FlightDescriptor;
+use arrow_flight::HandshakeRequest;
 use arrow_flight::decode::FlightDataDecoder;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::FlightData;
-use arrow_flight::FlightDescriptor;
-use arrow_flight::HandshakeRequest;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::{ready, stream, TryStreamExt};
+use futures::{TryStreamExt, ready, stream};
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::error::Error as StdError;
-use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
+use tonic::transport::Channel;
 
 pub mod tls;
 
@@ -113,8 +116,11 @@ impl From<&str> for TonicStatusMessage {
 impl std::fmt::Display for TonicStatusMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection/server configuration, and try again."),
-            TonicStatusMessage::Unmatched(message) => write!(f, "{message}")
+            TonicStatusMessage::TransportError => write!(
+                f,
+                "A network error occurred. Check the network connection/server configuration, and try again."
+            ),
+            TonicStatusMessage::Unmatched(message) => write!(f, "{message}"),
         }
     }
 }
@@ -141,7 +147,9 @@ pub enum Error {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
     #[snafu(display("Query execution failed.\n{source}"))]
@@ -168,16 +176,48 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
+    // Basic authentication used to exchange for a Bearer token
     UsernamePassword {
         username: Arc<str>,
-        password: Arc<str>,
+        password: Arc<SecretString>,
     },
+    // Anonymous access
     Anonymous,
+    // An existing bearer token
+    Bearer {
+        token: Arc<SecretString>,
+        prefix: bool, // whether this token requires the 'Bearer ' prefix, or if it is set to the 'authorization' header verbatim
+    },
+}
+
+struct Token {
+    value: Arc<SecretString>,
+    bearer: bool,
+}
+
+impl Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bearer {
+            write!(f, "Bearer {}", self.value.expose_secret())
+        } else {
+            write!(f, "{}", self.value.expose_secret())
+        }
+    }
+}
+
+impl Token {
+    #[must_use]
+    fn new(value: &str, bearer: bool) -> Self {
+        Token {
+            value: Arc::new(SecretString::new(value.into())),
+            bearer,
+        }
+    }
 }
 
 impl Credentials {
     #[must_use]
-    pub fn new(username: &str, password: &str) -> Self {
+    pub fn new(username: &str, password: SecretString) -> Self {
         Credentials::UsernamePassword {
             username: username.into(),
             password: password.into(),
@@ -239,6 +279,20 @@ impl FlightClient {
         self
     }
 
+    /// Overrides default maximum message size for encoding and decoding.
+    #[must_use]
+    pub fn with_max_message_size(
+        mut self,
+        max_encoding_message_size: usize,
+        max_decoding_message_size: usize,
+    ) -> Self {
+        self.flight_client = self
+            .flight_client
+            .max_encoding_message_size(max_encoding_message_size)
+            .max_decoding_message_size(max_decoding_message_size);
+        self
+    }
+
     /// Queries the flight service for the schema of the path.
     ///
     /// # Arguments
@@ -255,9 +309,7 @@ impl FlightClient {
         let mut req = tonic::Request::new(descriptor);
 
         let auth_header_value = match &token {
-            Some(token) => format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?,
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
             None => {
                 return UnauthorizedSnafu.fail();
             }
@@ -299,9 +351,7 @@ impl FlightClient {
         let mut req = descriptor.into_request();
 
         let auth_header_value = match &token {
-            Some(token) => format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?,
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
             None => {
                 return UnauthorizedSnafu.fail();
             }
@@ -343,9 +393,7 @@ impl FlightClient {
         let mut req = descriptor.into_request();
 
         let auth_header_value = match &token {
-            Some(token) => format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?,
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
             None => {
                 return UnauthorizedSnafu.fail();
             }
@@ -372,9 +420,7 @@ impl FlightClient {
         if let Some(ticket) = ep.ticket {
             let mut req = ticket.into_request();
             let auth_header_value = match token {
-                Some(token) => format!("Bearer {token}")
-                    .parse()
-                    .context(InvalidMetadataSnafu)?,
+                Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
                 None => {
                     return UnauthorizedSnafu.fail();
                 }
@@ -424,9 +470,7 @@ impl FlightClient {
 
         let mut req = subscription_request.into_streaming_request();
         let auth_header_value = match token {
-            Some(token) => format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?,
+            Some(token) => token.to_string().parse().context(InvalidMetadataSnafu)?,
             None => {
                 return UnauthorizedSnafu.fail();
             }
@@ -485,9 +529,7 @@ impl FlightClient {
 
         let mut publish_request = request_stream.into_streaming_request();
         if let Some(token) = token {
-            let auth_header_value = format!("Bearer {token}")
-                .parse()
-                .context(InvalidMetadataSnafu)?;
+            let auth_header_value = token.to_string().parse().context(InvalidMetadataSnafu)?;
 
             publish_request
                 .metadata_mut()
@@ -510,9 +552,18 @@ impl FlightClient {
         Ok(())
     }
 
-    async fn authenticate_basic_token(&self) -> Result<Option<String>> {
-        let Credentials::UsernamePassword { username, password } = &self.credentials else {
-            return Ok(None);
+    async fn authenticate_basic_token(&self) -> Result<Option<Token>> {
+        let (username, password) = match &self.credentials {
+            Credentials::UsernamePassword { username, password } => {
+                (username.as_ref(), password.expose_secret())
+            }
+            Credentials::Anonymous => return Ok(None),
+            Credentials::Bearer {
+                token,
+                prefix: bearer,
+            } => {
+                return Ok(Some(Token::new(token.expose_secret(), *bearer)));
+            }
         };
 
         let cmd = HandshakeRequest {
@@ -520,7 +571,8 @@ impl FlightClient {
             payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
+
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;
@@ -532,12 +584,12 @@ impl FlightClient {
             .await
             .map_err(TonicStatusError::from)
             .context(UnableToPerformHandshakeSnafu)?;
-        let mut token: Option<String> = None;
+        let mut token: Option<Token> = None;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
-            token = Some(auth["Bearer ".len()..].to_string());
+            token = Some(Token::new(&auth["Bearer ".len()..], true));
         }
         Ok(token)
     }

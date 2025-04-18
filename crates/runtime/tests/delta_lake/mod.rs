@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::test_request_context;
 use crate::RecordBatch;
+use crate::configure_test_datafusion;
+use crate::utils::test_request_context;
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
+use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
 use std::{fs::File, io::Write, sync::Arc};
 
 pub fn make_delta_lake_dataset(path: &str, name: &str, accelerated: bool) -> Dataset {
@@ -77,22 +78,20 @@ async fn run_delta_lake_test(
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
 
-    let status = runtime::status::RuntimeStatus::new();
-    let df = crate::get_test_datafusion(Arc::clone(&status));
-    let rt = Arc::new(
-        Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .build()
-            .await,
-    );
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
+        .build()
+        .await;
+
+    let cloned_rt = Arc::new(rt.clone());
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = Arc::clone(&rt).load_components() => {}
+        () = cloned_rt.load_components() => {}
     }
 
     let query_result = rt

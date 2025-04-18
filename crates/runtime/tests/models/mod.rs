@@ -14,17 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, util::pretty::pretty_format_batches};
+use arrow::{array::StringArray, compute::concat_batches, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
-use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, get_params_with_secrets, Runtime};
+use reqwest::{Client, header::HeaderMap};
+use runtime::{Runtime, config::Config, get_params_with_secrets};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params,
+use spicepod::{
+    component::dataset::{Dataset, acceleration::Acceleration},
+    param::Params,
 };
 use std::sync::Arc;
 use std::{
@@ -32,7 +32,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 mod embedding;
 mod hf;
 mod local;
@@ -42,8 +42,8 @@ mod tools;
 mod nsql {
     use chrono::{DateTime, Utc};
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
     use opentelemetry_sdk::trace::TracerProvider;
 
@@ -114,8 +114,8 @@ mod nsql {
 
 mod search {
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
 
     use crate::models::{http_post, normalize_search_response};
@@ -185,6 +185,27 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        ..Default::default()
+    });
+    dataset
+}
+
+fn get_small_clickbench_dataset(name: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
+        name,
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 500")),
         ..Default::default()
     });
     dataset
@@ -503,6 +524,46 @@ async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
             .value(0),
     )
     .expect("value is a JSON string")
+}
+
+#[allow(clippy::expect_used)]
+async fn sql_to_json_values(rt: &Arc<Runtime>, query: &str) -> Vec<Value> {
+    let data = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .boxed()
+        .expect("Failed to collect data")
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()
+        .expect("Failed to collect data");
+
+    // Data may be split into multiple batches, so we need to concatenate them
+    let concat_data = if data.len() > 1 {
+        concat_batches(&data[0].schema(), &data).expect("Failed to concatenate batches")
+    } else {
+        data[0].clone()
+    };
+
+    let mut json_values: Vec<Value> = Vec::new();
+
+    let string_column = concat_data
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("column is a StringArray");
+
+    for row_idx in 0..concat_data.num_rows() {
+        let json_str = string_column.value(row_idx);
+        let json_val = serde_json::from_str(json_str).expect("value is a JSON string");
+
+        json_values.push(json_val);
+    }
+    json_values
 }
 
 async fn get_params_with_secrets_value(

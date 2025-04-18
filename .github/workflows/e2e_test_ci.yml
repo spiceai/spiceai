@@ -133,7 +133,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        run: make -C bin/spiced
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension"
 
       - name: Update build cache (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -652,6 +652,8 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
+          # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+          brew update
           brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
@@ -1331,7 +1333,6 @@ jobs:
           echo "      enabled: true" >> spicepod.yaml
           echo "      refresh_sql: 'SELECT * FROM spiceai.commits LIMIT 20'" >> spicepod.yaml
 
-
           echo "  - from: github:github.com/spiceai/spiceai/stargazers" >> spicepod.yaml
           echo "    name: spiceai.stargazers" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
@@ -1567,7 +1568,6 @@ jobs:
           echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
           echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
 
-
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -1612,17 +1612,19 @@ jobs:
           killall spice || true
           cat spice.log
 
-  graceful_shutdown_test:
-    name: 'DuckDB graceful shutdown on ${{ matrix.target.name }}'
+  graceful_shutdown_test_append:
+    name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     strategy:
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        spicepod: [duckdb_append_with_pk_and_indexes.yaml, duckdb_append_with_pk.yaml, duckdb_append_with_indexes.yaml]
         # run only on "Linux x64"
         exclude:
           - target:
@@ -1656,7 +1658,7 @@ jobs:
         run: |
           brew install oha
 
-      - name : Install oha (Linux)
+      - name: Install oha (Linux)
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
@@ -1672,7 +1674,7 @@ jobs:
       - name: Configure Spicepod
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
-          mv duckdb_append_with_pk_and_indexes.yaml spicepod.yaml
+          cp ${{ matrix.spicepod }} spicepod.yaml
           cat spicepod.yaml
 
       - name: Start Spice runtime
@@ -1688,10 +1690,11 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Run test workfload for 30s
+      - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 5
         run: |
-          ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 30s -c 10
+          ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 120s -c 10
 
       - name: Send SIGTERM to Spice
         working-directory: ./test/spicepods/tpch/accelerated/constraints
@@ -1704,7 +1707,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
           ls -la .spice/data
-  
+
           if [ -f .spice/data/accelerated_duckdb.db ]; then
             echo "Verification successful: accelerated_duckdb.db exists."
           else
@@ -1718,7 +1721,183 @@ jobs:
             echo "Verification failed: accelerated_duckdb.db.wal exists."
             exit 1
           fi
-  
+
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
+
+      - name: Restart Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify data_upsert dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_upsert
+
+      - name: Verify data_drop dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_drop
+
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
+
+  graceful_shutdown_test_full:
+    name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        spicepod: [duckdb_full_with_pk_and_indexes.yaml, duckdb_full_with_pk.yaml, duckdb_full_with_indexes.yaml]
+        # run only on "Linux x64"
+        exclude:
+          - target:
+              target_os: 'darwin'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: check installation
+        run: |
+          spice version
+
+      - name: Install oha (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install oha
+
+      - name: Install oha (Linux)
+        if: matrix.target.target_os == 'linux'
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          chmod +x ./oha
+          ./oha --version
+
+      - name: Configure Spicepod
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          cp ${{ matrix.spicepod }} spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -f .spice/tpch.db
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 3
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Run test workfload for 120s
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 5
+        run: |
+          ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D tpch_query.sql -z 120s -c 10
+
+      - name: Send SIGTERM to Spice
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 0.5
+        run: |
+          killall spice
+          while pgrep spice > /dev/null; do sleep 1; done
+
+      - name: Verify local DuckDB database
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          ls -la .spice/data
+
+          if [ -f .spice/data/accelerated_duckdb.db ]; then
+            echo "Verification successful: accelerated_duckdb.db exists."
+          else
+            echo "Verification failed: accelerated_duckdb.db does not exist."
+            exit 1
+          fi
+
+          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
+            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
+          else
+            echo "Verification failed: accelerated_duckdb.db.wal exists."
+            exit 1
+          fi
+
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
+
+      - name: Restart Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -f .spice/tpch.db
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 3
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: customer
+
       - name: Check logs
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         if: always()

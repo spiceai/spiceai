@@ -141,7 +141,11 @@ nsql> How much money have I made in each country?
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
-		defer line.Close()
+		defer func() {
+			if err := line.Close(); err != nil {
+				slog.Error("closing line", "error", err)
+			}
+		}()
 		for {
 			message, err := line.Prompt("nsql> ")
 			if err == liner.ErrPromptAborted {

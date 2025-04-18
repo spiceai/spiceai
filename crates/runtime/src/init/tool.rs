@@ -17,16 +17,16 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    get_params_with_secrets, metrics, status,
-    tools::{self, factory::default_available_catalogs, Tooling},
-    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
+    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu, get_params_with_secrets, metrics,
+    status,
+    tools::{self, Tooling, factory::default_available_catalogs},
 };
 use futures::future::join_all;
 use opentelemetry::KeyValue;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     #[allow(clippy::implicit_hasher)]

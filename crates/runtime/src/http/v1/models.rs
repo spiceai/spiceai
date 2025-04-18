@@ -17,16 +17,16 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use axum::{
+    Extension,
     extract::Query,
     http::status,
     response::{IntoResponse, Json, Response},
-    Extension,
 };
 use csv::Writer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{status::ComponentStatus, Runtime};
+use crate::{Runtime, status::ComponentStatus};
 
 use super::Format;
 

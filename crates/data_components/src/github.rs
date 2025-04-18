@@ -35,7 +35,7 @@ use datafusion::{
 };
 use std::{any::Any, path::Path, sync::Arc};
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 
 #[derive(Debug, Snafu)]

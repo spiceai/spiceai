@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::BTreeMap, time::SystemTime};
 
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, Builder, BuilderTarget, ExtendedMetrics, MetricCollector,
-    NoExtendedMetrics, QueryMetric, QueryStatus,
+    Builder, BuilderTarget, ExtendedMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
+    QueryStatus, system_time_to_unix_epoch_ms,
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -147,6 +147,15 @@ impl MetricCollector<SearchScoreMetric, NoExtendedMetrics> for SpiceTest<Complet
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
     }
 
     fn metrics(&self) -> Result<Vec<QueryMetric<SearchScoreMetric>>> {

@@ -17,19 +17,19 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::{
-        metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
+        ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
     },
-    common::v1::{any_value::Value, AnyValue, InstrumentationScope, KeyValue},
+    common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value::Value},
     metrics::v1::{
-        metric::Data, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics,
-        ScopeMetrics,
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data,
+        number_data_point,
     },
     resource::v1::Resource,
 };
 use tonic::{
+    IntoRequest,
     metadata::MetadataValue,
     transport::{Channel, ClientTlsConfig},
-    IntoRequest,
 };
 
 #[derive(Parser)]

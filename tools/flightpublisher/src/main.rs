@@ -17,7 +17,7 @@ limitations under the License.
 use std::fs::File;
 
 use arrow::record_batch::RecordBatch;
-use arrow_flight::{encode::FlightDataEncoderBuilder, FlightClient, FlightDescriptor, PutResult};
+use arrow_flight::{FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder};
 use clap::Parser;
 use futures::stream::TryStreamExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

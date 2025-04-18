@@ -58,8 +58,8 @@ impl Parameters {
 
         if !prefix_removed && spec.r#type.is_prefixed() {
             tracing::warn!(
-            "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-        );
+                "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+            );
             return None;
         }
 
@@ -192,7 +192,9 @@ impl Parameters {
         if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
         } else {
-            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator.");
+            panic!(
+                "Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator."
+            );
         }
     }
 
@@ -227,6 +229,19 @@ pub struct Parameters {
     params: Vec<(String, SecretString)>,
     prefix: &'static str,
     all_params: &'static [ParameterSpec],
+}
+
+impl std::fmt::Debug for Parameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Parameters")
+            .field(
+                "params",
+                &self.params.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
+            .field("prefix", &self.prefix)
+            .field("all_params", &self.all_params)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> IntoIterator for &'a Parameters {

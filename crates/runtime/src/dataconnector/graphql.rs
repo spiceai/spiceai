@@ -21,7 +21,7 @@ use data_components::{
     token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::datasource::TableProvider;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
@@ -31,11 +31,12 @@ use super::{
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct GraphQLFactory {}
 
 impl GraphQLFactory {

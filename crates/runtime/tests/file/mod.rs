@@ -17,12 +17,13 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use runtime::{status, Runtime};
+
+use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
 
 pub fn get_dataset() -> Result<Dataset, anyhow::Error> {
@@ -51,23 +52,19 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
                 .with_dataset(get_dataset()?)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_datafusion(df)
-                    .with_app(app)
-                    .build()
-                    .await,
-            );
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = Arc::clone(&rt).load_components() => {}
+() = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

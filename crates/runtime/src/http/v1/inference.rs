@@ -18,10 +18,10 @@ use crate::{datafusion::DataFusion, model::run};
 use app::App;
 use arrow::array::Float32Array;
 use axum::{
+    Extension, Json,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use model_components::{model::Model, modelsource};
 use serde::{Deserialize, Serialize};
@@ -296,7 +296,9 @@ async fn run_inference(
                 tracing::error!(
                     "Failed to cast inference result for model {model_name} to Float32Array"
                 );
-                tracing::debug!("Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}");
+                tracing::debug!(
+                    "Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}"
+                );
                 return PredictResponse {
                     status: PredictStatus::InternalError,
                     error_message: Some(

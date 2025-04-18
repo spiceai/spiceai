@@ -18,26 +18,27 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use snafu::prelude::*;
+use snafu::{ResultExt, prelude::*};
 
 use runtime::{
+    Runtime,
     accelerated_table::{
-        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
+        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
     component::dataset::{
+        DatasetBuilder, Mode, TimeFormat,
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
-        Dataset, Mode, TimeFormat,
     },
-    dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{create_new_connector, ConnectorParamsBuilder, DataConnectorError},
+    dataaccelerator::{self, AcceleratorEngineRegistry},
+    dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
-    status, Runtime,
+    status,
 };
 use tokio::sync::RwLock;
 
@@ -46,7 +47,9 @@ pub enum Error {
     #[snafu(display("Unable to get read-write table provider"))]
     NoReadWriteProvider {},
 
-    #[snafu(display("Unable to create data connector"))]
+    #[snafu(display(
+        "Unable to create data connector: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
@@ -149,7 +152,11 @@ impl SpiceExtension {
         Ok(response)
     }
 
-    async fn register_runtime_metrics_table(&self, runtime: &Runtime, from: String) -> Result<()> {
+    async fn register_runtime_metrics_table(
+        &self,
+        runtime: Arc<Runtime>,
+        from: String,
+    ) -> Result<()> {
         let retention = Retention::new(
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -169,6 +176,7 @@ impl SpiceExtension {
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
+            runtime.accelerator_engine_registry(),
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
@@ -176,6 +184,7 @@ impl SpiceExtension {
             refresh,
             retention,
             runtime.secrets(),
+            Arc::clone(&runtime),
         )
         .await
         .boxed()
@@ -190,7 +199,7 @@ impl SpiceExtension {
         Ok(())
     }
 
-    async fn start_metrics(&self, runtime: &Runtime) -> Result<()> {
+    async fn start_metrics(&self, runtime: Arc<Runtime>) -> Result<()> {
         if !self.metrics_enabled() {
             return Ok(());
         }
@@ -242,7 +251,7 @@ impl Extension for SpiceExtension {
         Ok(())
     }
 
-    async fn on_start(&self, runtime: &Runtime) -> Result<()> {
+    async fn on_start(&self, runtime: Arc<Runtime>) -> Result<()> {
         self.start_metrics(runtime).await?;
 
         Ok(())
@@ -274,8 +283,22 @@ async fn get_spiceai_table_provider(
     name: &str,
     cloud_dataset_path: &str,
     secrets: Arc<RwLock<Secrets>>,
+    runtime: Arc<Runtime>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
-    let mut dataset = Dataset::try_new(cloud_dataset_path.to_string(), name)
+    let app_ref = runtime.app();
+    let app_lock = app_ref.read().await;
+    let Some(app) = app_lock.as_ref() else {
+        return Err(Error::UnableToCreateDataConnector {
+            source: "Missing App From Runtime".into(),
+        });
+    };
+
+    let mut dataset = DatasetBuilder::try_new(cloud_dataset_path.to_string(), name)
+        .boxed()
+        .context(UnableToCreateDataConnectorSnafu)?
+        .with_app(Arc::clone(app))
+        .with_runtime(runtime)
+        .build()
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?;
 
@@ -306,7 +329,9 @@ async fn get_spiceai_table_provider(
 /// # Errors
 ///
 /// This function will return an error if the accelerated table provider cannot be created
+#[allow(clippy::too_many_arguments)]
 pub async fn create_synced_internal_accelerated_table(
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,
@@ -314,21 +339,24 @@ pub async fn create_synced_internal_accelerated_table(
     refresh: Refresh,
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
+    runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
+        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
+            .await?;
     let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
-    let accelerated_table_provider = create_accelerator_table(
-        table_reference.clone(),
-        federated_table.schema(),
-        None,
-        &acceleration,
-        secrets,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = accelerator_engine_registry
+        .create_accelerator_table(
+            table_reference.clone(),
+            federated_table.schema(),
+            None,
+            &acceleration,
+            secrets,
+            None,
+        )
+        .await
+        .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,

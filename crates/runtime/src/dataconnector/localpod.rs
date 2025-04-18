@@ -25,15 +25,15 @@ use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 
-use crate::datafusion::DataFusion;
 use crate::DataConnector;
+use crate::datafusion::DataFusion;
 use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
 use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct LocalPodFactory {}
 
 impl LocalPodFactory {
@@ -76,7 +76,7 @@ impl DataConnectorFactory for LocalPodFactory {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LocalPodConnector {
     datafusion: Arc<DataFusion>,
 }

@@ -47,7 +47,9 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_compression_type")
         .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
     ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.")
+        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
+    ParameterSpec::runtime("schema_source_path")
+        .description("Specify a path to use for schema inference.")
 ];
 
 pub enum DelimitedFormat {

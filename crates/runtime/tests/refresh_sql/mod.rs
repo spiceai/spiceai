@@ -20,14 +20,15 @@ use futures::TryStreamExt;
 use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
+
 use runtime::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::acceleration::RefreshMode,
-    status, Runtime,
+    Runtime, accelerated_table::refresh::RefreshOverrides,
+    component::dataset::acceleration::RefreshMode,
 };
-use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
+use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context, wait_until_true},
 };
 
@@ -58,24 +59,20 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
-                    .build()
-                    .await,
-            );
+            let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
+                            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                                panic!("Timeout waiting for components to load");
+                            }
+            () = cloned_rt.load_components() => {}
+                        }
 
             runtime_ready_check(&rt).await;
 

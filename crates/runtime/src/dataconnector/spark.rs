@@ -17,8 +17,8 @@ limitations under the License.
 use async_trait::async_trait;
 
 use crate::component::dataset::Dataset;
-use data_components::spark_connect::SparkConnect;
 use data_components::Read;
+use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -55,6 +55,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Spark {
     read_provider: Arc<dyn Read>,
+}
+
+impl std::fmt::Debug for Spark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spark").finish_non_exhaustive()
+    }
 }
 
 impl Spark {

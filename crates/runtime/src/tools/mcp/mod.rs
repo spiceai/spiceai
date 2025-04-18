@@ -21,7 +21,9 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
-use mcp_client::{transport::Error as TransportError, Error as McpError};
+use async_trait::async_trait;
+use mcp_client::{Error as McpError, transport::Error as TransportError};
+use mcp_core::protocol::CallToolResult;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;

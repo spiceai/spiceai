@@ -1,0 +1,33 @@
+version: v1
+kind: Spicepod
+name: append-refresh-with-indexes
+
+runtime:
+  task_history:
+    enabled: true
+    captured_output: truncated
+  results_cache:
+    enabled: false
+
+datasets:
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
+    name: data_upsert
+    time_column: DateUpdated
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: &default_refresh_check_interval 1s
+      indexes:
+        Id: enabled
+
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
+    name: data_drop
+    time_column: DateUpdated
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *default_refresh_check_interval

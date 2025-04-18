@@ -14,21 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+
+use anyhow::anyhow;
+use runtime::{Runtime, component::dataset::DatasetBuilder};
 use spicepod::component::dataset::{
-    acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
+    acceleration::{Acceleration, Mode, RefreshMode},
 };
 use std::sync::Arc;
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -49,15 +52,12 @@ fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope_retry(3, || async {
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let expected_path = "./single_duckdb.db";
             let app = AppBuilder::new("test_acceleration_duckdb_single_instance")
                 .with_dataset(get_dataset(
@@ -75,14 +75,38 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );
 
+            let app_ref = rt.app();
+            let app_lock = app_ref.read().await;
+            let Some(app) = app_lock.as_ref() else {
+                return Err(anyhow!("Failed to obtain app from runtime"));
+            };
+
+            let cloned_rt = Arc::clone(&rt);
+            let runtime_datasets = app
+                .datasets
+                .clone()
+                .into_iter()
+                .map(DatasetBuilder::try_from)
+                .map(move |ds_builder| {
+                    ds_builder
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .and_then(|ds_builder| {
+                            ds_builder
+                                .with_app(Arc::clone(app))
+                                .with_runtime(Arc::clone(&cloned_rt))
+                                .build()
+                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -90,10 +114,11 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Verify checkpoints are created before shutting down runtime
+            wait_for_checkpoints(runtime_datasets, 120).await?;
+
             rt.shutdown().await;
-            runtime::dataaccelerator::unregister_all().await;
-            runtime::dataaccelerator::register_all().await;
+            drop(rt);
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
             let pool = DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite)

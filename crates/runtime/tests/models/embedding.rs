@@ -23,7 +23,7 @@ use crate::{
 use app::AppBuilder;
 use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
-use runtime::{auth::EndpointAuth, Runtime};
+use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::embeddings::Embeddings;
 use std::sync::Arc;
 

@@ -140,9 +140,9 @@ impl RateLimiter for GitHubRateLimiter {
                         .unwrap_or(Duration::from_secs(1));
                     let wait_duration_secs = wait_duration.as_secs();
                     tracing::warn!(
-                    "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {}.",
-                    wait_duration_secs,
-                    if wait_duration_secs == 1 { "" } else { "s" },
+                        "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {}.",
+                        wait_duration_secs,
+                        if wait_duration_secs == 1 { "" } else { "s" },
                         secondary.retry_after
                     );
                     tokio::time::sleep(wait_duration).await;
