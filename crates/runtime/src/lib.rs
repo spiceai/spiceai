@@ -558,8 +558,8 @@ impl Runtime {
             };
             tokio::select! {
                 result = graceful_shutdown => result,
-                _ = force_shutdown_signal() => {
-                    tracing::warn!("Force shutdown signal received. Terminating immediately.");
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
                     // return error to force stop waiting for other tasks and terminate immediately
                     Err(Error::ForceTerminated)
                 }

@@ -62,7 +62,7 @@ pub async fn shutdown_signal() {
 }
 
 pub async fn force_shutdown_signal() {
-    shutdown_signal_impl().await;
+    shutdown_signal().await;
 
     // use 500ms as a debounce window to prevent the same Ctrl-C signal from being handled multiple times
     let last_signal_time = Instant::now();
