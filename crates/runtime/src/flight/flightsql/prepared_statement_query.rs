@@ -18,17 +18,18 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_flight::{
-    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, PutResult, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
     flight_service_server::FlightService,
-    sql::{self, CommandPreparedStatementQuery, ProstMessageExt},
+    sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
-use datafusion::{common::ParamValues, parquet::data_type::AsBytes};
+use datafusion::common::ParamValues;
 use prost::Message;
-use tokio_stream::{StreamExt, adapters::Peekable, empty};
+use serde::{Deserialize, Serialize};
+use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
@@ -39,9 +40,10 @@ use crate::{
     timing::TimedStream,
 };
 
+#[derive(Serialize, Deserialize)]
 pub(crate) struct PreparedStatement {
     query: String,
-    parameters: Option<ParamValues>,
+    parameters: Vec<u8>,
 }
 
 /// Create a prepared statement from given SQL statement.
@@ -60,17 +62,13 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     let stmt = PreparedStatement {
         query: statement.query.clone(),
-        parameters: None,
+        parameters: vec![],
     };
 
-    flight_svc
-        .prepared_statements
-        .write()
-        .await
-        .insert(statement.query.clone(), stmt);
+    let handle = serde_json::to_vec(&stmt).map_err(error_to_status)?;
 
     Ok(sql::ActionCreatePreparedStatementResult {
-        prepared_statement_handle: statement.query.into(),
+        prepared_statement_handle: handle.into(),
         dataset_schema: schema_bytes,
         ..Default::default()
     })
@@ -85,17 +83,10 @@ pub(crate) async fn get_flight_info(
         metrics::track_flight_request("get_flight_info", Some("prepared_statement_query")).await;
     set_flightsql_protocol().await;
 
-    tracing::trace!("get_flight_info: {handle:?}");
-    let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
-        Ok(sql) => sql,
-        Err(e) => {
-            return Err(Status::invalid_argument(format!(
-                "Invalid prepared statement handle: {e}"
-            )));
-        }
-    };
+    let PreparedStatement { query, .. } =
+        serde_json::from_slice(&handle.prepared_statement_handle).map_err(error_to_status)?;
 
-    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &query)
         .await
         .map_err(to_tonic_err)?;
 
@@ -124,13 +115,12 @@ pub(crate) async fn do_get(
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tracing::trace!("do_get: {query:?}");
 
-    let handle =
-        String::from_utf8(query.prepared_statement_handle.to_vec()).map_err(error_to_status)?;
+    let PreparedStatement {
+        query: sql,
+        parameters,
+    } = serde_json::from_slice(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let (sql, parameters) = match &flight_svc.prepared_statements.read().await.get(&handle) {
-        Some(PreparedStatement { query, parameters }) => (query.clone(), parameters.clone()),
-        None => (handle, None),
-    };
+    let parameters = decode_param_values(&parameters).map_err(error_to_status)?;
 
     let (output, from_cache) =
         Box::pin(Service::sql_to_flight_stream(datafusion, &sql, parameters)).await?;
@@ -146,7 +136,7 @@ pub(crate) async fn do_get(
 ///
 /// See [Sequence Diagrams](https://arrow.apache.org/docs/format/FlightSql.html#sequence-diagrams)
 pub(crate) async fn do_put_query(
-    flight_svc: &Service,
+    _flight_svc: &Service,
     query: CommandPreparedStatementQuery,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
@@ -179,19 +169,19 @@ pub(crate) async fn do_put_query(
         ));
     }
 
-    let parameters = decode_param_values(parameters.as_bytes()).map_err(error_to_status)?;
+    let mut stmt: PreparedStatement =
+        serde_json::from_slice(&query.prepared_statement_handle).map_err(error_to_status)?;
+    stmt.parameters = parameters;
+    let handle = serde_json::to_vec(&stmt).map_err(error_to_status)?;
 
-    let handle =
-        String::from_utf8(query.prepared_statement_handle.to_vec()).map_err(error_to_status)?;
+    let result = DoPutPreparedStatementResult {
+        prepared_statement_handle: Some(handle.into()),
+    };
 
-    flight_svc
-        .prepared_statements
-        .write()
-        .await
-        .entry(handle)
-        .and_modify(|stmt| stmt.parameters = parameters);
-
-    Ok(Response::new(Box::pin(empty())))
+    let output = futures::stream::iter(vec![Ok(PutResult {
+        app_metadata: result.encode_to_vec().into(),
+    })]);
+    Ok(Response::new(Box::pin(output)))
 }
 
 async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Status> {
