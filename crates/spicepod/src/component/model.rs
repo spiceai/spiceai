@@ -89,6 +89,7 @@ pub enum ModelSource {
     Perplexity,
     SpiceAI,
     File,
+    Databricks,
 }
 
 // Matches model paths in these formats:
@@ -139,6 +140,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Xai)
         } else if value.starts_with("spiceai") {
             Ok(ModelSource::SpiceAI)
+        } else if value.starts_with("databricks") {
+            Ok(ModelSource::Databricks)
         } else {
             Err("Unknown prefix")
         }
@@ -157,6 +160,7 @@ impl Display for ModelSource {
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
+            ModelSource::Databricks => write!(f, "databricks"),
         }
     }
 }
@@ -341,6 +345,7 @@ impl Model {
                 | ModelSource::OpenAi
                 | ModelSource::Anthropic
                 | ModelSource::Xai
+                | ModelSource::Databricks
         ) {
             return Some(ModelType::Llm);
         }
