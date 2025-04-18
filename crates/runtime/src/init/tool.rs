@@ -40,7 +40,7 @@ impl Runtime {
         }
 
         let mut spawned_tasks = vec![];
-        let cloned_self = self.clone();
+        let cloned_self = Arc::clone(&self);
 
         // Load all built-in tools, regardless if they are in the spicepod.
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
@@ -49,7 +49,7 @@ impl Runtime {
         for ctlg in default_available_catalogs(Arc::clone(&self)) {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                let cloned_self = cloned_self.clone();
+                let cloned_self = Arc::clone(&cloned_self);
                 let handle = tokio::spawn(async move {
                     cloned_self.insert_tool(tool.into()).await;
                 });
@@ -82,7 +82,6 @@ impl Runtime {
             .update_tool(&name, status::ComponentStatus::Ready);
     }
 
-
     async fn load_tool(self: Arc<Self>, tool: &Tool) {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(None)
@@ -104,8 +103,8 @@ impl Runtime {
                 Arc::clone(&self),
                 env_with_secrets,
             )
-                .await
-                .context(UnableToInitializeLlmToolSnafu)
+            .await
+            .context(UnableToInitializeLlmToolSnafu)
             {
                 Ok(t) => {
                     self.insert_tool(t).await;
