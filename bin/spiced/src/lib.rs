@@ -265,6 +265,8 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let result = match server_thread.await {
+        // Don't treat force terminated as an error
+        Ok(Err(runtime::Error::ForceTerminated { .. })) => Ok(()),
         Ok(ok) => ok.context(UnableToStartServersSnafu),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),

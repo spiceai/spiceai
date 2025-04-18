@@ -40,6 +40,7 @@ const (
 	modelKeyFlag        = "model"
 	httpEndpointKeyFlag = "http-endpoint"
 	userAgentKeyFlag    = "user-agent"
+	temperatureFlag     = "temperature"
 )
 
 type Message struct {
@@ -52,6 +53,38 @@ type ChatRequestBody struct {
 	Model         string         `json:"model"`
 	Stream        bool           `json:"stream"`
 	StreamOptions *StreamOptions `json:"stream_options"`
+	ChatRequestOptions
+}
+
+// ChatRequestOptions contains all optional fields for chat requests
+type ChatRequestOptions struct {
+	Temperature *float32 `json:"temperature,omitempty"`
+}
+
+func NewChatRequestBody(messages []Message, model string, stream bool, streamOptions *StreamOptions) *ChatRequestBody {
+	return &ChatRequestBody{
+		Messages:      messages,
+		Model:         model,
+		Stream:        stream,
+		StreamOptions: streamOptions,
+	}
+}
+
+func ApplyChatOptions(body *ChatRequestBody, cmd *cobra.Command) (*ChatRequestBody, error) {
+	if cmd.Flags().Changed("temperature") {
+		temperature, err := cmd.Flags().GetFloat32("temperature")
+		if err != nil {
+			slog.Error("could not get temperature flag", "error", err)
+			os.Exit(1)
+		}
+		if temperature < 0 {
+			slog.Error("temperature must be greater than or equal to 0")
+			os.Exit(1)
+		}
+		body.Temperature = &temperature
+	}
+
+	return body, nil
 }
 
 type StreamOptions struct {
@@ -118,6 +151,16 @@ spice chat --model <model> --cloud
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		if apiKey != "" {
 			rtcontext.SetApiKey(apiKey)
+		}
+
+		temperature, err := cmd.Flags().GetFloat32("temperature")
+		if err != nil {
+			slog.Error("could not get temperature flag", "error", err)
+			os.Exit(1)
+		}
+		if temperature < 0 {
+			slog.Error("temperature must be greater than or equal to 0")
+			os.Exit(1)
 		}
 
 		userAgent, _ := cmd.Flags().GetString(userAgentKeyFlag)
@@ -215,12 +258,11 @@ spice chat --model <model> --cloud
 				util.ShowSpinner(done)
 			}()
 
-			body := &ChatRequestBody{
-				Messages:      messages,
-				Model:         model,
-				Stream:        true,
-				StreamOptions: &StreamOptions{IncludeUsage: true},
-			}
+			body := NewChatRequestBody(messages, model, true, &StreamOptions{
+				IncludeUsage: true,
+			})
+			body, _ = ApplyChatOptions(body, cmd)
+
 			var timeAtCompletion time.Time
 			var timeAtFirstToken time.Time
 			startTime := time.Now()
@@ -382,6 +424,7 @@ func init() {
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
+	chatCmd.Flags().Float32(temperatureFlag, 1, "Model temperature for chat request")
 
 	RootCmd.AddCommand(chatCmd)
 }
