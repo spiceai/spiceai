@@ -45,7 +45,7 @@ pub static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("median_duration")
+        .u64_gauge("median_duration_ms")
         .with_description("Median duration of the query.")
         .with_unit("ms")
         .build()
@@ -53,7 +53,7 @@ pub static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("min_duration")
+        .u64_gauge("min_duration_ms")
         .with_description("Minimum duration of the query.")
         .with_unit("ms")
         .build()
@@ -61,7 +61,7 @@ pub static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("max_duration")
+        .u64_gauge("max_duration_ms")
         .with_description("Maximum duration of the query.")
         .with_unit("ms")
         .build()
@@ -69,7 +69,7 @@ pub static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("p90_duration")
+        .u64_gauge("p90_duration_ms")
         .with_description("90th percentile duration of the query.")
         .with_unit("ms")
         .build()
@@ -77,7 +77,7 @@ pub static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("p95_duration")
+        .u64_gauge("p95_duration_ms")
         .with_description("95th percentile duration of the query.")
         .with_unit("ms")
         .build()
@@ -85,8 +85,16 @@ pub static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 pub static P99_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_gauge("p99_duration")
+        .u64_gauge("p99_duration_ms")
         .with_description("99th percentile duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("test_duration_ms")
+        .with_description("The entire duration of the test.")
         .with_unit("ms")
         .build()
 });

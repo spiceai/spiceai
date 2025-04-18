@@ -131,7 +131,7 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		Tree     string `json:"tree"`
 		Status   string `json:"status"`
 		Duration string `json:"duration"`
-		Task     string `json:"task"`
+		SpanID   string `json:"span_id"`
 	}
 	type TaskRowFull struct {
 		TaskRowBase
@@ -150,7 +150,7 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 	base := TaskRowBase{
 		Tree:     treePrefix,
 		Duration: fmt.Sprintf("%8.2fms", t.ExecutionDurationMs),
-		Task:     t.Task,
+		SpanID:   t.SpanID,
 	}
 
 	if t.ErrorMessage == nil || *t.ErrorMessage == "" {

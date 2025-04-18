@@ -225,12 +225,7 @@ impl ToolUsingChat {
         messages.extend(tool_messages);
 
         if !messages.is_empty() {
-            // exclude "list_datasets" tool from counting, since it is used on every AI inference call
-            let used_tools = spiced_tools
-                .iter()
-                .filter(|t| t.function.name != "list_datasets")
-                .count();
-
+            let used_tools = spiced_tools.len();
             if used_tools > 0 {
                 let context = RequestContext::current(AsyncMarker::new().await);
                 crate::model::add_tools_used(&context, used_tools);
@@ -373,7 +368,7 @@ impl Chat for ToolUsingChat {
         let context = RequestContext::current(AsyncMarker::new().await);
         let inner_req = self.prepare_req(req).await?;
 
-        // wrap the completion stream to track the `ai_inferences_count` when it is ready.
+        // wrap the completion stream to track the `ai_inferences_with_spice_count` when it is ready.
         let stream = self.chat_stream_inner(inner_req).await?;
         Ok(Box::pin(InferenceTrackingStream::new(stream, context)))
     }
@@ -387,9 +382,9 @@ impl Chat for ToolUsingChat {
             .chat_request_inner(inner_req, self.recursion_limit)
             .await;
 
-        // track ai_inferences_count metric
+        // track ai_inferences_with_spice_count metric
         let context = RequestContext::current(AsyncMarker::new().await);
-        crate::model::track_ai_inferences_count(&context);
+        crate::model::track_ai_inferences_with_spice_count(&context);
 
         response
     }
@@ -750,7 +745,7 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(None) => {
                 let context = Arc::clone(context);
-                crate::model::track_ai_inferences_count(&context);
+                crate::model::track_ai_inferences_with_spice_count(&context);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
