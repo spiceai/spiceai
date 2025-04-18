@@ -398,7 +398,8 @@ impl Runtime {
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
     }
-    #[must_use] pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+    #[must_use]
+    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
