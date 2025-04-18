@@ -3025,6 +3025,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "697b5419f348fd5ae2478e8018cb016c00a5881c7f46c717de98ffd135a5651c"
+dependencies = [
+ "nix",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "cudarc"
 version = "0.12.2"
 source = "git+https://github.com/EricLBuehler/cudarc?rev=f6e5bf51153d40e34eb1262b98895ac1235b6422#f6e5bf51153d40e34eb1262b98895ac1235b6422"
@@ -13672,6 +13682,7 @@ name = "util"
 version = "1.2.0-unstable"
 dependencies = [
  "backoff",
+ "ctrlc",
  "humantime",
  "rand 0.9.0",
  "tokio",
