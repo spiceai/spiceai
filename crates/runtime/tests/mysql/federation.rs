@@ -146,7 +146,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("mysql_federation_push_down_{snapshot_suffix}"),
                     query,
                     true,
@@ -244,7 +244,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 
         for (query, snapshot_suffix, validate_result) in queries {
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 &format!("mysql_federation_inner_join_with_acc_{snapshot_suffix}"),
                 query,
                 true,

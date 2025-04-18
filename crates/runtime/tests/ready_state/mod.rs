@@ -814,7 +814,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
-                .await);
+                .await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -929,7 +929,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
-                .await);
+                .await;
 
             let cloned_rt = Arc::new(rt.clone());
 

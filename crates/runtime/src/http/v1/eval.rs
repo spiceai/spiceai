@@ -112,7 +112,7 @@ pub(crate) async fn post(
 
     if !llms.read().await.contains_key(&model) {
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
-    };
+    }
 
     if !df
         .has_table(&TableReference::parse_str(eval.dataset.as_str()))
@@ -123,7 +123,7 @@ pub(crate) async fn post(
             format!("dataset '{}' not found", eval.dataset),
         )
             .into_response();
-    };
+    }
 
     match handle_eval_run(
         eval,

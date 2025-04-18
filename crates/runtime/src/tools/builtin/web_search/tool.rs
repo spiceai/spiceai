@@ -16,10 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, collections::HashMap};
 
-use crate::{
-    Runtime,
-    tools::{SpiceModelTool, utils::parameters},
-};
+use crate::tools::{SpiceModelTool, utils::parameters};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use serde_json::Value;

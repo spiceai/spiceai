@@ -34,7 +34,7 @@ static ENV: LazyLock<Environment> = LazyLock::new(|| unsafe {
     // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
     if let Err(e) = Environment::set_connection_pooling(AttrConnectionPooling::DriverAware) {
         tracing::error!("Failed to set ODBC connection pooling: {e}");
-    };
+    }
     match Environment::new() {
         Ok(env) => env,
         Err(e) => {

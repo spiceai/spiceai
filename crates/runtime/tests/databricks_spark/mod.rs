@@ -85,8 +85,6 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                     .await;
 
             let cloned_rt = Arc::new(rt.clone());
->>>>>>> trunk
-
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -119,7 +117,7 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("databricks_spark_connect_test_{snapshot_suffix}"),
                     query,
                     true,

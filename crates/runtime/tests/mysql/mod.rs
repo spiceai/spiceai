@@ -243,7 +243,7 @@ async fn mysql_integration_test() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("mysql_integration_test_{snapshot_suffix}"),
                     query,
                     true,

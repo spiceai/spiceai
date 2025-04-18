@@ -91,7 +91,7 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("file_integration_test_{snapshot_suffix}"),
                     query,
                     false, // snapshot plan changes depending on the runner's filesystem

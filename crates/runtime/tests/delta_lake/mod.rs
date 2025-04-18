@@ -73,7 +73,7 @@ async fn run_delta_lake_test(
     dataset_name: &str,
     query: &str,
     expected_results: &[&str],
-) -> Result<Arc<Runtime>, String> {
+) -> Result<Runtime, String> {
     let app = AppBuilder::new(app_name)
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();

@@ -274,7 +274,7 @@ async fn init_spice_app(
     acceleration_engine: &str,
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
-) -> Result<Arc<Runtime>, anyhow::Error> {
+) -> Result<Runtime, anyhow::Error> {
     let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();

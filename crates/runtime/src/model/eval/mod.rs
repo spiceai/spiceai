@@ -361,7 +361,7 @@ async fn run_model(
                     tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                 } else {
                     tracing::warn!("Failed to serialize output for logging");
-                };
+                }
                 outputs.push(output);
             }
             Err(e) => {

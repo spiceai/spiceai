@@ -25,7 +25,7 @@ use tools::McpProxy;
 use tracing::Span;
 use tracing_futures::Instrument;
 
-use crate::{Runtime, tools::SpiceModelTool};
+use crate::tools::SpiceModelTool;
 
 use super::Result;
 

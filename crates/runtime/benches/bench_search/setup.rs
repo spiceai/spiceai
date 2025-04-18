@@ -85,7 +85,7 @@ pub(crate) async fn setup_benchmark(
         () = cloned_rt.load_components() => {}
     }
 
-    Ok((rt, benchmark_result))
+    Ok((rt.into(), benchmark_result))
 }
 
 pub(crate) async fn load_search_queries(rt: &Runtime) -> Result<Vec<Query>, String> {

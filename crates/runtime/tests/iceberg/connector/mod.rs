@@ -147,7 +147,7 @@ async fn run_iceberg_test(
     query: &str,
     assert_snapshot: bool,
     snapshot_name: Option<&str>,
-) -> Result<Arc<Runtime>, anyhow::Error> {
+) -> Result<Runtime, anyhow::Error> {
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
 
     let rt = Runtime::builder()

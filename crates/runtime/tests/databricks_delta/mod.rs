@@ -115,7 +115,7 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("databricks_delta_lake_test_{snapshot_suffix}"),
                     query,
                     true,

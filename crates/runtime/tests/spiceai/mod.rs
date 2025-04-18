@@ -99,7 +99,7 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("spiceai_federation_test_{snapshot_suffix}"),
                     query,
                     true,

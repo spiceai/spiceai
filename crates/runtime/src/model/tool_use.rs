@@ -45,9 +45,6 @@ use tracing::{Instrument, Span};
 
 use crate::Runtime;
 use crate::request::{AsyncMarker, RequestContext};
-use crate::request::{AsyncMarker, RequestContext};
-use crate::tools::SpiceModelTool;
-use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 
 pub struct ToolUsingChat {
@@ -99,7 +96,7 @@ impl ToolUsingChat {
             let mut list_dataset_messages = self.create_list_dataset_messages().await?;
             list_dataset_messages.extend_from_slice(req.messages.as_slice());
             req.messages = list_dataset_messages;
-        };
+        }
 
         Ok(req)
     }
@@ -247,14 +244,14 @@ impl ToolUsingChat {
             {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             if recursion_limit.is_some_and(|f| f == 0) {
                 tracing::debug!(
                     "Tool-use recursion limit reached. Will call model, but not process further"
                 );
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             // Append spiced runtime tools to the request.
             let inner_req = self.add_runtime_tools(&req);
@@ -318,14 +315,14 @@ impl ToolUsingChat {
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
         let updated_req = self.add_runtime_tools(&req);
@@ -670,7 +667,7 @@ fn make_a_stream(
                                         }
                                         return;
                                     }
-                                };
+                                }
                             } else if matches!(finish_reason, FinishReason::Stop)
                                 || matches!(finish_reason, FinishReason::Length)
                             {

@@ -69,7 +69,7 @@ impl Runtime {
             if let Err(err) = Arc::clone(&self).register_catalog(catalog, connector).await {
                 tracing::error!("{err}");
                 return Err(RetryError::transient(err));
-            };
+            }
 
             self.status
                 .update_catalog(&catalog.name, status::ComponentStatus::Ready);

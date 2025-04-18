@@ -50,8 +50,6 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                     .build()
                     .await;
             let cloned_rt = Arc::new(rt.clone());
->>>>>>> trunk
-
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
@@ -107,7 +105,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("test_select_{snapshot_suffix}"),
                     query,
                     false,

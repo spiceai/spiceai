@@ -70,29 +70,22 @@ impl BuiltinToolCatalog {
         // Get default description if none is provided
         let description = match (id, description) {
             (_, Some(desc)) => desc, // Use provided description if available
-            ("websearch", None) => "Search the web for information".to_string(),
-            ("get_readiness", None) => {
-                "Get the readiness status of the Spice.ai runtime".to_string()
-            }
+            ("websearch", None) => "Search the web for information",
+            ("get_readiness", None) => "Get the readiness status of the Spice.ai runtime",
             ("document_similarity", None) => {
-                "Search Spice.ai datasets using Vector Similarity Search (VSS)".to_string()
+                "Search Spice.ai datasets using Vector Similarity Search (VSS)"
             }
-            ("table_schema", None) => "Get the schema of the Spice.ai dataset".to_string(),
-            ("sql", None) => {
-                "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime".to_string()
-            }
+            ("table_schema", None) => "Get the schema of the Spice.ai dataset",
+            ("sql", None) => "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
             ("sample_distinct_columns", None) => {
-                "Sample distinct column values from a Spice.ai dataset".to_string()
+                "Sample distinct column values from a Spice.ai dataset"
             }
-            ("random_sample", None) => {
-                "Get a random sample of rows from a Spice.ai dataset".to_string()
-            }
+            ("random_sample", None) => "Get a random sample of rows from a Spice.ai dataset",
             ("top_n_sample", None) => {
                 "Get top N samples from a Spice.ai dataset based on a specified ordering"
-                    .to_string()
             }
-            ("list_datasets", None) => "List available datasets".to_string(),
-            (_, None) => format!("Tool for {id}"),
+            ("list_datasets", None) => "List available datasets",
+            (_, None) => "",
         };
 
         match id {
@@ -103,41 +96,41 @@ impl BuiltinToolCatalog {
             "get_readiness" => Ok(Arc::new(GetReadinessTool::new(
                 Arc::clone(&self.rt),
                 Some(name),
-                description,
+                Some(description),
             ))),
             "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(
                 Arc::clone(&self.rt),
                 Some(name),
-                description,
+                Some(description),
             ))),
             "table_schema" => Ok(Arc::new(TableSchemaTool::new(
                 Arc::clone(&self.rt),
                 Some(name),
-                description,
+                Some(description),
             ))),
             "sql" => Ok(Arc::new(SqlTool::new(
                 self.rt.datafusion(),
                 Some(name),
-                description,
+                Some(description),
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), description),
+                    .with_overrides(Some(name), Some(description)),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), description),
+                    .with_overrides(Some(name), Some(description)),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), description),
+                    .with_overrides(Some(name), Some(description)),
             )),
             "list_datasets" => {
                 let table_allowlist: Option<Vec<&str>> = params
                     .get("table_allowlist")
                     .map(|t| t.expose_secret().split(',').map(str::trim).collect());
                 Ok(Arc::new(ListDatasetsTool::new(
-                    name,
+                    Some(name),
                     Some(description),
                     table_allowlist,
                     Arc::clone(&self.rt),

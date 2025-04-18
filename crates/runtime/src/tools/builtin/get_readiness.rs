@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::Runtime;
-use crate::tools::SpiceModelTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
+use tools::SpiceModelTool;
 
 pub struct GetReadinessTool {
     name: String,

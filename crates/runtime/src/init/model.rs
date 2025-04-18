@@ -179,7 +179,7 @@ impl Runtime {
                 llm_map.remove(&m.name);
             }
             None => return,
-        };
+        }
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
@@ -230,7 +230,7 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
                 name: m.name.clone(),
                 path: f.path.clone(),
             });
-        };
+        }
     }
     Ok(())
 }

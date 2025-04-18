@@ -66,7 +66,7 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument(
             "Flight descriptor needs to specify a path to indicate which data to subscribe to",
         ));
-    };
+    }
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 

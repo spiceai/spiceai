@@ -340,7 +340,7 @@ impl FlightSQLTable {
             if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
             {
                 return Ok(schema);
-            };
+            }
         }
 
         UnableToRetrieveSchemaSnafu {
@@ -555,7 +555,7 @@ fn query_to_stream(
                             }
                         },
                         Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
-                };
+                }
             }
         };
     }

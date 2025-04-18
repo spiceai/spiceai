@@ -465,7 +465,7 @@ async fn display_records(
 
     if let Err(e) = df.show().await {
         println!("Error displaying results: {e}");
-    };
+    }
     let elapsed = start_time.elapsed();
     if num_rows == total_rows {
         println!(

@@ -175,7 +175,7 @@ impl TableSchemaTool {
             .find(|d| tbl.resolved_eq(&TableReference::parse_str(&d.name)))
         {
             return Some(ds.columns.clone());
-        };
+        }
         if let Some(view) = app
             .views
             .iter()

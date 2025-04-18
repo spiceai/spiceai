@@ -32,7 +32,7 @@ impl Runtime {
         for view in &views {
             if let Err(e) = self.load_view(view) {
                 tracing::error!("Unable to load view: {e}");
-            };
+            }
         }
     }
 

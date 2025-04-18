@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    Runtime,
     datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };

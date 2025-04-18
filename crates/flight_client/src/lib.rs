@@ -534,7 +534,7 @@ impl FlightClient {
             publish_request
                 .metadata_mut()
                 .insert("authorization", auth_header_value);
-        };
+        }
 
         let resp = match self.flight_client.clone().do_put(publish_request).await {
             Ok(resp) => resp,

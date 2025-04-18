@@ -98,7 +98,7 @@ async fn prepare_test_environment() -> Result<RunningContainer<'static>, String>
 }
 
 async fn create_refresh_task(
-    rt: &Arc<Runtime>,
+    rt: &Runtime,
     table_name: &str,
 ) -> Result<(RefreshTask, Refresh), String> {
     let table = rt

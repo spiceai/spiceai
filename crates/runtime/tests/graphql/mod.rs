@@ -225,7 +225,7 @@ fn make_graphql_dataset(
 
     if let Some(unnest_depth) = unnest_depth {
         params.insert("unnest_depth".to_string(), unnest_depth.to_string());
-    };
+    }
 
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -290,7 +290,7 @@ async fn test_graphql() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("test_graphql_{snapshot_suffix}"),
                     query,
                     true,
@@ -375,7 +375,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
 
         for (query, snapshot_suffix, validate_result) in queries {
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 &format!("test_graphql_pagination_{snapshot_suffix}"),
                 query,
                 true,

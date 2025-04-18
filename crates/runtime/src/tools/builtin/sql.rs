@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    Runtime,
     datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };

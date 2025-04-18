@@ -74,7 +74,7 @@ async fn test_github_issues() -> Result<(), String> {
             let mut now = std::time::Instant::now();
 
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 "test_github_issues_auto",
                 "SELECT * FROM spiceai_issues_auto LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -92,7 +92,7 @@ async fn test_github_issues() -> Result<(), String> {
             now = std::time::Instant::now();
 
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 "test_github_issues_search",
                 "SELECT * FROM spiceai_issues_search LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -123,7 +123,7 @@ async fn test_github_issues() -> Result<(), String> {
             now = std::time::Instant::now();
 
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 "test_github_issues_search_author",
                 "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 100",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -179,7 +179,7 @@ async fn test_github_commits() -> Result<(), String> {
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 "test_github_commits_auto",
                 "SELECT * FROM spiceai_commits_auto LIMIT 10",
                 true,
@@ -238,7 +238,7 @@ async fn test_github_stargazers() -> Result<(), String> {
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
-                Arc::clone(&rt),
+                &mut rt,
                 "test_github_stargazers_auto",
                 "SELECT * FROM spiceai_stargazers_auto LIMIT 10",
                 true,

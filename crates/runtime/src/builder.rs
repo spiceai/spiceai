@@ -144,7 +144,6 @@ impl RuntimeBuilder {
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
-        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
         let status = match self.runtime_status {
@@ -217,7 +216,7 @@ impl RuntimeBuilder {
                 eprintln!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.insert(extension_name.into(), extension.into());
-            };
+            }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
         tools::factory::register_all_factories(Arc::new(rt.clone())).await;
@@ -232,7 +231,7 @@ impl RuntimeBuilder {
         if let Some(app) = app {
             if let Err(e) = secrets.load_from(&app.secrets).await {
                 eprintln!("Error loading secret stores: {e}");
-            };
+            }
         }
 
         secrets

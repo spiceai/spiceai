@@ -690,7 +690,7 @@ impl AcceleratedTable {
                                     }
                                 }
                             }
-                        };
+                        }
                     }
                     Err(e) => {
                         tracing::error!("[retention] Error running retention check: {e}");

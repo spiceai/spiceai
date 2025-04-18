@@ -69,18 +69,18 @@ impl EnvSecretStore {
                         tracing::warn!("Error opening path {}: {err}", path.display());
                     }
                 }
-            };
+            }
         }
         if let Err(err) = dotenvy::from_filename(".env.local") {
             if matches!(err, dotenvy::Error::LineParse(_, _)) {
                 tracing::warn!(".env.local: {err}");
             }
-        };
+        }
         if let Err(err) = dotenvy::from_filename(".env") {
             if matches!(err, dotenvy::Error::LineParse(_, _)) {
                 tracing::warn!(".env: {err}");
             }
-        };
+        }
     }
 }
 

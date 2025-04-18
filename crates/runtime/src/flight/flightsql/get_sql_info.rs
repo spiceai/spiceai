@@ -31,7 +31,6 @@ use arrow_flight::{
     },
 };
 use futures::{StreamExt, TryStreamExt, stream};
-use once_cell::sync::Lazy;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -387,8 +386,8 @@ const SQL_INFO_DATE_TIME_FUNCTIONS: &[&str] = &[
 
 const SQL_INFO_SYSTEM_FUNCTIONS: &[&str] = &["array", "arrow_typeof", "struct"];
 
-static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: Lazy<HashMap<SqlSupportsConvert, DataType>> =
-    Lazy::new(|| {
+static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: std::sync::LazyLock<HashMap<SqlSupportsConvert, DataType>> =
+    std::sync::LazyLock::new(|| {
         [
             // Referenced from DataFusion data types
             // https://arrow.apache.org/datafusion/user-guide/sql/data_types.html
@@ -446,7 +445,7 @@ static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: Lazy<HashMap<SqlSupportsConvert, DataTy
         .collect()
     });
 
-pub(crate) static SQL_INFO_SUPPORTS_CONVERT: Lazy<HashMap<i32, Vec<i32>>> = Lazy::new(|| {
+pub(crate) static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Vec<i32>>> = std::sync::LazyLock::new(|| {
     let mut convert: HashMap<i32, Vec<i32>> = HashMap::new();
     for (from_type_sql, from_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone() {
         let mut can_convert_to: Vec<i32> = vec![];
@@ -463,7 +462,7 @@ pub(crate) static SQL_INFO_SUPPORTS_CONVERT: Lazy<HashMap<i32, Vec<i32>>> = Lazy
 });
 
 #[allow(non_snake_case)]
-static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
+static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| {
     // The following are not defined in the [`SqlInfo`], but are
     // documented at
     // https://arrow.apache.org/docs/format/FlightSql.html#protocol-buffer-definitions.

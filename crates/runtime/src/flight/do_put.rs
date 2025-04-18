@@ -82,7 +82,7 @@ pub(crate) async fn handle(
     if fd.path.is_empty() {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
-    };
+    }
 
     let path = TableReference::parse_str(&fd.path.join("."));
 
@@ -93,7 +93,7 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
-    };
+    }
 
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;

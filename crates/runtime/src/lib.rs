@@ -23,7 +23,8 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tools::{factory::ToolFactory, sync::Mutex, task::JoinHandle, time::Instant};
+use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
+use tools::factory::ToolFactory;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -47,10 +48,7 @@ use futures::future::{join_all, try_join_all};
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
-use crate::tools::{
-    SpiceModelTool, Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs,
-    with_name,
-};
+use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -62,8 +60,6 @@ use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
-use tools::factory::default_available_catalogs;
-use tools::{Tooling, catalog::SpiceToolCatalog};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
@@ -398,7 +394,7 @@ impl Runtime {
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
     }
-    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+    #[must_use] pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
@@ -666,16 +662,10 @@ impl Runtime {
             }
         });
 
-        let models = tokio::spawn({
+        let models_and_evals = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
                 Arc::clone(&self_clone).load_models().await;
-            }
-        });
-
-        let evals = tokio::spawn({
-            let self_clone = Arc::clone(&self);
-            async move {
                 let app_ref = Arc::clone(&self_clone).app();
                 let app_lock = app_ref.read().await;
 

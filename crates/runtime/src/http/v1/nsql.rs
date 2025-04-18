@@ -371,6 +371,6 @@ pub(crate) async fn post(
                 tracing::error!("Error running NSQL model: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
-        };
+        }
     }
 }

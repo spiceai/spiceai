@@ -107,7 +107,7 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    Arc::clone(&rt),
+                    &mut rt,
                     &format!("test_select_{snapshot_suffix}"),
                     query,
                     false,

@@ -390,12 +390,12 @@ pub fn validate_batches_as_strings(
                             let trimmed_actual_val = trimmed_actual_val.trim_end_matches('0');
                             if expected_val.starts_with(trimmed_actual_val) {
                                 let expected_trailing = if expected_val.contains('.') {
-                                    expected_val.split('.').last().unwrap_or("")
+                                    expected_val.split('.').next_back().unwrap_or("")
                                 } else {
                                     ""
                                 };
                                 let actual_trailing = if trimmed_actual_val.contains('.') {
-                                    trimmed_actual_val.split('.').last().unwrap_or("")
+                                    trimmed_actual_val.split('.').next_back().unwrap_or("")
                                 } else {
                                     ""
                                 };
