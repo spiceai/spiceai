@@ -131,30 +131,40 @@ spice chat --model <model> --cloud
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
+		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
+		if err != nil {
+			slog.Error("could not get http-endpoint flag", "error", err)
+			os.Exit(1)
+		}
+		if httpEndpoint != "" {
+			rtcontext.SetHttpEndpoint(httpEndpoint)
+		}
+
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
 			slog.Error("could not get model flag", "error", err)
 			os.Exit(1)
 		}
+
+		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
+		if err != nil {
+			slog.Error("could not list models", "error", err)
+			os.Exit(1)
+		}
+
+		if len(models.Data) == 0 {
+			slog.Error("No models found")
+			os.Exit(1)
+		}
+
+		availableModels := []string{}
+		for _, model := range models.Data {
+			if model.Status == "Ready" {
+				availableModels = append(availableModels, model.Id)
+			}
+		}
+
 		if model == "" {
-			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
-			if err != nil {
-				slog.Error("could not list models", "error", err)
-				os.Exit(1)
-			}
-
-			if len(models.Data) == 0 {
-				slog.Error("No models found")
-				os.Exit(1)
-			}
-
-			availableModels := []string{}
-			for _, model := range models.Data {
-				if model.Status == "Ready" {
-					availableModels = append(availableModels, model.Id)
-				}
-			}
-
 			if len(availableModels) == 0 {
 				slog.Error("No models are ready")
 				os.Exit(1)
@@ -178,15 +188,20 @@ spice chat --model <model> --cloud
 
 			cmd.Printf("Using model: %s\n", selectedModel)
 			model = selectedModel
-		}
+		} else {
+			modelIsAvailable := false
+			for _, availableModel := range availableModels {
+				if availableModel == model {
+					modelIsAvailable = true
+					break
+				}
+			}
 
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
-		if err != nil {
-			slog.Error("could not get http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
+			if !modelIsAvailable {
+				slog.Error("Requested model is not available", "model", model)
+				slog.Info("Available models", "models", strings.Join(availableModels, ", "))
+				os.Exit(1)
+			}
 		}
 
 		var messages = []Message{}
