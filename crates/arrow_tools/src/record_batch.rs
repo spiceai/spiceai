@@ -432,7 +432,7 @@ mod test {
             .map(|(name, dt)| Field::new(name, dt, true))
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns).unwrap()
+        RecordBatch::try_new(schema, columns).expect("new RecordBatch")
     }
 
     fn assert_param_values_eq(result: ParamValues, expected: ParamValues) {
@@ -446,9 +446,7 @@ mod test {
             (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
                 assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
                 for (key, expected_value) in expected_map {
-                    let result_value = result_map
-                        .get(&key)
-                        .unwrap_or_else(|| panic!("Key {key} not found in result map"));
+                    let result_value = result_map.get(&key).expect("key in result map");
                     assert_eq!(
                         result_value, &expected_value,
                         "ScalarValue mismatch for key {key}",
@@ -471,7 +469,7 @@ mod test {
             ],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let expected = ParamValues::List(vec![
             ScalarValue::Int32(Some(42)),
             ScalarValue::Utf8(Some("hello".to_string())),
@@ -490,7 +488,7 @@ mod test {
             ],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let mut expected_map = HashMap::new();
         expected_map.insert("param1".to_string(), ScalarValue::Int32(Some(100)));
         expected_map.insert(
@@ -512,7 +510,7 @@ mod test {
             ],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let mut expected_map = HashMap::new();
         expected_map.insert("1".to_string(), ScalarValue::Int32(Some(10)));
         expected_map.insert(
@@ -534,7 +532,7 @@ mod test {
             ],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let expected = ParamValues::List(vec![
             ScalarValue::Utf8(Some("first".to_string())),
             ScalarValue::Int32(Some(200)),
@@ -550,7 +548,7 @@ mod test {
             vec![Arc::new(Int32Array::from(vec![Some(1)]))],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let expected = ParamValues::List(vec![ScalarValue::Int32(Some(1))]);
 
         assert_param_values_eq(result, expected);
@@ -563,7 +561,7 @@ mod test {
             vec![Arc::new(StringArray::from(vec![Some("value")]))],
         );
 
-        let result = record_to_param_values(&batch).unwrap();
+        let result = record_to_param_values(&batch).expect("record to param values");
         let mut expected_map = HashMap::new();
         expected_map.insert(
             "x".to_string(),
