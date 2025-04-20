@@ -18,6 +18,22 @@ async-trait.workspace = true
 bytes.workspace = true
 futures = { workspace = true }
 hf-hub.workspace = true
+image = { version = "0.25.1", default-features = false, features = [
+    'bmp',
+    'dds',
+    'exr',
+    'ff',
+    'gif',
+    'hdr',
+    'ico',
+    'jpeg',
+    'png',
+    'pnm',
+    'qoi',
+    'tga',
+    'tiff',
+    'webp',
+] }
 insta = { workspace = true, features = ["filters"] }
 regex = "1.10.4"
 reqwest.workspace = true

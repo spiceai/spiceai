@@ -113,6 +113,14 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Unsupported value for `model_type` from {from}.\n{source}\n Verify the `model_type` parameter from the expected source and try again"
+    ))]
+    UnsupportedInferredModelType {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        from: String,
+    },
+
+    #[snafu(display(
         "The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."
     ))]
     ModelNotFound { model: String, model_source: String },
@@ -154,6 +162,12 @@ pub enum Error {
         "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
     ))]
     ModelFileMissing { file_url: String },
+
+    #[snafu(display(""))]
+    InvalidModelFile {
+        filename: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -313,6 +327,8 @@ pub fn message_to_mistral(
     use either::Either;
     use serde_json::{Value, json};
 
+    let mut images: Vec<image::DynamicImage> = vec![];
+
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content, ..
@@ -328,6 +344,7 @@ pub fn message_to_mistral(
                                 ("content".to_string(), Value::String(t.text.clone()))
                             }
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                                // TODO Add image to map
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
