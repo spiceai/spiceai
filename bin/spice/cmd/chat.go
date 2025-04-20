@@ -138,8 +138,19 @@ spice chat --model <model>
 
 # Start a chat session with spiced instance in spice.ai cloud
 spice chat --model <model> --cloud
+
+# Send a single message and exit
+spice chat --model <model> "What is Spice.ai?"
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		if len(args) > 1 {
+			slog.Error("too many arguments provided", "expected", "0 or 1", "got", len(args))
+			cmd.Println("Usage: spice chat [message]")
+			cmd.Println("  - With no message: starts an interactive chat")
+			cmd.Println("  - With one message: sends the message and exits")
+			os.Exit(1)
+		}
+
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 		err := rtcontext.Init()
@@ -247,31 +258,18 @@ spice chat --model <model> --cloud
 			}
 		}
 
-		var messages = []Message{}
+		getChatResponse := func(messages []Message, useSpinner bool) error {
+			// Only create these variables if using spinner
+			var done chan bool
+			var doneLoading bool
 
-		line := liner.NewLiner()
-		line.SetCtrlCAborts(true)
-		defer func() {
-			if err := line.Close(); err != nil {
-				slog.Error("closing line", "error", err)
+			if useSpinner {
+				done = make(chan bool)
+				doneLoading = false
+				go func() {
+					util.ShowSpinner(done)
+				}()
 			}
-		}()
-		for {
-			message, err := line.Prompt("chat> ")
-			if err == liner.ErrPromptAborted {
-				break
-			} else if err != nil {
-				slog.Error("reading input line", "error", err)
-				continue
-			}
-
-			line.AppendHistory(message)
-			messages = append(messages, Message{Role: "user", Content: message})
-
-			done := make(chan bool)
-			go func() {
-				util.ShowSpinner(done)
-			}()
 
 			body := NewChatRequestBody(messages, model, true, &StreamOptions{
 				IncludeUsage: true,
@@ -284,7 +282,7 @@ spice chat --model <model> --cloud
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
-				continue
+				return fmt.Errorf("failed to send chat request: %w", err)
 			}
 
 			scanner := bufio.NewScanner(response.Body)
@@ -292,7 +290,10 @@ spice chat --model <model> --cloud
 
 			/// Usage for the entire stream, and related timing.
 			var usage Usage
-			doneLoading := false
+
+			if useSpinner {
+				doneLoading = false
+			}
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
@@ -324,7 +325,7 @@ spice chat --model <model> --cloud
 					continue
 				}
 
-				if !doneLoading {
+				if useSpinner && !doneLoading {
 					done <- true
 					doneLoading = true
 				}
@@ -344,10 +345,10 @@ spice chat --model <model> --cloud
 			}
 
 			if err := scanner.Err(); err != nil {
-				slog.Error("error occurred while processing the input stream", "error", err)
+				slog.Error("error occurred while processing the response stream", "error", err)
 			}
 
-			if !doneLoading {
+			if useSpinner && !doneLoading {
 				done <- true
 				doneLoading = true
 			}
@@ -363,6 +364,50 @@ spice chat --model <model> --cloud
 				))
 			} else {
 				cmd.Print("\n\n")
+			}
+
+			return nil
+		}
+
+		if len(args) > 0 {
+			userMessage := args[0]
+
+			var messages = []Message{
+				{Role: "user", Content: userMessage},
+			}
+
+			err = getChatResponse(messages, false)
+			if err != nil {
+				os.Exit(1)
+			}
+
+			return
+		}
+
+		var messages = []Message{}
+
+		line := liner.NewLiner()
+		line.SetCtrlCAborts(true)
+		defer func() {
+			if err := line.Close(); err != nil {
+				slog.Error("closing line", "error", err)
+			}
+		}()
+		for {
+			message, err := line.Prompt("chat> ")
+			if err == liner.ErrPromptAborted {
+				break
+			} else if err != nil {
+				slog.Error("reading input line", "error", err)
+				continue
+			}
+
+			line.AppendHistory(message)
+			messages = append(messages, Message{Role: "user", Content: message})
+
+			err = getChatResponse(messages, true)
+			if err != nil {
+				continue
 			}
 		}
 	},
