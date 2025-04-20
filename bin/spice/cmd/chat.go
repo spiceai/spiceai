@@ -258,7 +258,7 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 		}
 
-		getChatResponse := func(messages []Message, useSpinner bool) error {
+		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
 			// Only create these variables if using spinner
 			var done chan bool
 			var doneLoading bool
@@ -282,7 +282,7 @@ spice chat --model <model> "What is Spice.ai?"
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
-				return fmt.Errorf("failed to send chat request: %w", err)
+				return messages, fmt.Errorf("failed to send chat request: %w", err)
 			}
 
 			scanner := bufio.NewScanner(response.Body)
@@ -350,7 +350,6 @@ spice chat --model <model> "What is Spice.ai?"
 
 			if useSpinner && !doneLoading {
 				done <- true
-				doneLoading = true
 			}
 
 			if responseMessage != "" {
@@ -366,7 +365,7 @@ spice chat --model <model> "What is Spice.ai?"
 				cmd.Print("\n\n")
 			}
 
-			return nil
+			return messages, nil
 		}
 
 		if len(args) > 0 {
@@ -376,7 +375,7 @@ spice chat --model <model> "What is Spice.ai?"
 				{Role: "user", Content: userMessage},
 			}
 
-			err = getChatResponse(messages, false)
+			_, err = getChatResponse(messages, false)
 			if err != nil {
 				os.Exit(1)
 			}
@@ -405,7 +404,7 @@ spice chat --model <model> "What is Spice.ai?"
 			line.AppendHistory(message)
 			messages = append(messages, Message{Role: "user", Content: message})
 
-			err = getChatResponse(messages, true)
+			messages, err = getChatResponse(messages, true)
 			if err != nil {
 				continue
 			}
