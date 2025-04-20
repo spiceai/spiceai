@@ -1,0 +1,104 @@
+#!/usr/bin/expect -f
+
+# Test invalid --model error case
+proc test_invalid_model {} {
+    set command "spice chat --model not_exist"
+
+    catch {exec sh -c "$command 2>&1"} output
+    puts "Command output: $output"
+
+    # Check for expected error messages in the output
+    if {[regexp {ERROR.*Requested model is not available.*not_exist} $output]} {
+        puts "✓ Error message about unavailable model detected"
+    } else {
+        puts "✗ Missing error about unavailable model"
+        exit 1
+    }
+
+    # Check that available models are listed
+    if {[regexp {INFO.*Available models} $output]} {
+        puts "✓ Available models list is shown"
+    } else {
+        puts "✗ Available models list not shown"
+        exit 1
+    }
+
+    # Check that expected models are in the list
+    if {[regexp {openai-gpt} $output]} {
+        puts "✓ Found expected model 'openai-gpt' in the list"
+    } else {
+        puts "✗ Expected model 'openai-gpt' not found in the list"
+        exit 1
+    }
+
+    puts "✓ Invalid model test passed"
+}
+
+# Test invalid --http-endpoint error case
+proc test_invalid_http_endpoint {} {
+    set command "spice chat --http-endpoint https://data.spicea"
+
+    catch {exec sh -c "$command 2>&1"} output
+    puts "Command output: $output"
+
+    # Check for expected error messages in the output
+    if {[regexp {ERROR.*could not list models.*no such host} $output]} {
+        puts "✓ Error message about invalid host detected"
+    } else {
+        puts "✗ Missing error about invalid host"
+        exit 1
+    }
+
+    # Check for the specific host name in the error
+    if {[regexp {lookup data.spicea: no such host} $output]} {
+        puts "✓ Invalid hostname correctly reported in error"
+    } else {
+        puts "✗ Invalid hostname not correctly reported"
+        exit 1
+    }
+
+    puts "✓ Invalid host test passed"
+}
+
+# Test invalid --temperature error case
+proc test_invalid_temperature {} {
+    set command "spice chat --temperature -1"
+
+    catch {exec sh -c "$command 2>&1"} output
+    puts "Command output: $output"
+
+    # Check for expected error messages in the output
+    if {[regexp {ERROR.*temperature must be greater than or equal to 0} $output]} {
+        puts "✓ Error message about invalid temperature detected"
+    } else {
+        puts "✗ Missing error about invalid temperature"
+        exit 1
+    }
+
+    puts "✓ Invalid temperature test passed"
+}
+
+# Test invalid --api-key error case
+proc test_invalid_api_key {} {
+    set command "spice chat --http-endpoint https://data.spiceai.io --api-key \"wrong_key\""
+
+    catch {exec sh -c "$command 2>&1"} output
+    puts "Command output: $output"
+
+    # Check for expected error messages in the output
+    if {[regexp {ERROR.*could not list models.*unauthorized: invalid or missing Spice API key} $output]} {
+        puts "✓ Error message about invalid API key detected"
+    } else {
+        puts "✗ Missing error about invalid API key"
+        exit 1
+    }
+
+    puts "✓ Invalid API key test passed"
+}
+
+# Run the test
+test_invalid_model
+test_invalid_http_endpoint
+test_invalid_temperature
+test_invalid_api_key
+exit 0
