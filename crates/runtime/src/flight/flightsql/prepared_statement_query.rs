@@ -26,7 +26,9 @@ use arrow_flight::{
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
+use bytes::Bytes;
 use datafusion::common::ParamValues;
+use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio_stream::{StreamExt, adapters::Peekable};
@@ -65,7 +67,7 @@ pub(crate) async fn do_action_create_prepared_statement(
         parameters: vec![],
     };
 
-    let handle = serde_json::to_vec(&stmt).map_err(error_to_status)?;
+    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     Ok(sql::ActionCreatePreparedStatementResult {
         prepared_statement_handle: handle.into(),
@@ -111,7 +113,7 @@ pub(crate) async fn do_get(
     let PreparedStatement {
         query: sql,
         parameters,
-    } = serde_json::from_slice(&query.prepared_statement_handle).map_err(error_to_status)?;
+    } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
     let parameters = decode_param_values(&parameters).map_err(error_to_status)?;
 
@@ -163,9 +165,9 @@ pub(crate) async fn do_put_query(
     }
 
     let mut stmt: PreparedStatement =
-        serde_json::from_slice(&query.prepared_statement_handle).map_err(error_to_status)?;
+        from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
     stmt.parameters = parameters;
-    let handle = serde_json::to_vec(&stmt).map_err(error_to_status)?;
+    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
 
     let result = DoPutPreparedStatementResult {
         prepared_statement_handle: Some(handle.into()),
