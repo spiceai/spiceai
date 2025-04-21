@@ -545,6 +545,10 @@ jobs:
         run: |
           ./test/cli/spice_chat_error.exp
 
+      - name: Test `spice chat <message>`
+        run: |
+          ./test/cli/spice_chat_message.exp
+
       - name: Stop spice and check logs
         if: always()
         run: |
