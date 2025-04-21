@@ -167,7 +167,8 @@ datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev 
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e0e423e9e29a711d076892865d51747b06429d1b" } # spiceai-45
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" } # spiceai-45
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "f60653b6ff9a0f26e5b44a1d43d947fdf1fd8853" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1713e9af2729f686aac46aef63e8c84545083e29" } # spiceai
+
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b850ae60dbe67209320c86daeadf47b51f937660" } # spiceai-1.2.2
 

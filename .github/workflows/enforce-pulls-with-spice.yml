@@ -7,11 +7,15 @@ on:
   merge_group:
     types: [checks_requested]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   enforce-pull-with-spice:
     runs-on: spiceai-macos
     steps:
-      - uses: spiceai/pulls-with-spice-action@v1.0.5
+      - uses: spiceai/pulls-with-spice-action@v1.0.6
         if: github.event_name == 'pull_request'
         with:
           require_title_min_length: '10'
