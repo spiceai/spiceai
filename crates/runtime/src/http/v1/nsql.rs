@@ -78,8 +78,6 @@ async fn sample_messages(
     sample_from: &[TableReference],
     rt: Arc<Runtime>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut messages = Vec::new();
-
     let message_futures = sample_from.iter().flat_map(|dataset| {
         [
             SampleTableParams::DistinctColumns(DistinctColumnsParams {
@@ -115,8 +113,7 @@ async fn sample_messages(
         .try_collect::<Vec<_>>()
         .await?;
 
-    messages.extend(tool_call_messages.into_iter().flatten());
-    Ok(messages)
+    Ok(tool_call_messages.into_iter().flatten().collect())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
