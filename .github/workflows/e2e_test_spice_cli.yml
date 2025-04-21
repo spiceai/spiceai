@@ -547,11 +547,11 @@ jobs:
 
       - name: Test `spice chat` error
         run: |
-          ./test/cli/spice_chat_error.exp
+          expect ./test/cli/spice_chat_error.exp
 
       - name: Test `spice chat <message>`
         run: |
-          ./test/cli/spice_chat_message.exp
+          expect ./test/cli/spice_chat_message.exp
 
       - name: Stop spice and check logs
         if: always()
