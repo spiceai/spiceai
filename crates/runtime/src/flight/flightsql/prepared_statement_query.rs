@@ -26,7 +26,6 @@ use arrow_flight::{
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
-use bytes::Bytes;
 use datafusion::common::ParamValues;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
