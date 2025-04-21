@@ -23,6 +23,7 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use util::force_shutdown_signal;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -314,6 +315,9 @@ pub enum Error {
 
     #[snafu(display("Initialization has been cancelled"))]
     ComponentsInitializationCancelled,
+
+    #[snafu(display("Force shutdown requested"))]
+    ForceTerminated,
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -546,10 +550,20 @@ impl Runtime {
 
         // Shutdown signal
         let shutdown_signal_future = async {
-            shutdown_signal().await;
-            tracing::debug!("Shutdown signal received.");
-            self.shutdown().await;
-            Ok(())
+            let graceful_shutdown = async {
+                shutdown_signal().await;
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
+                self.shutdown().await;
+                Ok(())
+            };
+            tokio::select! {
+                result = graceful_shutdown => result,
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
+                    // return error to force stop waiting for other tasks and terminate immediately
+                    Err(Error::ForceTerminated)
+                }
+            }
         };
 
         // wait for all servers to shut down or if any of the servers fail to start

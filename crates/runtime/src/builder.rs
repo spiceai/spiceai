@@ -44,7 +44,7 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
-    runtime_status: Option<Arc<status::RuntimeStatus>>,
+    runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
@@ -60,7 +60,7 @@ impl RuntimeBuilder {
             metrics_endpoint: None,
             prometheus_registry: None,
             autoload_extensions: HashMap::new(),
-            runtime_status: None,
+            runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
@@ -130,11 +130,6 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_runtime_status(mut self, runtime_status: Arc<status::RuntimeStatus>) -> Self {
-        self.runtime_status = Some(runtime_status);
-        self
-    }
-
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
@@ -147,13 +142,8 @@ impl RuntimeBuilder {
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
-        let status = match self.runtime_status {
-            Some(status) => status,
-            None => status::RuntimeStatus::new(),
-        };
-
         let mut df = DataFusion::builder(
-            Arc::clone(&status),
+            Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
         )
         .build();
@@ -203,9 +193,9 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
-            status,
+            status: self.runtime_status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
-            accelerator_engine_registry: Arc::clone(&self.accelerator_engine_registry),
+            accelerator_engine_registry: self.accelerator_engine_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

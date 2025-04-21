@@ -84,7 +84,7 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 	}()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return *new(T), fmt.Errorf("Unauthorized")
+		return *new(T), fmt.Errorf("unauthorized: invalid or missing Spice API key")
 	}
 
 	if resp.StatusCode == http.StatusNotFound {

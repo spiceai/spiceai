@@ -20,7 +20,6 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
 use opentelemetry_sdk::metrics::MetricError;
-use secrecy::SecretString;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -37,7 +36,7 @@ pub enum Error {
 
 #[derive(Debug, Default)]
 pub struct TelemetryExporterBuilder {
-    api_key: Option<SecretString>,
+    credentials: Option<Credentials>,
     service_name: Option<Arc<str>>,
     endpoint: Option<Arc<str>>,
 }
@@ -49,8 +48,8 @@ impl TelemetryExporterBuilder {
     }
 
     #[must_use]
-    pub fn with_api_key(mut self, api_key: SecretString) -> Self {
-        self.api_key = Some(api_key);
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = Some(credentials);
         self
     }
 
@@ -72,11 +71,7 @@ impl TelemetryExporterBuilder {
     ///
     /// Returns an error if the endpoint is not set.
     pub async fn build(self) -> Result<TelemetryExporter, Error> {
-        let credentials = if let Some(api_key) = self.api_key {
-            Credentials::new("", api_key)
-        } else {
-            Credentials::anonymous()
-        };
+        let credentials = self.credentials.unwrap_or(Credentials::anonymous());
 
         let endpoint = self.endpoint.ok_or(Error::MissingEndpoint)?;
         let flight_client = match FlightClient::try_new(endpoint, credentials, None).await {

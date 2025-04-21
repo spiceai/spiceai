@@ -671,12 +671,12 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
             started_at: usize::try_from(
                 self.start_time()
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_millis(),
             )?,
             finished_at: usize::try_from(
                 self.end_time()
                     .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                    .as_millis(),
             )?,
             metrics: self.metrics()?,
             memory_usage: None,
