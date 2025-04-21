@@ -130,15 +130,22 @@ type OpenAIErrorResponse struct {
 }
 
 var chatCmd = &cobra.Command{
-	Use:   "chat",
+	Use:   "chat [flags] [message]",
 	Short: "Chat with the Spice.ai LLM agent",
+	Long: `Chat with the Spice.ai LLM agent.
+	With no message argument: starts an interactive chat session.
+	With one message argument: sends the message and exits.`,
 	Example: `
 # Start a chat session with local spiced instance
 spice chat --model <model>
 
 # Start a chat session with spiced instance in spice.ai cloud
 spice chat --model <model> --cloud
+
+# Send a single prompt and receive a response
+spice chat --model <model> "What is Spice.ai?"
 `,
+	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
@@ -174,30 +181,40 @@ spice chat --model <model> --cloud
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
+		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
+		if err != nil {
+			slog.Error("could not get http-endpoint flag", "error", err)
+			os.Exit(1)
+		}
+		if httpEndpoint != "" {
+			rtcontext.SetHttpEndpoint(httpEndpoint)
+		}
+
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
 			slog.Error("could not get model flag", "error", err)
 			os.Exit(1)
 		}
+
+		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
+		if err != nil {
+			slog.Error("could not list models", "error", err)
+			os.Exit(1)
+		}
+
+		if len(models.Data) == 0 {
+			slog.Error("No models found")
+			os.Exit(1)
+		}
+
+		availableModels := []string{}
+		for _, model := range models.Data {
+			if model.Status == "Ready" {
+				availableModels = append(availableModels, model.Id)
+			}
+		}
+
 		if model == "" {
-			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
-			if err != nil {
-				slog.Error("could not list models", "error", err)
-				os.Exit(1)
-			}
-
-			if len(models.Data) == 0 {
-				slog.Error("No models found")
-				os.Exit(1)
-			}
-
-			availableModels := []string{}
-			for _, model := range models.Data {
-				if model.Status == "Ready" {
-					availableModels = append(availableModels, model.Id)
-				}
-			}
-
 			if len(availableModels) == 0 {
 				slog.Error("No models are ready")
 				os.Exit(1)
@@ -221,42 +238,34 @@ spice chat --model <model> --cloud
 
 			cmd.Printf("Using model: %s\n", selectedModel)
 			model = selectedModel
-		}
-
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
-		if err != nil {
-			slog.Error("could not get http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
-		}
-
-		var messages = []Message{}
-
-		line := liner.NewLiner()
-		line.SetCtrlCAborts(true)
-		defer func() {
-			if err := line.Close(); err != nil {
-				slog.Error("closing line", "error", err)
-			}
-		}()
-		for {
-			message, err := line.Prompt("chat> ")
-			if err == liner.ErrPromptAborted {
-				break
-			} else if err != nil {
-				slog.Error("reading input line", "error", err)
-				continue
+		} else {
+			modelIsAvailable := false
+			for _, availableModel := range availableModels {
+				if availableModel == model {
+					modelIsAvailable = true
+					break
+				}
 			}
 
-			line.AppendHistory(message)
-			messages = append(messages, Message{Role: "user", Content: message})
+			if !modelIsAvailable {
+				slog.Error("Requested model is not available", "model", model)
+				slog.Info("Available models", "models", strings.Join(availableModels, ", "))
+				os.Exit(1)
+			}
+		}
 
-			done := make(chan bool)
-			go func() {
-				util.ShowSpinner(done)
-			}()
+		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
+			// Only create these variables if using spinner
+			var done chan bool
+			var doneLoading bool
+
+			if useSpinner {
+				done = make(chan bool)
+				doneLoading = false
+				go func() {
+					util.ShowSpinner(done)
+				}()
+			}
 
 			body := NewChatRequestBody(messages, model, true, &StreamOptions{
 				IncludeUsage: true,
@@ -269,7 +278,7 @@ spice chat --model <model> --cloud
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
-				continue
+				return messages, fmt.Errorf("failed to send chat request: %w", err)
 			}
 
 			scanner := bufio.NewScanner(response.Body)
@@ -277,7 +286,10 @@ spice chat --model <model> --cloud
 
 			/// Usage for the entire stream, and related timing.
 			var usage Usage
-			doneLoading := false
+
+			if useSpinner {
+				doneLoading = false
+			}
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
@@ -309,7 +321,7 @@ spice chat --model <model> --cloud
 					continue
 				}
 
-				if !doneLoading {
+				if useSpinner && !doneLoading {
 					done <- true
 					doneLoading = true
 				}
@@ -329,12 +341,11 @@ spice chat --model <model> --cloud
 			}
 
 			if err := scanner.Err(); err != nil {
-				slog.Error("error occurred while processing the input stream", "error", err)
+				slog.Error("error occurred while processing the response stream", "error", err)
 			}
 
-			if !doneLoading {
+			if useSpinner && !doneLoading {
 				done <- true
-				doneLoading = true
 			}
 
 			if responseMessage != "" {
@@ -348,6 +359,50 @@ spice chat --model <model> --cloud
 				))
 			} else {
 				cmd.Print("\n\n")
+			}
+
+			return messages, nil
+		}
+
+		if len(args) > 0 {
+			userMessage := args[0]
+
+			var messages = []Message{
+				{Role: "user", Content: userMessage},
+			}
+
+			_, err = getChatResponse(messages, false)
+			if err != nil {
+				os.Exit(1)
+			}
+
+			return
+		}
+
+		var messages = []Message{}
+
+		line := liner.NewLiner()
+		line.SetCtrlCAborts(true)
+		defer func() {
+			if err := line.Close(); err != nil {
+				slog.Error("closing line", "error", err)
+			}
+		}()
+		for {
+			message, err := line.Prompt("chat> ")
+			if err == liner.ErrPromptAborted {
+				break
+			} else if err != nil {
+				slog.Error("reading input line", "error", err)
+				continue
+			}
+
+			line.AppendHistory(message)
+			messages = append(messages, Message{Role: "user", Content: message})
+
+			messages, err = getChatResponse(messages, true)
+			if err != nil {
+				continue
 			}
 		}
 	},

@@ -90,17 +90,35 @@ mod nsql {
         headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let response = http_post(
-            format!("{base_url}/v1/sql").as_str(),
+        // With `sample_data_enabled`, tools run concurrently, so for deterministic results, order by task and input for verification instead of start time.
+        let query = if ts
+            .body
+            .get("sample_data_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
             format!(
                 "SELECT task, input
-                        FROM runtime.task_history
-                        WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
-                        AND start_time > '{}'
-                        ORDER BY start_time, task;",
+                FROM runtime.task_history
+                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                AND start_time > '{}'
+                ORDER BY task, input;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
-            .as_str(),
+        } else {
+            format!(
+                "SELECT task, input
+                FROM runtime.task_history
+                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                AND start_time > '{}'
+                ORDER BY start_time, task;",
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+        };
+
+        let response = http_post(
+            format!("{base_url}/v1/sql").as_str(),
+            query.as_str(),
             headers,
         )
         .await

@@ -24,12 +24,15 @@ use std::{
 
 use crate::datafusion::DataFusion;
 use arrow::compute::concat;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 use super::SampleFrom;
+
+// Max columns for parallel distinct sampling per tool call
+const MAX_CONCURRENT_COLUMNS_SCANS: usize = 5;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -135,27 +138,38 @@ impl SampleFrom for DistinctColumnsParams {
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
+        let data_sample_futures = columns.iter().map(|column| {
+            let tbl = tbl.clone();
+            let df = Arc::clone(&df);
+            async move {
+                // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
+                if column_supports_distinct_sampling(column)
+                    && (self.cols.is_none()
+                        || self
+                            .cols
+                            .as_ref()
+                            .is_some_and(|cols| cols.contains(column.name())))
+                {
+                    Self::sample_distinct_from_column(df, &tbl, column.name(), self.limit).await
+                } else {
+                    Self::sample_from_column(df, &tbl, column.name(), self.limit).await
+                }
+            }
+        });
+
+        let data_samples = futures::stream::iter(data_sample_futures)
+            .boxed()
+            // Use `buffered` (ordered) to preserve column order to match the schema.
+            .buffered(MAX_CONCURRENT_COLUMNS_SCANS)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        result.extend(data_samples);
+
         // Sampling data will return at most `limit` rows, but may return fewer if the table has fewer rows or empty
         let mut min_sample_rows_count = self.limit;
-
-        for (i, column) in columns.iter().enumerate() {
-            // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
-            let column_data = if column_supports_distinct_sampling(column)
-                && (self.cols.is_none()
-                    || self
-                        .cols
-                        .as_ref()
-                        .is_some_and(|cols| cols.contains(column.name())))
-            {
-                Self::sample_distinct_from_column(Arc::clone(&df), &tbl, column.name(), self.limit)
-                    .await?
-            } else {
-                Self::sample_from_column(Arc::clone(&df), &tbl, column.name(), self.limit).await?
-            };
-
+        for column_data in &result {
             min_sample_rows_count = min_sample_rows_count.min(column_data.len());
-
-            result.insert(i, column_data);
         }
 
         // If the number of rows sampled is less than the limit, ensure that all columns have the same length

@@ -102,6 +102,7 @@ pub fn construct_model(
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
+        ModelSource::Databricks => databricks(model_id, params),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -111,7 +112,7 @@ pub fn construct_model(
     let system_prompt = match component.params.get("system_prompt") {
         Some(Value::String(s)) => Some(s.as_str()),
         Some(v) => {
-            return Err(LlmError::InvalidParamError {
+            return Err(LlmError::InvalidParamValueError {
                 param: "system_prompt".to_string(),
                 message: format!("Expected a string, got: {v:?}"),
             });
@@ -221,6 +222,35 @@ fn huggingface(
     llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
 }
 
+fn databricks(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
+        return Err(LlmError::MissingParamError {
+            param_key: "databricks_endpoint",
+        });
+    };
+    let Some(token) = extract_secret!(params, "databricks_token") else {
+        return Err(LlmError::MissingParamError {
+            param_key: "databricks_token",
+        });
+    };
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "databricks".to_string(),
+        });
+    };
+
+    Ok(Arc::new(llms::openai::new_openai_client(
+        model_id,
+        Some(format!("https://{endpoint}/serving-endpoints").as_str()),
+        Some(token),
+        None,
+        None,
+    )) as Arc<dyn Chat>)
+}
+
 fn openai(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -234,14 +264,14 @@ fn openai(
         match temperature_str.parse::<f64>() {
             Ok(temperature) => {
                 if temperature < 0.0 {
-                    return Err(LlmError::InvalidParamError {
+                    return Err(LlmError::InvalidParamValueError {
                         param: "openai_temperature".to_string(),
                         message: "Ensure it is a non-negative number.".to_string(),
                     });
                 }
             }
             Err(_) => {
-                return Err(LlmError::InvalidParamError {
+                return Err(LlmError::InvalidParamValueError {
                     param: "openai_temperature".to_string(),
                     message: "Ensure it is a non-negative number.".to_string(),
                 });

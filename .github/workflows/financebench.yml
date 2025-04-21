@@ -9,7 +9,12 @@ on:
           required: false
           type: choice
           options:
+            - "all"
             - "gpt-4o"
+            - "gpt-4.1"
+            - "o1"
+            - "o3-mini"
+            - "o4-mini"
           default: "all"
 
 concurrency:
@@ -89,10 +94,27 @@ jobs:
         id: setup-matrix
         with:
           script: |
+
             const matrix = [
               {
                 name: "gpt-4o",
-                spicepod: "./test/financebench/spicepod_gpt-4o.yaml"
+                spicepod: "./test/financebench/spicepod_openai.yaml"
+              },
+              {
+                name: "gpt-4.1",
+                spicepod: "./test/financebench/spicepod_openai.yaml"
+              },
+              {
+                name: "o1",
+                spicepod: "./test/financebench/spicepod_openai.yaml"
+              },
+              {
+                name: "o3-mini",
+                spicepod: "./test/financebench/spicepod_openai.yaml"
+              },
+              {
+                name: "o4-mini",
+                spicepod: "./test/financebench/spicepod_openai.yaml"
               }
             ];
 
@@ -106,7 +128,7 @@ jobs:
             return filtered;
 
   run-testoperator:
-    name: financebench benchmark
+    name: benchmark
     needs:
       - build-testoperator
       - build-spiced
@@ -114,6 +136,7 @@ jobs:
     runs-on: 'spiceai-macos'
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
@@ -142,5 +165,6 @@ jobs:
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
             -p ${{ matrix.target.spicepod }} \
+            --model ${{ matrix.target.name }} \
             --ready-wait 180
   
