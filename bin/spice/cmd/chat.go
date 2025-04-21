@@ -139,7 +139,7 @@ spice chat --model <model>
 # Start a chat session with spiced instance in spice.ai cloud
 spice chat --model <model> --cloud
 
-# Send a single message and exit
+# Send a single prompt and receive a response
 spice chat --model <model> "What is Spice.ai?"
 `,
 	Run: func(cmd *cobra.Command, args []string) {
