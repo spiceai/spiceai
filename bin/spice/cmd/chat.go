@@ -130,8 +130,11 @@ type OpenAIErrorResponse struct {
 }
 
 var chatCmd = &cobra.Command{
-	Use:   "chat",
+	Use:   "chat [flags] [message]",
 	Short: "Chat with the Spice.ai LLM agent",
+	Long: `Chat with the Spice.ai LLM agent.
+	With no message argument: starts an interactive chat session.
+	With one message argument: sends the message and exits.`,
 	Example: `
 # Start a chat session with local spiced instance
 spice chat --model <model>
@@ -142,15 +145,8 @@ spice chat --model <model> --cloud
 # Send a single message and exit
 spice chat --model <model> "What is Spice.ai?"
 `,
+	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		if len(args) > 1 {
-			slog.Error("too many arguments provided", "expected", "0 or 1", "got", len(args))
-			cmd.Println("Usage: spice chat [message]")
-			cmd.Println("  - With no message: starts an interactive chat")
-			cmd.Println("  - With one message: sends the message and exits")
-			os.Exit(1)
-		}
-
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 		err := rtcontext.Init()
