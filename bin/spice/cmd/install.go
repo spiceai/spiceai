@@ -47,7 +47,7 @@ spice install ai
 
 		slog.Info("Checking for latest Spice runtime release...")
 
-		err = checkLatestCliReleaseVersion(cmd.Flags())
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}

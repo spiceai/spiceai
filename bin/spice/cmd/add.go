@@ -147,7 +147,7 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 
 		slog.Info(fmt.Sprintf("added %s\n", relativePath))
 
-		err = checkLatestCliReleaseVersion(cmd.Flags())
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}

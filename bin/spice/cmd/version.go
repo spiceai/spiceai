@@ -26,7 +26,6 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
@@ -69,21 +68,14 @@ spice version
 		// Intentionally without structured logging
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
-		err = checkLatestCliReleaseVersion(cmd.Flags())
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error(fmt.Sprintf("failed to check for latest CLI release version: %s\n", err.Error()))
 		}
 	},
 }
 
-func checkLatestCliReleaseVersion(flags *pflag.FlagSet) error {
-	rtcontext := context.NewContext()
-
-	err := rtcontext.Init(flags)
-	if err != nil {
-		return err
-	}
-
+func checkLatestCliReleaseVersion(rtcontext *context.RuntimeContext) error {
 	var latestReleaseVersion string
 	versionFilePath := filepath.Join(rtcontext.SpiceRuntimeDir(), "cli_version.txt")
 	if stat, err := os.Stat(versionFilePath); !os.IsNotExist(err) {

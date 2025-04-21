@@ -45,7 +45,7 @@ spice run
 			os.Exit(1)
 		}
 
-		err = checkLatestCliReleaseVersion(cmd.Flags())
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
