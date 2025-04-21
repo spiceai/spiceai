@@ -24,10 +24,10 @@ proc test_invalid_model {} {
     }
 
     # Check that expected models are in the list
-    if {[regexp {openai-gpt} $output]} {
-        puts "✓ Found expected model 'openai-gpt' in the list"
+    if {[regexp {model1} $output]} {
+        puts "✓ Found expected model 'model1' in the list"
     } else {
-        puts "✗ Expected model 'openai-gpt' not found in the list"
+        puts "✗ Expected model 'model1' not found in the list"
         exit 1
     }
 
