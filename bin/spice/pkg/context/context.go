@@ -329,8 +329,6 @@ func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 
 	args = append(spiceArgs, c.getRuntimeArgsFromFlags(args)...)
 
-	fmt.Printf("Running Spice.ai runtime with args: %s\n", strings.Join(args, " "))
-
 	cmd := exec.Command(spiceCMD, args...)
 
 	return cmd, nil
