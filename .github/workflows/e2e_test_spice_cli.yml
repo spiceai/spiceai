@@ -521,7 +521,7 @@ jobs:
 
       - name: Init spice app
         run: |
-          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cp ./test/cli/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
       - name: Start spice runtime
