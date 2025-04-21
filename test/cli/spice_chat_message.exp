@@ -1,0 +1,111 @@
+# Test single message mode (non-interactive)
+proc test_spice_chat_message {} {
+    set command "spice chat \"hello\" --model model1"
+
+    puts "Testing single message mode..."
+
+    # Use spawn instead of exec to observe process behavior
+    spawn {*}[split $command]
+
+    set timeout 30
+
+    # Look for either completion or chat prompt
+    expect {
+        "Spice.ai OSS CLI" {
+            exp_continue
+        }
+        "chat>" {
+            puts "✗ Command entered interactive mode when it shouldn't have"
+            exit 1
+        }
+        eof {
+            # Command terminated, this is the expected behavior of `spice chat <message>`
+            puts "✓ Command completed without entering interactive mode"
+        }
+    }
+
+    set output $expect_out(buffer)
+
+    if {[string length $output] > 1} {
+        puts "✓ Command produced output of reasonable length"
+    } else {
+        puts "✗ Command produced insufficient output"
+        exit 1
+    }
+
+    puts "✓ spice chat <message> test passed"
+}
+
+# Test selection of model when running spice chat with a message
+proc test_spice_chat_model_select {} {
+    set command "spice chat \"hello\""
+    puts "Testing spice chat <message> with model selection..."
+
+    spawn {*}[split $command]
+
+    set full_output ""
+
+    # Wait for the model selection prompt
+    expect {
+        "Spice.ai OSS CLI" {
+            append full_output $expect_out(buffer)
+            exp_continue
+        }
+        "Use the arrow keys to navigate:" {
+            puts "✓ Model selection prompt appeared"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Model selection prompt did not appear"
+            exit 1
+        }
+    }
+
+    # Press Enter to select the first model
+    send "\r"
+
+    # Check model confirmation
+    expect {
+        "Using model:" {
+            puts "✓ Model selection confirmed"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Model selection confirmation not shown"
+            exit 1
+        }
+    }
+
+    set timeout 30
+    expect {
+        -re {Time:.*Tokens:.*\n} {
+            puts "✓ Complete response with usage statistics received"
+            append full_output $expect_out(buffer)
+        }
+        timeout {
+            puts "✗ Usage statistics not shown within timeout"
+            exit 1
+        }
+        eof {
+            puts "✗ Command terminated unexpectedly"
+            exit 1
+        }
+    }
+
+    puts "Full output captured:\n$full_output"
+
+    if {[regexp {Using model:} $full_output] &&
+        [regexp {Time:.*Tokens:} $full_output] &&
+        [string length $full_output] > 1} {
+        puts "✓ Complete response cycle verified"
+    } else {
+        puts "✗ Incomplete response cycle"
+        exit 1
+    }
+
+    puts "✓ Model selection test passed"
+}
+
+test_spice_chat_message
+test_spice_chat_model_select
+exit 0
