@@ -48,7 +48,7 @@ sql> show tables
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
 		if err := rtcontext.Init(cmd.Flags()); err != nil {
-			slog.Error("could not initialize runtime context", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			return
 		}
 

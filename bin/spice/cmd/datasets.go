@@ -38,7 +38,7 @@ spice datasets
 		}
 		err := rtcontext.Init(cmd.Flags())
 		if err != nil {
-			slog.Error("could not initialize runtime context", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			return
 		}
 

@@ -82,7 +82,7 @@ $ spice trace ai_chat --include-input --truncate=120
 		rtcontext := context.NewContext()
 		err := rtcontext.Init(cmd.Flags())
 		if err != nil {
-			slog.Error("initializing runtime context", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			return
 		}
 

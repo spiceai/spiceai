@@ -73,7 +73,7 @@ nsql> How much money have I made in each country?
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 		if err := rtcontext.Init(cmd.Flags()); err != nil {
-			slog.Error("failed to initialize runtime context", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
 

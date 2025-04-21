@@ -146,7 +146,9 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	}
 
 	if apiKey, ok := dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
-		flags.Set("api-key", apiKey)
+		if err := flags.Set("api-key", apiKey); err != nil {
+			return fmt.Errorf("failed to set api-key flag from SPICE_SPICEAI_API_KEY environment variable: %w", err)
+		}
 	}
 
 	return nil

@@ -151,7 +151,7 @@ spice chat --model <model> "What is Spice.ai?"
 		rtcontext := context.NewContext().WithCloud(cloud)
 		err := rtcontext.Init(cmd.Flags())
 		if err != nil {
-			slog.Error("could not initialize runtime context", "error", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
 
