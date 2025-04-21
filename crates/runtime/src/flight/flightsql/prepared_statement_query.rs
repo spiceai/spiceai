@@ -30,6 +30,7 @@ use datafusion::common::ParamValues;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
 use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -54,15 +55,21 @@ pub(crate) async fn do_action_create_prepared_statement(
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
     set_flightsql_protocol().await;
-    let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &statement.query)
+
+    let query = mysql_to_postgres_query(&statement.query).map_err(error_to_status)?;
+
+    let (dataset_schema, parameter_schema) =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &query)
             .await
             .map_err(to_tonic_err)?;
 
-    let schema_bytes = Service::serialize_schema(&arrow_schema)?;
+    let dataset_schema = Service::serialize_schema(&dataset_schema)?;
+    let parameter_schema = Service::serialize_schema(
+        &parameter_schema.ok_or(Status::internal("no parameter schema"))?,
+    )?;
 
     let stmt = PreparedStatement {
-        query: statement.query.clone(),
+        query,
         parameters: vec![],
     };
 
@@ -70,8 +77,8 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     Ok(sql::ActionCreatePreparedStatementResult {
         prepared_statement_handle: handle.into(),
-        dataset_schema: schema_bytes,
-        ..Default::default()
+        dataset_schema,
+        parameter_schema,
     })
 }
 
@@ -215,4 +222,153 @@ fn decode_param_values(
 
 fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
     Status::internal(format!("{err:?}"))
+}
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unclosed quote in query"))]
+    UnclosedQuote,
+
+    #[snafu(display("Invalid comment syntax at position {}", position))]
+    InvalidComment { position: usize },
+}
+
+/// Translates a MySQL-style parameterized query to PostgreSQL-style.
+/// - Converts MySQL `?` placeholders to Postgres `$1`, `$2`, etc.
+/// - Replaces MySQL backticks (`) with Postgres double quotes (") for identifiers.
+/// Returns the translated query string or an error if parsing fails.
+fn mysql_to_postgres_query(query: &str) -> Result<String, Error> {
+    let mut result = String::new();
+    let mut param_count = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+    let mut in_comment = false;
+    let mut prev_char = '\0';
+    let mut position = 0;
+
+    for c in query.chars() {
+        position += 1;
+        match c {
+            // Handle single quotes
+            '\'' if !in_double_quote && !in_backtick && !in_comment => {
+                in_single_quote = !in_single_quote;
+                result.push(c);
+            }
+            // Handle double quotes (already in Postgres format)
+            '\"' if !in_single_quote && !in_backtick && !in_comment => {
+                in_double_quote = !in_double_quote;
+                result.push(c);
+            }
+            // Handle MySQL backticks (convert to double quotes)
+            '`' if !in_single_quote && !in_double_quote && !in_comment => {
+                in_backtick = !in_backtick;
+                result.push('"');
+            }
+            // Handle line comments
+            '-' if prev_char == '-'
+                && !in_single_quote
+                && !in_double_quote
+                && !in_backtick
+                && !in_comment =>
+            {
+                in_comment = true;
+                result
+                    .pop()
+                    .ok_or_else(|| Error::InvalidComment { position })?; // Remove previous '-'
+                result.push_str("--");
+            }
+            // Handle newlines in comments
+            '\n' if in_comment => {
+                in_comment = false;
+                result.push(c);
+            }
+            // Handle parameter placeholders
+            '?' if !in_single_quote && !in_double_quote && !in_backtick && !in_comment => {
+                param_count += 1;
+                result.push_str(&format!("${param_count}"));
+            }
+            _ => {
+                result.push(c);
+            }
+        }
+        prev_char = c;
+    }
+
+    // Check for unclosed quotes or backticks
+    if in_single_quote || in_double_quote || in_backtick {
+        return Err(Error::UnclosedQuote);
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_query() {
+        let input = "SELECT * FROM users WHERE id = ? AND name = ?";
+        let expected = "SELECT * FROM users WHERE id = $1 AND name = $2";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_query_with_quotes() {
+        let input = "SELECT * FROM users WHERE name = 'test?' AND id = ?";
+        let expected = "SELECT * FROM users WHERE name = 'test?' AND id = $1";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_query_with_comments() {
+        let input = "SELECT * FROM users WHERE id = ? -- comment with ?";
+        let expected = "SELECT * FROM users WHERE id = $1 -- comment with ?";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_query_with_double_quotes() {
+        let input = r#"SELECT * FROM "users" WHERE name = "?" AND id = ?"#;
+        let expected = r#"SELECT * FROM "users" WHERE name = "?" AND id = $1"#;
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_unclosed_quote() {
+        let input = "SELECT * FROM users WHERE name = 'test";
+        assert!(matches!(
+            mysql_to_postgres_query(input).unwrap_err(),
+            Error::UnclosedQuote
+        ));
+    }
+
+    #[test]
+    fn test_query_with_backticks() {
+        let input = "SELECT `name`, `age` FROM `users` WHERE `id` = ?";
+        let expected = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"id\" = $1";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_backticks_and_postgres_style() {
+        let input = "SELECT `name` FROM `users` WHERE `id` = $1";
+        let expected = "SELECT \"name\" FROM \"users\" WHERE \"id\" = $1";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_already_postgres_style() {
+        let input = "SELECT * FROM users WHERE id = $1 AND name = $2";
+        let expected = "SELECT * FROM users WHERE id = $1 AND name = $2";
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_postgres_style_with_quotes() {
+        let input = r#"SELECT * FROM "users" WHERE name = '$1' AND id = $1"#;
+        let expected = r#"SELECT * FROM "users" WHERE name = '$1' AND id = $1"#;
+        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+    }
 }
