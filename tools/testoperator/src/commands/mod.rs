@@ -18,11 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::args::CommonArgs;
 use test_framework::{
-    anyhow,
-    app::App,
-    spiced::StartRequest,
-    spicepod::Spicepod,
-    spicepod_utils::{from_app, make_spiceai_rw_dataset, set_read_write_api_key},
+    anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
 };
 
 #[cfg(feature = "append")]
@@ -38,24 +34,16 @@ mod util;
 pub(crate) mod vector_search;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
-const TEST_RESULTS_DATASET: &str = "test_results";
-const TEST_RESULTS_API_KEY: &str = "test_results_api_key";
-
 pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
+    if !args.metrics {
+        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
+        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
+    }
+
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
-    let mut app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
         .build();
-
-    if let Some(upload_results_dataset) = &args.upload_results_dataset {
-        println!("UPLOAD_RESULTS_DATASET: {upload_results_dataset}");
-        app.datasets.push(make_spiceai_rw_dataset(
-            upload_results_dataset,
-            TEST_RESULTS_DATASET,
-            None,
-        ));
-        set_read_write_api_key(&mut app.runtime, TEST_RESULTS_API_KEY.to_string());
-    }
 
     let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
     let start_request = if let Some(ref data_dir) = args.data_dir {

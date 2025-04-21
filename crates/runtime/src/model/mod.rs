@@ -24,6 +24,7 @@ mod chat;
 mod embed;
 pub(crate) mod eval;
 mod metrics;
+mod model_context;
 mod tool_use;
 mod wrapper;
 
@@ -40,6 +41,9 @@ pub use eval::{
         EVAL_RUNS_TABLE_TIME_COLUMN, EvalRunResponse, sql_query_for, start_tracing_eval_run,
     },
     scorer::{EvalScorerRegistry, Scorer, builtin_scorer},
+};
+pub use model_context::{
+    ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
 pub use tool_use::ToolUsingChat;
 

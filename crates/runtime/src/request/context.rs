@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
     future::Future,
     marker::PhantomData,
-    sync::{Arc, LazyLock, OnceLock, atomic::AtomicU8},
+    sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
 
 use app::App;
@@ -28,12 +30,15 @@ use spicepod::component::runtime::UserAgentCollection;
 
 use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
+type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
+
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
     cache_control: CacheControl,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
+    extensions: RwLock<Extensions>,
 }
 
 tokio::task_local! {
@@ -143,6 +148,23 @@ impl RequestContext {
     #[must_use]
     pub fn cache_control(&self) -> CacheControl {
         self.cache_control
+    }
+
+    pub fn extension<T>(&self) -> Option<Arc<T>>
+    where
+        T: 'static + Send + Sync + Clone,
+    {
+        let extensions = self.extensions.read().ok()?;
+        let type_id = TypeId::of::<T>();
+        extensions
+            .get(&type_id)
+            .and_then(|arc_any| Arc::clone(arc_any).downcast::<T>().ok())
+    }
+
+    pub fn insert_extension<T: 'static + Send + Sync>(&self, extension: T) {
+        if let Ok(mut extensions) = self.extensions.write() {
+            extensions.insert(TypeId::of::<T>(), Arc::new(extension));
+        }
     }
 }
 
@@ -278,6 +300,7 @@ impl RequestContextBuilder {
             cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
+            extensions: RwLock::new(HashMap::new()),
         }
     }
 }

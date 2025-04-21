@@ -43,6 +43,14 @@ pub enum Error {
 
     #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
     UnableToPerformHandshake { source: arrow::error::ArrowError },
+
+    #[snafu(display(
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+    ))]
+    InvalidParameterValue {
+        parameter: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -95,9 +103,24 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
 
+            let max_message_size =
+                match params
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.runtime.flight.as_ref())
+                {
+                    Some(flight) => flight.max_message_size_bytes().map_err(|err| {
+                        Error::InvalidParameterValue {
+                            parameter: "max_message_size".to_string(),
+                            source: err,
+                        }
+                    })?,
+                    None => None,
+                };
+
             let flight_client = FlightServiceClient::new(flight_channel)
-                .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+                .max_encoding_message_size(max_message_size.unwrap_or(MAX_ENCODING_MESSAGE_SIZE))
+                .max_decoding_message_size(max_message_size.unwrap_or(MAX_DECODING_MESSAGE_SIZE));
 
             let mut client = FlightSqlServiceClient::new_from_inner(flight_client);
             let username = params.parameters.get("username").expose().ok();

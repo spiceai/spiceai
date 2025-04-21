@@ -15,23 +15,21 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_app_and_start_request};
-use crate::{
-    args::DatasetTestArgs,
-    commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
-    wait_test_and_memory,
-};
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
-    flight::put_batches,
-    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
@@ -65,11 +63,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     .with_explain_plan_snapshot()
     .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(!args.common.disable_progress_bars)
-    .with_api_key(if args.common.upload_results_dataset.is_some() {
-        Some(TEST_RESULTS_API_KEY.to_string())
-    } else {
-        None
-    })
     .start()
     .await?;
 
@@ -81,17 +74,52 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = test.end()?;
     let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
-    print_batches(&records)?;
+    let commit_sha = metrics.commit_sha.clone();
+    let spiced_version = metrics.spiced_version.clone();
+    let app_name = app.name.clone();
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("benchmark.name", app_name.clone()),
+        KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
+        KeyValue::new("benchmark.query_set", query_set.to_string()),
+        KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
+    ]);
 
-    if args.common.upload_results_dataset.is_some() {
-        println!("Uploading test results...");
-        let mut flight_client = spiced_instance
-            .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
-            .await?;
-        put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    for query in &metrics.metrics {
+        let query_name = query.query_name.clone();
+        let row_count = row_counts.get(&query_name).unwrap_or(&0);
+        let attributes = vec![
+            KeyValue::new("query_name", query_name),
+            KeyValue::new("spiced_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+        ];
+
+        let status: u64 = u64::from(match query.query_status {
+            QueryStatus::Passed => true,
+            QueryStatus::Failed => false,
+        });
+
+        crate::metrics::QUERY_STATUS.record(status, &attributes);
+        crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+        crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+        crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+        crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+        crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+        crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+        crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+        crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
+    crate::metrics::TEST_DURATION
+        .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+
+    telemetry.emit().await?;
+
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    print_batches(&records)?;
     spiced_instance.stop()?;
 
     if !test_succeeded {

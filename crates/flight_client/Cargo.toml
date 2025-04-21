@@ -18,5 +18,6 @@ bytes.workspace = true
 futures.workspace = true
 rustls-native-certs = "0.8.1"
 rustls-pemfile = "2.1.3"
+secrecy.workspace = true
 snafu.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }

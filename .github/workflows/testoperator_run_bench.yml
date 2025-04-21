@@ -134,7 +134,8 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --validate=${{ github.event.inputs.validate_results }}
+            --validate=${{ github.event.inputs.validate_results }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
@@ -169,6 +170,7 @@ jobs:
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
       - name: Run the benchmark test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -182,7 +184,8 @@ jobs:
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --validate=${{ github.event.inputs.validate_results }}
+            --validate=${{ github.event.inputs.validate_results }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
@@ -217,6 +220,7 @@ jobs:
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
       
       - name: Install GH CLI
         if: github.event.inputs.update_snapshots == 'always'

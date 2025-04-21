@@ -20,13 +20,12 @@ use opentelemetry::metrics::{Meter, MeterProvider};
 
 use crate::noop::NoopMeterProvider;
 
-pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
-    OnceLock::new();
+pub static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> = OnceLock::new();
 
 /// If the meter provider isn't initialized for anonymous telemetry, use a `NoopMeterProvider`.
 ///
 /// This allows the instrumented code to not require any changes when anonymous telemetry is disabled/compiled out.
-static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
+pub static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
     LazyLock::new(|| METER_PROVIDER_ONCE.get_or_init(|| Arc::new(NoopMeterProvider::new())));
 
-pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("oss_telemetry"));
+pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("oss_telemetry"));

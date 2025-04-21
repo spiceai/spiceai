@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::CommonArgs, commands::TEST_RESULTS_API_KEY, wait_test_and_memory};
+use crate::{args::CommonArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -91,11 +91,6 @@ pub(crate) async fn run(args: &CommonArgs) -> anyhow::Result<()> {
         NotStarted::new().with_config(config).with_parallel_count(1),
     )
     .with_spiced_instance(spiced_instance)
-    .with_api_key(if args.upload_results_dataset.is_some() {
-        Some(TEST_RESULTS_API_KEY.to_string())
-    } else {
-        None
-    })
     .start()?;
 
     let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);

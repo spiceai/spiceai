@@ -12,7 +12,7 @@ version.workspace = true
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-byte-unit = "5.1.4"
+byte-unit.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true

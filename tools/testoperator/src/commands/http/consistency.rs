@@ -74,7 +74,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     let records = results.build_records()?;
     print_batches(&records)?;
 
-    let (p50, p95): (Vec<i64>, Vec<i64>) = results
+    let (p50, p95): (Vec<u64>, Vec<u64>) = results
         .metrics
         .iter()
         .map(|minute| (minute.median_duration_ms, minute.percentile_95_duration_ms))

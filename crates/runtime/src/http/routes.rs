@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
 use crate::Runtime;
@@ -180,8 +181,11 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
-            .route("/v1/nsql", post(v1::nsql::post))
-            .route("/v1/chat/completions", post(v1::chat::post))
+            .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
+            .route(
+                "/v1/chat/completions",
+                post(v1::chat::post).layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))

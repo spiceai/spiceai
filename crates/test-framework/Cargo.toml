@@ -13,6 +13,7 @@ anyhow = "1.0.95"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 async-openai.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
 duckdb = { optional = true, workspace = true, features = [
@@ -26,15 +27,20 @@ futures.workspace = true
 indicatif = "0.17.9"
 insta.workspace = true
 octocrab = "0.43.0"
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+otel-arrow = { path = "../../crates/otel-arrow" }
 rand = "0.9.0"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo = "0.33.1"
+telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true
 tonic.workspace = true

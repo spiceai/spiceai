@@ -118,6 +118,11 @@ pub enum Error {
     ModelNotFound { model: String, model_source: String },
 
     #[snafu(display(
+        "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
+    ))]
+    ModelNotProvided { model_source: String },
+
+    #[snafu(display(
         "Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadTokenizer {
@@ -135,7 +140,10 @@ pub enum Error {
     UnsupportedTaskForModel { from: String, task: String },
 
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
-    InvalidParamError { param: String, message: String },
+    InvalidParamValueError { param: String, message: String },
+
+    #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
+    MissingParamError { param_key: &'static str },
 
     #[snafu(display(
         "Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."
