@@ -38,6 +38,7 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use futures::future::try_join_all;
 use headers_accept::Accept;
 
 use itertools::Itertools;
@@ -52,6 +53,9 @@ use super::accept_header_types;
 
 // Default number of retries for NSQL queries if the generated query fails to execute
 const DEFAULT_NSQL_RETRIES: u8 = 10;
+
+// Maximum number of parallel tables for sampling
+const DATA_SAMPLING_MAX_PARALLEL_TABLES: usize = 5;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -76,29 +80,40 @@ async fn sample_messages(
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let mut messages = Vec::new();
 
-    for dataset in sample_from {
-        for params in [
-            SampleTableParams::DistinctColumns(DistinctColumnsParams {
-                tbl: dataset.to_string(),
-                limit: 3,
-                cols: None,
-            }),
-            SampleTableParams::RandomSample(RandomSampleParams {
-                tbl: dataset.to_string(),
-                limit: 3,
-            }),
-        ] {
-            let method = SampleTableMethod::from(&params);
-            let msgs = create_tool_use_messages(
-                Arc::clone(&rt),
-                &SampleDataTool::new(method.clone()),
-                format!("sample-{method:?}").as_str(),
-                &params,
-            )
-            .instrument(Span::current())
-            .await?;
-            messages.extend(msgs);
-        }
+    for datasets_chunk in sample_from.chunks(DATA_SAMPLING_MAX_PARALLEL_TABLES) {
+        let message_futures = datasets_chunk.iter().flat_map(|dataset| {
+            [
+                SampleTableParams::DistinctColumns(DistinctColumnsParams {
+                    tbl: dataset.to_string(),
+                    limit: 3,
+                    cols: None,
+                }),
+                SampleTableParams::RandomSample(RandomSampleParams {
+                    tbl: dataset.to_string(),
+                    limit: 3,
+                }),
+            ]
+            .into_iter()
+            .map(|params| {
+                let rt = Arc::clone(&rt);
+                let method = SampleTableMethod::from(&params);
+                async move {
+                    create_tool_use_messages(
+                        rt,
+                        &SampleDataTool::new(method.clone()),
+                        format!("sample-{method:?}").as_str(),
+                        &params,
+                    )
+                    .instrument(Span::current())
+                    .await
+                }
+            })
+        });
+
+        // Execute samples in parallel and collect results
+        let chunk_messages: Vec<Vec<ChatCompletionRequestMessage>> =
+            try_join_all(message_futures).await?;
+        messages.extend(chunk_messages.into_iter().flatten());
     }
     Ok(messages)
 }

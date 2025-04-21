@@ -35,7 +35,7 @@ use snafu::ResultExt;
 use super::SampleFrom;
 
 // Max columns for parallel distinct sampling per table
-const MAX_PARALLEL_DISTINCT_COLUMN_SCANS_PER_TABLE: usize = 10;
+const MAX_PARALLEL_DISTINCT_COLUMN_SCANS_PER_TABLE: usize = 5;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
