@@ -53,7 +53,7 @@ use super::{ResponseMimeType, sql_to_http_response};
             (
                 serde_json::Value = "application/json",
                 example = json!({
-                    "sql": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $1", "parameters": [3]
+                    "sql": "SELECT avg(total_amount), avg(tip_amount), count($1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $2", "parameters": [1, 3]
                 })
             ),
             (
