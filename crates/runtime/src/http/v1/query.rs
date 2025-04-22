@@ -53,13 +53,13 @@ use super::{ResponseMimeType, sql_to_http_response};
             (
                 serde_json::Value = "application/json",
                 example = json!({
-                    "query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $1", "parameters": [3]
+                    "sql": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $1", "parameters": [3]
                 })
             ),
             (
                 serde_json::Value = "application/json",
                 example = json!({
-                    "query": "SELECT :foo + 1 AS the_answer", "parameters": {"foo": 41}
+                    "sql": "SELECT :foo + 1 AS the_answer", "parameters": {"foo": 41}
                 })
             )
         )
@@ -184,7 +184,7 @@ pub(crate) async fn post(
 ) -> Response {
     #[derive(Deserialize)]
     struct ParameterizedQuery {
-        query: String,
+        sql: String,
         parameters: serde_json::Value,
     }
 
@@ -192,10 +192,10 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (query, parameters) = match content_type {
+    let (sql, parameters) = match content_type {
         Some(mime) if mime == "application/json" => {
             match serde_json::from_slice::<ParameterizedQuery>(&body) {
-                Ok(ParameterizedQuery { query, parameters }) => {
+                Ok(ParameterizedQuery { sql, parameters }) => {
                     let parameters = match param_utils::convert_json_to_param_values(parameters) {
                         Ok(p) => p,
                         Err(e) => {
@@ -205,7 +205,7 @@ pub(crate) async fn post(
                         }
                     };
 
-                    (query, Some(parameters))
+                    (sql, Some(parameters))
                 }
                 Err(e) => {
                     tracing::debug!("Error parsing JSON: {e}");
@@ -214,20 +214,20 @@ pub(crate) async fn post(
             }
         }
         _ => {
-            let query = match String::from_utf8(body.to_vec()) {
+            let sql = match String::from_utf8(body.to_vec()) {
                 Ok(query) => query,
                 Err(e) => {
                     tracing::debug!("Error reading query: {e}");
                     return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
                 }
             };
-            (query, None)
+            (sql, None)
         }
     };
 
     sql_to_http_response(
         df,
-        &query,
+        &sql,
         parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
     )
