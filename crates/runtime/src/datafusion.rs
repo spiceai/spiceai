@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -56,6 +56,7 @@ use datafusion::sql::{TableReference, sqlparser};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
+use moka::future::Cache;
 use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -263,7 +264,7 @@ pub struct DataFusion {
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
-    cached_plans: TokioRwLock<HashMap<Sql, LogicalPlan>>,
+    cached_plans: Cache<Sql, LogicalPlan>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -1346,18 +1347,17 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let cached_plans = self.cached_plans.read().await;
-        if let Some(plan) = cached_plans.get(sql) {
+        if let Some(plan) = self.cached_plans.get(sql).await {
             tracing::trace!("using cached plan for {sql}");
-            return Ok(plan.clone());
+            return Ok(plan);
         }
-        drop(cached_plans); // drop the lock
 
         let plan = session.create_logical_plan(sql).await?;
 
         tracing::trace!("caching plan for {sql}");
-        let mut cached_plans = self.cached_plans.write().await;
-        cached_plans.insert(sql.to_string(), plan.clone());
+        self.cached_plans
+            .insert(sql.to_string(), plan.clone())
+            .await;
 
         Ok(plan)
     }

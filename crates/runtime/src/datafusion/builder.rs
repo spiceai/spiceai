@@ -35,6 +35,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::FederationAnalyzerRule;
+use moka::future::Cache;
 use tokio::sync::RwLock as TokioRwLock;
 
 use crate::{embeddings, object_store_registry::default_runtime_env, status};
@@ -172,13 +173,15 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
+        const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 100;
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
-            cached_plans: TokioRwLock::default(),
+            cached_plans: Cache::new(DEFAULT_CACHED_PLANS_MAX_CAPACITY),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
         }
