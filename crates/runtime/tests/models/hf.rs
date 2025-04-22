@@ -118,8 +118,6 @@ mod nsql {
                     () = Arc::clone(&rt).load_components() => {}
                 }
 
-                drop(llm_init_lock);
-
                 runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
 
                 let test_cases = [
@@ -463,8 +461,6 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         }
 
         runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
-
-        drop(llm_init_lock);
 
         let response = send_chat_completions_request(
             http_base_url.as_str(),
