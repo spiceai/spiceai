@@ -287,7 +287,13 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
         .get_parameter_types()?
         .into_iter()
         .map(|(name, dt)| {
-            (name, dt.unwrap_or(arrow_schema::DataType::Int64)) // If cannot assign datatype, assume Int64
+            // If cannot determine datatype, we are assuming Int64.
+            // This appears to occur for LIMIT parameters such as for:
+            // ```sql
+            // SELECT * FROM table LIMIT $1
+            // ```
+            // Other cases are not known
+            (name, dt.unwrap_or(arrow_schema::DataType::Int64))
         })
         .collect::<BTreeMap<_, _>>();
 
