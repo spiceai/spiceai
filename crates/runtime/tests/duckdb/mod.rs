@@ -95,11 +95,11 @@ async fn duckdb_from_functions() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                                return Err("Timed out waiting for datasets to load".to_string());
-                            }
-            () = cloned_rt.load_components() => {}
-                        }
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
 
             let queries = vec![
                 ("csv_remote", make_test_query("csv_remote")),

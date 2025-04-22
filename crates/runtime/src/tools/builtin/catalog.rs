@@ -58,6 +58,11 @@ impl BuiltinToolCatalog {
     pub(crate) fn new(rt: Arc<Runtime>) -> Self {
         Self { rt }
     }
+
+    pub(crate) fn name() -> &str {
+        "auto"
+    }
+
     pub(crate) fn construct_builtin(
         &self,
         id: &str,
@@ -180,7 +185,7 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
             .ok()
     }
 
-    fn name(&self) -> &'static str {
-        "auto"
+    fn name(&self) -> &str {
+        Self::name()
     }
 }

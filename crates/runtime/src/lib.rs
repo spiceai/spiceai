@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
-use tools::factory::ToolFactory;
+use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
@@ -398,6 +398,7 @@ impl Runtime {
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
     }
+
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
@@ -614,9 +615,9 @@ impl Runtime {
                     .update_tool(&tool.name, ComponentStatus::Initializing);
             }
 
-            for tool_catalog in default_available_catalogs(Arc::clone(&self)) {
+            for catalog_name in default_catalog_names() {
                 self.status
-                    .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+                    .update_tool_catalog(catalog_name, ComponentStatus::Initializing);
             }
         }
 

@@ -160,7 +160,7 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-() = cloned_rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -220,7 +220,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-() = cloned_rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

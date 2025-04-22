@@ -541,9 +541,7 @@ async fn run_ready_state_test(
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
-                .await
-        ;
-
+                .await;
 
         let cloned_rt = Arc::new(rt.clone());
 
@@ -808,7 +806,6 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 ))
                 .build();
 
-
             let rt =
             Runtime::builder()
                 .with_app(app)
@@ -823,7 +820,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-() = cloned_rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             // Queries to native_on_registration_mixed should work right away
@@ -938,7 +935,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-() = cloned_rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             // Queries to native_on_registration_mixed should work right away

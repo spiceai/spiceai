@@ -39,6 +39,10 @@ impl MemoryToolCatalog {
         Self { rt }
     }
 
+    pub(crate) fn name() -> &str {
+        "memory"
+    }
+
     fn get_tool(
         &self,
         id: &str,
@@ -87,8 +91,8 @@ impl IndividualToolFactory for MemoryToolCatalog {
 
 #[async_trait]
 impl SpiceToolCatalog for MemoryToolCatalog {
-    fn name(&self) -> &'static str {
-        "memory"
+    fn name(&self) -> &str {
+        Self::name()
     }
 
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {

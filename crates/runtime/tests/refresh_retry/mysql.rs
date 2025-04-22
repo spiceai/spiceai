@@ -177,11 +177,11 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                                return Err("Timed out waiting for datasets to load".to_string());
-                            }
-            () = cloned_rt.load_components() => {}
-                        }
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
 
             let (refresh_task_no_retries, request) =
                 create_refresh_task(&rt, "lineitem_no_retries").await?;

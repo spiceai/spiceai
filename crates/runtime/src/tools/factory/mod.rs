@@ -115,6 +115,10 @@ pub fn default_available_catalogs(rt: Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCata
     ]
 }
 
+pub fn default_catalog_names<'a>() -> Vec<&'a str> {
+    vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
+}
+
 /// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].
 #[allow(clippy::implicit_hasher)]
 pub async fn forge(
