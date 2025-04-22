@@ -72,7 +72,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
     let commit_sha = metrics.commit_sha.clone();
     let spiced_version = metrics.spiced_version.clone();
@@ -115,6 +115,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+    crate::metrics::MAX_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
     telemetry.emit().await?;
 
