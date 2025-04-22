@@ -76,7 +76,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     )?;
 
     let stmt = PreparedStatement {
-        query: statement.query.clone(),
+        query: query.to_string(),
         parameters: vec![],
     };
 
