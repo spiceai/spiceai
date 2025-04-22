@@ -49,6 +49,7 @@ use axum::{
 use axum_extra::TypedHeader;
 use cache::QueryResultsCacheStatus;
 use csv::Writer;
+use datafusion::common::ParamValues;
 use headers_accept::Accept;
 use http::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -167,9 +168,10 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
     sql: &str,
+    parameters: Option<ParamValues>,
     format: ResponseMimeType,
 ) -> Response {
-    let (data, results_cache_status) = match run_sql(df, sql).await {
+    let (data, results_cache_status) = match run_sql(df, sql, parameters).await {
         Ok((data, results_cache_status)) => (data, results_cache_status),
         Err(e) => {
             tracing::debug!("Error executing query: {e}");
@@ -190,8 +192,15 @@ pub async fn sql_to_http_response(
 pub async fn run_sql(
     df: Arc<DataFusion>,
     sql: &str,
+    parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, QueryResultsCacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let query_res = QueryBuilder::new(sql, df).build().run().await?;
+    let builder = QueryBuilder::new(sql, df);
+    let builder = if let Some(parameters) = parameters {
+        builder.parameters(parameters)
+    } else {
+        builder
+    };
+    let query_res = builder.build().run().await?;
     Ok((
         query_res.data.try_collect::<Vec<RecordBatch>>().await?,
         query_res.results_cache_status,

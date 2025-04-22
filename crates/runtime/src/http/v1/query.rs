@@ -23,8 +23,10 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use headers_accept::Accept;
+use http::header::CONTENT_TYPE;
+use serde::Deserialize;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, param_utils};
 
 use super::{ResponseMimeType, sql_to_http_response};
 
@@ -162,20 +164,58 @@ use super::{ResponseMimeType, sql_to_http_response};
 ))]
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
+    headers: axum::http::HeaderMap,
     accept: Option<TypedHeader<Accept>>,
     body: Bytes,
 ) -> Response {
-    let query = match String::from_utf8(body.to_vec()) {
-        Ok(query) => query,
-        Err(e) => {
-            tracing::debug!("Error reading query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    #[derive(Deserialize)]
+    struct ParameterizedQuery {
+        query: String,
+        parameters: serde_json::Value,
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+
+    let (query, parameters) = match content_type {
+        Some(mime) if mime == "application/json" => {
+            match serde_json::from_slice::<ParameterizedQuery>(&body) {
+                Ok(ParameterizedQuery { query, parameters }) => {
+                    let parameters = match param_utils::convert_json_to_param_values(parameters) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::debug!("Error converting parameters: {e}");
+                            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
+                                .into_response();
+                        }
+                    };
+
+                    (query, Some(parameters))
+                }
+                Err(e) => {
+                    tracing::debug!("Error parsing JSON: {e}");
+                    return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
+                        .into_response();
+                }
+            }
+        }
+        _ => {
+            let query = match String::from_utf8(body.to_vec()) {
+                Ok(query) => query,
+                Err(e) => {
+                    tracing::debug!("Error reading query: {e}");
+                    return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                }
+            };
+            (query, None)
         }
     };
 
     sql_to_http_response(
         df,
         &query,
+        parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
     )
     .await
