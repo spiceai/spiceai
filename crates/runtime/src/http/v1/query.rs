@@ -45,10 +45,24 @@ use super::{ResponseMimeType, sql_to_http_response};
     ),
     request_body(
         description = "SQL query to execute",
-        content((
-            String = "text/plain",
-            example = "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
-        ))
+        content(
+            (
+                String = "text/plain",
+                example = "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
+            ),
+            (
+                serde_json::Value = "application/json",
+                example = json!({
+                    "query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT $1", "parameters": [3]
+                })
+            ),
+            (
+                serde_json::Value = "application/json",
+                example = json!({
+                    "query": "SELECT :foo + 1 AS the_answer", "parameters": {"foo": 41}
+                })
+            )
+        )
     ),
     responses(
         (status = 200, description = "SQL query executed successfully", content((
