@@ -26,6 +26,7 @@ use arrow_flight::{
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
+use bytes::Bytes;
 use datafusion::{
     common::ParamValues,
     sql::sqlparser::{
@@ -74,7 +75,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     let parameter_schema = if let Some(schema) = &parameter_schema {
         Service::serialize_schema(schema)?
     } else {
-        Default::default()
+        Bytes::default()
     };
 
     let stmt = PreparedStatement {
