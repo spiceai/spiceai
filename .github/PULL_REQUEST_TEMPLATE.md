@@ -1,21 +1,20 @@
-# 🗣 Description
+## 📝 Summary
 
-<!-- include a description about your pull request and changes, and why these changes need to be made -->
+<!-- What does this PR change? Why is it necessary? Keep it concise. -->
 
-## 🔨 Related Issues
+## 🔗 Related
 
-<!-- list any linked issues this pull request will close, or exclude if none -->
+<!-- Link to relevant issues, discussions, or other PRs. Use "Closes #123" to auto-close issues. Omit if none. -->
 
-## ⛓️‍💥 Breaking Change
+## 🚨 Breaking Changes
 
-<!-- Remove this block is this PR is not a breaking change -->
+<!-- Describe breaking changes if any, or delete this section. -->
+<!-- If breaking, make sure the "breaking change" label is added. -->
 
-* [ ] "Breaking Change" label added if this PR is a breaking change
+## 📚 Docs
 
-## 📄 Documentation Updates
+<!-- Note any required updates to docs, recipes, or guides. Omit if not applicable. -->
 
-<!-- list any documentation related issues, cookbook recipes or video content related to this PR -->
+## 👀 Notes for Reviewers
 
-## 🤔 Concerns
-
-<!-- list any particular concerns you have about this pull request that you want reviewers to directly address, or exclude if none -->
+<!-- Any areas needing special attention or questions for reviewers? Omit if none. -->
