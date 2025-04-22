@@ -193,26 +193,24 @@ pub(crate) async fn post(
         .and_then(|value| value.to_str().ok());
 
     let (sql, parameters) = match content_type {
-        Some(mime) if mime == "application/json" => {
-            match serde_json::from_slice::<ParameterizedQuery>(&body) {
-                Ok(ParameterizedQuery { sql, parameters }) => {
-                    let parameters = match param_utils::convert_json_to_param_values(parameters) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::debug!("Error converting parameters: {e}");
-                            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}"))
-                                .into_response();
-                        }
-                    };
+        Some("application/json") => match serde_json::from_slice::<ParameterizedQuery>(&body) {
+            Ok(ParameterizedQuery { sql, parameters }) => {
+                let parameters = match param_utils::convert_json_to_param_values(parameters) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::debug!("Error converting parameters: {e}");
+                        return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}"))
+                            .into_response();
+                    }
+                };
 
-                    (sql, Some(parameters))
-                }
-                Err(e) => {
-                    tracing::debug!("Error parsing JSON: {e}");
-                    return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
-                }
+                (sql, Some(parameters))
             }
-        }
+            Err(e) => {
+                tracing::debug!("Error parsing JSON: {e}");
+                return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
+            }
+        },
         _ => {
             let sql = match String::from_utf8(body.to_vec()) {
                 Ok(query) => query,
