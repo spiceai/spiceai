@@ -83,7 +83,7 @@ impl TaskHistoryExporter {
         } else {
             Some(span.parent_span_id.to_string().into())
         };
-        let task: Arc<str> = span.name.into();
+        let task: Arc<str> = extract_attr!(span, "task_override").unwrap_or(span.name.into());
         let input: Arc<str> = span
             .attributes
             .iter()

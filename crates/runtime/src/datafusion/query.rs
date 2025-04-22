@@ -14,18 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{cell::LazyCell, collections::BTreeMap, sync::Arc};
 
 use ::cache::{QueryResult, get_logical_plan_input_tables};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
+use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
+    common::ParamValues,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, context::SQLOptions},
+    logical_expr::LogicalPlan,
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::DataFrame,
 };
@@ -68,6 +71,9 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display("Failed to set parameters in logical plan: {source}"))]
+    BindingParameters { source: DataFusionError },
 }
 
 // There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
@@ -83,6 +89,7 @@ thread_local! {
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: Arc<str>,
+    parameters: Option<ParamValues>,
     tracker: QueryTracker,
 }
 
@@ -120,6 +127,7 @@ impl Query {
                 &session,
                 Arc::clone(&request_context),
                 &ctx.sql,
+                ctx.parameters.clone(),
                 tracker,
             )
             .await?
@@ -240,7 +248,8 @@ impl Query {
             .finish_with_error(request_context, error_message, error_code);
     }
 
-    pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
+    /// Return the schema for the data and (possibly) the parameters of a [`Query`].
+    pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let plan = match session.create_logical_plan(&self.sql).await {
@@ -258,7 +267,10 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        Ok(plan.schema().as_arrow().clone())
+        let dataset_schema = plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        Ok((dataset_schema, parameter_schema))
     }
 
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
@@ -269,6 +281,34 @@ impl Query {
             self.finish_with_error(request_context, e.to_string(), error_code);
         });
     }
+}
+
+fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataFusionError> {
+    let parameters = plan
+        .get_parameter_types()?
+        .into_iter()
+        .map(|(name, dt)| {
+            // If cannot determine datatype, we are assuming UInt64.
+            // This appears to occur for LIMIT parameters such as for:
+            // ```sql
+            // SELECT * FROM table LIMIT $1
+            // ```
+            // Other cases are not known
+            (name, dt.unwrap_or(arrow_schema::DataType::UInt64))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let maybe_schema = if parameters.is_empty() {
+        None
+    } else {
+        let mut builder = SchemaBuilder::new();
+        parameters
+            .into_iter()
+            .for_each(|(name, typ)| builder.push(Field::new(name, typ, false)));
+        Some(builder.finish())
+    };
+
+    Ok(maybe_schema)
 }
 
 #[must_use]
@@ -349,4 +389,107 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use ::cache::{QueryResultsCacheProvider, QueryResultsCacheStatus};
+    use arrow::array::Int64Array;
+    use serde_json::json;
+    use spicepod::component::runtime::ResultsCache;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry,
+        datafusion::{builder::DataFusionBuilder, param_utils::convert_json_to_param_values},
+        status::RuntimeStatus,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn parameterized_query() {
+        let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
+        let config = ResultsCache::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+            )
+            .with_cache_provider(cache_provider)
+            .build(),
+        );
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters.clone())
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
+
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheMiss
+        );
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheHit
+        );
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
+
+        // New parameters should not be cached
+        let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 2);
+        }
+
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheMiss
+        );
+    }
 }

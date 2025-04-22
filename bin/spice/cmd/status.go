@@ -35,13 +35,13 @@ spice status
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
-		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
+		err = api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
 		if err != nil {
 			slog.Error("getting spiced status", "error", err)
 		}

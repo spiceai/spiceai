@@ -49,7 +49,7 @@ spice upgrade
 		}
 
 		rtcontext := context.NewContext()
-		err = rtcontext.Init()
+		err = rtcontext.Init(cmd.Flags())
 		if err != nil {
 			slog.Error("initializing runtime context", "error", err)
 			os.Exit(1)

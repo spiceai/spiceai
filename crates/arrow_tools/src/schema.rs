@@ -67,6 +67,13 @@ pub fn verify_schema(
         let a_data_type = a.data_type();
         let b_data_type = b.data_type();
 
+        // Parameterized queries will result in a schema mismatch because the
+        // field type is unknown (and defaults to NULL) but once the query is
+        // executed, a (likely) non-null value is produced
+        if is_null_placeholder(a) || is_null_placeholder(b) {
+            continue;
+        }
+
         if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
@@ -78,6 +85,11 @@ pub fn verify_schema(
     }
 
     Ok(())
+}
+
+fn is_null_placeholder(field: &Arc<Field>) -> bool {
+    let is_placeholder = field.name().starts_with('$') || field.name().starts_with('?');
+    is_placeholder && field.data_type() == &DataType::Null
 }
 
 #[must_use]

@@ -47,6 +47,10 @@ sql> show tables
 	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
+		if err := rtcontext.Init(cmd.Flags()); err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
+		}
 
 		_, err := rtcontext.Version()
 		if err != nil {
@@ -55,30 +59,6 @@ sql> show tables
 		}
 
 		spiceArgs := []string{"--repl"}
-
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			args = append(args, "--tls-root-certificate-file", rootCertPath)
-		}
-
-		if apiKey, err := cmd.Flags().GetString("api-key"); err == nil && apiKey != "" {
-			args = append(args, "--api-key", apiKey)
-		}
-
-		if userAgent, err := cmd.Flags().GetString("user-agent"); err == nil && userAgent != "" {
-			args = append(args, "--user-agent", userAgent)
-		}
-
-		if cacheControl, err := cmd.Flags().GetString("cache-control"); err == nil && cacheControl != "" {
-			args = append(args, "--cache-control", cacheControl)
-		}
-
-		if flight, err := cmd.Flags().GetString("flight-endpoint"); err == nil && flight != "" {
-			args = append(args, "--repl-flight-endpoint", flight)
-		}
-
-		if http, err := cmd.Flags().GetString("http-endpoint"); err == nil && http != "" {
-			args = append(args, "--http-endpoint", http)
-		}
 
 		args = append(spiceArgs, args...)
 

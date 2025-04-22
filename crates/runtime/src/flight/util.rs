@@ -14,20 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_flight::flight_service_server::FlightService;
 use cache::QueryResultsCacheStatus;
 use tonic::{
     Response,
     metadata::{Ascii, MetadataValue},
 };
 
-use crate::{
-    flight::Service,
-    request::{AsyncMarker, Protocol, RequestContext},
-};
+use crate::request::{AsyncMarker, Protocol, RequestContext};
 
-pub fn attach_cache_metadata(
-    response: &mut Response<<Service as FlightService>::DoGetStream>,
+pub fn attach_cache_metadata<T>(
+    response: &mut Response<T>,
     results_cache_status: QueryResultsCacheStatus,
 ) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {

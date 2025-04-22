@@ -49,7 +49,7 @@ spice version
 		var err error
 
 		rtcontext := context.NewContext()
-		err = rtcontext.Init()
+		err = rtcontext.Init(cmd.Flags())
 		if err != nil {
 			slog.Error("initializing runtime context", "error", err)
 			os.Exit(1)
@@ -68,21 +68,14 @@ spice version
 		// Intentionally without structured logging
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
-		err = checkLatestCliReleaseVersion()
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error(fmt.Sprintf("failed to check for latest CLI release version: %s\n", err.Error()))
 		}
 	},
 }
 
-func checkLatestCliReleaseVersion() error {
-	rtcontext := context.NewContext()
-
-	err := rtcontext.Init()
-	if err != nil {
-		return err
-	}
-
+func checkLatestCliReleaseVersion(rtcontext *context.RuntimeContext) error {
 	var latestReleaseVersion string
 	versionFilePath := filepath.Join(rtcontext.SpiceRuntimeDir(), "cli_version.txt")
 	if stat, err := os.Stat(versionFilePath); !os.IsNotExist(err) {
