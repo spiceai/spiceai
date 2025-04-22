@@ -33,6 +33,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -194,7 +195,9 @@ spice chat --model <model> "What is Spice.ai?"
 		}
 
 		availableModels := []string{}
+		configuredModels := []string{}
 		for _, model := range models.Data {
+			configuredModels = append(configuredModels, model.Id)
 			if model.Status == "Ready" {
 				availableModels = append(availableModels, model.Id)
 			}
@@ -225,17 +228,15 @@ spice chat --model <model> "What is Spice.ai?"
 			cmd.Printf("Using model: %s\n", selectedModel)
 			model = selectedModel
 		} else {
-			modelIsAvailable := false
-			for _, availableModel := range availableModels {
-				if availableModel == model {
-					modelIsAvailable = true
-					break
-				}
+			if !slices.Contains(configuredModels, model) {
+				slog.Error(fmt.Sprintf("model %s does not exist — configured models: %s",
+					model, strings.Join(configuredModels, ", ")))
+				os.Exit(1)
 			}
 
-			if !modelIsAvailable {
-				slog.Error("Requested model is not available", "model", model)
-				slog.Info("Available models", "models", strings.Join(availableModels, ", "))
+			if !slices.Contains(availableModels, model) {
+				slog.Error(fmt.Sprintf("model %s is not ready — try again later or use an available model: %s",
+					model, strings.Join(availableModels, ", ")))
 				os.Exit(1)
 			}
 		}
