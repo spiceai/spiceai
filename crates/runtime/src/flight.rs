@@ -172,7 +172,7 @@ impl Service {
     ) -> Result<(Schema, Option<Schema>), Status> {
         let query = QueryBuilder::new(sql, datafusion).build();
 
-        Ok(query.get_schema().await.map_err(handle_datafusion_error)?)
+        query.get_schema().await.map_err(handle_datafusion_error)
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
