@@ -248,6 +248,7 @@ impl Query {
             .finish_with_error(request_context, error_message, error_code);
     }
 
+    /// Return the schema for the data and (possibly) the parameters of a [`Query`].
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
