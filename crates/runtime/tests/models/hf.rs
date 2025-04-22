@@ -108,7 +108,7 @@ mod nsql {
                     Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
                 });
 
-                let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+                let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
                 tokio::select! {
                     // increased timeout to download and load huggingface model
@@ -450,7 +450,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
             Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
         });
 
-        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+        let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
         tokio::select! {
             // increased timeout to download and load huggingface model
