@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{borrow::Cow, ops::ControlFlow, sync::Arc};
 
 use arrow::compute::concat_batches;
 use arrow_flight::{
@@ -26,7 +26,14 @@ use arrow_flight::{
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::record_to_param_values;
-use datafusion::common::ParamValues;
+use datafusion::{
+    common::ParamValues,
+    sql::sqlparser::{
+        ast::{Expr, Statement, Value, VisitMut, VisitorMut},
+        dialect::GenericDialect,
+        parser::{Parser, ParserError},
+    },
+};
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -56,7 +63,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
     set_flightsql_protocol().await;
 
-    let query = mysql_to_postgres_query(&statement.query).map_err(error_to_status)?;
+    let query = convert_jdbc_parameter_placeholders(&statement.query).map_err(error_to_status)?;
 
     let (dataset_schema, parameter_schema) =
         Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &query)
@@ -226,81 +233,69 @@ fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unclosed quote in query"))]
-    UnclosedQuote,
+    #[snafu(display("Multiple statements found in query. Only one statement is supported."))]
+    MultipleStatements,
 
-    #[snafu(display("Invalid comment syntax at position {}", position))]
-    InvalidComment { position: usize },
+    #[snafu(display("Invalid query: {query}\n{source}"))]
+    InvalidQuery { query: String, source: ParserError },
 }
 
-/// Translates a MySQL-style parameterized query to PostgreSQL-style.
-/// - Converts MySQL `?` placeholders to Postgres `$1`, `$2`, etc.
-/// - Replaces MySQL backticks (`) with Postgres double quotes (") for identifiers.
-/// Returns the translated query string or an error if parsing fails.
-fn mysql_to_postgres_query(query: &str) -> Result<String, Error> {
-    let mut result = String::new();
-    let mut param_count = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_backtick = false;
-    let mut in_comment = false;
-    let mut prev_char = '\0';
-    let mut position = 0;
+/// Converts any JDBC parameter placeholders to Postgres-style placeholders.
+///
+/// This function handles the conversion of JDBC parameter placeholders (e.g., `?`) to
+/// Postgres placeholders (e.g., `$1`, `$2`, etc.). If the query does not contain any JDBC
+/// parameter placeholders, the original query is returned unchanged.
+fn convert_jdbc_parameter_placeholders(query: &str) -> Result<Cow<str>, Error> {
+    // Simple check for the common case where the query does not contain any JDBC parameter placeholders
+    if !query.contains('?') {
+        return Ok(Cow::Borrowed(query));
+    }
 
-    for c in query.chars() {
-        position += 1;
-        match c {
-            // Handle single quotes
-            '\'' if !in_double_quote && !in_backtick && !in_comment => {
-                in_single_quote = !in_single_quote;
-                result.push(c);
-            }
-            // Handle double quotes (already in Postgres format)
-            '\"' if !in_single_quote && !in_backtick && !in_comment => {
-                in_double_quote = !in_double_quote;
-                result.push(c);
-            }
-            // Handle MySQL backticks (convert to double quotes)
-            '`' if !in_single_quote && !in_double_quote && !in_comment => {
-                in_backtick = !in_backtick;
-                result.push('"');
-            }
-            // Handle line comments
-            '-' if prev_char == '-'
-                && !in_single_quote
-                && !in_double_quote
-                && !in_backtick
-                && !in_comment =>
-            {
-                in_comment = true;
-                result
-                    .pop()
-                    .ok_or_else(|| Error::InvalidComment { position })?; // Remove previous '-'
-                result.push_str("--");
-            }
-            // Handle newlines in comments
-            '\n' if in_comment => {
-                in_comment = false;
-                result.push(c);
-            }
-            // Handle parameter placeholders
-            '?' if !in_single_quote && !in_double_quote && !in_backtick && !in_comment => {
-                param_count += 1;
-                result.push_str(&format!("${param_count}"));
-            }
-            _ => {
-                result.push(c);
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, query).context(InvalidQuerySnafu { query })?;
+    if statements.len() != 1 {
+        return Err(Error::MultipleStatements);
+    }
+    let Some(mut statement) = statements.pop() else {
+        unreachable!("We already checked that there is exactly one statement");
+    };
+
+    let mut visitor = ConvertJdbcPlaceholdersVisitor::new();
+    visitor.visit_statement(&mut statement);
+
+    Ok(Cow::Owned(statement.to_string()))
+}
+
+struct ConvertJdbcPlaceholdersVisitor {
+    next_placeholder: u32,
+}
+
+impl ConvertJdbcPlaceholdersVisitor {
+    fn new() -> Self {
+        Self {
+            next_placeholder: 1,
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &mut Statement) {
+        statement.visit(self);
+    }
+}
+
+impl VisitorMut for ConvertJdbcPlaceholdersVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Value(value) = expr {
+            if let Value::Placeholder(placeholder) = value {
+                *value = Value::Placeholder(
+                    placeholder.replace('?', &format!("${}", self.next_placeholder)),
+                );
+                self.next_placeholder += 1;
             }
         }
-        prev_char = c;
+        ControlFlow::Continue(())
     }
-
-    // Check for unclosed quotes or backticks
-    if in_single_quote || in_double_quote || in_backtick {
-        return Err(Error::UnclosedQuote);
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -311,36 +306,48 @@ mod tests {
     fn test_basic_query() {
         let input = "SELECT * FROM users WHERE id = ? AND name = ?";
         let expected = "SELECT * FROM users WHERE id = $1 AND name = $2";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_query_with_quotes() {
         let input = "SELECT * FROM users WHERE name = 'test?' AND id = ?";
         let expected = "SELECT * FROM users WHERE name = 'test?' AND id = $1";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_query_with_comments() {
         let input = "SELECT * FROM users WHERE id = ? -- comment with ?";
         let expected = "SELECT * FROM users WHERE id = $1 -- comment with ?";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_query_with_double_quotes() {
         let input = r#"SELECT * FROM "users" WHERE name = "?" AND id = ?"#;
         let expected = r#"SELECT * FROM "users" WHERE name = "?" AND id = $1"#;
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_unclosed_quote() {
         let input = "SELECT * FROM users WHERE name = 'test";
         assert!(matches!(
-            mysql_to_postgres_query(input).unwrap_err(),
-            Error::UnclosedQuote
+            convert_jdbc_parameter_placeholders(input).expect_err("should fail"),
+            Error::InvalidQuery { .. }
         ));
     }
 
@@ -348,27 +355,120 @@ mod tests {
     fn test_query_with_backticks() {
         let input = "SELECT `name`, `age` FROM `users` WHERE `id` = ?";
         let expected = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"id\" = $1";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_backticks_and_postgres_style() {
         let input = "SELECT `name` FROM `users` WHERE `id` = $1";
         let expected = "SELECT \"name\" FROM \"users\" WHERE \"id\" = $1";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_already_postgres_style() {
         let input = "SELECT * FROM users WHERE id = $1 AND name = $2";
         let expected = "SELECT * FROM users WHERE id = $1 AND name = $2";
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
     }
 
     #[test]
     fn test_postgres_style_with_quotes() {
         let input = r#"SELECT * FROM "users" WHERE name = '$1' AND id = $1"#;
         let expected = r#"SELECT * FROM "users" WHERE name = '$1' AND id = $1"#;
-        assert_eq!(mysql_to_postgres_query(input).unwrap(), expected);
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_complex_query_multiple_clauses() {
+        let input = "SELECT a, b FROM t WHERE x = ? AND y = ? GROUP BY a ORDER BY b DESC LIMIT ?";
+        let expected =
+            "SELECT a, b FROM t WHERE x = $1 AND y = $2 GROUP BY a ORDER BY b DESC LIMIT $3";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_insert_statement() {
+        let input = "INSERT INTO users (name, age) VALUES (?, ?)";
+        let expected = "INSERT INTO users (name, age) VALUES ($1, $2)";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_statement() {
+        let input = "UPDATE users SET age = ? WHERE name = ?";
+        let expected = "UPDATE users SET age = $1 WHERE name = $2";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_delete_statement() {
+        let input = "DELETE FROM users WHERE id = ?";
+        let expected = "DELETE FROM users WHERE id = $1";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_query_with_function_calls() {
+        let input = "SELECT COUNT(*) FROM users WHERE created_at > ? AND status = ?";
+        let expected = "SELECT COUNT(*) FROM users WHERE created_at > $1 AND status = $2";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_query_with_subquery() {
+        let input = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = ?) AND stock > ?";
+        let expected = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = $1) AND stock > $2";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_placeholders() {
+        let input = "SELECT * FROM users WHERE id = 1";
+        let expected = "SELECT * FROM users WHERE id = 1";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input),
+            Ok(Cow::Borrowed(expected))
+        );
+    }
+
+    #[test]
+    fn test_mix_of_question_marks_in_literals_and_placeholders() {
+        let input = "SELECT '?', name FROM users WHERE id = ? AND notes LIKE '%??%'";
+        let expected = "SELECT '?', name FROM users WHERE id = $1 AND notes LIKE '%??%'";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).map(|s| s.into_owned()),
+            Ok(expected.to_string())
+        );
     }
 }
