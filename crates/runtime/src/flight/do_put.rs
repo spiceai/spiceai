@@ -18,7 +18,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
-    FlightData, PutResult, flight_service_server::FlightService, utils::flight_data_to_arrow_batch,
+    FlightData, PutResult,
+    flight_service_server::FlightService,
+    sql::{Any, Command},
+    utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
@@ -27,12 +30,13 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::{
     sync::mpsc::{self, Sender},
     time::sleep,
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use async_stream::stream;
@@ -44,7 +48,7 @@ use crate::{
     timing::TimedStream,
 };
 
-use super::{Service, metrics};
+use super::{Service, flightsql::prepared_statement_query, metrics};
 
 pub(crate) async fn handle(
     flight_svc: &Service,
@@ -69,16 +73,37 @@ pub(crate) async fn handle(
         }
     }
 
-    let mut streaming_flight = request.into_inner();
+    let mut streaming_flight = request.into_inner().peekable();
 
-    let Ok(Some(message)) = streaming_flight.message().await else {
+    // We need to peek at the stream in case we branch below to prepared statements
+    let Some(Ok(first_message)) = streaming_flight.peek().await else {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight data provided"));
     };
-    let Some(fd) = &message.flight_descriptor else {
+    let Some(fd) = &first_message.flight_descriptor else {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
+
+    if let Ok(message) = Any::decode(&*fd.cmd) {
+        if let Command::CommandPreparedStatementQuery(query) =
+            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
+        {
+            return prepared_statement_query::do_put_query(flight_svc, query, streaming_flight)
+                .await;
+        }
+    }
+
+    // Since it is not a prepared statement we can take from the stream
+    let Some(Ok(first_message)) = streaming_flight.next().await else {
+        let _start = metrics::track_flight_request("do_put", None);
+        return Err(Status::invalid_argument("No flight data provided"));
+    };
+    let Some(fd) = &first_message.flight_descriptor else {
+        let _start = metrics::track_flight_request("do_put", None);
+        return Err(Status::invalid_argument("No flight descriptor provided"));
+    };
+
     if fd.path.is_empty() {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
@@ -95,7 +120,7 @@ pub(crate) async fn handle(
         )));
     };
 
-    let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
+    let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
@@ -112,7 +137,9 @@ pub(crate) async fn handle(
         )));
     }
 
-    let response_stream = create_response_stream(path, schema, df, streaming_flight, &message);
+    let first_message = first_message.clone();
+    let response_stream =
+        create_response_stream(path, schema, df, streaming_flight, &first_message);
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 
@@ -123,7 +150,7 @@ fn create_response_stream(
     path: TableReference,
     schema: SchemaRef,
     df: Arc<DataFusion>,
-    mut streaming_flight: Streaming<FlightData>,
+    mut streaming_flight: Peekable<Streaming<FlightData>>,
     first_message: &FlightData,
 ) -> impl futures::Stream<Item = Result<PutResult, Status>> + use<> {
     let dictionaries_by_id = Arc::new(HashMap::new());
@@ -167,9 +194,9 @@ fn create_response_stream(
                         }
                     }
                 },
-                message = streaming_flight.message() => {
+                message = streaming_flight.next() => {
                     match message {
-                        Ok(Some(message)) => {
+                        Some(Ok(message)) => {
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,
                                 Arc::clone(&schema),
@@ -185,7 +212,7 @@ fn create_response_stream(
 
                             yield handle_record_batch(new_batch, &batch_tx).await;
                         }
-                        Ok(None) => {
+                        None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
                             drop(batch_tx);
 
@@ -196,7 +223,7 @@ fn create_response_stream(
                             }
                             break;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             tracing::error!("Error reading message: {e}");
                             yield Err(Status::internal(format!("Error reading message: {e}")));
                             break;

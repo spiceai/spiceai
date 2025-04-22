@@ -72,6 +72,11 @@ spice search --cloud
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 
 		if !cloud {
 			rtcontext.RequireModelsFlavor(cmd)
@@ -90,20 +95,6 @@ spice search --cloud
 					slog.Warn(fmt.Sprintf("Dataset %s is not ready (%s) and will be excluded from the search.", dataset.Name, dataset.Status))
 				}
 			}
-		}
-
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
-		if err != nil {
-			slog.Error("could not get http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
-		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
 		}
 
 		matches := map[string][]SearchMatch{}

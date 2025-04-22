@@ -98,6 +98,7 @@ otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
 percent-encoding.workspace = true
 pin-project.workspace = true
+postcard.workspace = true
 prometheus.workspace = true
 prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [

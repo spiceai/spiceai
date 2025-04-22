@@ -80,13 +80,13 @@ $ spice trace ai_chat --include-input --truncate=120
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
 		var filter string
-		var err error
 		switch isValidTraceTask(args[0]) {
 		case true:
 			filter, err = getTraceFilter(args[0], id, trace_id)

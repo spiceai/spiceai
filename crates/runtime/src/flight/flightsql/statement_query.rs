@@ -75,7 +75,7 @@ pub(crate) async fn do_get(
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tracing::trace!("do_get_statement: {cmd:?}");
     let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query)).await?;
+        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query, None)).await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =

@@ -26,10 +26,16 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
+use arrow_flight::flight_service_server::FlightService;
+use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, PutResult, SchemaResult};
+use arrow_flight::{
+    FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, SchemaAsIpc,
+    Ticket, flight_service_server::FlightServiceServer,
+};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use cache::QueryResultsCacheStatus;
+use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
@@ -62,12 +68,6 @@ mod metrics;
 mod middleware;
 mod util;
 
-use arrow_flight::{
-    FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PutResult,
-    SchemaAsIpc, Ticket,
-    flight_service_server::{FlightService, FlightServiceServer},
-};
-
 pub struct Service {
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
@@ -88,6 +88,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
+        let _start = track_flight_request("do_handshake", None).await;
         handshake::handle(request.metadata(), self.basic_auth.as_ref()).await
     }
 
@@ -119,6 +120,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
+        let _start = track_flight_request("get_schema", None).await;
         get_schema::handle(self, request).await
     }
 
@@ -126,6 +128,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let _start = track_flight_request("do_get", None).await;
         Box::pin(do_get::handle(self, request)).await
     }
 
@@ -133,6 +136,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        let _start = track_flight_request("do_put", None).await;
         do_put::handle(self, request).await
     }
 
@@ -140,6 +144,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        let _start = track_flight_request("do_exchange", None).await;
         do_exchange::handle(self, request).await
     }
 
@@ -147,6 +152,7 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
+        let _start = track_flight_request("do_action", None).await;
         Box::pin(actions::do_action(self, request)).await
     }
 
@@ -154,6 +160,7 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
+        let _start = track_flight_request("list_actions", None).await;
         Ok(actions::list().await)
     }
 }
@@ -178,6 +185,7 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
+        parameters: Option<ParamValues>,
     ) -> Result<
         (
             BoxStream<'static, Result<FlightData, Status>>,
@@ -185,7 +193,14 @@ impl Service {
         ),
         Status,
     > {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
+
+        let query = match parameters {
+            Some(parameters) => query.parameters(parameters),
+            None => query,
+        };
+
+        let query = query.build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
 

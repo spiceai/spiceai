@@ -149,15 +149,10 @@ spice chat --model <model> "What is Spice.ai?"
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
-		err := rtcontext.Init()
+		err := rtcontext.Init(cmd.Flags())
 		if err != nil {
-			slog.Error("could not initialize runtime context", "error", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
-		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
 		}
 
 		temperature, err := cmd.Flags().GetFloat32("temperature")
@@ -179,15 +174,6 @@ spice chat --model <model> "What is Spice.ai?"
 
 		if !cloud {
 			rtcontext.RequireModelsFlavor(cmd)
-		}
-
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
-		if err != nil {
-			slog.Error("could not get http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)

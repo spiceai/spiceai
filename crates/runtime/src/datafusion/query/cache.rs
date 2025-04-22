@@ -18,11 +18,13 @@ use std::{collections::HashSet, sync::Arc};
 
 use cache::{CacheKey, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream};
 use datafusion::{
+    common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
     physical_plan::memory::MemoryStream,
     sql::TableReference,
 };
+use snafu::ResultExt;
 use tracing::Span;
 
 use crate::{
@@ -30,7 +32,9 @@ use crate::{
     request::{CacheControl, CacheKeyType, RequestContext},
 };
 
-use super::{Query, QueryResult, QueryTracker, attach_query_tracker_to_stream};
+use super::{
+    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
+};
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
@@ -69,6 +73,7 @@ impl Query {
         session: &SessionState,
         request_context: Arc<RequestContext>,
         sql: &str,
+        parameters: Option<ParamValues>,
         tracker: QueryTracker,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
@@ -94,6 +99,14 @@ impl Query {
                 tracker.finish_with_error(&request_context, snafu_error.to_string(), error_code);
                 return Err(snafu_error);
             }
+        };
+
+        // Use the logical plan with parameter values for caching and lookup
+        let plan = match parameters {
+            Some(param_values) => plan
+                .with_param_values(param_values)
+                .context(BindingParametersSnafu)?,
+            None => plan,
         };
 
         // Try to get cached results from plan
