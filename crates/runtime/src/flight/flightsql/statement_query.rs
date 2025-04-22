@@ -46,7 +46,7 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+    let (arrow_schema, _) = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
         .await
         .map_err(to_tonic_err)?;
 
