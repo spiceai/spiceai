@@ -192,8 +192,8 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (sql, parameters) = match content_type {
-        Some("application/json") => match serde_json::from_slice::<ParameterizedQuery>(&body) {
+    let (sql, parameters) = if let Some("application/json") = content_type {
+        match serde_json::from_slice::<ParameterizedQuery>(&body) {
             Ok(ParameterizedQuery { sql, parameters }) => {
                 let parameters = match param_utils::convert_json_to_param_values(parameters) {
                     Ok(p) => p,
@@ -210,17 +210,16 @@ pub(crate) async fn post(
                 tracing::debug!("Error parsing JSON: {e}");
                 return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
             }
-        },
-        _ => {
-            let sql = match String::from_utf8(body.to_vec()) {
-                Ok(query) => query,
-                Err(e) => {
-                    tracing::debug!("Error reading query: {e}");
-                    return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-                }
-            };
-            (sql, None)
         }
+    } else {
+        let sql = match String::from_utf8(body.to_vec()) {
+            Ok(query) => query,
+            Err(e) => {
+                tracing::debug!("Error reading query: {e}");
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+        };
+        (sql, None)
     };
 
     sql_to_http_response(
