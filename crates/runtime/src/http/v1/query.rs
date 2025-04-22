@@ -200,7 +200,7 @@ pub(crate) async fn post(
                         Ok(p) => p,
                         Err(e) => {
                             tracing::debug!("Error converting parameters: {e}");
-                            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
+                            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}"))
                                 .into_response();
                         }
                     };
@@ -209,8 +209,7 @@ pub(crate) async fn post(
                 }
                 Err(e) => {
                     tracing::debug!("Error parsing JSON: {e}");
-                    return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-                        .into_response();
+                    return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
                 }
             }
         }
