@@ -50,6 +50,7 @@ duckdb = { workspace = true, features = [
     "vtab",
     "vtab-arrow",
 ], optional = true }
+event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true

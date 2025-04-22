@@ -4335,7 +4335,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "event-stream"
+name = "event_stream"
 version = "1.2.0-unstable"
 dependencies = [
  "futures",
@@ -10806,6 +10806,7 @@ dependencies = [
  "document_parse",
  "dotenvy",
  "duckdb",
+ "event_stream",
  "flight_client",
  "flightrepl",
  "fundu",
@@ -11959,7 +11960,7 @@ version = "1.2.0-unstable"
 dependencies = [
  "app",
  "clap",
- "event-stream",
+ "event_stream",
  "flightrepl",
  "futures",
  "opentelemetry 0.27.1",

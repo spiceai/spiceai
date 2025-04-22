@@ -45,7 +45,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use tokio::sync::broadcast::{self, Receiver, Sender};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::span::Attributes;
-use tracing::{field::Visit, Event, Id, Subscriber};
+use tracing::{Event, Id, Subscriber, field::Visit};
 use tracing_subscriber::layer::{Context, Layer};
 
 #[derive(Debug, Snafu)]

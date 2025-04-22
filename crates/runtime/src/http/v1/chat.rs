@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use core::time;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
 #[cfg(feature = "openapi")]
@@ -23,8 +27,9 @@ use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
     error::OpenAIError,
     types::{
-        ChatChoice, ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        CreateChatCompletionRequest,
+        ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
+        CreateChatCompletionStreamResponse, Role,
     },
 };
 use async_stream::stream;
@@ -36,9 +41,15 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
+use event_stream::get_event_stream;
 use futures::StreamExt;
+use llms::chat::Chat;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::{
+    select,
+    sync::{RwLock, mpsc::channel, oneshot},
+};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
 
 /// Create Chat Completion
@@ -123,17 +134,7 @@ pub(crate) async fn post(
         match llms.read().await.get(&model_id) {
             Some(model) => {
                 if req.stream.unwrap_or_default() {
-                    match model.chat_stream(req).await {
-                        Ok(strm) => {
-                            create_sse_response(strm, time::Duration::from_secs(30), span_clone)
-                        }
-                        Err(e) => {
-                            tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                            tracing::error!("Error from v1/chat: {e}");
-
-                            openai_error_to_response(e)
-                        }
-                    }
+                    handle_streaming(model, req, true).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
@@ -162,6 +163,112 @@ pub(crate) async fn post(
     }
     .instrument(span)
     .await
+}
+
+/// Handle the SSE logic for when `v1/chat/completion` endpoint sets `"stream": true`.
+/// Expect the [`tracing::Span`] involved in the chat completion to be already [`Span::entered`].
+async fn handle_streaming(
+    model: &Arc<dyn Chat>,
+    req: CreateChatCompletionRequest,
+    include_stream_events: bool,
+) -> Response {
+    let span = Span::current();
+    tracing::info!(
+        target: "task_history",
+        progress = format!("This is a nice little test of the event stream for model {}", req.model.clone()),
+    );
+
+    let (tx, rx) = channel(100);
+    let tx = Arc::new(tx);
+
+    let (end_completion, completion_done) = oneshot::channel::<()>();
+
+    if include_stream_events {
+        let mut events = match get_event_stream() {
+            Ok(o) => o,
+            Err(e) => {
+                return openai_error_to_response(OpenAIError::StreamError(format!(
+                    "An error occurred in reading progress: {e}"
+                )));
+            }
+        };
+
+        let tx_clone = Arc::clone(&tx);
+        tokio::spawn(async move {
+            let mut chat_completion_ended = Box::pin(futures::stream::once(async move {
+                let _ = completion_done.await;
+            }));
+
+            select! {
+                Some(evnt) = events.next() =>  {
+                    println!("Event:: {evnt}");
+                    let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
+                },
+                _ = chat_completion_ended.next() => {
+                    // chat completion from LLM complete.
+                    return;
+                }
+            };
+        });
+    }
+
+    let mut stream: ChatCompletionResponseStream = match model.chat_stream(req).await {
+        Ok(strm) => strm,
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            tracing::error!("Error from v1/chat: {e}");
+
+            return openai_error_to_response(e);
+        }
+    };
+
+    tokio::spawn(async move {
+        while let Some(pkt) = stream.next().await {
+            let _ = tx.send(pkt).await;
+        }
+        let _ = end_completion.send(());
+    });
+
+    create_sse_response(
+        Box::pin(ReceiverStream::new(rx)),
+        time::Duration::from_secs(30),
+        span,
+    )
+}
+
+#[allow(clippy::cast_possible_truncation, deprecated)]
+pub(crate) fn create_working_stream_payload(
+    content: String,
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+    let created = u32::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+            .as_secs(),
+    )
+    .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+    Ok(CreateChatCompletionStreamResponse {
+        created,
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage: None,
+        model: String::new(),
+        id: String::new(),
+        choices: vec![ChatChoiceStream {
+            index: 0,
+            finish_reason: None,
+            logprobs: None,
+            delta: ChatCompletionStreamResponseDelta {
+                content: Some(content),
+                function_call: None,
+                tool_calls: None,
+                role: Some(Role::Assistant),
+                refusal: None,
+            },
+        }],
+    })
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].

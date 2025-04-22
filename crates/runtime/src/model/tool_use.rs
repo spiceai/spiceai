@@ -207,6 +207,7 @@ impl ToolUsingChat {
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
         );
+
         for (tool_call, _) in &tool_and_response_content {
             tracing::info!(
                 target: "task_history",
