@@ -178,6 +178,7 @@ impl DataFusionBuilder {
             data_writers: RwLock::new(HashSet::new()),
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
+            cached_plans: TokioRwLock::default(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
         }

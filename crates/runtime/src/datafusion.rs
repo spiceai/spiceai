@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -45,7 +45,9 @@ use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
@@ -253,12 +255,15 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
+type Sql = String;
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+    cached_plans: TokioRwLock<HashMap<Sql, LogicalPlan>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -1333,6 +1338,28 @@ impl DataFusion {
                 tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
             }
         }
+    }
+
+    /// Create or get a logical plan from the query
+    async fn get_or_create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let cached_plans = self.cached_plans.read().await;
+        if let Some(plan) = cached_plans.get(sql) {
+            tracing::trace!("using cached plan for {sql}");
+            return Ok(plan.clone());
+        }
+        drop(cached_plans); // drop the lock
+
+        let plan = session.create_logical_plan(sql).await?;
+
+        tracing::trace!("caching plan for {sql}");
+        let mut cached_plans = self.cached_plans.write().await;
+        cached_plans.insert(sql.to_string(), plan.clone());
+
+        Ok(plan)
     }
 }
 
