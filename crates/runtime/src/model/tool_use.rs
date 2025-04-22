@@ -207,6 +207,12 @@ impl ToolUsingChat {
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
         );
+        for (tool_call, _) in &tool_and_response_content {
+            tracing::info!(
+                target: "task_history",
+                progress = format!("Tool {} called with args {}.", tool_call.function.name, tool_call.function.arguments),
+            );
+        }
 
         // Tell model the assistant used these tools, and provided result.
         let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content

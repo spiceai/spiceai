@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+event-stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
 opentelemetry.workspace = true
@@ -46,24 +47,24 @@ cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
-  "duckdb",
-  "postgres",
-  "sqlite",
-  "mysql",
-  "flightsql",
-  "delta_lake",
-  "databricks",
-  "dremio",
-  "clickhouse",
-  "sharepoint",
-  "snowflake",
-  "spark",
-  "ftp",
-  "debezium",
-  "anonymous_telemetry",
-  "mssql",
-  "dynamodb",
-  "imap",
+    "duckdb",
+    "postgres",
+    "sqlite",
+    "mysql",
+    "flightsql",
+    "delta_lake",
+    "databricks",
+    "dremio",
+    "clickhouse",
+    "sharepoint",
+    "snowflake",
+    "spark",
+    "ftp",
+    "debezium",
+    "anonymous_telemetry",
+    "mssql",
+    "dynamodb",
+    "imap",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
