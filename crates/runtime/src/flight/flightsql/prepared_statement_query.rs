@@ -325,7 +325,17 @@ mod tests {
     #[test]
     fn test_query_with_comments() {
         let input = "SELECT * FROM users WHERE id = ? -- comment with ?";
-        let expected = "SELECT * FROM users WHERE id = $1 -- comment with ?";
+        let expected = "SELECT * FROM users WHERE id = $1";
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_query_with_backticks() {
+        let input = "SELECT `name`, `age` FROM `users` WHERE `id` = ?";
+        let expected = "SELECT `name`, `age` FROM `users` WHERE `id` = $1";
         assert_eq!(
             convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
@@ -343,8 +353,19 @@ mod tests {
     }
 
     #[test]
-    fn test_unclosed_quote() {
+    fn test_unclosed_quote_no_placeholders() {
         let input = "SELECT * FROM users WHERE name = 'test";
+
+        // Should return the original query because it doesn't contain any JDBC parameter placeholders
+        assert_eq!(
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
+            Cow::Borrowed(input)
+        );
+    }
+
+    #[test]
+    fn test_unclosed_quote_with_placeholders() {
+        let input = "SELECT * FROM users WHERE name = 'test?";
         assert!(matches!(
             convert_jdbc_parameter_placeholders(input).expect_err("should fail"),
             Error::InvalidQuery { .. }
@@ -352,9 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn test_query_with_backticks() {
-        let input = "SELECT `name`, `age` FROM `users` WHERE `id` = ?";
-        let expected = "SELECT \"name\", \"age\" FROM \"users\" WHERE \"id\" = $1";
+    fn test_query_with_one_placeholders() {
+        let input = "SELECT name, age FROM users WHERE id = ?";
+        let expected = "SELECT name, age FROM users WHERE id = $1";
         assert_eq!(
             convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
@@ -362,9 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn test_backticks_and_postgres_style() {
-        let input = "SELECT `name` FROM `users` WHERE `id` = $1";
-        let expected = "SELECT \"name\" FROM \"users\" WHERE \"id\" = $1";
+    fn test_postgres_style() {
+        let input = "SELECT name FROM users WHERE id = $1";
+        let expected = "SELECT name FROM users WHERE id = $1";
         assert_eq!(
             convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
