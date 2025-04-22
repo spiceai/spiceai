@@ -32,14 +32,16 @@ var catalogsCmd = &cobra.Command{
 spice catalogs
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
+		var rtcontext *context.RuntimeContext
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
+		} else {
+			rtcontext = context.NewContext()
 		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
 		catalogs, err := api.GetData[api.Catalog](rtcontext, "/v1/catalogs")

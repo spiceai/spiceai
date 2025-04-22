@@ -50,10 +50,10 @@ func init() {
 
 func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
-		ctx := context.NewContext()
-		err := ctx.Init()
+		rtcontext := context.NewContext()
+		err := rtcontext.Init(cmd.Flags())
 		if err != nil {
-			slog.Error("could not initialize runtime context", "error", err)
+			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
 
@@ -62,20 +62,21 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 		slog.Info(fmt.Sprintf("Getting Spicepod %s ...\n", podPath))
 
 		if connect {
-			if ctx.GetApiKey() == "" {
-				slog.Error("A valid Spice.ai Cloud Platform API key was not provided. Run `spice login` to authenticate before proceeding.")
+			apiKey, err := rtcontext.GetApiKey()
+			if err != nil || apiKey == "" {
+				slog.Error("Missing or invalid Spice.ai Cloud API key. Run `spice login` to authenticate and continue.")
 				os.Exit(1)
 			}
 
 			headers := map[string]string{
 				"Spice-Target-Source": "spice.ai",
-				"X-API-Key":           ctx.GetApiKey(),
+				"X-API-Key":           apiKey,
 			}
-			ctx.AddHeaders(headers)
+			rtcontext.AddHeaders(headers)
 		}
 
 		r := registry.GetRegistry(podPath)
-		downloadPath, err := r.GetPod(ctx, podPath)
+		downloadPath, err := r.GetPod(rtcontext, podPath)
 		if err != nil {
 			var itemNotFound *registry.RegistryItemNotFound
 			if errors.As(err, &itemNotFound) {
@@ -146,7 +147,7 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 
 		slog.Info(fmt.Sprintf("added %s\n", relativePath))
 
-		err = checkLatestCliReleaseVersion()
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}

@@ -36,10 +36,10 @@ spice models
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
 			rtcontext = context.NewHttpsContext(rootCertPath)
 		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
 		model_statuses, _, err := api.GetComponentStatuses(rtcontext)

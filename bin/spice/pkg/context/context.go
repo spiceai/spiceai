@@ -26,10 +26,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
@@ -44,29 +46,21 @@ const (
 
 type RuntimeContext struct {
 	spiceRuntimeDir string
+	flags           *pflag.FlagSet
 	spiceBinDir     string
 	appDir          string
 	podsDir         string
-	httpEndpoint    string
-	metricsEndpoint string
 	isCloud         bool
 	httpClient      *http.Client
-	apiKey          string
 	userAgent       string
 	extraHeaders    map[string]string
 }
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpEndpoint:    "http://127.0.0.1:8090",
-		metricsEndpoint: "http://127.0.0.1:9090",
-		httpClient:      &http.Client{},
-		userAgent:       util.GetSpiceUserAgent("spice"),
-		extraHeaders:    make(map[string]string),
-	}
-	err := rtcontext.Init()
-	if err != nil {
-		panic(err)
+		httpClient:   &http.Client{},
+		userAgent:    util.GetSpiceUserAgent("spice"),
+		extraHeaders: make(map[string]string),
 	}
 	return rtcontext
 }
@@ -95,14 +89,7 @@ func NewHttpsContext(rootCertPath string) *RuntimeContext {
 	}
 
 	rtcontext := &RuntimeContext{
-		httpEndpoint:    "https://127.0.0.1:8090",
-		metricsEndpoint: "https://127.0.0.1:9090",
-		httpClient:      client,
-	}
-
-	err = rtcontext.Init()
-	if err != nil {
-		panic(err)
+		httpClient: client,
 	}
 	return rtcontext
 }
@@ -124,14 +111,18 @@ func (c *RuntimeContext) PodsDir() string {
 }
 
 func (c *RuntimeContext) HttpEndpoint() string {
-	return c.httpEndpoint
+	if endpoint, err := c.flags.GetString("http-endpoint"); err == nil && endpoint != "" {
+		return endpoint
+	}
+
+	if c.IsCloud() {
+		return "https://data.spiceai.io"
+	}
+
+	return "http://127.0.0.1:8090"
 }
 
-func (c *RuntimeContext) MetricsEndpoint() string {
-	return c.metricsEndpoint
-}
-
-func (c *RuntimeContext) Init() error {
+func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -139,6 +130,7 @@ func (c *RuntimeContext) Init() error {
 
 	c.spiceRuntimeDir = filepath.Join(homeDir, constants.DotSpice)
 	c.spiceBinDir = filepath.Join(c.spiceRuntimeDir, "bin")
+	c.flags = flags
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -154,7 +146,9 @@ func (c *RuntimeContext) Init() error {
 	}
 
 	if apiKey, ok := dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
-		c.apiKey = apiKey
+		if err := flags.Set("api-key", apiKey); err != nil {
+			return fmt.Errorf("failed to set api-key flag from SPICE_SPICEAI_API_KEY environment variable: %w", err)
+		}
 	}
 
 	return nil
@@ -187,6 +181,40 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
 	}
+}
+
+func (c *RuntimeContext) EnsureInstalled(flavor constants.Flavor, autoUpgrade bool, allowAccelerator bool) (bool, error) {
+	if !flavor.IsValid() {
+		return false, fmt.Errorf("invalid flavor")
+	}
+
+	shouldInstall := false
+	var err error
+	var upgradeVersion string
+	if installRequired := c.IsRuntimeInstallRequired(); installRequired {
+		slog.Info("Spice runtime installation required")
+		shouldInstall = true
+	} else {
+		upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
+		if err != nil {
+			slog.Warn("error checking for runtime upgrade", "error", err)
+		} else if upgradeVersion != "" && autoUpgrade {
+			shouldInstall = true
+		}
+	}
+
+	if models, _ := c.ModelsFlavorInstalled(); !models && flavor == constants.FlavorAI {
+		shouldInstall = true
+	}
+
+	if shouldInstall {
+		err = c.InstallMatchingRuntime(flavor, allowAccelerator)
+		if err != nil {
+			return shouldInstall, err
+		}
+	}
+
+	return shouldInstall, nil
 }
 
 // Return type = (models, accelerated)
@@ -224,7 +252,7 @@ func (c *RuntimeContext) ModelsFlavorInstalled() (models bool, accelerated bool)
 }
 
 func (c *RuntimeContext) RuntimeUnavailableError() error {
-	return fmt.Errorf("the Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
+	return fmt.Errorf("the Spice runtime is unavailable at %s. Is it running?", c.HttpEndpoint())
 }
 
 func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
@@ -300,7 +328,8 @@ func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 	spiceArgs := []string{
 		"--pods-watcher-enabled",
 	}
-	args = append(spiceArgs, args...)
+
+	args = append(spiceArgs, c.getRuntimeArgsFromFlags(args)...)
 
 	cmd := exec.Command(spiceCMD, args...)
 
@@ -326,21 +355,12 @@ func (c *RuntimeContext) binaryFilePath(binaryFilePrefix string) string {
 }
 
 func (c *RuntimeContext) WithCloud(isCloud bool) *RuntimeContext {
-	if isCloud {
-		c.httpEndpoint = "https://data.spiceai.io"
-	} else {
-		c.httpEndpoint = "http://localhost:8090"
-	}
 	c.isCloud = isCloud
 	return c
 }
 
-func (c *RuntimeContext) SetApiKey(apiKey string) {
-	c.apiKey = apiKey
-}
-
-func (c *RuntimeContext) GetApiKey() string {
-	return c.apiKey
+func (c *RuntimeContext) GetApiKey() (string, error) {
+	return c.flags.GetString("api-key")
 }
 
 func (c *RuntimeContext) SetUserAgent(userAgent string) {
@@ -373,8 +393,8 @@ func (c *RuntimeContext) GetHeaders() map[string]string {
 	}
 
 	// api_key from context takes precedence
-	if c.apiKey != "" {
-		headers["X-API-Key"] = c.apiKey
+	if cmdApiKey, err := c.GetApiKey(); err == nil && cmdApiKey != "" {
+		headers["X-API-Key"] = cmdApiKey
 	}
 
 	for key, value := range c.extraHeaders {
@@ -386,10 +406,6 @@ func (c *RuntimeContext) GetHeaders() map[string]string {
 
 func (c *RuntimeContext) IsCloud() bool {
 	return c.isCloud
-}
-
-func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
-	c.httpEndpoint = endpoint
 }
 
 func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error) {
@@ -411,6 +427,49 @@ func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error)
 	}
 
 	return constants.OtherInstall, executableDir, nil
+}
+
+func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
+	if rootCertPath, err := c.flags.GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
+		args = append(args, "--tls-root-certificate-file", rootCertPath)
+	}
+
+	if apiKey, err := c.flags.GetString("api-key"); err == nil && apiKey != "" {
+		args = append(args, "--api-key", apiKey)
+	}
+
+	if c.userAgent != "" {
+		args = append(args, "--user-agent", c.userAgent)
+	} else if userAgent, err := c.flags.GetString("user-agent"); err == nil && userAgent != "" {
+		args = append(args, "--user-agent", userAgent)
+	}
+
+	if cacheControl, err := c.flags.GetString("cache-control"); err == nil && cacheControl != "" {
+		args = append(args, "--cache-control", cacheControl)
+	}
+
+	if flight, err := c.flags.GetString("flight-endpoint"); err == nil && flight != "" {
+		if slices.Contains(args, "--repl") {
+			args = append(args, "--repl-flight-endpoint", flight)
+		} else {
+			args = append(args, "--flight", flight)
+		}
+	}
+
+	args = append(args, "--http-endpoint", c.HttpEndpoint())
+
+	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
+		args = append(args, "--metrics", endpoint)
+	}
+
+	if capturedOutput, err := c.flags.GetString("captured-output"); err == nil && capturedOutput != "" {
+		args = append(args, "--set-runtime", "task_history.captured_output="+capturedOutput)
+	} else {
+		// Set the default value for captured_output to truncated to provide a better local developer experience with spice trace.
+		args = append(args, "--set-runtime", "task_history.captured_output=truncated")
+	}
+
+	return args
 }
 
 func getBrewPrefix() string {

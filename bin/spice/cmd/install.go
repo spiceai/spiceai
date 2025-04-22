@@ -23,7 +23,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
-	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -39,9 +38,16 @@ spice install ai
 # See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		rtcontext := context.NewContext()
+		err := rtcontext.Init(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
+
 		slog.Info("Checking for latest Spice runtime release...")
 
-		err := checkLatestCliReleaseVersion()
+		err = checkLatestCliReleaseVersion(rtcontext)
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
@@ -75,12 +81,6 @@ spice install ai
 		}
 
 		if force {
-			rtcontext := context.NewContext()
-			err := rtcontext.Init()
-			if err != nil {
-				slog.Error("initializing runtime context", "error", err)
-				os.Exit(1)
-			}
 			err = rtcontext.InstallMatchingRuntime(flavor, !cpu)
 			if err != nil {
 				slog.Error("installing runtime", "error", err)
@@ -88,7 +88,7 @@ spice install ai
 			}
 			installed = true
 		} else {
-			installed, err = runtime.EnsureInstalled(flavor, true, !cpu)
+			installed, err = rtcontext.EnsureInstalled(flavor, true, !cpu)
 			if err != nil {
 				slog.Error("verifying runtime install", "error", err)
 				os.Exit(1)
