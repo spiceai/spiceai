@@ -39,7 +39,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
 
-    /// User defined name & description, not from underlying MCP.
+    /// Spicepod defined name & description, not from underlying MCP.
     name: String,
     heartbeat_task: tokio::task::JoinHandle<()>,
 }
@@ -190,8 +190,11 @@ impl SpiceToolCatalog for McpToolCatalog {
         tools
             .into_iter()
             .map(|t| {
-                Arc::new(McpToolWrapper::new(Arc::clone(&self.client), t))
-                    as Arc<dyn SpiceModelTool>
+                Arc::new(McpToolWrapper::new(
+                    Arc::clone(&self.client),
+                    t,
+                    self.name.clone(),
+                )) as Arc<dyn SpiceModelTool>
             })
             .collect()
     }
@@ -221,6 +224,7 @@ impl SpiceToolCatalog for McpToolCatalog {
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
             tool,
+            self.name.clone(),
         )))
     }
 }

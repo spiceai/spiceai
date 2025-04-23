@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{cell::LazyCell, collections::BTreeMap, sync::Arc};
 
 use ::cache::{QueryResult, get_logical_plan_input_tables};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
+use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, context::SQLOptions},
+    logical_expr::LogicalPlan,
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::DataFrame,
 };
@@ -246,7 +248,8 @@ impl Query {
             .finish_with_error(request_context, error_message, error_code);
     }
 
-    pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
+    /// Return the schema for the data and (possibly) the parameters of a [`Query`].
+    pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
         let plan = match session.create_logical_plan(&self.sql).await {
@@ -264,7 +267,10 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        Ok(plan.schema().as_arrow().clone())
+        let dataset_schema = plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        Ok((dataset_schema, parameter_schema))
     }
 
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
@@ -275,6 +281,34 @@ impl Query {
             self.finish_with_error(request_context, e.to_string(), error_code);
         });
     }
+}
+
+fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataFusionError> {
+    let parameters = plan
+        .get_parameter_types()?
+        .into_iter()
+        .map(|(name, dt)| {
+            // If cannot determine datatype, we are assuming UInt64.
+            // This appears to occur for LIMIT parameters such as for:
+            // ```sql
+            // SELECT * FROM table LIMIT $1
+            // ```
+            // Other cases are not known
+            (name, dt.unwrap_or(arrow_schema::DataType::UInt64))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let maybe_schema = if parameters.is_empty() {
+        None
+    } else {
+        let mut builder = SchemaBuilder::new();
+        parameters
+            .into_iter()
+            .for_each(|(name, typ)| builder.push(Field::new(name, typ, false)));
+        Some(builder.finish())
+    };
+
+    Ok(maybe_schema)
 }
 
 #[must_use]

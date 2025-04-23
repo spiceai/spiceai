@@ -54,25 +54,6 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
-        Some(principal) => {
-            if !principal
-                .groups()
-                .iter()
-                .any(|group| *group == "write" || *group == "read_write")
-            {
-                return Err(Status::permission_denied(
-                    "Write access denied. Verify that authentication key used has write access and try again.",
-                ));
-            }
-        }
-        None => {
-            return Err(Status::unauthenticated(
-                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
-            ));
-        }
-    }
-
     let mut streaming_flight = request.into_inner().peekable();
 
     // We need to peek at the stream in case we branch below to prepared statements
@@ -91,6 +72,25 @@ pub(crate) async fn handle(
         {
             return prepared_statement_query::do_put_query(flight_svc, query, streaming_flight)
                 .await;
+        }
+    }
+
+    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
+        Some(principal) => {
+            if !principal
+                .groups()
+                .iter()
+                .any(|group| *group == "write" || *group == "read_write")
+            {
+                return Err(Status::permission_denied(
+                    "Write access denied. Verify that authentication key used has write access and try again.",
+                ));
+            }
+        }
+        None => {
+            return Err(Status::unauthenticated(
+                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+            ));
         }
     }
 

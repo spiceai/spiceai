@@ -98,3 +98,19 @@ pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .with_unit("ms")
         .build()
 });
+
+pub static MAX_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("max_memory_usage_mb")
+        .with_description("The maximum observed memory usage during the test.")
+        .with_unit("mb")
+        .build()
+});
+
+pub static MEDIAN_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("median_memory_usage_mb")
+        .with_description("The median observed memory usage during the test.")
+        .with_unit("mb")
+        .build()
+});
