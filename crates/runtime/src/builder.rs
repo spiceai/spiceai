@@ -18,7 +18,6 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
 use tokio::sync::RwLock;
-use workers::WorkerRegistry;
 
 use crate::{
     Runtime, catalogconnector,
@@ -197,7 +196,6 @@ impl RuntimeBuilder {
             status: self.runtime_status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
-            workers: Arc::new(RwLock::new(WorkerRegistry::new())),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

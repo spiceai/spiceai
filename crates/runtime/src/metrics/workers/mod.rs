@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{Counter, Histogram, LazyLock, Meter, UpDownCounter, global};
+use super::{Histogram, LazyLock, Meter, UpDownCounter, global};
 
 pub(crate) static WORKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("worker"));
 
@@ -29,12 +29,5 @@ pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
     WORKERS_METER
         .f64_histogram("spice.workers.load_duration_ms")
         .with_description("Time to load a worker in milliseconds")
-        .build()
-});
-
-pub(crate) static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    WORKERS_METER
-        .u64_counter("spice.workers.load_errors")
-        .with_description("Number of worker load errors")
         .build()
 });

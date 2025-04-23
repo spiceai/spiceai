@@ -14816,12 +14816,16 @@ name = "workers"
 version = "1.2.0-unstable"
 dependencies = [
  "arrow",
+ "async-openai",
  "async-trait",
- "model_components",
+ "llms",
+ "rand 0.9.0",
  "secrecy",
+ "serde",
  "serde_json",
  "snafu",
  "spicepod",
+ "tokio",
 ]
 
 [[package]]

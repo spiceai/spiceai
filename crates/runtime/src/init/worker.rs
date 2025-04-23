@@ -14,129 +14,62 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Allow dead code until next PR
-#![allow(dead_code)]
+use std::sync::Arc;
 
-use std::{collections::HashMap, sync::Arc};
-
-use crate::{Runtime, get_params_with_secrets, metrics, status, timing::TimeMeasurement, workers};
+use crate::{Runtime, metrics, status, timing::TimeMeasurement};
+use ::workers::RouterModel;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to load worker: {name}.\n{source}"))]
-    FailedToLoadWorker {
-        name: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
+pub enum Error {}
 
 impl Runtime {
-    pub(crate) async fn load_workers(self: Arc<Self>) {
+    pub(crate) async fn load_workers(&self) {
         let app_lock = self.app.read().await;
 
         if let Some(app) = app_lock.as_ref() {
             for worker in &app.workers {
                 self.status
                     .update_worker(&worker.name, status::ComponentStatus::Initializing);
-                if let Err(e) = self.load_worker(worker).await {
-                    tracing::warn!("Failed to load worker [{}]: {}", worker.name, e);
-                    self.status
-                        .update_worker(&worker.name, status::ComponentStatus::Error);
-                }
+                self.load_worker(worker).await;
             }
         }
     }
 
-    async fn load_worker(
-        &self,
-        worker_config: &spicepod::component::worker::Worker,
-    ) -> Result<(), Error> {
-        let source_str = worker_config.from.clone();
+    async fn load_worker(&self, cfg: &spicepod::component::worker::Worker) {
         let _guard = TimeMeasurement::new(
             &metrics::workers::LOAD_DURATION_MS,
-            &[
-                KeyValue::new("worker", worker_config.name.clone()),
-                KeyValue::new("source", source_str.clone()),
-            ],
+            &[KeyValue::new("worker", cfg.name.clone())],
         );
 
-        tracing::info!(
-            "Loading worker [{}] from {}...",
-            worker_config.name,
-            worker_config.from
-        );
+        tracing::info!("Loading worker [{}]...", cfg.name);
 
-        // Get required secrets
-        let p = worker_config
-            .params
-            .iter()
-            .map(|(k, v)| {
-                let k = k.clone();
-                match v.as_str() {
-                    Some(s) => (k, s.to_string()),
-                    None => (k, v.to_string()),
-                }
-            })
-            .collect::<HashMap<_, _>>();
+        // Currently, only worker paradigm is [`RouterModel`].
+        let worker = RouterModel::new(cfg.name.clone(), cfg.models.clone(), Arc::clone(&self.llms));
 
-        let params = get_params_with_secrets(self.secrets(), &p).await;
+        let mut llm_registry = self.llms.write().await;
+        llm_registry.insert(cfg.name.clone(), Arc::new(worker));
 
-        // Use the new worker factory system to load the worker
-        match workers::load_worker(worker_config, Arc::new(params)).await {
-            Ok(worker) => {
-                // Add worker to registry
-                let mut registry = self.workers.write().await;
-                registry.add(worker);
-
-                tracing::info!("Worker [{}] loaded, ready for use", worker_config.name);
-                metrics::workers::COUNT.add(
-                    1,
-                    &[
-                        KeyValue::new("worker", worker_config.name.clone()),
-                        KeyValue::new("source", source_str),
-                    ],
-                );
-                self.status
-                    .update_worker(&worker_config.name, status::ComponentStatus::Ready);
-                Ok(())
-            }
-            Err(e) => {
-                metrics::workers::LOAD_ERROR.add(1, &[]);
-                self.status
-                    .update_worker(&worker_config.name, status::ComponentStatus::Error);
-                Err(Error::FailedToLoadWorker {
-                    name: worker_config.name.clone(),
-                    source: Box::new(e),
-                })
-            }
-        }
+        tracing::info!("Worker [{}] loaded, ready for use", cfg.name);
+        metrics::workers::COUNT.add(1, &[KeyValue::new("worker", cfg.name.clone())]);
+        self.status
+            .update_worker(&cfg.name, status::ComponentStatus::Ready);
     }
 
-    async fn remove_worker(&self, worker_config: &spicepod::component::worker::Worker) {
-        let mut registry = self.workers.write().await;
-        registry.remove(&worker_config.name);
+    async fn remove_worker(&self, cfg: &spicepod::component::worker::Worker) {
+        let mut llm_registry = self.llms.write().await;
+        llm_registry.remove(&cfg.name);
 
-        tracing::info!("Worker [{}] has been unloaded", worker_config.name);
-        metrics::workers::COUNT.add(
-            -1,
-            &[
-                KeyValue::new("worker", worker_config.name.clone()),
-                KeyValue::new("source", worker_config.from.clone()),
-            ],
-        );
+        tracing::info!("Worker [{}] has been unloaded", cfg.name);
+        metrics::workers::COUNT.add(-1, &[KeyValue::new("worker", cfg.name.clone())]);
     }
 
     async fn update_worker(&self, worker_config: &spicepod::component::worker::Worker) {
         self.status
             .update_worker(&worker_config.name, status::ComponentStatus::Refreshing);
         self.remove_worker(worker_config).await;
-        if let Err(e) = self.load_worker(worker_config).await {
-            tracing::warn!("Failed to update worker [{}]: {}", worker_config.name, e);
-            self.status
-                .update_worker(&worker_config.name, status::ComponentStatus::Error);
-        }
+        self.load_worker(worker_config).await;
     }
 
     pub(crate) async fn apply_worker_diff(
@@ -162,11 +95,7 @@ impl Runtime {
             } else {
                 self.status
                     .update_worker(&worker.name, status::ComponentStatus::Initializing);
-                if let Err(e) = self.load_worker(worker).await {
-                    tracing::warn!("Failed to load worker [{}]: {}", worker.name, e);
-                    self.status
-                        .update_worker(&worker.name, status::ComponentStatus::Error);
-                }
+                self.load_worker(worker).await;
             }
         }
     }

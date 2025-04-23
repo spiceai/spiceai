@@ -26,8 +26,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub mod model;
-pub use model::ModelWorker;
+pub mod router;
+pub use router::RouterModel;
 
 /// Error types for worker operations
 #[derive(Debug, Snafu)]
@@ -59,9 +59,6 @@ pub trait SpiceWorker: Sync + Send {
 
     /// Get the parameters of the worker
     fn params(&self) -> &HashMap<String, Value>;
-
-    /// Get the dependencies of the worker
-    fn depends_on(&self) -> &Vec<String>;
 
     /// Load the worker's resources
     async fn load(&self, _params: Arc<HashMap<String, SecretString>>) -> Result<()> {
@@ -111,59 +108,4 @@ impl Default for WorkerRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Factory function to create a worker based on the "from" string
-pub fn load_worker(
-    worker_config: &spicepod::component::worker::Worker,
-) -> Result<Box<dyn SpiceWorker>> {
-    // Extract the worker type from the "from" string
-    let parts: Vec<&str> = worker_config.from.splitn(2, ':').collect();
-    let worker_type = parts.first().map_or("", |s| *s);
-
-    match worker_type {
-        "model" | "models" => {
-            // For model workers, extract the actual model source
-            let model_source = if parts.len() > 1 {
-                parts[1]
-            } else {
-                return Err(Error::InvalidWorkerConfig {
-                    message: "Model source not specified in 'from' field. Format should be 'models:<model-source>'".to_string() 
-                });
-            };
-
-            // Create a new ModelWorker with the extracted model source and all parameters
-            let model_worker = ModelWorker::new(
-                model_source,
-                worker_config.name.clone(),
-                worker_config.role.clone(),
-            )
-            .with_description(worker_config.description.clone().unwrap_or_default())
-            .with_params(worker_config.params.clone())
-            .with_depends_on(worker_config.depends_on.clone());
-
-            Ok(Box::new(model_worker))
-        }
-        // Add other worker types here as needed
-        "" => Err(Error::InvalidWorkerConfig {
-            message: "Worker type not specified in 'from' field".to_string(),
-        }),
-        _ => Err(Error::UnsupportedWorkerType {
-            worker_type: worker_type.to_string(),
-        }),
-    }
-}
-
-/// Loads a worker from a spicepod worker configuration
-#[allow(clippy::implicit_hasher)]
-pub async fn initialize_worker(
-    worker_config: &spicepod::component::worker::Worker,
-    params: Arc<HashMap<String, SecretString>>,
-) -> Result<Box<dyn SpiceWorker>> {
-    let worker = load_worker(worker_config)?;
-
-    // Initialize the worker
-    worker.load(params).await?;
-
-    Ok(worker)
 }

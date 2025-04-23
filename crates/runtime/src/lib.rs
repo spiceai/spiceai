@@ -48,7 +48,6 @@ pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
 use crate::tools::{SpiceModelTool, with_name};
-use ::workers::WorkerRegistry;
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -105,7 +104,6 @@ pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod view;
-pub mod workers;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -359,8 +357,6 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
-
-    workers: Arc<RwLock<WorkerRegistry>>,
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
@@ -698,6 +694,7 @@ impl Runtime {
 
                 #[cfg(feature = "models")]
                 {
+                    self_clone.load_workers().await;
                     self_clone.load_eval_scorer().await;
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
@@ -833,7 +830,6 @@ impl Runtime {
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
-        workers::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.

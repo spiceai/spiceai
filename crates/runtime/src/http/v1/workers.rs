@@ -50,25 +50,29 @@ pub(crate) struct WorkerResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct Worker {
-    /// The source of the worker
-    from: String,
-
-    /// The name of the worker
     name: String,
+    description: Option<String>,
 
-    /// The role of the worker
-    role: String,
+    /// Use generic to avoid using `utoipa::ToSchema` in `spicepod` crate.
+    models: Vec<serde_json::Value>,
 }
 
 impl From<&spicepod::component::worker::Worker> for Worker {
     fn from(value: &spicepod::component::worker::Worker) -> Self {
         let spicepod::component::worker::Worker {
-            from, name, role, ..
+            name,
+            description,
+            models,
+            ..
         } = value;
+
         Worker {
-            from: from.clone(),
             name: name.clone(),
-            role: role.clone(),
+            description: description.clone(),
+            models: models
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(), // This cannot fail as it has already been serialized.
         }
     }
 }
