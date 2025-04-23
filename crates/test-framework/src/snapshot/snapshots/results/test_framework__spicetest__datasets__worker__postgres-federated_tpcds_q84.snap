@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q84"
+---
++------------------+------------------+
+| customer_id      | customername     |
++------------------+------------------+
+| AAAAAAAAAFEHAAAA | ,                |
+| AAAAAAAAFJAEAAAA | Anderson, Miriam |
+| AAAAAAAAGADDAAAA | Castillo, Anita  |
+| AAAAAAAAHPHAAAAA | Gavin, Heather   |
+| AAAAAAAAKIHGAAAA | Johnson, Anthony |
+| AAAAAAAAKMDBAAAA | Bryant, Howard   |
+| AAAAAAAAMGBDAAAA | Wolf, Cynthia    |
+| AAAAAAAAPBIDAAAA | Mcdonald, Rachel |
++------------------+------------------+
