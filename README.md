@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="https://spiceai.org/docs">Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">Quickstart</a> | <a href="https://github.com/spiceai/cookbook">Cookbook</a>
+  <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a>
 </p>
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
