@@ -204,10 +204,8 @@ async fn handle_streaming(
                     println!("Event:: {evnt}");
                     let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
                 },
-                _ = chat_completion_ended.next() => {
-                    // chat completion from LLM complete.
-                    return;
-                }
+                // chat completion from LLM complete.
+                _ = chat_completion_ended.next() => {}
             };
         });
     }
