@@ -396,4 +396,150 @@ mod tests {
             })
             .await;
     }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_get_plan_or_cached_sql_cached_prepared_statements() {
+        let results_cache_config = ResultsCache {
+            enabled: true,
+            cache_max_size: None,
+            item_ttl: Some("10m".to_string()),
+            eviction_policy: None,
+            cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
+        };
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
+                .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .with_cache_provider(Arc::new(cache_provider))
+            .build(),
+        );
+
+        let parameters = ParamValues::List(vec![1.into()]);
+
+        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw));
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_get_plan_or_cached_plan_cached_prepared_statements() {
+        let results_cache_config = ResultsCache {
+            enabled: true,
+            cache_max_size: None,
+            item_ttl: Some("10m".to_string()),
+            eviction_policy: None,
+            cache_key_type: spicepod::component::runtime::CacheKeyType::Plan,
+        };
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
+                .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .with_cache_provider(Arc::new(cache_provider))
+            .build(),
+        );
+
+        let parameters = ParamValues::List(vec![1.into()]);
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default));
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        // Repeat the same query to ensure a cache hit
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheHit
+                );
+            })
+            .await;
+    }
 }

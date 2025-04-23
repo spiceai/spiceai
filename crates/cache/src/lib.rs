@@ -87,7 +87,7 @@ pub enum QueryResultsCacheStatus {
     CacheMiss,
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     String(&'a str),
