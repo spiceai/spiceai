@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: abfs_arrow
+name: abfs[parquet]-arrow
 datasets:
   - from: abfs://data/tpch/customer/
     name: customer

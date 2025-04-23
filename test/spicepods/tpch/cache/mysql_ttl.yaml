@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql_cache_ttl
+name: mysql-federated-cache_ttl
 
 runtime:
   results_cache:

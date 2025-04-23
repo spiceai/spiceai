@@ -4,6 +4,11 @@ name: ai-test-spicepod
 
 models:
   - from: openai:gpt-4o-mini
-    name: openai-gpt
+    name: model1
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+
+  - from: openai:gpt-4o-mini
+    name: model2
     params:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }

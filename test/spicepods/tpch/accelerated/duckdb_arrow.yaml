@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: duckdb_arrow
+name: duckdb-arrow
 datasets:
   - from: duckdb:customer
     name: customer

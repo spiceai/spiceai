@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres_sqlite_memory
+name: postgres-sqlite[memory]
 datasets:
   - from: postgres:customer
     name: customer

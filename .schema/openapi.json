@@ -1450,6 +1450,15 @@
         "requestBody": {
           "description": "SQL query to execute",
           "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "sql": "SELECT :foo + 1 AS the_answer",
+                "parameters": {
+                  "foo": 41
+                }
+              }
+            },
             "text/plain": {
               "schema": {
                 "type": "string"

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mssql
+name: mssql-federated
 datasets:
   - from: mssql:customer
     name: customer

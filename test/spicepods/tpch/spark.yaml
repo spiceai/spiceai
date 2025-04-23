@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spark
+name: spark[databricks]-federated
 datasets:
   - from: spark:spiceai_sandbox.tpch.customer
     name: customer
