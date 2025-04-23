@@ -29,8 +29,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use byte_unit::Byte;
+use datafusion::common::ParamValues;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
 use lru_cache::LruCache;
@@ -87,17 +89,36 @@ pub enum QueryResultsCacheStatus {
     CacheMiss,
 }
 
-#[derive(Debug, Hash, Eq, PartialEq)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
-    String(&'a str),
+    Query(&'a str, Option<&'a ParamValues>),
 }
 
 impl CacheKey<'_> {
     #[must_use]
     pub fn as_raw_key(&self) -> RawCacheKey {
         let mut hasher = DefaultHasher::new();
-        (*self).hash(&mut hasher);
+        match self {
+            Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
+            Self::Query(sql, param_values) => {
+                sql.hash(&mut hasher);
+                if let Some(params) = param_values {
+                    match params {
+                        ParamValues::List(vec) => vec.hash(&mut hasher),
+                        ParamValues::Map(hash_map) => {
+                            // implementing Hash for HashMap
+                            let mut pairs: Vec<(&String, &ScalarValue)> = hash_map.iter().collect();
+                            pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
+
+                            for (key, value) in pairs {
+                                key.hash(&mut hasher);
+                                value.hash(&mut hasher);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RawCacheKey(hasher.finish())
     }
 }

@@ -81,7 +81,7 @@ impl Query {
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::String(sql),
+            CacheKey::Query(sql, parameters.as_ref()),
         )
         .await?
         {
@@ -102,9 +102,9 @@ impl Query {
         };
 
         // Use the logical plan with parameter values for caching and lookup
-        let plan = match parameters {
+        let plan = match &parameters {
             Some(param_values) => plan
-                .with_param_values(param_values)
+                .with_param_values(param_values.clone())
                 .context(BindingParametersSnafu)?,
             None => plan,
         };
@@ -132,7 +132,9 @@ impl Query {
             CacheControl::Cache(CacheKeyType::Default) | CacheControl::NoCache => {
                 CacheKey::LogicalPlan(&plan).as_raw_key()
             }
-            CacheControl::Cache(CacheKeyType::Raw) => CacheKey::String(sql).as_raw_key(),
+            CacheControl::Cache(CacheKeyType::Raw) => {
+                CacheKey::Query(sql, parameters.as_ref()).as_raw_key()
+            }
         };
         tracker = tracker.results_cache_hit(false);
 
@@ -169,7 +171,7 @@ impl Query {
         // Validate that the provided cache key is the correct type for this request
         match (cache_key, &key) {
             (CacheKeyType::Default, CacheKey::LogicalPlan(_))
-            | (CacheKeyType::Raw, CacheKey::String(_)) => {}
+            | (CacheKeyType::Raw, CacheKey::Query(_, _)) => {}
             _ => {
                 return Ok(CacheResult::WrongCacheKeyType(tracker));
             }
@@ -263,12 +265,12 @@ mod tests {
     #[tokio::test]
     async fn test_request_cache_manager() {
         let cache_status = QueryResultsCacheStatus::CacheHit;
-        let raw_cache_key = CacheKey::String("test-key").as_raw_key();
+        let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
         let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
 
-        let raw_cache_key = CacheKey::String("test-key").as_raw_key();
+        let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
         let disabled_manager =
             RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, raw_cache_key);
