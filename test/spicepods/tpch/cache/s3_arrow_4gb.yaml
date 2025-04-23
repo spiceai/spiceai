@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_arrow_cache_4gb
+name: s3[parquet]-arrow-cache_4gb
 runtime:
   results_cache:
     enabled: true

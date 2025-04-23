@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: databricks_delta
+name: databricks[delta]-federated
 datasets:
   - from: databricks:spiceai_sandbox.tpch.partsupp
     name: partsupp

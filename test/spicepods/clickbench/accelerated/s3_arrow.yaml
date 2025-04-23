@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_arrow
+name: s3[parquet]-arrow
 datasets:
   - from: s3://benchmarks/clickbench/hits/
     name: hits

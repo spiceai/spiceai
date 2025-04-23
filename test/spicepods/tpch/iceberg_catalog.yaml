@@ -1,6 +1,6 @@
 version: v1beta1
 kind: Spicepod
-name: iceberg_catalog
+name: iceberg[catalog]-federated
 
 catalogs:
   - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: databricks_delta
+name: databricks[delta_lake]-federated
 datasets:
   - from: databricks:spiceai_sandbox.tpcds.item
     name: item

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_memory_on_zero_results
+name: file[parquet]-duckdb[memory]-on_zero_results
 datasets:
   - from: file:data/customer.parquet
     name: customer

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_cache_ttl
+name: s3[parquet]-federated-cache_ttl
 runtime:
   results_cache:
     enabled: true

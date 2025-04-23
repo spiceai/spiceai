@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_file_on_zero_results
+name: file[parquet]-duckdb[file]-on_zero_results
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales

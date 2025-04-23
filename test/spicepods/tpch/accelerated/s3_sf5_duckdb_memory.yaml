@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_duckdb_memory
+name: s3[parquet]-duckdb[memory]
 datasets:
   - from: s3://benchmarks/tpch_sf5/customer/
     name: customer

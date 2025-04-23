@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_sqlite_memory
+name: file[parquet]-sqlite[memory]
 datasets:
   - from: file:data/sf0_01/catalog_sales.parquet
     name: catalog_sales

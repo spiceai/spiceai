@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_arrow
+name: s3[parquet]-arrow
 datasets:
   - from: s3://benchmarks/tpch_sf5/customer/
     name: customer

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: duckdb
+name: duckdb-federated
 datasets:
   - from: duckdb:catalog_sales
     name: catalog_sales

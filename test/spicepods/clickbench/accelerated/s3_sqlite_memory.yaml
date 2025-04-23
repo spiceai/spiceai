@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sqlite_memory
+name: s3[parquet]-sqlite[memory]
 datasets:
   - from: s3://benchmarks/clickbench/hits/
     name: hits
