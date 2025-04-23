@@ -1385,3 +1385,41 @@ impl Drop for DataFusion {
         tracing::debug!("DataFusion resources cleanup");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::builder::RuntimeBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_or_create_logical_plan() {
+        static SQL: &str = "SELECT 1";
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .build(),
+        );
+
+        let session = df.ctx.state();
+
+        df.get_or_create_logical_plan(&session, SQL)
+            .await
+            .expect("logical plan");
+
+        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
+        assert_eq!(df.cached_plans.entry_count(), 1);
+
+        // Reusing the same query should no longer at to the cache
+        df.get_or_create_logical_plan(&session, SQL)
+            .await
+            .expect("logical plan");
+
+        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
+        assert_eq!(df.cached_plans.entry_count(), 1);
+    }
+}
