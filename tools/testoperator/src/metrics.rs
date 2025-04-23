@@ -99,9 +99,9 @@ pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub static MAX_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+pub static PEAK_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
-        .f64_gauge("max_memory_usage_mb")
+        .f64_gauge("peak_memory_usage_mb")
         .with_description("The maximum observed memory usage during the test.")
         .with_unit("mb")
         .build()
