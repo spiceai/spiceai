@@ -27,6 +27,7 @@ When a connector does not use acceleration, the `{accelerator[variant]}` value *
 Examples of full spicepod names:
 
 * `s3[parquet]-federated` - a non-accelerator S3 connector using Parquet.
+* `duckdb-federated` - a DuckDB connector using no acceleration.
 * `spicecloud-arrow` - a Spicecloud connector using Arrow acceleration.
 * `mysql-duckdb[file]-on_zero_results` - a MySQL connector using file-mode DuckDB acceleration, testing the behavior of on-zero-results action.
 * `file[parquet]-duckdb[file]-on_zero_results` - a File connector using Parquet data with DuckDB file-mode acceleration, testing the behavior of on-zero-results action.
