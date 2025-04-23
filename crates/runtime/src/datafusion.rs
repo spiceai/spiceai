@@ -40,7 +40,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::QueryResultsCacheProvider;
+use cache::{CacheKey, QueryResultsCacheProvider, RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -256,7 +256,7 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
-type Sql = String;
+type SqlHash = RawCacheKey;
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
@@ -264,7 +264,7 @@ pub struct DataFusion {
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
-    cached_plans: Cache<Sql, LogicalPlan>,
+    cached_plans: Cache<SqlHash, LogicalPlan>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -1347,7 +1347,9 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        if let Some(plan) = self.cached_plans.get(sql).await {
+        let key = CacheKey::String(sql).as_raw_key();
+
+        if let Some(plan) = self.cached_plans.get(&key).await {
             tracing::trace!("using cached plan for {sql}");
             return Ok(plan);
         }
@@ -1355,9 +1357,7 @@ impl DataFusion {
         let plan = session.create_logical_plan(sql).await?;
 
         tracing::trace!("caching plan for {sql}");
-        self.cached_plans
-            .insert(sql.to_string(), plan.clone())
-            .await;
+        self.cached_plans.insert(key, plan.clone()).await;
 
         Ok(plan)
     }
