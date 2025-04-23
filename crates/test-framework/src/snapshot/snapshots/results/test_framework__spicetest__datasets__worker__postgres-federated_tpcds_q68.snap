@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q68"
+---
++-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city         | bought_city | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+
+| Adair       | Sandra       | Springdale      | Farmington  | 47695            | 29778.70       | 449.13       | 41326.26   |
+| Adams       | Dorothy      | Sulphur Springs | Shady Grove | 6105             | 14076.28       | 905.66       | 26730.23   |
+| Adams       | Kristan      | Newport         | Mount Olive | 27218            | 22308.33       | 1158.63      | 37719.38   |
+| Adams       | Kevin        | Springdale      | Shiloh      | 60646            | 27503.96       | 680.56       | 40246.46   |
+| Adams       | Lina         | Union           | Franklin    | 66412            | 13057.49       | 785.70       | 35357.60   |
+| Adcock      | Dawn         | Sulphur Springs | Marion      | 19523            | 37144.42       | 2143.71      | 61434.97   |
+| Akin        | Kala         | Lebanon         | Friendship  | 44307            | 18390.17       | 266.87       | 31019.58   |
+| Akin        | Sharon       | Lakeside        | Jamestown   | 61782            | 19538.52       | 848.12       | 39807.45   |
+| Alaniz      | Elia         | Walnut Grove    | Green Acres | 39051            | 24088.99       | 831.86       | 48615.24   |
+| Albright    | Terrence     | Springfield     | Union       | 18171            | 39215.52       | 1528.79      | 67021.54   |
++-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+

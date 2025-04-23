@@ -1,0 +1,20 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    ready_wait: 60
+    runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    ready_wait: 60
+    runner_type: spiceai-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-duckdb[file].yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    ready_wait: 60
+    runner_type: spiceai-runners
+    duration: 28800
