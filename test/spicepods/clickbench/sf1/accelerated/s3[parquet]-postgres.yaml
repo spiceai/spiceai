@@ -1,0 +1,24 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-postgres
+datasets:
+  - from: s3://benchmarks/clickbench/hits/
+    name: hits
+    params:
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      refresh_sql: "SELECT * FROM hits LIMIT 5000000"
+      engine: postgres
+      refresh_on_startup: always
+      params:
+        pg_host: ${secrets:POSTGRES_RW_HOST}
+        pg_port: 5432
+        pg_user: postgres
+        pg_pass: ${secrets:POSTGRES_PASSWORD}
+        pg_db: clickbench_accelerated
+        pg_sslmode: disable

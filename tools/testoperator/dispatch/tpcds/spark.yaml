@@ -1,6 +1,0 @@
-tests:
-  bench:
-    spicepod_path: ./test/spicepods/tpcds/spark.yaml
-    query_set: tpcds
-    query_overrides: spark
-    runner_type: spiceai-runners

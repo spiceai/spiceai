@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q56"
+---
++------------------+-------------+
+| i_item_id        | total_sales |
++------------------+-------------+
+| AAAAAAAAEELAAAAA | 8.46        |
+| AAAAAAAADBCBAAAA | 34.50       |
+| AAAAAAAAEAMAAAAA | 69.51       |
+| AAAAAAAAECFAAAAA | 100.98      |
+| AAAAAAAAMLGAAAAA | 118.80      |
+| AAAAAAAAMDBAAAAA | 167.70      |
+| AAAAAAAAHEOAAAAA | 171.99      |
+| AAAAAAAAECHAAAAA | 236.34      |
+| AAAAAAAACALAAAAA | 241.31      |
+| AAAAAAAAEJDBAAAA | 277.64      |
++------------------+-------------+

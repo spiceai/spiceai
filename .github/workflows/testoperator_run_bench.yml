@@ -53,6 +53,11 @@ on:
         options:
           - 'spiceai-runners'
           - 'spiceai-large-runners'
+      scale_factor:
+        description: 'Scale factor for the benchmark'
+        required: false
+        type: string
+        default: '1'
       update_snapshots:
         description: 'Update the snapshots?'
         required: false
@@ -135,7 +140,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
-            --metrics
+            --metrics \
+            --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
@@ -185,7 +191,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --validate=${{ github.event.inputs.validate_results }} \
-            --metrics
+            --metrics \
+            --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}

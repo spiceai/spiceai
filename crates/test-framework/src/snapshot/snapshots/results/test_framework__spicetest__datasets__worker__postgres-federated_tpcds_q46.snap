@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q46"
+---
++-------------+--------------+-------------+-----------------+------------------+---------+-----------+
+| c_last_name | c_first_name | ca_city     | bought_city     | ss_ticket_number | amt     | profit    |
++-------------+--------------+-------------+-----------------+------------------+---------+-----------+
+| Aaron       | George       | Georgetown  | Sulphur Springs | 6922             | 1100.47 | -6529.57  |
+| Abbott      | Frederick    | Providence  | Kingston        | 7247             | 7023.24 | -10956.48 |
+| Abel        | Ida          | Mount Olive | Plainview       | 42486            | 1704.47 | -6390.61  |
+| Abrams      | Samuel       | Deerfield   | Georgetown      | 58309            | 8700.79 | -7131.97  |
+| Acevedo     | Harold       | Friendship  | Oakland         | 322              | 1874.14 | -12256.11 |
+| Ackerman    | Phyllis      | Kimball     | Green Acres     | 51343            | 3306.17 | -22113.19 |
+| Acosta      | Wilfred      | Pine Grove  | Bethel          | 26826            | 4130.82 | -12454.19 |
+| Adam        | Paul         | Oak Ridge   | Oakland         | 3215             | 2667.75 | -6241.50  |
+| Adame       | Wayne        | Maple Grove | Woodcrest       | 63388            | 0.00    | -12279.95 |
+| Adams       | Addie        | Highland    | Star            | 44191            | 0.00    | -4285.46  |
++-------------+--------------+-------------+-----------------+------------------+---------+-----------+

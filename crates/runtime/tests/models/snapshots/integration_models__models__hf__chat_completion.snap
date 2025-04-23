@@ -14,7 +14,7 @@ expression: "normalize_chat_completion_response(response, true)"
         "function_call": null,
         "refusal": null,
         "role": "assistant",
-        "tool_calls": []
+        "tool_calls": null
       }
     }
   ],

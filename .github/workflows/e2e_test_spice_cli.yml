@@ -521,7 +521,7 @@ jobs:
 
       - name: Init spice app
         run: |
-          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cp ./test/cli/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
       - name: Start spice runtime
@@ -541,9 +541,17 @@ jobs:
         run: |
           brew install expect
 
+      - name: Make expect scripts executable
+        run: |
+          chmod +x ./test/cli/*.exp
+
       - name: Test `spice chat` error
         run: |
-          ./test/cli/spice_chat_error.exp
+          expect ./test/cli/spice_chat_error.exp
+
+      - name: Test `spice chat <message>`
+        run: |
+          expect ./test/cli/spice_chat_message.exp
 
       - name: Stop spice and check logs
         if: always()
