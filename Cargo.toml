@@ -47,7 +47,6 @@ version = "1.2.0-unstable"
 arrow = { version = "54", features = ["prettyprint"] }
 arrow-buffer = "54"
 arrow-flight = "54"
-# Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
 arrow-cast = "54"
 arrow-csv = "54"
 arrow-ipc = "54"
@@ -162,6 +161,8 @@ uuid = "1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b9f9a4950ac6a2029b63d68acfba5f530da09bd8" } # spiceai-54
+
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
