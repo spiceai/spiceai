@@ -39,7 +39,7 @@ impl MemoryToolCatalog {
         Self { rt }
     }
 
-    pub(crate) fn name() -> &str {
+    pub(crate) fn name() -> &'static str {
         "memory"
     }
 
