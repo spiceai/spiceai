@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q45"
+---
++--------+-------------+-------------------------------+
+| ca_zip | ca_city     | sum(web_sales.ws_sales_price) |
++--------+-------------+-------------------------------+
+| 10059  | Centerville | 69.14                         |
+| 11423  | Guthrie     | 50.80                         |
+| 12297  | Freeman     | 103.16                        |
+| 17746  | Union Hill  | 139.77                        |
+| 20534  | Crossroads  | 72.80                         |
+| 20587  | Hopewell    | 0.69                          |
+| 21087  | Macedonia   | 3.78                          |
+| 23868  | Quincy      | 68.48                         |
+| 24107  | Concord     | 73.70                         |
+| 28054  | Mount Zion  | 8.19                          |
++--------+-------------+-------------------------------+
