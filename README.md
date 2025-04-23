@@ -9,23 +9,23 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml"><img alt="GitHub Actions Workflow Status - build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?label=docker%20build" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?event=pull_request&label=integration%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?event=pull_request&label=integration%20tests%20(models)" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?branch=trunk&label=docker%20build" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?branch=trunk&event=merge_group&label=unit%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&event=pull_request&label=integration%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&event=pull_request&label=integration%20tests%20(models)" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
 <p align="center">
-  <a href="https://spiceai.org/docs">Documentation</a> | <a href="#installation">Installation</a> | <a href="https://github.com/spiceai/cookbook">Cookbook</a>
+  <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a>
 </p>
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
-Spice provides four industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
+Spice provides four industry standard APIs in a lightweight, portable runtime (single binary/container):
 
 1. **SQL Query APIs**: Supports HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
 2. **OpenAI-Compatible APIs**: Provides HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
@@ -42,7 +42,7 @@ Spice is primarily used for:
 
 If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
 
-📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
+📣 Read the [Spice.ai 1.0-stable announcement](https://spiceai.org/blog/announcing-1.0-stable).
 
 Spice is built-on industry leading technologies including [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Arrow Flight, SQLite, and DuckDB.
 
@@ -53,6 +53,7 @@ Spice is built-on industry leading technologies including [Apache DataFusion](ht
 </div>
 
 🎥 [Watch the CMU Databases Accelerating Data and AI with Spice.ai Open-Source](https://www.youtube.com/watch?v=tyM-ec1lKfU)
+🎥 [Watch How to Query Data using Spice, OpenAI, and MCP](https://www.youtube.com/watch?v=TFAu4qxjTPk&list=PLesJrUXEx3U-dQul0PqLV3TGTdUmr3B6e&index=8)
 
 ## Why Spice?
 
@@ -140,6 +141,8 @@ Limited = Partial or restricted support
 - **Is Spice a cache?** No specifically; you can think of Spice data acceleration as an _active_ cache, materialization, or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval, trigger, or as data changes using CDC. In addition to acceleration Spice supports [results caching](https://spiceai.org/docs/features/caching).
 
 - **Is Spice a CDN for databases?** Yes, a common use-case for Spice is as a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data-intensive application or for AI context.
+
+[➡️ Docs FAQ](https://spiceai.org/docs/faq)
 
 ### Watch a 30-sec BI dashboard acceleration demo
 
