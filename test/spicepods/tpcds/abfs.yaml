@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: abfs
+name: abfs[parquet]-federated
 datasets:
   - from: abfs://data/tpcds/catalog_sales/
     name: catalog_sales

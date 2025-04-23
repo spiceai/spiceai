@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql_cache_4gb
+name: mysql-federated-cache_4gb
 
 runtime:
   results_cache:

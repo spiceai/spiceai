@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_mixed_acceleration
+name: file[parquet]-mixed[duckdb[file]+sqlite[file]]
 datasets:
   - from: file:data/customer.parquet
     name: customer

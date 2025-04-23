@@ -343,7 +343,7 @@ pub(crate) async fn post(
 
                 tracing::debug!("Running query:\n{cleaned_query}");
 
-                match run_sql(Arc::clone(&df), &cleaned_query)
+                match run_sql(Arc::clone(&df), &cleaned_query, None)
                     .instrument(span.clone())
                     .await
                 {

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres
+name: postgres-federated
 datasets:
   - from: postgres:hits
     name: hits

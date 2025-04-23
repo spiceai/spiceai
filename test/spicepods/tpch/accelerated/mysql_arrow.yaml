@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql_arrow
+name: mysql-arrow
 
 # Define common anchors
 definitions:

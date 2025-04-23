@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_postgres
+name: file[parquet]-postgres
 datasets:
   - from: file:data/customer.parquet
     name: customer

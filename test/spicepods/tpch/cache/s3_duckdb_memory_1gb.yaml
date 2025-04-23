@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_duckdb_memory_cache_1gb
+name: s3[parquet]-duckdb[memory]-cache_1gb
 runtime:
   results_cache:
     enabled: true

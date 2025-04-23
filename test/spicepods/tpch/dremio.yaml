@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: dremio
+name: dremio-federated
 datasets:
   - from: dremio:tpch.customer
     name: customer

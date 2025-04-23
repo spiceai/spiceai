@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: odbc_databricks
+name: odbc[databricks]-federated
 datasets:
   - from: odbc:spiceai_sandbox.tpch.customer
     name: customer

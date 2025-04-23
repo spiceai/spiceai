@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_postgres
+name: s3[parquet]-postgres
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer/
     name: customer

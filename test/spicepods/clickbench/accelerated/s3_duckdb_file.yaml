@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_duckdb_file
+name: s3[parquet]-duckdb[file]
 datasets:
   - from: s3://benchmarks/clickbench/hits/
     name: hits
