@@ -7054,7 +7054,6 @@ dependencies = [
  "either",
  "futures",
  "hf-hub 0.3.2",
- "image 0.25.5",
  "indexmap 2.9.0",
  "insta",
  "jsonpath-rust",
