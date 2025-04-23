@@ -117,6 +117,8 @@ impl DataFusionBuilder {
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
+        const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
+
         let mut state = SessionStateBuilder::new()
             .with_config(self.config)
             .with_default_features()
@@ -174,7 +176,6 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
-        const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
         let cached_plans = CacheBuilder::new(DEFAULT_CACHED_PLANS_MAX_CAPACITY)
             .time_to_live(Duration::from_secs(3600)) // 1 hour TTL
             .build();
