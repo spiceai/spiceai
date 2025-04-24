@@ -10813,6 +10813,7 @@ dependencies = [
  "mcp-server",
  "mediatype",
  "model_components",
+ "moka",
  "mysql_async",
  "notify",
  "ns_lookup",

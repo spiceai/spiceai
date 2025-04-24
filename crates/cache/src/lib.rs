@@ -123,6 +123,7 @@ impl CacheKey<'_> {
     }
 }
 
+#[derive(Hash, Eq, PartialEq)]
 pub struct RawCacheKey(u64);
 
 impl QueryResult {

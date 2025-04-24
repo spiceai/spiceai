@@ -90,7 +90,7 @@ impl Query {
             CacheResult::WrongCacheKeyType(tracker) => (tracker, None),
         };
 
-        let plan = match session.create_logical_plan(sql).await {
+        let plan = match df.get_or_create_logical_plan(session, sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 let e = find_datafusion_root(e);
