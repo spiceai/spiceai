@@ -2198,7 +2198,7 @@ dependencies = [
  "metal 0.27.0",
  "num-traits",
  "num_cpus",
- "rand 0.9.0",
+ "rand 0.9.1",
  "rand_distr 0.5.1",
  "rayon",
  "safetensors",
@@ -4576,7 +4576,7 @@ dependencies = [
  "half",
  "mistralrs_cudarc_fork",
  "num-traits",
- "rand 0.9.0",
+ "rand 0.9.1",
  "rand_distr 0.5.1",
 ]
 
@@ -7063,7 +7063,7 @@ dependencies = [
  "mistralrs-core",
  "paste",
  "pulldown-cmark 0.13.0",
- "rand 0.9.0",
+ "rand 0.9.1",
  "regex",
  "reqwest 0.12.12",
  "reqwest-eventsource",
@@ -7625,7 +7625,7 @@ dependencies = [
  "image 0.25.5",
  "indexmap 2.9.0",
  "mistralrs-core",
- "rand 0.9.0",
+ "rand 0.9.1",
  "reqwest 0.12.12",
  "serde",
  "serde_json",
@@ -7679,7 +7679,7 @@ dependencies = [
  "once_cell",
  "ordered-float 5.0.0",
  "radix_trie",
- "rand 0.9.0",
+ "rand 0.9.1",
  "rand_isaac",
  "rayon",
  "regex",
@@ -8849,7 +8849,7 @@ dependencies = [
  "glob",
  "opentelemetry 0.29.1",
  "percent-encoding",
- "rand 0.9.0",
+ "rand 0.9.1",
  "serde_json",
  "thiserror 2.0.12",
 ]
@@ -9443,7 +9443,7 @@ dependencies = [
  "hmac",
  "md-5",
  "memchr",
- "rand 0.9.0",
+ "rand 0.9.1",
  "sha2",
  "stringprep",
 ]
@@ -10047,13 +10047,12 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3779b94aeb87e8bd4e834cee3650289ee9e0d5677f976ecdb6d219e5f4f6cd94"
+checksum = "9fbfd9d094a40bf3ae768db9361049ace4c0e04a4fd6b359518bd7b73a73dd97"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.0",
- "zerocopy 0.8.17",
 ]
 
 [[package]]
@@ -10131,7 +10130,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
 dependencies = [
  "num-traits",
- "rand 0.9.0",
+ "rand 0.9.1",
 ]
 
 [[package]]
@@ -10828,7 +10827,7 @@ dependencies = [
  "prometheus",
  "prometheus-parse",
  "prost 0.13.4",
- "rand 0.9.0",
+ "rand 0.9.1",
  "regex",
  "reqwest 0.12.12",
  "runtime-auth",
@@ -12542,7 +12541,7 @@ dependencies = [
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
  "otel-arrow",
- "rand 0.9.0",
+ "rand 0.9.1",
  "regex",
  "reqwest 0.12.12",
  "rstest",
@@ -12943,7 +12942,7 @@ dependencies = [
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
- "rand 0.9.0",
+ "rand 0.9.1",
  "socket2",
  "tokio",
  "tokio-util",
@@ -13963,7 +13962,7 @@ dependencies = [
  "backoff",
  "ctrlc",
  "humantime",
- "rand 0.9.0",
+ "rand 0.9.1",
  "tokio",
  "tracing",
 ]
@@ -14026,7 +14025,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ced87ca4be083373936a67f8de945faa23b6b42384bd5b64434850802c6dccd0"
 dependencies = [
  "getrandom 0.3.1",
- "rand 0.9.0",
+ "rand 0.9.1",
  "serde",
 ]
 
