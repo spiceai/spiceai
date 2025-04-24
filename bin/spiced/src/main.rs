@@ -26,6 +26,8 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     let args = spiced::Args::parse();
 
+    println!("WE USING MIMALLOC!");
+
     if args.version {
         println!("{}", get_version_string());
         return;
