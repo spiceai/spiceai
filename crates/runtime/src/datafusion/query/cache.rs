@@ -44,11 +44,11 @@ pub(super) enum PlanOrCached {
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: QueryResultsCacheStatus,
-    pub(super) raw_cache_key: RawCacheKey,
+    pub(super) raw_cache_key: Option<RawCacheKey>,
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: RawCacheKey) -> Self {
+    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: Option<RawCacheKey>) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -133,9 +133,7 @@ impl Query {
             ),
         };
 
-        let Some(raw_cache_key) = sql_cache_key.or(plan_cache_key) else {
-            unreachable!("One of sql_cache_key or plan_cache_key is always set");
-        };
+        let raw_cache_key = sql_cache_key.or(plan_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
         tracker = tracker.results_cache_hit(false);
@@ -274,13 +272,11 @@ mod tests {
         let cache_status = QueryResultsCacheStatus::CacheHit;
         let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
-        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
+        let manager = RequestCacheManager::new(cache_status, Some(raw_cache_key));
         assert!(manager.should_cache_results());
 
-        let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
-
         let disabled_manager =
-            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, raw_cache_key);
+            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, None);
         assert!(!disabled_manager.should_cache_results());
     }
 
