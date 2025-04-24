@@ -223,6 +223,20 @@ impl RuntimeStatus {
             .collect()
     }
 
+    /// Returns the status of all registered datasets.
+    #[must_use]
+    pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        let statuses = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        statuses
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix("dataset:").map(|name| (name.into(), *v)))
+            .collect()
+    }
+
     /// Sets the runtime to the shutting down state.
     pub fn mark_shutdown(&self) {
         self.is_shutdown.store(true, Ordering::Relaxed);

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
+use datafusion::{datasource::ViewTable, error::Result, prelude::SessionContext};
 use std::collections::HashSet;
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
@@ -34,32 +35,8 @@ pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<Ta
                     table_names.extend(cte_table_names);
                 }
             }
-            // Process the main query body
-            if let ast::SetExpr::Select(select_statement) = *statement.body {
-                for from in select_statement.from {
-                    let mut relations = vec![];
-                    relations.push(from.relation.clone());
-                    for join in from.joins {
-                        relations.push(join.relation.clone());
-                    }
-
-                    for relation in relations {
-                        match relation {
-                            ast::TableFactor::Table { name, .. } => {
-                                table_names.push(name.to_string().into());
-                            }
-                            ast::TableFactor::Derived { subquery, .. } => {
-                                table_names.extend(get_dependent_table_names(
-                                    &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                        subquery,
-                                    ))),
-                                ));
-                            }
-                            _ => (),
-                        }
-                    }
-                }
-            }
+            // Extract table names from the main query
+            table_names.extend(extract_tables_from_set_expr(&statement.body, &cte_names));
         }
     }
 
@@ -68,4 +45,226 @@ pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<Ta
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
+}
+
+fn extract_tables_from_set_expr(
+    expr: &ast::SetExpr,
+    cte_names: &HashSet<TableReference>,
+) -> Vec<TableReference> {
+    match expr {
+        ast::SetExpr::Select(select_statement) => {
+            let mut table_names = vec![];
+            for from in &select_statement.from {
+                let mut relations = vec![from.relation.clone()];
+                for join in &from.joins {
+                    relations.push(join.relation.clone());
+                }
+
+                for relation in relations {
+                    match relation {
+                        ast::TableFactor::Table { name, .. } => {
+                            let table_ref = name.to_string().into();
+                            if !cte_names.contains(&table_ref) {
+                                table_names.push(table_ref);
+                            }
+                        }
+                        ast::TableFactor::Derived { subquery, .. } => {
+                            table_names.extend(get_dependent_table_names(
+                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
+                                    subquery,
+                                ))),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            table_names
+        }
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            let mut table_names = extract_tables_from_set_expr(left, cte_names);
+            table_names.extend(extract_tables_from_set_expr(right, cte_names));
+            table_names
+        }
+        _ => vec![],
+    }
+}
+
+pub(crate) async fn create_view_table(
+    ctx: &SessionContext,
+    statement: &parser::Statement,
+    view: impl Into<String>,
+) -> Result<ViewTable> {
+    let plan = ctx.state().statement_to_plan(statement.clone()).await?;
+    ViewTable::try_new(plan, Some(view.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_simple_query() {
+        let sql = r"
+            SELECT a, b FROM employees limit 10;
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<_> = vec![TableReference::bare("employees".to_string())]
+            .into_iter()
+            .collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_schema() {
+        let sql = r"
+            SELECT a, b FROM dbo.employees limit 10;
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["dbo.employees".into()].into_iter().collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_joins() {
+        let sql = r"
+            SELECT e.name, d.department_name
+            FROM employees e
+            JOIN departments d ON e.department_id = d.id
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["employees".into(), "departments".into()]
+                .into_iter()
+                .collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_cte_and_join() {
+        let sql = r"
+            WITH tmp AS (
+                SELECT * FROM t1
+            )
+            SELECT tmp.id, t2.name
+            FROM tmp
+            JOIN t2 ON tmp.id = t2.id;
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["t1".into(), "t2".into()].into_iter().collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_cte_and_union() {
+        let sql = r"
+            WITH all_sales AS (
+                SELECT sales FROM s3_source
+                UNION ALL
+                SELECT fare_amount + tip_amount AS sales FROM dremio_source
+            )
+            SELECT SUM(sales) AS total_sales,
+                   COUNT(*) AS total_transactions,
+                   MAX(sales) AS max_sale,
+                   AVG(sales) AS avg_sale
+            FROM all_sales;
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["s3_source".into(), "dremio_source".into()]
+                .into_iter()
+                .collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_nested_subqueries() {
+        let sql = r"
+            SELECT * FROM (
+                SELECT * FROM (
+                    SELECT * FROM orders
+                ) AS subquery1
+            ) AS subquery2
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["orders".into()].into_iter().collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    fn extract_table_names_from_sql(sql: &str) -> HashSet<TableReference> {
+        let statements =
+            DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).expect("to parse sql");
+        assert_eq!(statements.len(), 1);
+
+        let table_names = get_dependent_table_names(&statements[0]);
+        table_names.into_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_cte_and_multiple_queries() {
+        let sql = r"
+            WITH cte1 AS (
+                SELECT * FROM table1
+            ), cte2 AS (
+                SELECT * FROM table2
+            )
+            SELECT * FROM cte1
+            UNION ALL
+            SELECT * FROM cte2
+            UNION
+            SELECT * FROM table3
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["table1".into(), "table2".into(), "table3".into()]
+                .into_iter()
+                .collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
+
+    #[tokio::test]
+    async fn test_get_dependent_table_names_with_set_operations() {
+        let sql = r"
+            SELECT * FROM table1
+            UNION
+            SELECT * FROM table2
+            INTERSECT
+            SELECT * FROM table3
+        ";
+
+        let actual_table_names = extract_table_names_from_sql(sql);
+
+        let expected_table_names: HashSet<TableReference> =
+            vec!["table1".into(), "table2".into(), "table3".into()]
+                .into_iter()
+                .collect();
+
+        assert_eq!(expected_table_names, actual_table_names);
+    }
 }

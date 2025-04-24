@@ -25,7 +25,7 @@ use runtime::{
     Runtime, accelerated_table::refresh::RefreshOverrides,
     component::dataset::acceleration::RefreshMode,
 };
-use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
+use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
 
 use crate::{
     configure_test_datafusion, init_tracing,

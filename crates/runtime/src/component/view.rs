@@ -20,7 +20,10 @@ use snafu::prelude::*;
 use spicepod::component::view as spicepod_view;
 use std::{collections::HashMap, fs};
 
-use super::{dataset::Dataset, validate_identifier};
+use super::{
+    dataset::{Dataset, acceleration},
+    validate_identifier,
+};
 use spicepod::semantic::Column;
 
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
@@ -30,6 +33,7 @@ pub struct View {
     pub sql: String,
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
+    pub acceleration: Option<acceleration::Acceleration>,
 }
 
 impl TryFrom<spicepod_view::View> for View {
@@ -50,11 +54,17 @@ impl TryFrom<spicepod_view::View> for View {
             });
         };
 
+        let acceleration = view
+            .acceleration
+            .map(acceleration::Acceleration::try_from)
+            .transpose()?;
+
         Ok(View {
             name: table_reference,
             sql,
             metadata: view.metadata,
             columns: view.columns,
+            acceleration,
         })
     }
 }
@@ -64,5 +74,14 @@ impl View {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
         Ok(sql)
+    }
+
+    #[must_use]
+    pub fn is_accelerated(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.enabled;
+        }
+
+        false
     }
 }

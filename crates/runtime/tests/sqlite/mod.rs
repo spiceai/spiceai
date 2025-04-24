@@ -25,10 +25,8 @@ use arrow::{
 };
 
 use runtime::Runtime;
-use spicepod::component::dataset::{
-    Dataset,
-    acceleration::{Acceleration, Mode},
-};
+use spicepod::acceleration::{Acceleration, Mode};
+use spicepod::component::dataset::Dataset;
 
 use crate::{
     PlanCheckFn, ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,

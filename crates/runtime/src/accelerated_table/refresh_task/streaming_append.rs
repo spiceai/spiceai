@@ -40,7 +40,7 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
 
-        self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Refreshing)
+        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
         let mut stream = Box::pin(self.get_append_stream().await);
@@ -78,7 +78,7 @@ impl RefreshTask {
                 Err(e) => {
                     tracing::error!("Error getting update for dataset {dataset_name}: {e}");
                     let sql = refresh.read().await.sql.clone();
-                    self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Error)
+                    self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Error)
                         .await;
                 }
             }
