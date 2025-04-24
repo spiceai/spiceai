@@ -41,9 +41,6 @@ jobs:
     if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
     needs: setup
     runs-on: spiceai-runners
-    env:
-      IMAGE_TAG: default
-      CARGO_FEATURES: release
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +51,10 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
 
+      - name: default
+        run: |
+          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
