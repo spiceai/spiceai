@@ -101,7 +101,7 @@ jobs:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
-      
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:
@@ -122,6 +122,7 @@ jobs:
             echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
           elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+            echo "MYSQL_DB_SF100=tpch_sf100" >> $GITHUB_ENV
           fi
 
       - name: Setup ODBC
@@ -228,7 +229,7 @@ jobs:
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
-      
+
       - name: Install GH CLI
         if: github.event.inputs.update_snapshots == 'always'
         run: |
@@ -265,7 +266,7 @@ jobs:
               git pull --rebase origin ${BRANCH_NAME}
             fi
             git push origin ${BRANCH_NAME}
-            
+
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
               echo "PR already exists -> ${PR_URL}"

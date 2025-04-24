@@ -16,7 +16,7 @@ limitations under the License.
 
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
-use spicepod::{component::dataset::acceleration as spicepod_acceleration, param::Params};
+use spicepod::{acceleration as spicepod_acceleration, param::Params};
 use std::{collections::HashMap, fmt::Display, time::Duration};
 
 pub mod constraints;

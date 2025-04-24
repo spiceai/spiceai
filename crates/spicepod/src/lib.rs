@@ -30,6 +30,7 @@ use component::{
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
+pub mod acceleration;
 pub mod component;
 pub mod extension;
 pub mod metric;
