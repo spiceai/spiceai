@@ -29,12 +29,12 @@ use tokio::runtime::Runtime;
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Snmalloc
-// #[global_allocator]
-// static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 // System
-#[global_allocator]
-static ALLOC: std::alloc::System = std::alloc::System;
+// #[global_allocator]
+// static ALLOC: std::alloc::System = std::alloc::System;
 
 fn main() {
     let args = spiced::Args::parse();
