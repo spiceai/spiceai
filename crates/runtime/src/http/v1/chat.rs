@@ -43,6 +43,7 @@ use axum::{
 };
 use event_stream::get_event_stream;
 use futures::StreamExt;
+use http::HeaderValue;
 use llms::chat::Chat;
 use serde::Serialize;
 use tokio::{
@@ -51,6 +52,8 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
+
+static SPICE_COMPLETION_PROGRESS_HEADER: &str = "x-spiceai-completion-progress";
 
 /// Create Chat Completion
 ///
@@ -134,7 +137,9 @@ pub(crate) async fn post(
         match llms.read().await.get(&model_id) {
             Some(model) => {
                 if req.stream.unwrap_or_default() {
-                    handle_streaming(model, req, true).instrument(span_clone).await
+                    let include_stream_events = headers.get(SPICE_COMPLETION_PROGRESS_HEADER)
+                        .map_or(false, |v| v == HeaderValue::from_static("enabled"));
+                    handle_streaming(model, req, include_stream_events).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
@@ -173,11 +178,6 @@ async fn handle_streaming(
     include_stream_events: bool,
 ) -> Response {
     let span = Span::current();
-    tracing::info!(
-        target: "task_history",
-        progress = format!("This is a nice little test of the event stream for model {}", req.model.clone()),
-    );
-
     let (tx, rx) = channel(100);
     let tx = Arc::new(tx);
 
@@ -201,7 +201,6 @@ async fn handle_streaming(
 
             select! {
                 Some(evnt) = events.next() =>  {
-                    println!("Event:: {evnt}");
                     let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
                 },
                 // chat completion from LLM complete.
