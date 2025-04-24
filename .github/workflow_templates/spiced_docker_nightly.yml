@@ -117,7 +117,7 @@ jobs:
 
       - name: default
         run: |
-          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release" >> $GITHUB_ENV
       - &build-arm64-image
         name: Build ARM64 ${{ env.IMAGE_TAG }} image

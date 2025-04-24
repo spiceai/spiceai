@@ -1,12 +1,3 @@
-##################################################################################################################################
-#                                                                                                                                #
-#  WARNING: TOOL-GENERATED FILE - DO NOT EDIT MANUALLY!                                                                          #
-#                                                                                                                                #
-#  Command: yq 'explode(.)' .github/workflow_templates/spiced_docker_nightly.yml > .github/workflows/spiced_docker_nightly.yml   #
-#                                                                                                                                #
-#  Keep this notice at the top of the file.                                                                                      #
-#                                                                                                                                #
-##################################################################################################################################
 name: spiced_docker_nightly
 on:
   schedule:
@@ -108,7 +99,7 @@ jobs:
             image=moby/buildkit:latest
       - name: default
         run: |
-          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release" >> $GITHUB_ENV
       - name: Build ARM64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
