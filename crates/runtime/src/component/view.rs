@@ -89,8 +89,6 @@ pub struct ViewBuilder {
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
-    pub runtime: Option<Arc<Runtime>>,
-    pub app: Option<Arc<App>>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -122,8 +120,6 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             metadata: view.metadata,
             columns: view.columns,
             acceleration,
-            runtime: None,
-            app: None,
         })
     }
 }
@@ -165,33 +161,12 @@ impl ViewBuilder {
             metadata: HashMap::default(),
             columns: vec![],
             acceleration: None,
-            runtime: None,
-            app: None,
         }
     }
 
     #[must_use]
-    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
-        self.runtime = Some(runtime);
-        self
-    }
-
-    #[must_use]
-    pub fn with_app(mut self, app: Arc<App>) -> Self {
-        self.app = Some(app);
-        self
-    }
-
-    pub fn build(self) -> crate::Result<View> {
-        let runtime = self.runtime.context(crate::UnableToCreateViewSnafu {
-            reason: "Runtime is not set.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues".to_string()
-        })?;
-
-        let app = self.app.context(crate::UnableToCreateViewSnafu {
-            reason: "App is not set.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues".to_string()
-        })?;
-
-        Ok(View {
+    pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
+        View {
             name: self.name,
             sql: self.sql,
             metadata: self.metadata,
@@ -199,6 +174,6 @@ impl ViewBuilder {
             acceleration: self.acceleration,
             runtime,
             app,
-        })
+        }
     }
 }

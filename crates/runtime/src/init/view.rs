@@ -60,10 +60,8 @@ impl Runtime {
             .iter()
             .cloned()
             .map(|spicepod_view| {
-                ViewBuilder::try_from(spicepod_view)?
-                    .with_app(Arc::clone(app))
-                    .with_runtime(Arc::clone(&rt_ref))
-                    .build()
+                ViewBuilder::try_from(spicepod_view)
+                    .map(|builder| builder.build_with(Arc::clone(&rt_ref), Arc::clone(app)))
             })
             .zip(&app.views)
             .filter_map(|(view, spicepod_view)| match view {
