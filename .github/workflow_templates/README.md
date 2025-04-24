@@ -27,3 +27,9 @@ Add the following notice to the top of any tool-generated workflow file. Replace
 ```bash
 yq 'explode(.)' .github/workflow_templates/spiced_docker.yml > .github/workflows/spiced_docker.yml
 ```
+
+## `spiced_docker_nightly.yml`
+
+```bash
+yq 'explode(.)' .github/workflow_templates/spiced_docker_nightly.yml > .github/workflows/spiced_docker_nightly.yml
+```
