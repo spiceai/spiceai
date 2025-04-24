@@ -40,12 +40,14 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::QueryResultsCacheProvider;
+use cache::{CacheKey, QueryResultsCacheProvider, RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
@@ -54,6 +56,7 @@ use datafusion::sql::{TableReference, sqlparser};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
+use moka::future::Cache;
 use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -253,12 +256,15 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
+type SqlHash = RawCacheKey;
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+    cached_plans: Cache<SqlHash, LogicalPlan>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -1334,6 +1340,27 @@ impl DataFusion {
             }
         }
     }
+
+    /// Create or get a logical plan from the query
+    async fn get_or_create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let key = CacheKey::String(sql).as_raw_key();
+
+        if let Some(plan) = self.cached_plans.get(&key).await {
+            tracing::trace!("using cached plan for {sql}");
+            return Ok(plan);
+        }
+
+        let plan = session.create_logical_plan(sql).await?;
+
+        tracing::trace!("caching plan for {sql}");
+        self.cached_plans.insert(key, plan.clone()).await;
+
+        Ok(plan)
+    }
 }
 
 #[must_use]
@@ -1356,5 +1383,43 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
 impl Drop for DataFusion {
     fn drop(&mut self) {
         tracing::debug!("DataFusion resources cleanup");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::builder::RuntimeBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_or_create_logical_plan() {
+        static SQL: &str = "SELECT 1";
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .build(),
+        );
+
+        let session = df.ctx.state();
+
+        df.get_or_create_logical_plan(&session, SQL)
+            .await
+            .expect("logical plan");
+
+        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
+        assert_eq!(df.cached_plans.entry_count(), 1);
+
+        // Reusing the same query should no longer at to the cache
+        df.get_or_create_logical_plan(&session, SQL)
+            .await
+            .expect("logical plan");
+
+        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
+        assert_eq!(df.cached_plans.entry_count(), 1);
     }
 }
