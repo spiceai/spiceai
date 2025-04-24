@@ -1,0 +1,70 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-postgres
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: &pg_params
+        pg_host: ${secrets:POSTGRES_RW_HOST}
+        pg_port: 5432
+        pg_user: postgres
+        pg_pass: ${secrets:POSTGRES_PASSWORD}
+        pg_db: tpch_accelerated
+        pg_sslmode: disable
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        l_partkey: enabled
+        l_suppkey: enabled
+        l_orderkey: enabled
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        o_orderkey: enabled
+  - from: file:data/part.parquet
+    name: part
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        p_partkey: enabled
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        ps_partkey: enabled
+  - from: file:data/region.parquet
+    name: region
+    acceleration: *acceleration
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        s_suppkey: enabled

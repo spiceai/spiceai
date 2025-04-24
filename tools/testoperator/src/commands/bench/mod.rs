@@ -83,6 +83,10 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
         KeyValue::new("benchmark.query_set", query_set.to_string()),
         KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
+        KeyValue::new(
+            "benchmark.scale_factor",
+            args.scale_factor.unwrap_or(1.0).to_string(),
+        ),
     ]);
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
@@ -115,7 +119,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::MAX_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
     telemetry.emit().await?;

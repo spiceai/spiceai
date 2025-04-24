@@ -2,6 +2,10 @@
 name: integration tests
 
 on:
+  push:
+    branches:
+      - trunk
+      - release/*
   pull_request:
     branches:
       - trunk
@@ -71,7 +75,7 @@ jobs:
           else
             echo "Excluding extended_tests"
           fi
-          
+
           TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./integration_test
 
