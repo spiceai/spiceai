@@ -20,13 +20,26 @@ use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
+// Jemalloc
+// #[global_allocator]
+// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Mimalloc
+// #[global_allocator]
+// static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Snmalloc
+// #[global_allocator]
+// static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// System
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: std::alloc::System = std::alloc::System;
 
 fn main() {
     let args = spiced::Args::parse();
 
-    println!("WE USING JEMALLOC!");
+    println!("WE USING SYSTEM ALLOCATOR!");
 
     if args.version {
         println!("{}", get_version_string());
