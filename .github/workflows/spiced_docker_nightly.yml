@@ -1,3 +1,12 @@
+##################################################################################################################################
+#                                                                                                                                #
+#  WARNING: TOOL-GENERATED FILE - DO NOT EDIT MANUALLY!                                                                          #
+#                                                                                                                                #
+#  Command: yq 'explode(.)' .github/workflow_templates/spiced_docker_nightly.yml > .github/workflows/spiced_docker_nightly.yml   #
+#                                                                                                                                #
+#  Keep this notice at the top of the file.                                                                                      #
+#                                                                                                                                #
+##################################################################################################################################
 name: spiced_docker_nightly
 on:
   schedule:
