@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql-arrow
+name: mysql-duckdb[file]
 
 # Define common anchors
 definitions:
