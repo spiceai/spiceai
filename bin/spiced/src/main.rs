@@ -21,12 +21,12 @@ use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
     let args = spiced::Args::parse();
 
-    println!("WE USING MIMALLOC!");
+    println!("WE USING JEMALLOC!");
 
     if args.version {
         println!("{}", get_version_string());
