@@ -138,7 +138,7 @@ pub(crate) async fn post(
             Some(model) => {
                 if req.stream.unwrap_or_default() {
                     let include_stream_events = headers.get(SPICE_COMPLETION_PROGRESS_HEADER)
-                        .map_or(false, |v| v == HeaderValue::from_static("enabled"));
+                        .is_some_and(|v| v == HeaderValue::from_static("enabled"));
                     handle_streaming(model, req, include_stream_events).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
