@@ -26,10 +26,8 @@ use futures::StreamExt;
 
 use runtime::Runtime;
 use spicepod::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Mode},
-    },
+    acceleration::{Acceleration, Mode},
+    component::dataset::Dataset,
     param::Params as DatasetParams,
 };
 use std::collections::HashMap;

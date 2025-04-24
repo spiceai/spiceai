@@ -20,10 +20,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 
 use runtime::Runtime;
-use spicepod::{
-    component::dataset::{Dataset, acceleration::Acceleration},
-    param::Params,
-};
+use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{init_tracing, utils::test_request_context};
 
@@ -35,6 +32,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
     use crate::postgres::common;
     use crate::utils::runtime_ready_check;
     use arrow::array::RecordBatch;
+    use spicepod::acceleration::Acceleration;
     use std::sync::Arc;
 
     let _tracing = init_tracing(Some("integration=debug,info"));

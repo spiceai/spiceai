@@ -18,8 +18,7 @@ use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
 use spicepod::{
-    component::dataset::{Dataset, acceleration::Acceleration},
-    param::Params as DatasetParams,
+    acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
 use tracing::instrument;
 

@@ -369,7 +369,11 @@ impl Runtime {
             Ok(()) => {
                 tracing::info!(
                     "{}",
-                    dataset_registered_trace(&connector, &ds, self.df.cache_provider().is_some())
+                    dataset_registered_trace(
+                        connector.as_ref(),
+                        &ds,
+                        self.df.cache_provider().is_some()
+                    )
                 );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                     if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {

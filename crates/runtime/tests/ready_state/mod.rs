@@ -62,8 +62,9 @@ use runtime::{
     parameters::ParameterSpec,
     request::{AsyncMarker, Protocol, RequestContext},
 };
-use spicepod::component::dataset::{
-    Dataset as SpicepodDataset, ReadyState, acceleration::Acceleration,
+use spicepod::{
+    acceleration::Acceleration,
+    component::dataset::{Dataset as SpicepodDataset, ReadyState},
 };
 
 use crate::{configure_test_datafusion, init_tracing};

@@ -20,10 +20,8 @@ use futures::TryStreamExt;
 
 use runtime::Runtime;
 use spicepod::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Mode, RefreshMode},
-    },
+    acceleration::{Acceleration, Mode, RefreshMode},
+    component::dataset::Dataset,
     param::Params,
 };
 use std::io::Write;

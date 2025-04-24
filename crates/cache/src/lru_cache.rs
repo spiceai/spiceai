@@ -67,7 +67,12 @@ impl LruCache {
 #[async_trait]
 impl QueryResultCache for LruCache {
     async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>> {
-        match self.cache.get(&key.as_raw_key().0).await {
+        let raw_key = key.as_raw_key();
+        self.get_raw_key(raw_key).await
+    }
+
+    async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>> {
+        match self.cache.get(&raw_key.0).await {
             Some(value) => Ok(Some(value)),
             None => Ok(None),
         }
@@ -138,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_put_and_get() {
         let cache = LruCache::new(10, Duration::from_secs(60));
-        let key = CacheKey::String("test_query");
+        let key = CacheKey::Query("test_query", None);
         let result = create_test_cached_result();
 
         // Put a value in the cache
@@ -147,7 +152,7 @@ mod tests {
             .await
             .expect("Failed to put in cache");
 
-        let key = CacheKey::String("test_query");
+        let key = CacheKey::Query("test_query", None);
 
         // Get the value from the cache
         let retrieved = cache.get(key).await.expect("Failed to get from cache");
@@ -161,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_miss() {
         let cache = LruCache::new(10, Duration::from_secs(60));
-        let key = CacheKey::String("nonexistent_query");
+        let key = CacheKey::Query("nonexistent_query", None);
 
         // Try to get a non-existent key
         let retrieved = cache.get(key).await.expect("Failed to get from cache");
@@ -171,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_put_raw_key() {
         let cache = LruCache::new(10, Duration::from_secs(60));
-        let raw_key = CacheKey::String("test_query").as_raw_key();
+        let raw_key = CacheKey::Query("test_query", None).as_raw_key();
         let result = create_test_cached_result();
 
         // Put a value with a raw key
@@ -181,7 +186,7 @@ mod tests {
             .expect("Failed to put with raw key");
 
         let retrieved = cache
-            .get(CacheKey::String("test_query"))
+            .get(CacheKey::Query("test_query", None))
             .await
             .expect("Failed to get from cache");
         assert!(retrieved.is_some());
@@ -200,7 +205,7 @@ mod tests {
         let result = create_test_cached_result();
 
         // Put a value in the cache
-        let get_key = || CacheKey::String("test_query");
+        let get_key = || CacheKey::Query("test_query", None);
         let key = get_key();
         cache
             .put(key, result)
@@ -231,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_ttl() {
         let cache = LruCache::new(10, Duration::from_millis(100));
-        let key = || CacheKey::String("test_query");
+        let key = || CacheKey::Query("test_query", None);
         let result = create_test_cached_result();
 
         // Put a value in the cache

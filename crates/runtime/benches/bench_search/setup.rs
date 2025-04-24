@@ -27,10 +27,13 @@ use crate::{
 };
 
 use app::AppBuilder;
-use spicepod::component::{
-    dataset::{Dataset, Mode, acceleration::Acceleration, replication::Replication},
-    embeddings::{EmbeddingChunkConfig, Embeddings},
-    runtime::{CacheKeyType, ResultsCache},
+use spicepod::{
+    acceleration::Acceleration,
+    component::{
+        dataset::{Dataset, Mode, replication::Replication},
+        embeddings::{EmbeddingChunkConfig, Embeddings},
+        runtime::{CacheKeyType, ResultsCache},
+    },
 };
 
 use super::SearchBenchmarkResultBuilder;

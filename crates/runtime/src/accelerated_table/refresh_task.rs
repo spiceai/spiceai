@@ -21,6 +21,7 @@ use arrow::{
 };
 use arrow_schema::SchemaRef;
 use async_stream::stream;
+use datafusion::datasource::TableType;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
@@ -155,8 +156,9 @@ impl RefreshTask {
             // This is expected and should not be logged as an error.
             if !self.runtime_status.is_shutdown() {
                 tracing::error!(
-                    "Failed to refresh dataset {}: {e}",
-                    include_source_to_dataset_name(
+                    "Failed to refresh {} {}: {e}",
+                    self.component_type(),
+                    include_source_to_table_name(
                         &self.dataset_name,
                         self.federated_source.as_deref()
                     )
@@ -169,7 +171,7 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.mark_dataset_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
+        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
         let _timer = MultiTimeMeasurement::new(
@@ -217,8 +219,9 @@ impl RefreshTask {
             // This is expected and should not be logged as an error.
             if !self.runtime_status.is_shutdown() {
                 tracing::warn!(
-                    "Failed to load data for dataset {}: {}",
-                    include_source_to_dataset_name(
+                    "Failed to load data for {} {}: {}",
+                    self.component_type(),
+                    include_source_to_table_name(
                         &self.dataset_name,
                         self.federated_source.as_deref()
                     ),
@@ -280,7 +283,7 @@ impl RefreshTask {
                     } else {
                         if notify_refresh_stat_available.send(stat).is_err() {
                             tracing::error!(
-                                "Failed to provide stats on the amount of data written to the dataset: {ds_name}"
+                                "Failed to provide stats on the amount of data written into {ds_name}"
                             );
                         }
                         None
@@ -294,7 +297,7 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            self.mark_dataset_status(sql, status::ComponentStatus::Error)
+            self.set_refresh_status(sql, status::ComponentStatus::Error)
                 .await;
             return Err(e);
         }
@@ -302,11 +305,11 @@ impl RefreshTask {
         if let (Some(start_time), Ok(refresh_stat)) =
             (start_time, on_written_data_stat_available.try_recv())
         {
-            self.trace_dataset_loaded(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
+            self.trace_load_completed(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
                 .await;
         }
 
-        self.mark_dataset_status(sql, status::ComponentStatus::Ready)
+        self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
 
         Ok(())
@@ -321,12 +324,14 @@ impl RefreshTask {
         let filter_converter = self.get_filter_converter(refresh);
 
         if is_spice_internal_dataset(&dataset_name) {
-            tracing::debug!("Loading data for dataset {dataset_name}");
+            tracing::debug!("Loading data for {} {dataset_name}", self.component_type());
         } else {
-            tracing::info!("Loading data for dataset {dataset_name}");
+            tracing::info!("Loading data for {} {dataset_name}", self.component_type());
         }
-        self.runtime_status
-            .update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
+
+        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
+            .await;
+
         let refresh = refresh.clone();
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
@@ -355,10 +360,10 @@ impl RefreshTask {
                 .is_some_and(|x| x.columns().is_empty())
         {
             if let Some(start_time) = start_time {
-                self.trace_dataset_loaded(start_time, 0, 0).await;
+                self.trace_load_completed(start_time, 0, 0).await;
             }
 
-            self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Ready)
+            self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Ready)
                 .await;
 
             return Ok(());
@@ -410,7 +415,7 @@ impl RefreshTask {
         }
     }
 
-    async fn trace_dataset_loaded(
+    async fn trace_load_completed(
         &self,
         start_time: SystemTime,
         num_rows: usize,
@@ -425,17 +430,19 @@ impl RefreshTask {
                 String::new()
             };
 
+            let component_type = self.component_type();
+
             if is_spice_internal_dataset(&self.dataset_name) {
                 tracing::debug!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}.",
+                    "Loaded {num_rows} rows{memory_size} for {component_type} {dataset_name} in {elapsed}.",
                 );
             } else {
                 tracing::info!(
-                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}."
+                    "Loaded {num_rows} rows{memory_size} for {component_type} {dataset_name} in {elapsed}."
                 );
                 for synchronized_table in self.sink.read().await.synchronized_tables() {
                     tracing::info!(
-                        "Loaded {num_rows} rows{memory_size} for dataset {} in {elapsed}.",
+                        "Loaded {num_rows} rows{memory_size} for {component_type} {} in {elapsed}.",
                         synchronized_table.child_dataset_name()
                     );
                 }
@@ -722,12 +729,12 @@ impl RefreshTask {
             .collect()
     }
 
-    async fn mark_dataset_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
-        let dataset_names = self.get_dataset_names().await;
+    async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        // runtime status update
+        self.update_component_status(status).await;
 
-        for dataset_name in dataset_names {
-            self.runtime_status.update_dataset(&dataset_name, status);
-
+        // telemetry update
+        for dataset_name in self.get_dataset_names().await {
             if status == status::ComponentStatus::Error {
                 let labels = [KeyValue::new("dataset", dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
@@ -748,6 +755,37 @@ impl RefreshTask {
         }
     }
 
+    fn component_type(&self) -> &'static str {
+        if self.is_view_acceleration() {
+            "view"
+        } else {
+            "dataset"
+        }
+    }
+
+    async fn update_component_status(&self, status: status::ComponentStatus) {
+        // main component status update
+        if self.is_view_acceleration() {
+            self.runtime_status.update_view(&self.dataset_name, status);
+        } else {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status);
+        }
+
+        // synchronized tables can be datasets only
+        for synchronized_table in self.sink.read().await.synchronized_tables() {
+            self.runtime_status
+                .update_dataset(&synchronized_table.child_dataset_name(), status);
+        }
+    }
+
+    fn is_view_acceleration(&self) -> bool {
+        match &*self.federated {
+            FederatedTable::Immediate(provider) => provider.table_type() == TableType::View,
+            FederatedTable::Deferred(_) => false,
+        }
+    }
+
     async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
         if let super::Error::UnableToGetDataFromConnector { source } = error {
             if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
@@ -757,7 +795,7 @@ impl RefreshTask {
                     "Dataset {} is waiting for {dataset_name} to finish loading initial acceleration.",
                     self.dataset_name
                 );
-                self.mark_dataset_status(refresh_sql, status::ComponentStatus::Initializing)
+                self.set_refresh_status(refresh_sql, status::ComponentStatus::Initializing)
                     .await;
                 return;
             }
@@ -786,18 +824,19 @@ impl RefreshTask {
         }
 
         tracing::warn!(
-            "Failed to load data for dataset {}: {error}",
-            include_source_to_dataset_name(&self.dataset_name, self.federated_source.as_deref()),
+            "Failed to load data for {} {}: {error}",
+            self.component_type(),
+            include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
         );
-        self.mark_dataset_status(refresh_sql, status::ComponentStatus::Error)
+        self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
             .await;
     }
 }
 
-fn include_source_to_dataset_name(dataset_name: &TableReference, source: Option<&str>) -> String {
+fn include_source_to_table_name(name: &TableReference, source: Option<&str>) -> String {
     match source {
-        Some(source) => format!("{dataset_name} ({source})"),
-        None => dataset_name.to_string(),
+        Some(source) => format!("{name} ({source})"),
+        None => name.to_string(),
     }
 }
 
