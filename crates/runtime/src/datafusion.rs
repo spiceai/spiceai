@@ -21,8 +21,9 @@ use std::time::Duration;
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
-use crate::component::dataset::acceleration::{self, RefreshMode};
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
+use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
@@ -1172,20 +1173,18 @@ impl DataFusion {
 
     pub(crate) fn register_view(
         self: &Arc<Self>,
-        table: TableReference,
-        view: String,
-        acceleration: Option<acceleration::Acceleration>,
+        view: View,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
-        tracing::info!("Initializing view {table}");
+        tracing::info!("Initializing view {}", &view.name);
 
-        let table_exists = self.ctx.table_exist(table.clone()).unwrap_or(false);
+        let table_exists = self.ctx.table_exist(view.name.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
-        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &table)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
 
-        let statements = DFParser::parse_sql_with_dialect(view.as_str(), &PostgreSqlDialect {})
+        let statements = DFParser::parse_sql_with_dialect(&view.sql, &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
@@ -1210,6 +1209,8 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
+
+            let table = &view.name;
 
             for dependent_table_name in &dependent_table_names {
                 let mut attempts = 0;
@@ -1245,33 +1246,27 @@ impl DataFusion {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(table, status::ComponentStatus::Error);
                 return;
             }
 
-            let view_table = match create_view_table(&ctx, &statements[0], view).await {
+            let view_table = match create_view_table(&ctx, &statements[0], &view.sql).await {
                 Ok(view_table) => view_table,
                 Err(e) => {
                     tracing::error!("Failed to create view: {e}");
-                    status.update_view(&table, status::ComponentStatus::Error);
+                    status.update_view(table, status::ComponentStatus::Error);
                     return;
                 }
             };
 
-            if let Some(acceleration) = acceleration {
+            if let Some(acceleration) = &view.acceleration {
                 if acceleration.enabled {
                     if let Err(e) = df_ref
-                        .create_accelerated_view(
-                            &table,
-                            view_table,
-                            acceleration,
-                            &dependent_table_names,
-                            secrets,
-                        )
+                        .create_accelerated_view(&view, view_table, &dependent_table_names, secrets)
                         .await
                     {
                         tracing::error!("Failed to create view: {e}");
-                        status.update_view(&table, status::ComponentStatus::Error);
+                        status.update_view(table, status::ComponentStatus::Error);
                     }
                     return;
                 }
@@ -1280,11 +1275,11 @@ impl DataFusion {
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
                 tracing::error!("Failed to create view: {e}");
-                status.update_view(&table, status::ComponentStatus::Error);
+                status.update_view(table, status::ComponentStatus::Error);
                 return;
             };
-            tracing::info!("{}", view_registered_trace(&table, None));
-            status.update_view(&table, status::ComponentStatus::Ready);
+            tracing::info!("{}", view_registered_trace(table, None));
+            status.update_view(table, status::ComponentStatus::Ready);
         });
 
         Ok(())
@@ -1292,15 +1287,23 @@ impl DataFusion {
 
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
-        table: &TableReference,
+        view: &View,
         view_table: ViewTable,
-        acceleration: acceleration::Acceleration,
         dependent_tables: &[TableReference],
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
+        let table = &view.name;
+
         tracing::debug!(
-            "Creating accelerated view {table:?} with dependent tables {dependent_tables:?}"
+            "Creating accelerated view {table} with dependent tables {dependent_tables:?}"
         );
+
+        let acceleration =
+            view.acceleration
+                .as_ref()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: table.to_string(),
+                })?;
 
         // If accelerated view depends on other tables, wait until they are ready; this is required to complete
         // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
@@ -1343,7 +1346,14 @@ impl DataFusion {
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()
-            .create_accelerator_table(table.clone(), schema, None, &acceleration, secrets, None)
+            .create_accelerator_table(
+                table.clone(),
+                schema,
+                None,
+                acceleration,
+                secrets,
+                Some(view),
+            )
             .await
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to create view acceleration: {e}"),
@@ -1382,7 +1392,7 @@ impl DataFusion {
             })?;
 
         // ready status will be updated by the accelerated dataset
-        tracing::info!("{}", view_registered_trace(table, Some(&acceleration)));
+        tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
 
         Ok(())
     }

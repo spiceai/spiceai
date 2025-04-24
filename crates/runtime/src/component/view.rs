@@ -14,58 +14,55 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::component::view as spicepod_view;
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, sync::Arc};
+
+use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
-    dataset::{Dataset, acceleration},
+    dataset::{
+        Dataset,
+        acceleration::{self, Acceleration},
+    },
     validate_identifier,
 };
 use spicepod::semantic::Column;
 
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct View {
     pub name: TableReference,
     pub sql: String,
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub runtime: Arc<Runtime>,
+    pub app: Arc<App>,
 }
 
-impl TryFrom<spicepod_view::View> for View {
-    type Error = crate::Error;
+impl PartialEq for View {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.sql == other.sql
+            && self.metadata == other.metadata
+            && self.columns == other.columns
+            && self.acceleration == other.acceleration
+    }
+}
 
-    fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
-        validate_identifier(&view.name).context(crate::ComponentSnafu)?;
-
-        let table_reference = Dataset::parse_table_reference(&view.name)?;
-
-        let sql = if let Some(view_sql) = &view.sql {
-            view_sql.to_string()
-        } else if let Some(sql_ref) = &view.sql_ref {
-            Self::load_sql_ref(sql_ref)?
-        } else {
-            return Err(crate::Error::NeedToSpecifySQLView {
-                name: table_reference.to_string(),
-            });
-        };
-
-        let acceleration = view
-            .acceleration
-            .map(acceleration::Acceleration::try_from)
-            .transpose()?;
-
-        Ok(View {
-            name: table_reference,
-            sql,
-            metadata: view.metadata,
-            columns: view.columns,
-            acceleration,
-        })
+impl std::fmt::Debug for View {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("View")
+            .field("name", &self.name)
+            .field("sql", &self.sql)
+            .field("metadata", &self.metadata)
+            .field("columns", &self.columns)
+            .field("acceleration", &self.acceleration)
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,5 +80,125 @@ impl View {
         }
 
         false
+    }
+}
+
+pub struct ViewBuilder {
+    pub name: TableReference,
+    pub sql: String,
+    pub metadata: HashMap<String, Value>,
+    pub columns: Vec<Column>,
+    pub acceleration: Option<acceleration::Acceleration>,
+    pub runtime: Option<Arc<Runtime>>,
+    pub app: Option<Arc<App>>,
+}
+
+impl TryFrom<spicepod_view::View> for ViewBuilder {
+    type Error = crate::Error;
+
+    fn try_from(view: spicepod_view::View) -> Result<Self, Self::Error> {
+        validate_identifier(&view.name).context(crate::ComponentSnafu)?;
+
+        let table_reference = Dataset::parse_table_reference(&view.name)?;
+
+        let sql = if let Some(view_sql) = &view.sql {
+            view_sql.to_string()
+        } else if let Some(sql_ref) = &view.sql_ref {
+            View::load_sql_ref(sql_ref)?
+        } else {
+            return Err(crate::Error::NeedToSpecifySQLView {
+                name: table_reference.to_string(),
+            });
+        };
+
+        let acceleration = view
+            .acceleration
+            .map(acceleration::Acceleration::try_from)
+            .transpose()?;
+
+        Ok(ViewBuilder {
+            name: table_reference,
+            sql,
+            metadata: view.metadata,
+            columns: view.columns,
+            acceleration,
+            runtime: None,
+            app: None,
+        })
+    }
+}
+
+impl AccelerationSource for View {
+    fn is_file_accelerated(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            if acceleration.engine == acceleration::Engine::PostgreSQL {
+                return false;
+            }
+            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+        }
+        false
+    }
+
+    fn app(&self) -> Arc<app::App> {
+        Arc::clone(&self.app)
+    }
+
+    fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
+    }
+
+    fn acceleration(&self) -> Option<&Acceleration> {
+        self.acceleration.as_ref()
+    }
+
+    fn name(&self) -> &TableReference {
+        &self.name
+    }
+}
+
+impl ViewBuilder {
+    #[must_use]
+    pub fn new(name: TableReference, sql: String) -> Self {
+        Self {
+            name,
+            sql,
+            metadata: HashMap::default(),
+            columns: vec![],
+            acceleration: None,
+            runtime: None,
+            app: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<App>) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn build(self) -> crate::Result<View> {
+        let runtime = self.runtime.context(crate::UnableToCreateViewSnafu {
+            reason: "Runtime is not set.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues".to_string()
+        })?;
+
+        let app = self.app.context(crate::UnableToCreateViewSnafu {
+            reason: "App is not set.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues".to_string()
+        })?;
+
+        Ok(View {
+            name: self.name,
+            sql: self.sql,
+            metadata: self.metadata,
+            columns: self.columns,
+            acceleration: self.acceleration,
+            runtime,
+            app,
+        })
     }
 }

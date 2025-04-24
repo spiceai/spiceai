@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{dataaccelerator::AccelerationSource, Runtime};
+use crate::{Runtime, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -767,7 +767,6 @@ impl AccelerationSource for Dataset {
         &self.name
     }
 }
-
 
 pub mod acceleration;
 
