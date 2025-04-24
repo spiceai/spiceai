@@ -102,9 +102,10 @@ impl Query {
         };
 
         // Use the logical plan with parameter values for caching and lookup
-        let plan = match &parameters {
+        let plan_cache_key = CacheKey::Query(sql, parameters.as_ref()).as_raw_key();
+        let plan = match parameters {
             Some(param_values) => plan
-                .with_param_values(param_values.clone())
+                .with_param_values(param_values)
                 .context(BindingParametersSnafu)?,
             None => plan,
         };
@@ -132,9 +133,7 @@ impl Query {
             CacheControl::Cache(CacheKeyType::Default) | CacheControl::NoCache => {
                 CacheKey::LogicalPlan(&plan).as_raw_key()
             }
-            CacheControl::Cache(CacheKeyType::Raw) => {
-                CacheKey::Query(sql, parameters.as_ref()).as_raw_key()
-            }
+            CacheControl::Cache(CacheKeyType::Raw) => plan_cache_key,
         };
         tracker = tracker.results_cache_hit(false);
 
@@ -400,7 +399,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_sql_cached_prepared_statements() {
         let results_cache_config = ResultsCache {
             enabled: true,
@@ -461,7 +459,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_plan_cached_prepared_statements() {
         let results_cache_config = ResultsCache {
             enabled: true,
