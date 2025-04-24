@@ -54,7 +54,7 @@ tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai
 cudarc = { version = "0.12.2", optional = true, features = [
     "cuda-version-from-build-system",
 ] }
-either = "1.13.0"
+either = "1.15.0"
 indexmap.workspace = true
 tempfile.workspace = true
 
