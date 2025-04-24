@@ -157,7 +157,7 @@ jobs:
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - name: Build ARM64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
@@ -250,7 +250,7 @@ jobs:
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - name: Build AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:

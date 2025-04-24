@@ -145,7 +145,7 @@ jobs:
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-arm64-image
 
       - name: Upload ARM64 artifacts
@@ -212,7 +212,7 @@ jobs:
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-amd64-image
 
       - name: Upload AMD64 artifacts
