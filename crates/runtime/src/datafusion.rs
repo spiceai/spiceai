@@ -1347,7 +1347,7 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let key = CacheKey::String(sql).as_raw_key();
+        let key = CacheKey::Query(sql, None).as_raw_key();
 
         if let Some(plan) = self.cached_plans.get(&key).await {
             tracing::trace!("using cached plan for {sql}");
