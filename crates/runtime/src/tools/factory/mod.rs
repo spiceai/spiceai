@@ -115,6 +115,7 @@ pub fn default_available_catalogs(rt: Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCata
     ]
 }
 
+#[must_use]
 pub fn default_catalog_names<'a>() -> Vec<&'a str> {
     vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
 }
