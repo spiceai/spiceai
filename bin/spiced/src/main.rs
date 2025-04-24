@@ -39,7 +39,7 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 fn main() {
     let args = spiced::Args::parse();
 
-    println!("WE USING SYSTEM ALLOCATOR!");
+    println!("WE USING SNMALLOC!");
 
     if args.version {
         println!("{}", get_version_string());
