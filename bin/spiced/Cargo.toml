@@ -29,6 +29,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = "0.3.6"
+mimalloc = "0.1.46"
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
 tokio.workspace = true

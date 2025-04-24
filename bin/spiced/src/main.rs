@@ -21,7 +21,7 @@ use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
 #[global_allocator]
-static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let args = spiced::Args::parse();
