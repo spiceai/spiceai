@@ -67,7 +67,12 @@ impl LruCache {
 #[async_trait]
 impl QueryResultCache for LruCache {
     async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>> {
-        match self.cache.get(&key.as_raw_key().0).await {
+        let raw_key = key.as_raw_key();
+        self.get_raw_key(raw_key).await
+    }
+
+    async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>> {
+        match self.cache.get(&raw_key.0).await {
             Some(value) => Ok(Some(value)),
             None => Ok(None),
         }

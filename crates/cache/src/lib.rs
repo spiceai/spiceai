@@ -123,7 +123,7 @@ impl CacheKey<'_> {
     }
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Hash, Clone, Copy, Eq, PartialEq)]
 pub struct RawCacheKey(u64);
 
 impl QueryResult {
@@ -149,6 +149,7 @@ pub struct CachedQueryResult {
 #[async_trait]
 pub trait QueryResultCache {
     async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>>;
+    async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>>;
     async fn put<'a>(&self, key: CacheKey<'a>, result: CachedQueryResult) -> Result<()>;
     async fn put_raw_key(&self, raw_key: RawCacheKey, result: CachedQueryResult) -> Result<()>;
     async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()>;
@@ -213,8 +214,16 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
+        let raw_key = key.as_raw_key();
+        self.get_raw_key(raw_key).await
+    }
+
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>> {
         metrics::REQUESTS.add(1, &[]);
-        match self.cache.get(key).await {
+        match self.cache.get_raw_key(raw_key).await {
             Ok(Some(cached_result)) => {
                 metrics::HITS.add(1, &[]);
                 Ok(Some(cached_result))

@@ -206,12 +206,20 @@ impl Query {
             };
 
             let final_stream = if cache_manager.should_cache_results() {
-                Self::wrap_stream_with_cache(
-                    &ctx.df,
-                    res_stream,
-                    cache_manager.raw_cache_key,
-                    Arc::clone(&tracker.datasets),
-                )
+                if let Some(raw_cache_key) = cache_manager.raw_cache_key {
+                    Self::wrap_stream_with_cache(
+                        &ctx.df,
+                        res_stream,
+                        raw_cache_key,
+                        Arc::clone(&tracker.datasets),
+                    )
+                } else {
+                    // It's not a good idea to log in the query path, and especially at a `warn!` level,
+                    // but this should never happen if the cache manager is implemented correctly, and its better
+                    // to let the query succeed and pollute the logs than to panic.
+                    tracing::warn!("No cache key computed for query, skipping caching");
+                    res_stream
+                }
             } else {
                 res_stream
             };
