@@ -25,13 +25,12 @@ use rand::{
     distr::{Distribution, weighted::WeightedIndex},
     rng,
 };
+use spicepod::component::worker;
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicUsize},
 };
 use tokio::sync::RwLock;
-
-use spicepod::component::worker;
 
 pub struct RouterModel {
     router_name: String,
@@ -99,8 +98,9 @@ impl Chat for RouterModel {
 
                 model.chat_stream(req).await
             }
-            Some(worker::RouterConfig::Weighted { .. }) => {
-                let name = select_from_weighted(&self.models_cfg);
+            Some(worker::RouterConfig::Weighted { from, .. }) => {
+                // `select_from_weighted` should be `Some(T)` since `self.models_cfg` isn't empty.
+                let name = select_from_weighted(&self.models_cfg).unwrap_or(from.clone());
                 let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
                     return Err(OpenAIError::InvalidArgument(format!(
                         "Model router '{}' expects a model '{name}' to exist, but does not",
@@ -162,8 +162,9 @@ impl Chat for RouterModel {
 
                 model.chat_request(req).await
             }
-            Some(worker::RouterConfig::Weighted { .. }) => {
-                let name = select_from_weighted(&self.models_cfg);
+            Some(worker::RouterConfig::Weighted { from, .. }) => {
+                // `select_from_weighted` should be `Some(T)` since `self.models_cfg` isn't empty.
+                let name = select_from_weighted(&self.models_cfg).unwrap_or(from.clone());
                 let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
                     return Err(OpenAIError::InvalidArgument(format!(
                         "Model router '{}' expects a model '{name}' to exist, but does not",
@@ -212,13 +213,13 @@ impl Chat for RouterModel {
 }
 
 /// Assumes all elements of `cfg` are [`worker::RouterConfig::Weighted`].
-/// Panics if no elements of `cfg` are [`worker::RouterConfig::Weighted`].
-fn select_from_weighted(cfg: &[worker::RouterConfig]) -> String {
-    let weighted: Vec<(String, u32)> = cfg
+/// Returns `None` if `cfg.len() <=0`
+fn select_from_weighted(cfg: &[worker::RouterConfig]) -> Option<String> {
+    let weighted: Vec<(&String, u32)> = cfg
         .iter()
         .filter_map(|c| {
             if let worker::RouterConfig::Weighted { from, weight } = c {
-                Some((from.clone(), *weight))
+                Some((from, *weight))
             } else {
                 None
             }
@@ -232,7 +233,7 @@ fn select_from_weighted(cfg: &[worker::RouterConfig]) -> String {
         0
     };
 
-    weighted[index].0.clone()
+    weighted.get(index).map(|&(a, _)| a.clone())
 }
 
 /// Assumes all elements of `cfg` are [`worker::RouterConfig::Fallback`].
@@ -250,4 +251,204 @@ fn into_ordered_fallbacks(cfg: &[worker::RouterConfig]) -> Vec<(String, u32)> {
 
     fallbacks.sort_by(|(_, a), (_, b)| a.cmp(b));
     fallbacks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod weighted {
+
+        use super::*;
+        #[test]
+        fn test_select_from_weighted() {
+            let cfg = vec![
+                worker::RouterConfig::Weighted {
+                    from: "example1.com".to_string(),
+                    weight: 1,
+                },
+                worker::RouterConfig::Weighted {
+                    from: "example2.com".to_string(),
+                    weight: 2,
+                },
+                worker::RouterConfig::Weighted {
+                    from: "example3.com".to_string(),
+                    weight: 4,
+                },
+            ];
+            let mut count_1 = 0;
+            let mut count_2 = 0;
+            let mut count_4 = 0;
+            let n = 1000;
+            for _ in 1..n {
+                let Some(v) = select_from_weighted(&cfg) else {
+                    continue;
+                };
+                match v.as_str() {
+                    "example1.com" => count_1 += 1,
+                    "example2.com" => count_2 += 1,
+                    "example3.com" => count_4 += 1,
+                    _ => {}
+                }
+            }
+
+            assert!(count_2 > count_1);
+            assert!(count_4 > count_2);
+
+            // An integer approximation to check that weights are approximately correct.
+            assert!(count_2 - 2 * count_1 < n / 10);
+            assert!(count_4 - 2 * count_2 < n / 10);
+        }
+    }
+
+    mod roundrobin {
+        use super::*;
+        #[test]
+        fn test_select_from_round_robin() {
+            let rtr = RouterModel::new(
+                "foo".to_string(),
+                vec![
+                    worker::RouterConfig::RoundRobin {
+                        from: "example1.com".to_string(),
+                    },
+                    worker::RouterConfig::RoundRobin {
+                        from: "example2.com".to_string(),
+                    },
+                ],
+                Arc::new(RwLock::new(HashMap::new())),
+            );
+            assert_eq!(
+                rtr.select_from_round_robin(),
+                Some("example1.com".to_string())
+            );
+            assert_eq!(
+                rtr.select_from_round_robin(),
+                Some("example2.com".to_string())
+            );
+            assert_eq!(
+                rtr.select_from_round_robin(),
+                Some("example1.com".to_string())
+            );
+            assert_eq!(
+                rtr.select_from_round_robin(),
+                Some("example2.com".to_string())
+            );
+        }
+    }
+
+    mod fallback {
+
+        use super::*;
+
+        #[test]
+        fn test_into_ordered_fallbacks_empty() {
+            assert_eq!(into_ordered_fallbacks(&[]), vec![]);
+        }
+
+        #[test]
+        fn test_into_ordered_fallbacks_single_fallback() {
+            assert_eq!(
+                into_ordered_fallbacks(&[worker::RouterConfig::Fallback {
+                    from: "example.com".to_string(),
+                    order: 1,
+                }]),
+                vec![("example.com".to_string(), 1)]
+            );
+        }
+
+        #[test]
+        fn test_into_ordered_fallbacks_multiple_fallbacks() {
+            assert_eq!(
+                into_ordered_fallbacks(&[
+                    worker::RouterConfig::Fallback {
+                        from: "example1.com".to_string(),
+                        order: 2,
+                    },
+                    worker::RouterConfig::Fallback {
+                        from: "example2.com".to_string(),
+                        order: 1,
+                    },
+                    worker::RouterConfig::Fallback {
+                        from: "example3.com".to_string(),
+                        order: 3,
+                    }
+                ]),
+                vec![
+                    ("example2.com".to_string(), 1),
+                    ("example1.com".to_string(), 2),
+                    ("example3.com".to_string(), 3),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_into_ordered_fallbacks_mixed_configs() {
+            assert_eq!(
+                into_ordered_fallbacks(&[
+                    worker::RouterConfig::Fallback {
+                        from: "example1.com".to_string(),
+                        order: 2,
+                    },
+                    worker::RouterConfig::Weighted {
+                        from: "example2.com".to_string(),
+                        weight: 50,
+                    },
+                    worker::RouterConfig::Fallback {
+                        from: "example3.com".to_string(),
+                        order: 1,
+                    },
+                    worker::RouterConfig::RoundRobin {
+                        from: "example4.com".to_string(),
+                    }
+                ]),
+                vec![
+                    ("example3.com".to_string(), 1),
+                    ("example1.com".to_string(), 2),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_into_ordered_fallbacks_no_fallbacks() {
+            assert_eq!(
+                into_ordered_fallbacks(&[
+                    worker::RouterConfig::Weighted {
+                        from: "example1.com".to_string(),
+                        weight: 50,
+                    },
+                    worker::RouterConfig::RoundRobin {
+                        from: "example2.com".to_string(),
+                    }
+                ]),
+                vec![]
+            );
+        }
+
+        #[test]
+        fn test_into_ordered_fallbacks_equal_orders() {
+            let result = into_ordered_fallbacks(&[
+                worker::RouterConfig::Fallback {
+                    from: "example1.com".to_string(),
+                    order: 1,
+                },
+                worker::RouterConfig::Fallback {
+                    from: "example2.com".to_string(),
+                    order: 1,
+                },
+                worker::RouterConfig::Fallback {
+                    from: "example3.com".to_string(),
+                    order: 2,
+                },
+            ]);
+
+            assert_eq!(result.len(), 3);
+
+            assert!(result.contains(&("example1.com".to_string(), 1)));
+            assert!(result.contains(&("example2.com".to_string(), 1)));
+            assert!(result.contains(&("example3.com".to_string(), 2)));
+
+            let order_1_count = result.iter().take_while(|(_, order)| *order == 1).count();
+            assert_eq!(order_1_count, 2);
+        }
+    }
 }

@@ -20,14 +20,14 @@ pub(crate) static WORKERS_METER: LazyLock<Meter> = LazyLock::new(|| global::mete
 
 pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     WORKERS_METER
-        .i64_up_down_counter("spice.workers")
-        .with_description("Number of workers loaded")
+        .i64_up_down_counter("worker_active_count")
+        .with_description("Number of currently loaded workers.")
         .build()
 });
 
 pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     WORKERS_METER
-        .f64_histogram("spice.workers.load_duration_ms")
-        .with_description("Time to load a worker in milliseconds")
+        .f64_histogram("workers_load_duration_ms")
+        .with_description("Duration in milliseconds to load the worker.")
         .build()
 });

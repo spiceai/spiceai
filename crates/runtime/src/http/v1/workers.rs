@@ -71,8 +71,8 @@ impl From<&spicepod::component::worker::Worker> for Worker {
             description: description.clone(),
             models: models
                 .iter()
-                .filter_map(|m| serde_json::to_value(m).ok())
-                .collect(), // This cannot fail as it has already been serialized.
+                .filter_map(|m| serde_json::to_value(m).ok()) // '.to_value' cannot fail as `.models` came from a serialized form (i.e. in spicepod.yaml).
+                .collect(),
         }
     }
 }

@@ -50,6 +50,7 @@ impl Runtime {
 
         let mut llm_registry = self.llms.write().await;
         llm_registry.insert(cfg.name.clone(), Arc::new(worker));
+        drop(llm_registry);
 
         tracing::info!("Worker [{}] loaded, ready for use", cfg.name);
         metrics::workers::COUNT.add(1, &[KeyValue::new("worker", cfg.name.clone())]);
