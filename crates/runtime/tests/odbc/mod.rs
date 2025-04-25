@@ -29,10 +29,9 @@ use crate::{
 
 use std::collections::HashMap;
 
-use spicepod::{
-    component::dataset::{Dataset, acceleration::Acceleration},
-    param::Params as DatasetParams,
-};
+use spicepod::acceleration::Acceleration;
+use spicepod::acceleration::RefreshMode;
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 // This method is only used in tests
 #[allow(clippy::expect_used)]
@@ -50,9 +49,9 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.acceleration = Some(Acceleration {
         enabled: acceleration,
-        mode: spicepod::component::dataset::acceleration::Mode::Memory,
+        mode: spicepod::acceleration::Mode::Memory,
         engine: Some(engine.to_string()),
-        refresh_mode: Some(spicepod::component::dataset::acceleration::RefreshMode::Full),
+        refresh_mode: Some(RefreshMode::Full),
         refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 10")),
         ..Default::default()
     });

@@ -33,3 +33,4 @@ pub(crate) mod spiced_runtime;
 pub(crate) mod telemetry;
 pub(crate) mod tools;
 pub(crate) mod views;
+pub(crate) mod workers;

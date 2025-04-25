@@ -1660,51 +1660,51 @@ jobs:
 
       - name: Install oha (Linux)
         if: matrix.target.target_os == 'linux'
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
           chmod +x ./oha
           ./oha --version
 
       - name: Start append data simulation
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           ./simulate_append_data.sh &
 
       - name: Configure Spicepod
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           cp ${{ matrix.spicepod }} spicepod.yaml
           cat spicepod.yaml
 
       - name: Start Spice runtime
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test workfload for 120s
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 5
         run: |
           ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 120s -c 10
 
       - name: Send SIGTERM to Spice
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 0.5
         run: |
           killall spice
           while pgrep spice > /dev/null; do sleep 1; done
 
       - name: Verify local DuckDB database
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           ls -la .spice/data
 
@@ -1723,7 +1723,7 @@ jobs:
           fi
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
         run: |
           killall spice || true
@@ -1734,14 +1734,14 @@ jobs:
           fi
 
       - name: Restart Spice runtime
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
@@ -1757,7 +1757,7 @@ jobs:
           name: data_drop
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
         run: |
           killall spice || true
@@ -1810,20 +1810,20 @@ jobs:
 
       - name: Install oha (Linux)
         if: matrix.target.target_os == 'linux'
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
           chmod +x ./oha
           ./oha --version
 
       - name: Configure Spicepod
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           cp ${{ matrix.spicepod }} spicepod.yaml
           cat spicepod.yaml
 
       - name: Start Spice runtime
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1831,26 +1831,26 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 3
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test workfload for 120s
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 5
         run: |
           ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D tpch_query.sql -z 120s -c 10
 
       - name: Send SIGTERM to Spice
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 0.5
         run: |
           killall spice
           while pgrep spice > /dev/null; do sleep 1; done
 
       - name: Verify local DuckDB database
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           ls -la .spice/data
 
@@ -1869,7 +1869,7 @@ jobs:
           fi
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
         run: |
           killall spice || true
@@ -1880,7 +1880,7 @@ jobs:
           fi
 
       - name: Restart Spice runtime
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1888,7 +1888,7 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 3
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
@@ -1899,7 +1899,7 @@ jobs:
           name: customer
 
       - name: Check logs
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         if: always()
         run: |
           killall spice || true

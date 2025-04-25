@@ -19,23 +19,12 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use app::AppBuilder;
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-};
-use llms::chat::create_hf_model;
-use runtime::{
-    Runtime,
-    auth::EndpointAuth,
-    model::ToolUsingChat,
-    tools::{options::SpiceToolsOptions, utils::get_tools},
-};
+use async_openai::types::EmbeddingInput;
+use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
-
-use llms::chat::Chat;
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
@@ -46,7 +35,10 @@ use crate::{
         get_taxi_trips_dataset, get_tpcds_dataset, normalize_chat_completion_response,
         send_chat_completions_request,
     },
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        runtime_ready_check, runtime_ready_check_with_timeout, test_request_context,
+        verify_env_secret_exists,
+    },
 };
 
 use tokio::sync::Mutex;
@@ -65,7 +57,7 @@ mod nsql {
 
     use crate::{
         models::nsql::{TestCase, run_nsql_test},
-        utils::verify_env_secret_exists,
+        utils::{runtime_ready_check_with_timeout, verify_env_secret_exists},
     };
 
     use super::*;
@@ -116,7 +108,7 @@ mod nsql {
                     Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
                 });
 
-                let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+                let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
                 tokio::select! {
                     // increased timeout to download and load huggingface model
@@ -126,9 +118,7 @@ mod nsql {
                     () = Arc::clone(&rt).load_components() => {}
                 }
 
-                drop(llm_init_lock);
-
-                runtime_ready_check(&rt).await;
+                runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
 
                 let test_cases = [
                     TestCase {
@@ -431,7 +421,6 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/4943
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -461,7 +450,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
             Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
         });
 
-        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+        let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
         tokio::select! {
             // increased timeout to download and load huggingface model
@@ -471,7 +460,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
             () = Arc::clone(&rt).load_components() => {}
         }
 
-        drop(llm_init_lock);
+        runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
 
         let response = send_chat_completions_request(
             http_base_url.as_str(),
@@ -492,73 +481,6 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 
         Ok(())
     }).await
-}
-
-#[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/4943
-async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
-    if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
-        verify_env_secret_exists("SPICE_HF_TOKEN")
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
-    test_request_context().scope(async {
-        let model = Arc::new(create_hf_model(
-            HF_TEST_MODEL,
-        Some(HF_TEST_MODEL_TYPE),
-        None,
-            None,
-        )?);
-
-        let app = AppBuilder::new("ai-app")
-        .with_dataset(get_taxi_trips_dataset())
-        .build();
-
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
-
-        tokio::select! {
-            // increased timeout to download and load huggingface model
-            () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-            }
-            () = Arc::clone(&rt).load_components() => {}
-        }
-
-        drop(llm_init_lock);
-
-        let tool_model = Box::new(ToolUsingChat::new(
-            Arc::clone(&model),
-            Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
-            Some(10),
-        ));
-
-        let req = CreateChatCompletionRequestArgs::default()
-            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-                .build()?
-                .into(),ChatCompletionRequestUserMessageArgs::default()
-                .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
-                .build()?
-                .into()])
-            .build()?;
-
-        let mut response = tool_model.chat_request(req).await?;
-
-        // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
-        // https://github.com/spiceai/spiceai/issues/3426
-        response.choices.iter_mut().for_each(|c| {
-            c.message.content = Some("__placeholder__".to_string());
-        });
-
-        insta::assert_snapshot!("chat_1_response_choices", format!("{:?}", response.choices));
-
-        Ok(())
-    })
-    .await
 }
 
 fn get_huggingface_model(

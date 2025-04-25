@@ -38,7 +38,7 @@ use runtime::{
     Runtime,
     accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
-use spicepod::component::dataset::acceleration::Acceleration;
+use spicepod::acceleration::Acceleration;
 use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};

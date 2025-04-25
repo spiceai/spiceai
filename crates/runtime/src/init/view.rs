@@ -17,20 +17,21 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    LogErrors, Result, Runtime, UnableToAttachViewSnafu, component::view::View, metrics, status,
-    topological_ordering::construct_effected_in_topological_order, view,
+    LogErrors, Result, Runtime, UnableToAttachViewSnafu, component::view::View, metrics,
+    secrets::Secrets, status, topological_ordering::construct_effected_in_topological_order, view,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 use itertools::Itertools;
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
         let views: Vec<View> = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
         for view in &views {
-            if let Err(e) = self.load_view(view) {
+            if let Err(e) = self.load_view(view, self.secrets()) {
                 tracing::error!("Unable to load view: {e}");
             };
         }
@@ -80,17 +81,19 @@ impl Runtime {
             .collect()
     }
 
-    fn load_view(&self, view: &View) -> Result<()> {
+    fn load_view(&self, view: &View, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
-        df.register_view(view.name.clone(), view.sql.clone())
-            .context(UnableToAttachViewSnafu)
-            .inspect_err(|_| {
-                self.status
-                    .update_view(&view.name, status::ComponentStatus::Error);
-            })?;
-
-        self.status
-            .update_view(&view.name, status::ComponentStatus::Ready);
+        df.register_view(
+            view.name.clone(),
+            view.sql.clone(),
+            view.acceleration.clone(),
+            secrets,
+        )
+        .context(UnableToAttachViewSnafu)
+        .inspect_err(|_| {
+            self.status
+                .update_view(&view.name, status::ComponentStatus::Error);
+        })?;
         Ok(())
     }
 
@@ -108,7 +111,7 @@ impl Runtime {
         self.status
             .update_view(&view.name, status::ComponentStatus::Refreshing);
         self.remove_view(view);
-        let _ = self.load_view(view);
+        let _ = self.load_view(view, self.secrets());
     }
 
     /// Update views based on changed between the current and new app.
@@ -181,7 +184,7 @@ impl Runtime {
                 } else {
                     self.status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
-                    let _ = self.load_view(view);
+                    let _ = self.load_view(view, self.secrets());
                 }
             }
         }

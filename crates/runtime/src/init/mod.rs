@@ -30,3 +30,5 @@ pub(crate) mod results_cache;
 pub(crate) mod task_history;
 pub(crate) mod tool;
 pub(crate) mod view;
+
+pub mod worker;
