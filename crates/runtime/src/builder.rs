@@ -253,7 +253,7 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = byte_unit::Byte::from_str(&memory_limit)
         .ok()
         // losing the fractional part of a byte is not a problem
-        .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value().ceil() as u64);
+        .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
         tracing::warn!(
@@ -261,5 +261,58 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         );
     }
 
-    memory_limit
+    if memory_limit == Some(0) {
+        tracing::warn!(
+            "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+        );
+
+        None
+    } else {
+        memory_limit
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse_memory_limit() {
+        let test_cases: Vec<(Option<&str>, Option<u64>)> = vec![
+            // bytes
+            (Some("1GB"), Some(1_000_000_000)),
+            (Some("1G"), Some(1_000_000_000)),
+            (Some("1MB"), Some(1_000_000)),
+            (Some("1M"), Some(1_000_000)),
+            (Some("1KB"), Some(1_000)),
+            (Some("1K"), Some(1_000)),
+            (Some("1B"), Some(1)),
+            // bits
+            (Some("1gb"), Some(125_000_000)),
+            (Some("1mb"), Some(125_000)),
+            (Some("1kb"), Some(125)),
+            (Some("1b"), Some(1)),
+            // kibi, gibi, mebi
+            (Some("1GiB"), Some(1_073_741_824)),
+            (Some("1Gi"), Some(1_073_741_824)),
+            (Some("1MiB"), Some(1_048_576)),
+            (Some("1Mi"), Some(1_048_576)),
+            (Some("1KiB"), Some(1024)),
+            (Some("1Ki"), Some(1024)),
+            // without a b identifier, defaults to bytes
+            (Some("1g"), Some(1_000_000_000)),
+            (Some("1m"), Some(1_000_000)),
+            (Some("1k"), Some(1_000)),
+            (Some("1"), Some(1)),
+            (Some("0"), None),
+            (Some("-1"), None),
+            (Some("invalid"), None),
+            (None, None),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = parse_memory_limit(input.map(|s| s.to_string()));
+            assert_eq!(result, expected, "Input: {input:?}");
+        }
+    }
 }

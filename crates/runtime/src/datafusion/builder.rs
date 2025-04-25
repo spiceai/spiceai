@@ -246,18 +246,25 @@ pub(crate) fn runtime_env(
     };
 
     let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
-        let Ok(limit) = limit.try_into() else {
-            panic!("Memory limit could not fit into a usize");
+        let limit = if let Ok(limit) = limit.try_into() {
+            limit
+        } else {
+            tracing::warn!(
+                "Memory limit {limit} is too large for the memory pool.\n Defaulting to a maximum sized pool of {}.",
+                usize::MAX
+            );
+
+            usize::MAX
         };
 
         let Some(topn) = NonZeroUsize::new(5) else {
-            panic!("Memory pool TopN must be greater than 0");
+            unreachable!("Memory pool TopN must be greater than 0");
         };
 
         Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
     } else {
         let Some(topn) = NonZeroUsize::new(5) else {
-            panic!("Memory pool TopN must be greater than 0");
+            unreachable!("Memory pool TopN must be greater than 0");
         };
 
         Arc::new(TrackConsumersPool::new(
