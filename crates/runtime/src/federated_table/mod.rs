@@ -85,7 +85,7 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(&dataset).await.ok()?;
+        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref()).await.ok()?;
         let federated_schema = checkpoint.get_schema().await.ok()??;
         let dataset_name = dataset.name.clone();
 

@@ -14,21 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Code needed to initialize the runtime
+package api
 
-pub(crate) mod catalog;
-pub(crate) mod dataset;
-pub(crate) mod embedding;
-#[cfg(feature = "models")]
-pub(crate) mod eval;
-pub(crate) mod extension;
-pub(crate) mod llm;
-pub(crate) mod metrics;
-pub(crate) mod model;
-pub(crate) mod pods_watcher;
-pub(crate) mod results_cache;
-pub(crate) mod task_history;
-pub(crate) mod tool;
-pub(crate) mod view;
+type Worker struct {
+	Name        string           `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Description string           `json:"description,omitempty" csv:"description" yaml:"description,omitempty"`
+	Models      []map[string]any `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
+}
 
-pub mod worker;
+type WorkerResponse struct {
+	Object string   `json:"object,omitempty" csv:"object" yaml:"object,omitempty"`
+	Data   []Worker `json:"data,omitempty" csv:"data" yaml:"data,omitempty"`
+}

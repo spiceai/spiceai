@@ -14,21 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Code needed to initialize the runtime
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::doc_markdown)]
 
-pub(crate) mod catalog;
-pub(crate) mod dataset;
-pub(crate) mod embedding;
-#[cfg(feature = "models")]
-pub(crate) mod eval;
-pub(crate) mod extension;
-pub(crate) mod llm;
-pub(crate) mod metrics;
-pub(crate) mod model;
-pub(crate) mod pods_watcher;
-pub(crate) mod results_cache;
-pub(crate) mod task_history;
-pub(crate) mod tool;
-pub(crate) mod view;
-
-pub mod worker;
+pub mod router;
+pub use router::RouterModel;

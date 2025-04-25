@@ -49,6 +49,12 @@ impl Runtime {
                 Arc::clone(&self).apply_view_diff(current_app, &new_app);
                 self.apply_model_diff(current_app, &new_app).await;
 
+                if !cfg!(feature = "models") {
+                    Arc::clone(&self)
+                        .apply_worker_diff(current_app, &new_app)
+                        .await;
+                }
+
                 drop(app_read_lock);
 
                 let mut app_write_lock = self.app.write().await;
