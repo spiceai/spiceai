@@ -1250,7 +1250,8 @@ impl DataFusion {
                 return;
             }
 
-            let view_table = match create_view_table(&ctx, &statements[0], &view.sql).await {
+            let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
+            {
                 Ok(view_table) => view_table,
                 Err(e) => {
                     tracing::error!("Failed to create view: {e}");

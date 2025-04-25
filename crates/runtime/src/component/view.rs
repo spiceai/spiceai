@@ -36,7 +36,7 @@ use spicepod::semantic::Column;
 #[derive(Clone)]
 pub struct View {
     pub name: TableReference,
-    pub sql: String,
+    pub sql: Arc<str>,
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
@@ -168,7 +168,7 @@ impl ViewBuilder {
     pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
         View {
             name: self.name,
-            sql: self.sql,
+            sql: Arc::from(self.sql),
             metadata: self.metadata,
             columns: self.columns,
             acceleration: self.acceleration,

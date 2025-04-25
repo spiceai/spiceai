@@ -164,7 +164,7 @@ impl Runtime {
             .iter()
             .map(|v| {
                 let Some(statement) =
-                    DFParser::parse_sql_with_dialect(v.sql.as_str(), &PostgreSqlDialect {})
+                    DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
                         .boxed()?.pop_front() else {
                             return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!("no statements found in view {}", v.name)));
                         };
