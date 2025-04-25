@@ -65,7 +65,7 @@ pub struct Runtime {
     pub temp_directory: Option<String>,
 
     /// Specifies the runtime memory limit. When configured, will spill to disk
-    /// for supported queries & accelerations that are larger than memory.
+    /// for supported queries larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
 
