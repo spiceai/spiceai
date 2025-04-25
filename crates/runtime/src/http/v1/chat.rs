@@ -182,6 +182,7 @@ async fn handle_streaming(
     let tx = Arc::new(tx);
     let (end_completion, completion_done) = oneshot::channel::<()>();
 
+    // Get span event stream and setup background thread to read events and write to `tx`.
     if include_stream_events {
         let mut events = match get_event_stream() {
             Ok(o) => o,
@@ -218,10 +219,12 @@ async fn handle_streaming(
         }
     };
 
+    // Merge [`ChatCompletionResponseStream`] into joint event & LLM stream.
     tokio::spawn(async move {
         while let Some(pkt) = stream.next().await {
             let _ = tx.send(pkt).await;
         }
+        // Signal event stream to close.
         let _ = end_completion.send(());
     });
 
