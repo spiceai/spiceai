@@ -1360,14 +1360,10 @@ impl DataFusion {
                 reason: format!("Failed to create view acceleration: {e}"),
             })?;
 
-        // If we already have an existing dataset checkpoint table that has been checkpointed,
-        // it means there is data from a previous acceleration and we don't need
-        // to wait for the first refresh to complete to mark it ready.
+        // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
         if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await {
             if checkpoint.exists().await {
-                // self.runtime_status
-                //     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
                 initial_load_complete = true;
             }
         }
