@@ -36,9 +36,8 @@ use datafusion::{
     optimizer::{
         AnalyzerRule,
         analyzer::{
-            count_wildcard_rule::CountWildcardRule, expand_wildcard_rule::ExpandWildcardRule,
-            inline_table_scan::InlineTableScan, resolve_grouping_function::ResolveGroupingFunction,
-            type_coercion::TypeCoercion,
+            expand_wildcard_rule::ExpandWildcardRule, inline_table_scan::InlineTableScan,
+            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
     },
     prelude::{SessionConfig, SessionContext},
@@ -229,7 +228,6 @@ fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
-        Arc::new(CountWildcardRule::new()),
     ]
 }
 
@@ -298,7 +296,7 @@ mod tests {
         let default_rules = Analyzer::new().rules;
         assert_eq!(
             default_rules.len(),
-            5,
+            4,
             "Default analyzer rules have changed"
         );
         let expected_rule_names = vec![
@@ -306,7 +304,6 @@ mod tests {
             "expand_wildcard_rule",
             "resolve_grouping_function",
             "type_coercion",
-            "count_wildcard_rule",
         ];
         for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
             assert_eq!(

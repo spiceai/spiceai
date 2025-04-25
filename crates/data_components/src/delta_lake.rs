@@ -19,12 +19,13 @@ use async_trait::async_trait;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
 };
 use datafusion::datasource::physical_plan::{
-    FileScanConfig, ParquetExec, ParquetFileReaderFactory,
+    FileScanConfig, ParquetFileReaderFactory, ParquetSource,
 };
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
@@ -210,18 +211,20 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let file_scan_config =
-            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::clone(schema))
-                .with_limit(limit)
-                .with_projection(new_projections)
-                .with_table_partition_cols(partition_cols.to_vec())
-                .with_file_group(partitioned_files.to_vec());
-        let exec = ParquetExec::builder(file_scan_config)
+        let parquet_source = ParquetSource::new(TableParquetOptions::default())
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
-            .with_predicate(Arc::clone(physical_expr))
-            .build();
+            .with_predicate(Arc::clone(schema), Arc::clone(physical_expr));
+        let file_scan_config = FileScanConfig::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::clone(schema),
+            Arc::new(parquet_source),
+        )
+        .with_limit(limit)
+        .with_projection(new_projections)
+        .with_table_partition_cols(partition_cols.to_vec())
+        .with_file_group(partitioned_files.to_vec());
 
-        Arc::new(exec)
+        file_scan_config.build()
     }
 }
 
@@ -746,6 +749,10 @@ enum DeltaBinaryOperator {
 
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
 #[allow(clippy::too_many_lines)]
+#[allow(
+    deprecated,
+    reason = "Needed to exhaustively match on all expression types"
+)]
 fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     match expr {
         Expr::BinaryExpr(binary) => {

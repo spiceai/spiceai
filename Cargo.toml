@@ -73,13 +73,14 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
     "tokio_io",
     "tls",
 ] }
-datafusion = "45"
-datafusion-common = "45"
-datafusion-execution = "45"
-datafusion-expr = "45"
+datafusion = "46"
+datafusion-common = "46"
+datafusion-execution = "46"
+datafusion-expr = "46"
+datafusion-datasource = "46"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" } # spiceai-45
-datafusion-functions-json = "0.45"
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
+datafusion-functions-json = "0.46"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
 duckdb = "1.2.2"
@@ -176,10 +177,11 @@ arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c118e722ceec90be232d4f2f7683e8b6a81b55b5" } # spiceai-46
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c118e722ceec90be232d4f2f7683e8b6a81b55b5" } # spiceai-46
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "c118e722ceec90be232d4f2f7683e8b6a81b55b5" } # spiceai-46
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c118e722ceec90be232d4f2f7683e8b6a81b55b5" } # spiceai-46
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "c118e722ceec90be232d4f2f7683e8b6a81b55b5" } # spiceai-46
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "9c246d91df647597ad076bdb34f8c25eb9754d7c" } # phillip/250425-df-46

@@ -36,11 +36,12 @@ use datafusion::datasource::file_format::file_compression_type::FileCompressionT
 use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl, MetadataColumn,
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use datafusion_datasource::metadata::MetadataColumn;
 use futures::TryStreamExt;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;

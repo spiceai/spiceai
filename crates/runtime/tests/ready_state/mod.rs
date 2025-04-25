@@ -36,16 +36,17 @@ use datafusion::{
     arrow::array::Int32Array,
     catalog::Session,
     common::Statistics,
-    datasource::{MemTable, TableProvider},
+    datasource::{MemTable, TableProvider, memory::MemorySourceConfig},
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-        memory::MemoryExec, stream::RecordBatchStreamAdapter,
+        stream::RecordBatchStreamAdapter,
     },
     prelude::{Expr, SessionContext},
     sql::unparser::dialect::{Dialect, PostgreSqlDialect},
 };
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_federation::{
     FederatedTableProviderAdaptor, table_reference::MultiPartTableReference,
 };
@@ -361,7 +362,11 @@ impl SQLExecutor for MockSQLExecutor {
         // Create a context to execute against the mock data
         let ctx = SessionContext::new();
 
-        let exec = MemoryExec::try_new(&[vec![data]], Arc::clone(&schema), None)?;
+        let exec = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+            &[vec![data]],
+            Arc::clone(&schema),
+            None,
+        )?)));
 
         let stream = exec.execute(0, ctx.task_ctx())?;
 
