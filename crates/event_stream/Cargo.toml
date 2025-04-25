@@ -13,6 +13,6 @@ futures.workspace = true
 futures-util = "0.3.31"
 snafu.workspace = true
 tokio.workspace = true
-tokio-stream = "0.1.17"
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

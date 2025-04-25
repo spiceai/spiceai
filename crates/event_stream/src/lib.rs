@@ -21,7 +21,7 @@ limitations under the License.
 //! # Usage
 //!
 //! ```rust
-//! use runtime::task_history::event_stream::get_event_stream;
+//! use event_stream::get_event_stream;
 //!
 //! let span = tracing::span!(tracing::Level::INFO, "my_span");
 //! let event_stream = get_event_stream(&span);
@@ -238,5 +238,98 @@ impl Visit for EventMessageVisitor<'_> {
         if field.name() == self.field_name {
             let _ = write!(self.message, "{value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    use tracing::{Level, info, span, subscriber::with_default};
+    use tracing_subscriber::{Registry, prelude::*};
+
+    #[tokio::test]
+    async fn test_get_event_stream_no_span() {
+        with_default(
+            Registry::default().with(EventStreamLayer::new("message")),
+            || {
+                // The current span is the "no span" no-op that has no ID.
+                let res = get_event_stream();
+                assert!(matches!(res, Err(TracingError::NoSpanId)));
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_event_stream_receives_event() {
+        with_default(
+            Registry::default().with(EventStreamLayer::new("message")),
+            || {
+                let span = span!(Level::INFO, "test_span");
+                let _enter = span.enter();
+
+                let mut stream = get_event_stream().expect("Failed to obtain event stream");
+
+                info!(message = "hello world", "Emitting an event");
+
+                // `with_default` does not support async, spawn an async task instead.
+                tokio::spawn(async move {
+                    let received = timeout(Duration::from_millis(100), stream.next())
+                        .await
+                        .expect("Timed out waiting for an event")
+                        .expect("Expected an event on the stream");
+                    assert_eq!(received, "hello world".to_string());
+                });
+            },
+        );
+
+        // Wait briefly to allow the background task to complete.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_event_stream_descendant_event() {
+        let subscriber = Registry::default().with(EventStreamLayer::new("message"));
+
+        with_default(subscriber, || {
+            let parent_span = span!(Level::INFO, "parent_span");
+            let _enter_parent = parent_span.enter();
+            info!(message = "parent event", "Emitting an event");
+
+            // Get the event stream from the parent span.
+            let mut stream = get_event_stream().expect("Failed to obtain event stream");
+
+            // Child scope
+            {
+                let child_span = span!(Level::INFO, "child_span");
+                let _enter_child = child_span.enter();
+
+                // Emit an event in the child span.
+                info!(message = "child event", "Emitting a child event");
+            }
+
+            // Spawn an async task to wait for the two events.
+            tokio::spawn(async move {
+                assert_eq!(
+                    timeout(Duration::from_millis(100), stream.next())
+                        .await
+                        .expect("Timed out waiting for an event")
+                        .expect("Expected an event on the stream"),
+                    "child event".to_string()
+                );
+
+                assert_eq!(
+                    timeout(Duration::from_millis(100), stream.next())
+                        .await
+                        .expect("Timed out waiting for an event")
+                        .expect("Expected an event on the stream"),
+                    "parent event".to_string()
+                );
+            });
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
