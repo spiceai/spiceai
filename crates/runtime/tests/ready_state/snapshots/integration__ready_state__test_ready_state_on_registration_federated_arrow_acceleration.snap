@@ -8,6 +8,6 @@ expression: explain_str
 | logical_plan  | BytesProcessedNode                                           |
 |               |   TableScan: federated_on_registration_arrow projection=[id] |
 | physical_plan | BytesProcessedExec                                           |
-|               |   MemoryExec: partitions=1, partition_sizes=[1]              |
+|               |   DataSourceExec: partitions=1, partition_sizes=[1]          |
 |               |                                                              |
 +---------------+--------------------------------------------------------------+
