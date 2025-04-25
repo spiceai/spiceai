@@ -25,7 +25,7 @@ use std::{
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{LOCALHOST, test_request_context, wait_until_true},
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow_flight::{
@@ -52,8 +52,6 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
-
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[tokio::test]
 async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
