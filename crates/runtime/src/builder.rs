@@ -142,10 +142,22 @@ impl RuntimeBuilder {
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
+        let memory_limit = self
+            .app
+            .as_ref()
+            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
+
+        let temp_directory = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.temp_directory.clone());
+
         let mut df = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
         )
+        .memory_limit(memory_limit)
+        .temp_directory(temp_directory)
         .build();
 
         if let Some(callback) = self.datafusion_configuration_fn {
@@ -231,4 +243,27 @@ impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
+    let memory_limit = memory_limit?;
+    let original_memory_limit = memory_limit.clone();
+    let memory_limit = memory_limit.to_uppercase();
+    let memory_limit = if let Some(limit) = memory_limit.strip_suffix("GB") {
+        limit.parse::<u64>().map(|v| v * 1024 * 1024 * 1024).ok()
+    } else if let Some(limit) = memory_limit.strip_suffix("MB") {
+        limit.parse::<u64>().map(|v| v * 1024 * 1024).ok()
+    } else if let Some(limit) = memory_limit.strip_suffix("KB") {
+        limit.parse::<u64>().map(|v| v * 1024).ok()
+    } else {
+        None
+    };
+
+    if memory_limit.is_none() {
+        tracing::warn!(
+            "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+        );
+    }
+
+    memory_limit
 }
