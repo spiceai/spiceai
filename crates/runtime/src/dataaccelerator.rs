@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
@@ -261,13 +260,13 @@ pub trait DataAccelerator: Send + Sync {
     /// Initialize the accelerator for a component
     async fn init(
         &self,
-        _dataset: &Dataset,
+        _source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
     /// Check if the accelerator is initialized for a component
-    fn is_initialized(&self, _dataset: &Dataset) -> bool {
+    fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
         true
     }
 
@@ -283,8 +282,8 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// Check if the file path is valid
-    fn is_valid_file(&self, dataset: &Dataset) -> bool {
-        if let Ok(path) = self.file_path(dataset) {
+    fn is_valid_file(&self, source: &dyn AccelerationSource) -> bool {
+        if let Ok(path) = self.file_path(source) {
             let path = std::path::Path::new(&path);
 
             !path.is_dir()

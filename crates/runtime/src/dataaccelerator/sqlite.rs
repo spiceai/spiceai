@@ -29,10 +29,7 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Engine, Mode},
-    },
+    component::dataset::acceleration::{Engine, Mode},
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
@@ -128,8 +125,8 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
-    pub fn sqlite_busy_timeout(&self, dataset: &Dataset) -> Result<Duration> {
-        if let Some(acceleration) = dataset.acceleration.as_ref() {
+    pub fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
+        if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
             return self
                 .sqlite_factory
@@ -140,22 +137,22 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
-        let sqlite_file = self.sqlite_file_path(dataset)?;
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<SqliteConnectionPool> {
+        let sqlite_file = self.sqlite_file_path(source)?;
 
-        let acceleration = dataset
-            .acceleration
-            .as_ref()
-            .context(AccelerationNotEnabledSnafu {
-                dataset: dataset.name.to_string(),
-            })?;
+        let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
+            dataset: source.name().to_string(),
+        })?;
 
         let mode = match acceleration.mode {
             Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
-        let busy_timeout = self.sqlite_busy_timeout(dataset)?;
+        let busy_timeout = self.sqlite_busy_timeout(source)?;
 
         let pool = self
             .sqlite_factory
@@ -195,13 +192,13 @@ impl DataAccelerator for SqliteAccelerator {
             })
     }
 
-    fn is_initialized(&self, dataset: &Dataset) -> bool {
-        if !dataset.is_file_accelerated() {
+    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
+        if !source.is_file_accelerated() {
             return true; // memory mode SQLite is always initialized
         }
 
         // otherwise, we're initialized if the file exists
-        self.has_existing_file(dataset)
+        self.has_existing_file(source)
     }
 
     /// Initializes an SQLite database for the dataset
@@ -210,19 +207,19 @@ impl DataAccelerator for SqliteAccelerator {
     /// Federation then requires that all attached databases exist before dataset registration.
     async fn init(
         &self,
-        dataset: &Dataset,
+        source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !dataset.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(source)?;
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(dataset) {
+            } else if !self.is_valid_file(source) {
                 if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -239,7 +236,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            self.get_shared_pool(dataset).await?;
+            self.get_shared_pool(source).await?;
         }
 
         Ok(())

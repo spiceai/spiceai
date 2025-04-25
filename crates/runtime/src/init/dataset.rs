@@ -738,12 +738,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds)
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(()) => {
                         initialized_datasets.push(Arc::clone(ds));
                     }

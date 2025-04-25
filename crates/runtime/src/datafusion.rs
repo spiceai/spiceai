@@ -1360,13 +1360,25 @@ impl DataFusion {
                 reason: format!("Failed to create view acceleration: {e}"),
             })?;
 
+        // If we already have an existing dataset checkpoint table that has been checkpointed,
+        // it means there is data from a previous acceleration and we don't need
+        // to wait for the first refresh to complete to mark it ready.
+        let mut initial_load_complete = false;
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await {
+            if checkpoint.exists().await {
+                // self.runtime_status
+                //     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+                initial_load_complete = true;
+            }
+        }
+
         // TODO Extend and refactor (move to helper functionality that can be re-used with datasets logic)
         let mut refresh = Refresh::new(RefreshMode::Full);
         if let Some(refresh_check_interval) = acceleration.refresh_check_interval {
             refresh = refresh.check_interval(refresh_check_interval);
         }
 
-        let builder = AcceleratedTable::builder(
+        let mut builder = AcceleratedTable::builder(
             Arc::clone(&runtime_status),
             table.clone(),
             federated_table.into(),
@@ -1374,6 +1386,9 @@ impl DataFusion {
             accelerated_table_provider,
             refresh,
         );
+        builder.initial_load_complete(initial_load_complete);
+        builder.cache_provider(self.cache_provider());
+        builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
 
         let (accelerated_table, _) =
             builder
@@ -1392,8 +1407,13 @@ impl DataFusion {
                 reason: format!("Failed to registed view: {e}"),
             })?;
 
-        // ready status will be updated by the accelerated dataset
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
+
+        // if initial load completed, mark view as ready; otherwise, ready status will be updated by acceleration
+        if initial_load_complete {
+            self.runtime_status
+                .update_view(&view.name, status::ComponentStatus::Ready);
+        }
 
         Ok(())
     }

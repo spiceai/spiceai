@@ -117,22 +117,22 @@ impl DuckDBAccelerator {
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<DuckDbConnectionPool> {
-        let duckdb_file = self.duckdb_file_path(dataset);
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<DuckDbConnectionPool> {
+        let duckdb_file = self.duckdb_file_path(source);
 
-        let acceleration = dataset
-            .acceleration
-            .as_ref()
-            .context(AccelerationNotEnabledSnafu {
-                dataset: dataset.name.to_string(),
-            })?;
+        let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
+            dataset: source.name().to_string(),
+        })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
-                    &dataset.app(),
-                    dataset.runtime(),
+                    &source.app(),
+                    source.runtime(),
                 );
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
@@ -146,7 +146,7 @@ impl DuckDBAccelerator {
             }
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, &dataset.app(), dataset.runtime());
+                    self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
@@ -240,31 +240,31 @@ impl DataAccelerator for DuckDBAccelerator {
             .map_err(|e| DataAcceleratorError::InvalidConfiguration { msg: e.to_string() })
     }
 
-    fn is_initialized(&self, dataset: &Dataset) -> bool {
-        if !dataset.is_file_accelerated() {
+    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
+        if !source.is_file_accelerated() {
             return true; // memory mode DuckDB is always initialized
         }
 
         // otherwise, we're initialized if the file exists
-        self.has_existing_file(dataset)
+        self.has_existing_file(source)
     }
 
     async fn init(
         &self,
-        dataset: &Dataset,
+        source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !dataset.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(source)?;
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
-            } else if !self.is_valid_file(dataset) {
+            } else if !self.is_valid_file(source) {
                 if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -281,7 +281,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            self.get_shared_pool(dataset).await?;
+            self.get_shared_pool(source).await?;
         }
 
         Ok(())
