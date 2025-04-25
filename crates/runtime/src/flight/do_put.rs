@@ -48,12 +48,19 @@ use crate::{
     timing::TimedStream,
 };
 
-use super::{Service, flightsql::prepared_statement_query, metrics};
+use super::{
+    Service, flightsql::prepared_statement_query, metrics, middleware::RateLimiterExtension,
+};
 
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let rate_limit_check_fn = request
+        .extensions()
+        .get::<RateLimiterExtension>()
+        .map(RateLimiterExtension::check_fn);
+
     let mut streaming_flight = request.into_inner().peekable();
 
     // We need to peek at the stream in case we branch below to prepared statements
@@ -74,6 +81,11 @@ pub(crate) async fn handle(
                 .await;
         }
     }
+
+    // Check if the request should be rate limited.
+    if let Some(rate_limit_check) = rate_limit_check_fn {
+        rate_limit_check()?;
+    };
 
     match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
         Some(principal) => {
