@@ -144,7 +144,7 @@ impl Chat for RouterModel {
             })),
         }?
         .map_ok(move |mut ss| {
-            ss.model = public_name.clone();
+            ss.model.clone_from(&public_name);
             ss
         })))
     }
@@ -212,7 +212,7 @@ impl Chat for RouterModel {
             })),
         }
         .map(|mut r| {
-            r.model = self.router_name.clone();
+            r.model.clone_from(&self.router_name);
             r
         })
     }
