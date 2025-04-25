@@ -220,12 +220,14 @@ async fn register_test_table(
 
 async fn write_record_batches(
     client: &mut FlightClient,
-    batches: impl Iterator<Item = RecordBatch>,
+    batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<PutResult>, FlightError> {
     let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
-        .build(futures::stream::iter(batches.map(Ok).collect::<Vec<_>>()));
+        .build(futures::stream::iter(
+            batches.into_iter().map(Ok).collect::<Vec<_>>(),
+        ));
 
     let response: Vec<PutResult> = client
         .do_put(flight_data_stream)

@@ -1,11 +1,17 @@
 use std::sync::Arc;
 
-use arrow::array::{Array as _, ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{Array as _, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt as _;
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
+use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 
-use crate::{flight::start_spice_test_app, init_tracing, utils::test_request_context};
+use crate::{
+    flight::{create_flight_client, start_spice_test_app, test_record_batch, write_record_batches},
+    init_tracing,
+    utils::test_request_context,
+};
 
 #[tokio::test]
 async fn test_basic_binding() -> Result<(), anyhow::Error> {
@@ -38,6 +44,66 @@ async fn test_basic_binding() -> Result<(), anyhow::Error> {
                 .expect("the_answer is Int64Array");
             assert_eq!(column.len(), 1);
             assert_eq!(column.value(0), 42);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_multiple_parameters() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+            let (channel, _df) = start_spice_test_app(Some(auth), None).await?;
+
+            let test_record_batch = test_record_batch()?;
+
+            let batches = vec![test_record_batch.clone(), test_record_batch];
+
+            let mut client = create_flight_client(channel.clone(), Some("valid"))?;
+            write_record_batches(&mut client, batches).await?;
+
+            let mut client = FlightSqlServiceClient::new(channel);
+            client.handshake("", "valid").await?;
+            let param_batch = create_param_batch(
+                vec![
+                    ("$1", arrow::datatypes::DataType::Int32, false),
+                    ("$2", arrow::datatypes::DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow::array::Array>,
+                    Arc::new(StringArray::from(vec!["a"])) as Arc<dyn arrow::array::Array>,
+                ],
+            )?;
+
+            let results = execute_prepared_statement(
+                &mut client,
+                "SELECT a, b FROM my_table WHERE a = $1 AND b = $2",
+                param_batch,
+            )
+            .await?;
+
+            assert_eq!(results.len(), 2);
+            let record = results.first().expect("at least 1");
+            let (i, _) = record.schema().column_with_name("a").expect("a column");
+            let column = record
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("a is Int32Array");
+            assert_eq!(column.len(), 1);
+            assert_eq!(column.value(0), 1);
+            let (i, _) = record.schema().column_with_name("b").expect("b column");
+            let column = record
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("a is StringArray");
+            assert_eq!(column.len(), 1);
+            assert_eq!(column.value(0), "a");
             Ok(())
         })
         .await
