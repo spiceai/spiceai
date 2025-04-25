@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use app::App;
 use tokio::sync::RwLock;
@@ -142,10 +142,22 @@ impl RuntimeBuilder {
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
+        let memory_limit = self
+            .app
+            .as_ref()
+            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
+
+        let temp_directory = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.temp_directory.clone());
+
         let mut df = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
         )
+        .memory_limit(memory_limit)
+        .temp_directory(temp_directory)
         .build();
 
         if let Some(callback) = self.datafusion_configuration_fn {
@@ -230,5 +242,77 @@ impl RuntimeBuilder {
 impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
+    let memory_limit = memory_limit?;
+    let original_memory_limit = memory_limit.clone();
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let memory_limit = byte_unit::Byte::from_str(&memory_limit)
+        .ok()
+        // losing the fractional part of a byte is not a problem
+        .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
+
+    if memory_limit.is_none() {
+        tracing::warn!(
+            "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+        );
+    }
+
+    if memory_limit == Some(0) {
+        tracing::warn!(
+            "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+        );
+
+        None
+    } else {
+        memory_limit
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse_memory_limit() {
+        let test_cases: Vec<(Option<&str>, Option<u64>)> = vec![
+            // bytes
+            (Some("1GB"), Some(1_000_000_000)),
+            (Some("1G"), Some(1_000_000_000)),
+            (Some("1MB"), Some(1_000_000)),
+            (Some("1M"), Some(1_000_000)),
+            (Some("1KB"), Some(1_000)),
+            (Some("1K"), Some(1_000)),
+            (Some("1B"), Some(1)),
+            // bits
+            (Some("1gb"), Some(125_000_000)),
+            (Some("1mb"), Some(125_000)),
+            (Some("1kb"), Some(125)),
+            (Some("1b"), Some(1)),
+            // kibi, gibi, mebi
+            (Some("1GiB"), Some(1_073_741_824)),
+            (Some("1Gi"), Some(1_073_741_824)),
+            (Some("1MiB"), Some(1_048_576)),
+            (Some("1Mi"), Some(1_048_576)),
+            (Some("1KiB"), Some(1024)),
+            (Some("1Ki"), Some(1024)),
+            // without a b identifier, defaults to bytes
+            (Some("1g"), Some(1_000_000_000)),
+            (Some("1m"), Some(1_000_000)),
+            (Some("1k"), Some(1_000)),
+            (Some("1"), Some(1)),
+            (Some("0"), None),
+            (Some("-1"), None),
+            (Some("invalid"), None),
+            (None, None),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = parse_memory_limit(input.map(ToString::to_string));
+            assert_eq!(result, expected, "Input: {input:?}");
+        }
     }
 }
