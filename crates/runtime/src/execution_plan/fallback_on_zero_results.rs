@@ -367,10 +367,10 @@ mod tests {
         }
 
         fn memory_exec() -> Arc<dyn ExecutionPlan> {
-            Arc::new(DataSourceExec::new(
+            Arc::new(DataSourceExec::new(Arc::new(
                 MemorySourceConfig::try_new(&[vec![batch_input()]], schema(), None)
                     .expect("memory exec should not panic"),
-            ))
+            )))
         }
 
         fn memory_table_provider() -> Arc<dyn TableProvider> {
