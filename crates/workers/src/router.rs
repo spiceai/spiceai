@@ -20,7 +20,7 @@ use async_openai::{
         ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream::StreamExt};
 use llms::chat::{Chat, nsql::SqlGeneration};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
@@ -122,8 +122,17 @@ impl Chat for RouterModel {
                         )));
                     };
 
-                    if let Ok(resp) = model.chat_stream(req.clone()).await {
-                        return Ok(resp);
+                    match model.chat_stream(req.clone()).await {
+                        Err(_) => continue,
+
+                        // Check if first item in stream is `Err` since this is a common error by providers.
+                        Ok(stream) => {
+                            let mut peekable = Box::pin(Box::pin(stream).peekable());
+                            match peekable.as_mut().peek().await.as_ref() {
+                                Some(Err(_)) => continue,
+                                None | Some(Ok(_)) => return Ok(peekable),
+                            }
+                        }
                     }
                 }
                 Err(OpenAIError::ApiError(ApiError {
