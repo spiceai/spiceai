@@ -33,10 +33,10 @@ use tokio::sync::RwLock;
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let views: Vec<View> = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
-        for view in &views {
-            if let Err(e) = self.load_view(view, self.secrets()) {
+        for view in views {
+            if let Err(e) = self.load_view(&view, self.secrets()) {
                 tracing::error!("Unable to load view: {e}");
             };
         }
@@ -47,7 +47,7 @@ impl Runtime {
         self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
-    ) -> Vec<View> {
+    ) -> Vec<Arc<View>> {
         let rt_ref = Arc::clone(&self);
 
         let datasets = self
@@ -77,7 +77,7 @@ impl Runtime {
                         }
                         None
                     } else {
-                        Some(view)
+                        Some(Arc::new(view))
                     }
                 }
                 Err(e) => {
@@ -91,9 +91,9 @@ impl Runtime {
             .collect()
     }
 
-    fn load_view(&self, view: &View, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+    fn load_view(&self, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
-        df.register_view(view.clone(), secrets)
+        df.register_view(Arc::clone(view), secrets)
             .context(UnableToAttachViewSnafu)
             .inspect_err(|_| {
                 self.status
@@ -112,7 +112,7 @@ impl Runtime {
         tracing::info!("Unloaded view {}", name);
     }
 
-    fn update_view(&self, view: &View) {
+    fn update_view(&self, view: &Arc<View>) {
         self.status
             .update_view(&view.name, status::ComponentStatus::Refreshing);
         self.remove_view(&view.name);

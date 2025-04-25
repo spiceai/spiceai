@@ -1173,7 +1173,7 @@ impl DataFusion {
 
     pub(crate) fn register_view(
         self: &Arc<Self>,
-        view: View,
+        view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<()> {
         tracing::info!("Initializing view {}", &view.name);
