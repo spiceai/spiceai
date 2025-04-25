@@ -181,8 +181,8 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" } # spiceai-45
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1713e9af2729f686aac46aef63e8c84545083e29" } # spiceai
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "9c246d91df647597ad076bdb34f8c25eb9754d7c" } # phillip/250425-df-46
 
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b850ae60dbe67209320c86daeadf47b51f937660" } # spiceai-1.2.2
@@ -192,8 +192,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f4059bc6b7b0defe2945a170e26509d54119e24" } # spiceai-0.4.0-df-46
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f4059bc6b7b0defe2945a170e26509d54119e24" } # spiceai-0.4.0-df-46
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1f4059bc6b7b0defe2945a170e26509d54119e24" } # spiceai-0.4.0-df-46
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
