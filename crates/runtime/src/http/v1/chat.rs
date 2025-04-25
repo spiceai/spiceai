@@ -446,7 +446,7 @@ mod tests {
         }))
         .expect("Failed to make test request payload.");
 
-        let guard = tracing::subscriber::set_default(
+        let _ = tracing::subscriber::set_default(
             tracing_subscriber::registry().with(event_stream::EventStreamLayer::new("progress")),
         );
         let span = span!(Level::INFO, "test_span");
