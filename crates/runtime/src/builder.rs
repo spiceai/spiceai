@@ -311,7 +311,7 @@ mod test {
         ];
 
         for (input, expected) in test_cases {
-            let result = parse_memory_limit(input.map(|s| s.to_string()));
+            let result = parse_memory_limit(input.map(ToString::to_string));
             assert_eq!(result, expected, "Input: {input:?}");
         }
     }
