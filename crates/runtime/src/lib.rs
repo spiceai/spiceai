@@ -357,7 +357,6 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
-
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
@@ -613,6 +612,11 @@ impl Runtime {
                 self.status
                     .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
             }
+
+            for model in &app.models {
+                self.status
+                    .update_model(&model.name, ComponentStatus::Initializing);
+            }
         }
 
         let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
@@ -690,6 +694,7 @@ impl Runtime {
 
                 #[cfg(feature = "models")]
                 {
+                    self_clone.load_workers().await;
                     self_clone.load_eval_scorer().await;
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());

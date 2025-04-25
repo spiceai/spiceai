@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q55"
+---
++----------+---------------------+-----------+
+| brand_id | brand               | ext_price |
++----------+---------------------+-----------+
+| 9015008  | scholarunivamalg #8 | 25131.36  |
++----------+---------------------+-----------+

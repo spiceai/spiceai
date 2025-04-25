@@ -22,7 +22,8 @@ use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
+use spicepod::acceleration::Acceleration;
+use spicepod::component::dataset::Dataset;
 use std::{fs::File, io::Write, sync::Arc};
 
 pub fn make_delta_lake_dataset(path: &str, name: &str, accelerated: bool) -> Dataset {

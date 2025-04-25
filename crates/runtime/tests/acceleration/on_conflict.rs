@@ -26,10 +26,8 @@ use rand::Rng;
 
 use runtime::Runtime;
 use spicepod::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
-    },
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
+    component::dataset::Dataset,
     param::Params,
 };
 use std::{collections::HashMap, sync::Arc};

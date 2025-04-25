@@ -154,6 +154,27 @@ impl RuntimeStatus {
         metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
     }
 
+    /// Update the status of a worker
+    pub fn update_worker(&self, name: &str, status: ComponentStatus) {
+        let mut components = match self.statuses.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let full_name = format!("worker:{name}");
+        components.insert(full_name, status);
+    }
+
+    /// Get the status of a worker
+    #[must_use]
+    pub fn worker_status(&self, name: &str) -> Option<ComponentStatus> {
+        let components = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let full_name = format!("worker:{name}");
+        components.get(&full_name).copied()
+    }
+
     /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
     ///
     /// This function returns `true` if all components that have ever been registered
@@ -220,6 +241,20 @@ impl RuntimeStatus {
                 k.strip_prefix("model:")
                     .map(|model_name| (model_name.to_string(), *v))
             })
+            .collect()
+    }
+
+    /// Returns the status of all registered datasets.
+    #[must_use]
+    pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        let statuses = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        statuses
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix("dataset:").map(|name| (name.into(), *v)))
             .collect()
     }
 

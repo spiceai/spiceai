@@ -44,11 +44,11 @@ pub(super) enum PlanOrCached {
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: QueryResultsCacheStatus,
-    pub(super) raw_cache_key: RawCacheKey,
+    pub(super) raw_cache_key: Option<RawCacheKey>,
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: RawCacheKey) -> Self {
+    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: Option<RawCacheKey>) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -77,17 +77,21 @@ impl Query {
         tracker: QueryTracker,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
-        let (tracker, cache_status) = match Self::try_get_cached_result(
+        let (tracker, cache_status, sql_cache_key) = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::String(sql),
+            CacheKey::Query(sql, parameters.as_ref()),
         )
         .await?
         {
-            CacheResult::Hit(result) => return Ok(PlanOrCached::Cached(result)),
-            CacheResult::MissOrSkipped(tracker, status) => (tracker, Some(status)),
-            CacheResult::WrongCacheKeyType(tracker) => (tracker, None),
+            (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
+            (CacheResult::MissOrSkipped(tracker, status), sql_cache_key) => {
+                (tracker, Some(status), sql_cache_key)
+            }
+            (CacheResult::WrongCacheKeyType(tracker), sql_cache_key) => {
+                (tracker, None, sql_cache_key)
+            }
         };
 
         let plan = match df.get_or_create_logical_plan(session, sql).await {
@@ -110,7 +114,7 @@ impl Query {
         };
 
         // Try to get cached results from plan
-        let (mut tracker, cache_status) = match Self::try_get_cached_result(
+        let (mut tracker, cache_status, plan_cache_key) = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
@@ -118,28 +122,26 @@ impl Query {
         )
         .await?
         {
-            CacheResult::Hit(result) => return Ok(PlanOrCached::Cached(result)),
-            CacheResult::MissOrSkipped(tracker, status) => (tracker, status),
-            CacheResult::WrongCacheKeyType(tracker) => (
+            (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
+            (CacheResult::MissOrSkipped(tracker, status), plan_cache_key) => {
+                (tracker, status, plan_cache_key)
+            }
+            (CacheResult::WrongCacheKeyType(tracker), plan_cache_key) => (
                 tracker,
                 cache_status.unwrap_or(QueryResultsCacheStatus::CacheMiss),
+                plan_cache_key,
             ),
         };
 
+        let raw_cache_key = sql_cache_key.or(plan_cache_key);
+
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
-        let cache_control = request_context.cache_control();
-        let plan_cache_key = match cache_control {
-            CacheControl::Cache(CacheKeyType::Default) | CacheControl::NoCache => {
-                CacheKey::LogicalPlan(&plan).as_raw_key()
-            }
-            CacheControl::Cache(CacheKeyType::Raw) => CacheKey::String(sql).as_raw_key(),
-        };
         tracker = tracker.results_cache_hit(false);
 
         Ok(PlanOrCached::Plan(
             plan,
             tracker,
-            RequestCacheManager::new(cache_status, plan_cache_key),
+            RequestCacheManager::new(cache_status, raw_cache_key),
         ))
     }
 
@@ -148,11 +150,11 @@ impl Query {
         request_context: Arc<RequestContext>,
         mut tracker: QueryTracker,
         key: CacheKey<'_>,
-    ) -> super::Result<CacheResult> {
+    ) -> super::Result<(CacheResult, Option<RawCacheKey>)> {
         let Some(cache_provider) = df.cache_provider() else {
-            return Ok(CacheResult::MissOrSkipped(
-                tracker,
-                QueryResultsCacheStatus::CacheDisabled,
+            return Ok((
+                CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheDisabled),
+                None,
             ));
         };
 
@@ -160,27 +162,29 @@ impl Query {
 
         // If the user requested no caching, skip the cache lookup
         let CacheControl::Cache(cache_key) = cache_control else {
-            return Ok(CacheResult::MissOrSkipped(
-                tracker,
-                QueryResultsCacheStatus::CacheBypass,
+            return Ok((
+                CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass),
+                None,
             ));
         };
 
         // Validate that the provided cache key is the correct type for this request
         match (cache_key, &key) {
             (CacheKeyType::Default, CacheKey::LogicalPlan(_))
-            | (CacheKeyType::Raw, CacheKey::String(_)) => {}
+            | (CacheKeyType::Raw, CacheKey::Query(_, _)) => {}
             _ => {
-                return Ok(CacheResult::WrongCacheKeyType(tracker));
+                return Ok((CacheResult::WrongCacheKeyType(tracker), None));
             }
         }
 
-        let cached_result = match cache_provider.get(key).await {
+        let raw_key = key.as_raw_key();
+
+        let cached_result = match cache_provider.get_raw_key(raw_key).await {
             Ok(Some(result)) => result,
             Ok(None) => {
-                return Ok(CacheResult::MissOrSkipped(
-                    tracker,
-                    QueryResultsCacheStatus::CacheMiss,
+                return Ok((
+                    CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheMiss),
+                    Some(raw_key),
                 ));
             }
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
@@ -197,15 +201,18 @@ impl Query {
                 Err(e) => return Err(super::Error::UnableToCreateMemoryStream { source: e }),
             };
 
-        Ok(CacheResult::Hit(QueryResult::new(
-            attach_query_tracker_to_stream(
-                Span::current(),
-                request_context,
-                tracker,
-                Box::pin(record_batch_stream),
-            ),
-            QueryResultsCacheStatus::CacheHit,
-        )))
+        Ok((
+            CacheResult::Hit(QueryResult::new(
+                attach_query_tracker_to_stream(
+                    Span::current(),
+                    request_context,
+                    tracker,
+                    Box::pin(record_batch_stream),
+                ),
+                QueryResultsCacheStatus::CacheHit,
+            )),
+            Some(raw_key),
+        ))
     }
 
     fn should_cache_results(
@@ -263,15 +270,13 @@ mod tests {
     #[tokio::test]
     async fn test_request_cache_manager() {
         let cache_status = QueryResultsCacheStatus::CacheHit;
-        let raw_cache_key = CacheKey::String("test-key").as_raw_key();
+        let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
-        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
+        let manager = RequestCacheManager::new(cache_status, Some(raw_cache_key));
         assert!(manager.should_cache_results());
 
-        let raw_cache_key = CacheKey::String("test-key").as_raw_key();
-
         let disabled_manager =
-            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, raw_cache_key);
+            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, None);
         assert!(!disabled_manager.should_cache_results());
     }
 
@@ -385,6 +390,150 @@ mod tests {
 
         // Repeat the same query with the default cache key type, but with different whitespace - this should be a cache hit since the plan is the same
         let query_builder = QueryBuilder::new("SELECT 1 ", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheHit
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_plan_or_cached_sql_cached_prepared_statements() {
+        let results_cache_config = ResultsCache {
+            enabled: true,
+            cache_max_size: None,
+            item_ttl: Some("10m".to_string()),
+            eviction_policy: None,
+            cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
+        };
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
+                .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .with_cache_provider(Arc::new(cache_provider))
+            .build(),
+        );
+
+        let parameters = ParamValues::List(vec![1.into()]);
+
+        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw));
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_plan_or_cached_plan_cached_prepared_statements() {
+        let results_cache_config = ResultsCache {
+            enabled: true,
+            cache_max_size: None,
+            item_ttl: Some("10m".to_string()),
+            eviction_policy: None,
+            cache_key_type: spicepod::component::runtime::CacheKeyType::Plan,
+        };
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
+                .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .with_cache_provider(Arc::new(cache_provider))
+            .build(),
+        );
+
+        let parameters = ParamValues::List(vec![1.into()]);
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default));
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.results_cache_status,
+                    QueryResultsCacheStatus::CacheMiss
+                );
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+            })
+            .await;
+
+        let parameters = ParamValues::List(vec![2.into()]);
+
+        // Repeat the same query to ensure a cache hit
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {

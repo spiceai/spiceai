@@ -37,10 +37,8 @@ use futures::TryStreamExt;
 use mysql_async::{Params, Row, prelude::Queryable};
 use runtime::{Runtime, spice_data_base_path};
 use spicepod::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, IndexType, Mode},
-    },
+    acceleration::{Acceleration, IndexType, Mode},
+    component::dataset::Dataset,
     param::Params as SpicepodParams,
 };
 

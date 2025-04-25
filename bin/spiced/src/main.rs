@@ -20,8 +20,39 @@ use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-system")]
+#[global_allocator]
+static ALLOC: std::alloc::System = std::alloc::System;
+
+// snmalloc is the default allocator if no other allocator is selected
+#[cfg(not(any(
+    feature = "alloc-jemalloc",
+    feature = "alloc-mimalloc",
+    feature = "alloc-system"
+)))]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// Function to determine the allocator name at compile time
+const fn get_allocator_name() -> Option<&'static str> {
+    if cfg!(feature = "alloc-jemalloc") {
+        Some("jemalloc")
+    } else if cfg!(feature = "alloc-mimalloc") {
+        Some("mimalloc")
+    } else if cfg!(feature = "alloc-system") {
+        Some("system")
+    } else {
+        None
+    }
+}
 
 fn main() {
     let args = spiced::Args::parse();
@@ -63,7 +94,14 @@ fn main() {
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
     spiced::in_tracing_context(|| {
-        tracing::info!("Starting runtime {version}", version = get_version_string());
+        if let Some(allocator_name) = get_allocator_name() {
+            tracing::info!(
+                "Starting runtime {version} (allocator: {allocator_name})",
+                version = get_version_string(),
+            );
+        } else {
+            tracing::info!("Starting runtime {version}", version = get_version_string());
+        }
     });
     spiced::run(args).await?;
     Ok(())

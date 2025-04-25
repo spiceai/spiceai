@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod secret;
 pub mod tool;
 pub mod view;
+pub mod worker;
 
 pub trait Nameable {
     fn name(&self) -> &str;

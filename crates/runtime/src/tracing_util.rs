@@ -14,21 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::sql::TableReference;
 use opentelemetry::trace::TraceId;
 use rand::RngCore;
 
 use crate::{
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
+        acceleration::{self, Acceleration, Mode, RefreshMode, ZeroResultsAction},
     },
     dataconnector::DataConnector,
 };
-use std::sync::Arc;
 
 // Format: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (duckdb), results cache enabled.
 pub fn dataset_registered_trace(
-    data_connector: &Arc<dyn DataConnector>,
+    data_connector: &dyn DataConnector,
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
@@ -37,7 +37,7 @@ pub fn dataset_registered_trace(
         if acceleration.enabled {
             info.push_str(&format!(
                 ", acceleration ({})",
-                dataset_acceleration_info(data_connector, acceleration)
+                acceleration_info(Some(data_connector), acceleration)
             ));
         }
     }
@@ -50,9 +50,28 @@ pub fn dataset_registered_trace(
     info
 }
 
+// Format: View taxi_trips_vw registered, acceleration (duckdb)
+pub fn view_registered_trace(
+    table: &TableReference,
+    acceleration: Option<&acceleration::Acceleration>,
+) -> String {
+    let mut info = format!("View {table} registered");
+    if let Some(acceleration) = acceleration {
+        if acceleration.enabled {
+            info.push_str(&format!(
+                ", acceleration ({})",
+                acceleration_info(None, acceleration)
+            ));
+        }
+    }
+
+    info.push('.');
+    info
+}
+
 // Format: sqlite:file, 30s refresh, 1hr retention, fallback on source on empty result
-fn dataset_acceleration_info(
-    data_connector: &Arc<dyn DataConnector>,
+fn acceleration_info(
+    data_connector: Option<&dyn DataConnector>,
     acceleration: &Acceleration,
 ) -> String {
     let mut info: String = acceleration.engine.to_string();
@@ -61,7 +80,13 @@ fn dataset_acceleration_info(
         info.push_str(":file");
     }
 
-    match data_connector.resolve_refresh_mode(acceleration.refresh_mode) {
+    let refresh_mode = if let Some(data_connector) = data_connector {
+        data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+    } else {
+        acceleration.refresh_mode.unwrap_or(RefreshMode::Disabled)
+    };
+
+    match refresh_mode {
         RefreshMode::Full | RefreshMode::Disabled => {}
         RefreshMode::Append => {
             info.push_str(", append");
@@ -107,6 +132,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::datasource::TableProvider;
     use std::any::Any;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[derive(Debug)]
@@ -138,7 +164,7 @@ mod tests {
             .expect("Failed to build dataset");
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
-        let info = dataset_registered_trace(&test_data_connector, &ds, false);
+        let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
         assert_eq!(
             info,
             "Dataset taxi_trips registered (s3://taxi_trips/2024/)."
@@ -163,7 +189,7 @@ mod tests {
         ds.acceleration = Some(acceleration);
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
-        let info = dataset_registered_trace(&test_data_connector, &ds, true);
+        let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, true);
         assert_eq!(
             info,
             "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
@@ -196,10 +222,45 @@ mod tests {
         ds.acceleration = Some(acceleration);
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
-        let info = dataset_registered_trace(&test_data_connector, &ds, false);
+        let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, false);
         assert_eq!(
             info,
             "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+        );
+    }
+
+    #[test]
+    fn test_view_registered_trace_no_acceleration() {
+        let table_ref = TableReference::from("taxi_trips_vw");
+        let info = view_registered_trace(&table_ref, None);
+        assert_eq!(info, "View taxi_trips_vw registered.");
+    }
+
+    #[test]
+    fn test_view_registered_trace_with_default_acceleration() {
+        let table_ref = TableReference::from("taxi_trips_vw");
+        let acceleration = Some(Acceleration {
+            enabled: true,
+            ..Default::default()
+        });
+        let info = view_registered_trace(&table_ref, acceleration.as_ref());
+        assert_eq!(info, "View taxi_trips_vw registered, acceleration (arrow).");
+    }
+
+    #[test]
+    fn test_view_registered_trace_with_complex_acceleration() {
+        let table_ref = TableReference::from("taxi_trips_vw");
+        let acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Engine::DuckDB,
+            mode: Mode::File,
+            refresh_check_interval: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let info = view_registered_trace(&table_ref, acceleration.as_ref());
+        assert_eq!(
+            info,
+            "View taxi_trips_vw registered, acceleration (duckdb:file, 30s refresh)."
         );
     }
 }
