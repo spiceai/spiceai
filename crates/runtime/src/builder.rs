@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use app::App;
 use tokio::sync::RwLock;
@@ -248,16 +248,12 @@ impl Default for RuntimeBuilder {
 fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = memory_limit?;
     let original_memory_limit = memory_limit.clone();
-    let memory_limit = memory_limit.to_uppercase();
-    let memory_limit = if let Some(limit) = memory_limit.strip_suffix("GB") {
-        limit.parse::<u64>().map(|v| v * 1024 * 1024 * 1024).ok()
-    } else if let Some(limit) = memory_limit.strip_suffix("MB") {
-        limit.parse::<u64>().map(|v| v * 1024 * 1024).ok()
-    } else if let Some(limit) = memory_limit.strip_suffix("KB") {
-        limit.parse::<u64>().map(|v| v * 1024).ok()
-    } else {
-        None
-    };
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let memory_limit = byte_unit::Byte::from_str(&memory_limit)
+        .ok()
+        // losing the fractional part of a byte is not a problem
+        .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value().ceil() as u64);
 
     if memory_limit.is_none() {
         tracing::warn!(

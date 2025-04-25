@@ -29,6 +29,7 @@ axum.workspace = true
 axum-extra = { version = "0.9.6", features = ["typed-header"] }
 base64.workspace = true
 bytes.workspace = true
+byte-unit.workspace = true
 cache = { path = "../cache" }
 chrono = { version = "0.4.38" }
 clap.workspace = true
