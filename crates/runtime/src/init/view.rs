@@ -17,8 +17,13 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    LogErrors, Result, Runtime, UnableToAttachViewSnafu, component::view::View, metrics,
-    secrets::Secrets, status, topological_ordering::construct_effected_in_topological_order, view,
+    LogErrors, Result, Runtime, UnableToAttachViewSnafu,
+    component::view::{View, ViewBuilder},
+    metrics,
+    secrets::Secrets,
+    status,
+    topological_ordering::construct_effected_in_topological_order,
+    view,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
@@ -28,10 +33,10 @@ use tokio::sync::RwLock;
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let views: Vec<View> = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
-        for view in &views {
-            if let Err(e) = self.load_view(view, self.secrets()) {
+        for view in views {
+            if let Err(e) = self.load_view(&view, self.secrets()) {
                 tracing::error!("Unable to load view: {e}");
             };
         }
@@ -42,7 +47,9 @@ impl Runtime {
         self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
-    ) -> Vec<View> {
+    ) -> Vec<Arc<View>> {
+        let rt_ref = Arc::clone(&self);
+
         let datasets = self
             .get_valid_datasets(app, log_errors)
             .iter()
@@ -52,7 +59,10 @@ impl Runtime {
         app.views
             .iter()
             .cloned()
-            .map(View::try_from)
+            .map(|spicepod_view| {
+                ViewBuilder::try_from(spicepod_view)
+                    .map(|builder| builder.build_with(Arc::clone(&rt_ref), Arc::clone(app)))
+            })
             .zip(&app.views)
             .filter_map(|(view, spicepod_view)| match view {
                 Ok(view) => {
@@ -67,7 +77,7 @@ impl Runtime {
                         }
                         None
                     } else {
-                        Some(view)
+                        Some(Arc::new(view))
                     }
                 }
                 Err(e) => {
@@ -81,36 +91,31 @@ impl Runtime {
             .collect()
     }
 
-    fn load_view(&self, view: &View, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+    fn load_view(&self, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
-        df.register_view(
-            view.name.clone(),
-            view.sql.clone(),
-            view.acceleration.clone(),
-            secrets,
-        )
-        .context(UnableToAttachViewSnafu)
-        .inspect_err(|_| {
-            self.status
-                .update_view(&view.name, status::ComponentStatus::Error);
-        })?;
+        df.register_view(Arc::clone(view), secrets)
+            .context(UnableToAttachViewSnafu)
+            .inspect_err(|_| {
+                self.status
+                    .update_view(&view.name, status::ComponentStatus::Error);
+            })?;
         Ok(())
     }
 
-    fn remove_view(&self, view: &View) {
-        if self.df.table_exists(view.name.clone()) {
-            if let Err(e) = self.df.remove_view(&view.name) {
-                tracing::warn!("Unable to unload view {}: {}", &view.name, e);
+    fn remove_view(&self, name: &TableReference) {
+        if self.df.table_exists(name.clone()) {
+            if let Err(e) = self.df.remove_view(name) {
+                tracing::warn!("Unable to unload view {}: {}", name, e);
                 return;
             }
         }
-        tracing::info!("Unloaded view {}", &view.name);
+        tracing::info!("Unloaded view {}", name);
     }
 
-    fn update_view(&self, view: &View) {
+    fn update_view(&self, view: &Arc<View>) {
         self.status
             .update_view(&view.name, status::ComponentStatus::Refreshing);
-        self.remove_view(view);
+        self.remove_view(&view.name);
         let _ = self.load_view(view, self.secrets());
     }
 
@@ -140,7 +145,7 @@ impl Runtime {
         // Remove views that are no longer in the app
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name) {
-                let view = match View::try_from(view.clone()) {
+                let view_builder = match ViewBuilder::try_from(view.clone()) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!("Could not remove view {}: {e}", view.name);
@@ -148,8 +153,8 @@ impl Runtime {
                     }
                 };
                 self.status
-                    .update_view(&view.name, status::ComponentStatus::Disabled);
-                self.remove_view(&view);
+                    .update_view(&view_builder.name, status::ComponentStatus::Disabled);
+                self.remove_view(&view_builder.name);
             }
         }
 
@@ -159,7 +164,7 @@ impl Runtime {
             .iter()
             .map(|v| {
                 let Some(statement) =
-                    DFParser::parse_sql_with_dialect(v.sql.as_str(), &PostgreSqlDialect {})
+                    DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
                         .boxed()?.pop_front() else {
                             return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!("no statements found in view {}", v.name)));
                         };

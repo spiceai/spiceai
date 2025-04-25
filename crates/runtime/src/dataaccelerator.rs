@@ -19,7 +19,7 @@ use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexT
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
-use crate::spice_data_base_path;
+use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -131,7 +131,7 @@ impl AcceleratorEngineRegistry {
         constraints: Option<&Constraints>,
         acceleration_settings: &acceleration::Acceleration,
         secrets: Arc<RwLock<Secrets>>,
-        dataset: Option<&Dataset>,
+        source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
@@ -229,7 +229,7 @@ impl AcceleratorEngineRegistry {
         let external_table = external_table_builder.build()?;
 
         let table_provider = accelerator
-            .create_external_table(&external_table, dataset)
+            .create_external_table(&external_table, source)
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -246,7 +246,7 @@ pub trait DataAccelerator: Send + Sync {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
-        dataset: Option<&Dataset>,
+        source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -258,7 +258,7 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
-    /// Initialize the accelerator for a dataset
+    /// Initialize the accelerator for a component
     async fn init(
         &self,
         _dataset: &Dataset,
@@ -266,7 +266,7 @@ pub trait DataAccelerator: Send + Sync {
         Ok(())
     }
 
-    /// Check if the accelerator is initialized for a dataset
+    /// Check if the accelerator is initialized for a component
     fn is_initialized(&self, _dataset: &Dataset) -> bool {
         true
     }
@@ -278,7 +278,7 @@ pub trait DataAccelerator: Send + Sync {
 
     /// For file-based accelerators, return the file path
     /// For any other accelerator, return None
-    fn file_path(&self, _dataset: &Dataset) -> Result<String> {
+    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String> {
         Err(Error::FileModeUnsupported {})
     }
 
@@ -297,8 +297,8 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// Check if the file path exists
-    fn has_existing_file(&self, dataset: &Dataset) -> bool {
-        if let Ok(path) = self.file_path(dataset) {
+    fn has_existing_file(&self, source: &dyn AccelerationSource) -> bool {
+        if let Ok(path) = self.file_path(source) {
             let path = std::path::Path::new(&path);
             path.is_file()
         } else {
@@ -437,6 +437,25 @@ impl AcceleratorExternalTableBuilder {
 
         Ok(external_table)
     }
+}
+
+/// Represents acceleration source component, such as a dataset or a view.
+/// Provides additional information about the source, such as its name and associated runtime information.
+pub trait AccelerationSource: Sync {
+    /// Returns true if the source uses file-based acceleration
+    fn is_file_accelerated(&self) -> bool;
+
+    /// Returns the application associated with this source
+    fn app(&self) -> Arc<app::App>;
+
+    /// Returns the runtime associated with this source
+    fn runtime(&self) -> Arc<Runtime>;
+
+    /// Returns the acceleration configuration if it exists
+    fn acceleration(&self) -> Option<&Acceleration>;
+
+    /// Returns the name of this source
+    fn name(&self) -> &TableReference;
 }
 
 fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {

@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::Runtime;
-use acceleration::Engine;
+use crate::{Runtime, dataaccelerator::AccelerationSource};
+use acceleration::{Acceleration, Engine};
 use app::App;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::{
@@ -745,6 +745,29 @@ impl Dataset {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
 }
+
+impl AccelerationSource for Dataset {
+    fn is_file_accelerated(&self) -> bool {
+        self.is_file_accelerated()
+    }
+
+    fn app(&self) -> Arc<app::App> {
+        self.app()
+    }
+
+    fn runtime(&self) -> Arc<Runtime> {
+        self.runtime()
+    }
+
+    fn acceleration(&self) -> Option<&Acceleration> {
+        self.acceleration.as_ref()
+    }
+
+    fn name(&self) -> &TableReference {
+        &self.name
+    }
+}
+
 pub mod acceleration;
 
 pub mod replication {
