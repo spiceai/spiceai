@@ -143,6 +143,7 @@ utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
+workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]

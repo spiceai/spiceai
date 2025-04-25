@@ -21,6 +21,7 @@ members = [
     "crates/telemetry",
     "crates/test-framework",
     "crates/util",
+    "crates/workers",
     "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
