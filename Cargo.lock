@@ -14849,6 +14849,7 @@ dependencies = [
  "arrow",
  "async-openai",
  "async-trait",
+ "futures",
  "llms",
  "rand 0.9.0",
  "secrecy",

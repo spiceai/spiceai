@@ -20,6 +20,7 @@ use async_openai::{
         ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };
+use futures::TryStreamExt;
 use llms::chat::{Chat, nsql::SqlGeneration};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
@@ -84,7 +85,8 @@ impl Chat for RouterModel {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        match self.models_cfg.first() {
+        let public_name = self.router_name.clone();
+        Ok(Box::pin(match self.models_cfg.first() {
             Some(worker::RouterConfig::RoundRobin { .. }) => {
                 // This cannot be `None` as by this point, there is at least one model.
                 let name = self.select_from_round_robin().unwrap_or_default();
@@ -140,7 +142,11 @@ impl Chat for RouterModel {
                 param: None,
                 code: None,
             })),
-        }
+        }?
+        .map_ok(move |mut ss| {
+            ss.model = public_name.clone();
+            ss
+        })))
     }
 
     #[allow(deprecated)]
@@ -205,6 +211,10 @@ impl Chat for RouterModel {
                 code: None,
             })),
         }
+        .map(|mut r| {
+            r.model = self.router_name.clone();
+            r
+        })
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
