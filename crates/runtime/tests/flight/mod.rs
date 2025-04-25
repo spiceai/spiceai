@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -39,10 +39,9 @@ use runtime_auth::FlightBasicAuth;
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;
 
-use crate::{
-    configure_test_datafusion,
-    utils::{LOCALHOST, wait_until_true},
-};
+use crate::{configure_test_datafusion, utils::wait_until_true};
+
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 mod do_put;
 mod prepared_statements;

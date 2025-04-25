@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     future::Future,
-    net::{IpAddr, Ipv4Addr},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -36,8 +35,6 @@ pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock
             .build(),
     )
 });
-
-pub const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
     runtime_ready_check_with_timeout(rt, Duration::from_secs(120)).await;
