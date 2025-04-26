@@ -22,7 +22,7 @@ use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, Mode};
+use crate::component::dataset::{Dataset, Mode, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -1306,41 +1306,11 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
+        let runtime_status = self.runtime_status();
+
         // If accelerated view depends on other tables, wait until they are ready; this is required to complete
         // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
-
-        // Exponential retry with max duration of 10 seconds between retries
-        let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(None)
-            .max_duration(Some(Duration::from_secs(10)))
-            .build();
-        let runtime_status = self.runtime_status();
-        let dependent_tables = dependent_tables
-            .iter()
-            .cloned()
-            .map(resolve_table_reference)
-            .collect::<Vec<_>>();
-
-        let _ = retry(retry_strategy, || async {
-            let statuses = runtime_status
-                .get_dataset_statuses()
-                .into_iter()
-                .map(|(key, value)| (resolve_table_reference(key), value))
-                .collect::<std::collections::HashMap<_, _>>();
-
-            if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
-                statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
-            }) {
-                tracing::debug!(
-                    "Dependent table {not_ready_table} is not ready for view {table}. Retrying..."
-                );
-
-                return Err(RetryError::transient(()));
-            }
-
-            Ok(())
-        })
-        .await;
+        wait_untill_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
 
         let schema = view_table.schema();
         let federated_table = FederatedTable::new(Arc::new(view_table) as Arc<dyn TableProvider>);
@@ -1368,10 +1338,16 @@ impl DataFusion {
             }
         }
 
-        // TODO Extend and refactor (move to helper functionality that can be re-used with datasets logic)
-        let mut refresh = Refresh::new(RefreshMode::Full);
+        let mut refresh = Refresh::new(RefreshMode::Full).with_retry(
+            view.refresh_retry_enabled(),
+            view.refresh_retry_max_attempts(),
+        );
         if let Some(refresh_check_interval) = acceleration.refresh_check_interval {
             refresh = refresh.check_interval(refresh_check_interval);
+        }
+
+        if let Some(max_jitter) = view.refresh_max_jitter() {
+            refresh = refresh.max_jitter(max_jitter);
         }
 
         let mut builder = AcceleratedTable::builder(
@@ -1385,6 +1361,8 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.cache_provider(self.cache_provider());
         builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
+        builder.refresh_on_startup(acceleration.refresh_on_startup);
+        builder.ready_state(view.ready_state);
 
         let (accelerated_table, _) =
             builder
@@ -1406,7 +1384,7 @@ impl DataFusion {
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
 
         // if initial load completed, mark view as ready; otherwise, ready status will be updated by acceleration
-        if initial_load_complete {
+        if initial_load_complete || view.ready_state == ReadyState::OnRegistration {
             self.runtime_status
                 .update_view(&view.name, status::ComponentStatus::Ready);
         }
@@ -1545,6 +1523,43 @@ impl Drop for DataFusion {
     fn drop(&mut self) {
         tracing::debug!("DataFusion resources cleanup");
     }
+}
+
+async fn wait_untill_dependent_tables_are_ready(
+    table: &TableReference,
+    dependent_tables: &[TableReference],
+    runtime_status: &Arc<status::RuntimeStatus>,
+) {
+    // Exponential retry with max duration of 10 seconds between retries
+    let retry_strategy = FibonacciBackoffBuilder::new()
+        .max_retries(None)
+        .max_duration(Some(Duration::from_secs(10)))
+        .build();
+    let dependent_tables = dependent_tables
+        .iter()
+        .cloned()
+        .map(resolve_table_reference)
+        .collect::<Vec<_>>();
+
+    let _ = retry(retry_strategy, || async {
+        let statuses = runtime_status
+            .get_dataset_statuses()
+            .into_iter()
+            .map(|(key, value)| (resolve_table_reference(key), value))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
+            statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
+        }) {
+            tracing::debug!(
+                "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
+            );
+
+            return Err(RetryError::transient(()));
+        }
+        Ok(())
+    })
+    .await;
 }
 
 #[cfg(test)]
