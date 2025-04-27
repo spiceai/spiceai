@@ -74,6 +74,13 @@ pub fn verify_schema(
             continue;
         }
 
+        // We set the DataFusion option `df_config.options_mut().optimizer.expand_views_at_output = true`
+        // to expand views at the output of a query. This means that a query that expects a
+        // `Utf8View` will be expanded to a `LargeUtf8` in the result set.
+        if a_data_type == &DataType::Utf8View && b_data_type == &DataType::LargeUtf8 {
+            continue;
+        }
+
         if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
