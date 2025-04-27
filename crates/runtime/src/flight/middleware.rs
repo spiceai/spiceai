@@ -27,8 +27,8 @@ use governor::{
     RateLimiter,
     state::{InMemoryState, NotKeyed},
 };
-use http::HeaderValue;
 use runtime_auth::AuthRequestContext;
+use tonic::{Status, metadata::MetadataValue};
 use tower::{Layer, Service};
 
 /// Extracts the request context from the HTTP headers and adds it to the task-local context.
@@ -142,6 +142,25 @@ impl<S> WriteRateLimitMiddleware<S> {
     }
 }
 
+type RateLimitResult = Result<(), Status>;
+type RateLimitCheckFn = dyn Fn() -> RateLimitResult + Send + Sync;
+
+/// A rate limit check that returns the error response on rate limit violation
+#[derive(Clone)]
+pub struct RateLimiterExtension {
+    check: Arc<RateLimitCheckFn>,
+}
+
+impl RateLimiterExtension {
+    pub fn new(check: Arc<RateLimitCheckFn>) -> Self {
+        Self { check }
+    }
+
+    pub fn check_fn(&self) -> Arc<RateLimitCheckFn> {
+        Arc::clone(&self.check)
+    }
+}
+
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for WriteRateLimitMiddleware<S>
 where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
@@ -160,41 +179,45 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         // Apply rate limiting to the Flight DoPut only
         if req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut" {
             return Box::pin(self.inner.call(req));
         }
 
-        if let Err(wait_time) = self.rate_limiter.check() {
-            let retry_after_secs = wait_time
-                .wait_time_from(wait_time.earliest_possible())
-                .as_secs();
+        let rate_limiter = Arc::clone(&self.rate_limiter);
 
-            tracing::trace!("Request rate-limited, must retry after {retry_after_secs} seconds.",);
+        // Create a rate limit check that the downstream service can use to check if the request should be rate limited.
+        // We don't directly check the rate limit here because not all DoPut requests should be rate limited
+        // (i.e. binding parameters to parameterized queries).
+        let check: Arc<RateLimitCheckFn> = Arc::new(move || {
+            if let Err(wait_time) = rate_limiter.check() {
+                let retry_after_secs = wait_time
+                    .wait_time_from(wait_time.earliest_possible())
+                    .as_secs();
 
-            return Box::pin(async move {
-                let mut response = http::Response::new(ResBody::default());
-                *response.status_mut() = http::StatusCode::TOO_MANY_REQUESTS;
-
-                if let Ok(retry_after) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                    response.headers_mut().insert("retry-after", retry_after);
-                }
-
-                if let Ok(grpc_status) =
-                    HeaderValue::from_str(&format!("{}", tonic::Code::ResourceExhausted as i32))
-                {
-                    response.headers_mut().insert("grpc-status", grpc_status);
-                }
-
-                response.headers_mut().insert(
-                    "grpc-message",
-                    HeaderValue::from_static("Too many requests. Try again later."),
+                tracing::trace!(
+                    "Request rate-limited, must retry after {retry_after_secs} seconds."
                 );
 
-                Ok(response)
-            });
-        }
+                let mut status = Status::resource_exhausted(
+                    "Too many requests. Try again after {retry_after_secs} seconds.",
+                );
+
+                let header_map = status.metadata_mut();
+
+                if let Ok(retry_after) = MetadataValue::try_from(&retry_after_secs.to_string()) {
+                    header_map.insert("retry-after", retry_after);
+                }
+
+                return Err(status);
+            }
+
+            Ok(())
+        });
+
+        req.extensions_mut()
+            .insert(RateLimiterExtension::new(check));
 
         Box::pin(self.inner.call(req))
     }
