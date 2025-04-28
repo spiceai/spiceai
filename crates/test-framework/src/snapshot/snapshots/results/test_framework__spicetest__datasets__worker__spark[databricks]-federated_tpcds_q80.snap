@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q80"
 ---
-+-----------------+------------------------------+----------+---------+-----------+
-| channel         | id                           | sales    | returns | profit    |
-+-----------------+------------------------------+----------+---------+-----------+
-| catalog channel | catalog_pageAAAAAAAAAAPBAAAA | 9429.87  | 0.00    | -15357.45 |
-| catalog channel | catalog_pageAAAAAAAAABBCAAAA | 2112.48  | 0.00    | -800.35   |
-| catalog channel | catalog_pageAAAAAAAAABPBAAAA | 31147.33 | 0.00    | -2459.47  |
-| catalog channel | catalog_pageAAAAAAAAACBCAAAA | 1949.40  | 0.00    | 723.90    |
-| catalog channel | catalog_pageAAAAAAAAACPBAAAA | 18680.19 | 2119.26 | -18719.37 |
-| catalog channel | catalog_pageAAAAAAAAADPBAAAA | 30455.40 | 908.60  | 8010.43   |
-| catalog channel | catalog_pageAAAAAAAAAEPBAAAA | 24981.73 | 0.00    | 1617.00   |
-| catalog channel | catalog_pageAAAAAAAAAFPBAAAA | 5466.70  | 0.00    | -8074.72  |
-| catalog channel | catalog_pageAAAAAAAAAGBCAAAA | 8679.82  | 0.00    | -2615.72  |
-| catalog channel | catalog_pageAAAAAAAAAGPBAAAA | 22043.07 | 2711.57 | -2209.34  |
-+-----------------+------------------------------+----------+---------+-----------+
++-----------------+------------------------------+--------------------+---------+---------------------+
+| channel         | id                           | sales              | returns | profit              |
++-----------------+------------------------------+--------------------+---------+---------------------+
+| catalog channel | catalog_pageAAAAAAAAAAPBAAAA | 9429.869999999999  | 0.0     | -15357.45           |
+| catalog channel | catalog_pageAAAAAAAAABBCAAAA | 2112.48            | 0.0     | -800.35             |
+| catalog channel | catalog_pageAAAAAAAAABPBAAAA | 31147.329999999998 | 0.0     | -2459.469999999999  |
+| catalog channel | catalog_pageAAAAAAAAACBCAAAA | 1949.4             | 0.0     | 723.9               |
+| catalog channel | catalog_pageAAAAAAAAACPBAAAA | 18680.19           | 2119.26 | -18719.37           |
+| catalog channel | catalog_pageAAAAAAAAADPBAAAA | 30455.4            | 908.6   | 8010.429999999999   |
+| catalog channel | catalog_pageAAAAAAAAAEPBAAAA | 24981.73           | 0.0     | 1617.0000000000005  |
+| catalog channel | catalog_pageAAAAAAAAAFPBAAAA | 5466.7             | 0.0     | -8074.719999999999  |
+| catalog channel | catalog_pageAAAAAAAAAGBCAAAA | 8679.82            | 0.0     | -2615.7200000000003 |
+| catalog channel | catalog_pageAAAAAAAAAGPBAAAA | 22043.069999999996 | 2711.57 | -2209.34            |
++-----------------+------------------------------+--------------------+---------+---------------------+
