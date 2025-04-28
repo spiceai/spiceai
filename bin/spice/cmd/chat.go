@@ -239,11 +239,9 @@ spice chat --model <model> "What is Spice.ai?"
 					ids[i] = m.Id
 				}
 
-				slog.Error(
-					"model does not exist",
-					"model_id", model,
-					"configured_models", strings.Join(ids, ", "),
-				)
+				slog.Error(fmt.Sprintf("model %s does not exist — configured models: %s",
+					model, strings.Join(ids, ", ")))
+
 				os.Exit(1)
 			}
 

@@ -8,7 +8,7 @@ proc test_invalid_model {} {
     puts "Command output: $output"
 
     # Check for expected error messages in the output
-    if {[regexp {ERROR.*model does not exist model_id=not_exist} $output]} {
+    if {[regexp {ERROR.*model not_exist does not exist} $output]} {
         puts "✓ Error message about unavailable model detected"
     } else {
         puts "✗ Missing error about unavailable model"
@@ -16,7 +16,7 @@ proc test_invalid_model {} {
     }
 
     # Check that available models are listed
-    if {[regexp {ERROR.*configured_models} $output]} {
+    if {[regexp {ERROR.*configured models} $output]} {
         puts "✓ Available models list is shown"
     } else {
         puts "✗ Available models list not shown"
