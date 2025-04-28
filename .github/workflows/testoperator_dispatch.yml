@@ -4,6 +4,7 @@ on:
   schedule:
     # Every day, at 0900 UTC (0200 PDT)
     - cron: '0 9 * * *'
+
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -45,13 +46,16 @@ jobs:
     name: Dispatch tests
     runs-on: spiceai-runners
     concurrency:
-      group: testoperator-dispatch-${{ github.events.inputs.test_files_path || 'scheduled' }
+      group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'scheduled' }}
       cancel-in-progress: false
     strategy:
       matrix:
         commit:
           - ${{ github.event.inputs.spiced_commit || '' }}
           - '00e9d7d671ca9dd28eac1e78ba1253b1ae33fe76' # release/1.1
+        exclude:
+          - commit: '00e9d7d671ca9dd28eac1e78ba1253b1ae33fe76'
+            if: ${{ github.event_name != 'schedule' }}
     steps:
       - uses: actions/checkout@v4
         with:
