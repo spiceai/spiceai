@@ -253,7 +253,7 @@ spice chat --model <model> "What is Spice.ai?"
 				}
 			}
 			if !modelIsReady {
-				slog.Error(fmt.Sprintf("model %s is not ready — try again later or use an available model: %s",
+				slog.Error(fmt.Sprintf("model %s is not ready — try again when model is ready: %s",
 					model, strings.Join(availableModels, ", ")))
 				os.Exit(1)
 			}
