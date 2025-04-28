@@ -108,7 +108,7 @@ jobs:
     runs-on: spiceai-runners
     if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
-      group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'unset' }}
+      group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'unset' }}-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
