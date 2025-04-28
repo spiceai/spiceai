@@ -71,7 +71,7 @@ jobs:
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
-          ref: ${{ matrix.branch }}
+          ref: refs/remotes/origin/${{ matrix.branch }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
