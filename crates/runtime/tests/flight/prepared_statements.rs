@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array as _, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt as _;
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
@@ -31,19 +31,10 @@ async fn test_basic_binding() -> Result<(), anyhow::Error> {
                 execute_prepared_statement(&mut client, "SELECT $1 + 1 AS the_answer", param_batch)
                     .await?;
 
-            assert_eq!(results.len(), 1);
-            let record = results.first().expect("1 record batch only");
-            let (i, _) = record
-                .schema()
-                .column_with_name("the_answer")
-                .expect("the_answer column");
-            let column = record
-                .column(i)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("the_answer is Int64Array");
-            assert_eq!(column.len(), 1);
-            assert_eq!(column.value(0), 42);
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("basic_binding_table_content", results_str);
+
             Ok(())
         })
         .await
@@ -67,19 +58,10 @@ async fn test_question_mark_placeholder() -> Result<(), anyhow::Error> {
                 execute_prepared_statement(&mut client, "SELECT ? + 1 AS the_answer", param_batch)
                     .await?;
 
-            assert_eq!(results.len(), 1);
-            let record = results.first().expect("1 record batch only");
-            let (i, _) = record
-                .schema()
-                .column_with_name("the_answer")
-                .expect("the_answer column");
-            let column = record
-                .column(i)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("the_answer is Int64Array");
-            assert_eq!(column.len(), 1);
-            assert_eq!(column.value(0), 42);
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("question_mark_placeholder_table_content", results_str);
+
             Ok(())
         })
         .await
@@ -122,24 +104,10 @@ async fn test_multiple_parameters() -> Result<(), anyhow::Error> {
             )
             .await?;
 
-            assert_eq!(results.len(), 2);
-            let record = results.first().expect("at least 1");
-            let (i, _) = record.schema().column_with_name("a").expect("a column");
-            let column = record
-                .column(i)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("a is Int32Array");
-            assert_eq!(column.len(), 1);
-            assert_eq!(column.value(0), 1);
-            let (i, _) = record.schema().column_with_name("b").expect("b column");
-            let column = record
-                .column(i)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("a is StringArray");
-            assert_eq!(column.len(), 1);
-            assert_eq!(column.value(0), "a");
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("multiple_parameters_table_content", results_str);
+
             Ok(())
         })
         .await
