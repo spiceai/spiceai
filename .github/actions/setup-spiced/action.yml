@@ -9,6 +9,11 @@ inputs:
     description: 'spiced build commit'
     required: false
     type: string
+  ref: # optionally override the branch to fetch latest 10 commits from
+    description: 'target ref'
+    required: false
+    default: 'refs/heads/trunk'
+    type: string
   with_odbc: # whether to download the ODBC-enabled binary
     description: 'download the ODBC-enabled spiced binary'
     required: false
@@ -23,8 +28,10 @@ runs:
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       run: |
-        git fetch --depth=10 origin trunk
-        commit_hashes=($(git log origin/trunk --pretty=format:"%H" -n 10))
+        git fetch --depth=10 origin ${{ inputs.ref }}
+        echo "Fetching latest 10 commits from ${{ inputs.ref }}"
+
+        commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
         
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
           features="odbc_models"

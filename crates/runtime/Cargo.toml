@@ -51,6 +51,7 @@ duckdb = { workspace = true, features = [
     "vtab",
     "vtab-arrow",
 ], optional = true }
+event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
@@ -137,6 +138,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
+tracing-subscriber.workspace = true
 tract-core = "0.21.10"
 url = "2.5.4"
 util = { path = "../util" }
@@ -191,6 +193,7 @@ dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
+extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
@@ -221,7 +224,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-extended_tests = []
 
 [[bench]]
 harness = false

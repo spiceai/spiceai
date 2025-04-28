@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use core::time;
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
 #[cfg(feature = "openapi")]
@@ -23,8 +27,9 @@ use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
     error::OpenAIError,
     types::{
-        ChatChoice, ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        CreateChatCompletionRequest,
+        ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
+        CreateChatCompletionStreamResponse, Role,
     },
 };
 use async_stream::stream;
@@ -36,10 +41,19 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
+use event_stream::get_event_stream;
 use futures::StreamExt;
+use http::HeaderValue;
+use llms::chat::Chat;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::{
+    select,
+    sync::{RwLock, mpsc::channel, oneshot},
+};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
+
+static SPICE_COMPLETION_PROGRESS_HEADER: &str = "x-spiceai-completion-progress";
 
 /// Create Chat Completion
 ///
@@ -123,17 +137,9 @@ pub(crate) async fn post(
         match llms.read().await.get(&model_id) {
             Some(model) => {
                 if req.stream.unwrap_or_default() {
-                    match model.chat_stream(req).await {
-                        Ok(strm) => {
-                            create_sse_response(strm, time::Duration::from_secs(30), span_clone)
-                        }
-                        Err(e) => {
-                            tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                            tracing::error!("Error from v1/chat: {e}");
-
-                            openai_error_to_response(e)
-                        }
-                    }
+                    let include_stream_events = headers.get(SPICE_COMPLETION_PROGRESS_HEADER)
+                        .is_some_and(|v| v == HeaderValue::from_static("enabled"));
+                    handle_streaming(model, req, include_stream_events).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
@@ -162,6 +168,106 @@ pub(crate) async fn post(
     }
     .instrument(span)
     .await
+}
+
+/// Handle the SSE logic for when `v1/chat/completion` endpoint sets `"stream": true`.
+/// Expect the [`tracing::Span`] involved in the chat completion to be already [`Span::entered`].
+async fn handle_streaming(
+    model: &Arc<dyn Chat>,
+    req: CreateChatCompletionRequest,
+    include_stream_events: bool,
+) -> Response {
+    let span = Span::current();
+    let (tx, rx) = channel(100);
+    let tx = Arc::new(tx);
+    let (end_completion, completion_done) = oneshot::channel::<()>();
+
+    // Get span event stream and setup background thread to read events and write to `tx`.
+    if include_stream_events {
+        let mut events = match get_event_stream() {
+            Ok(o) => o,
+            Err(e) => {
+                return openai_error_to_response(OpenAIError::StreamError(format!(
+                    "An error occurred in reading progress: {e}"
+                )));
+            }
+        };
+
+        let tx_clone = Arc::clone(&tx);
+        tokio::spawn(async move {
+            let mut chat_completion_ended = Box::pin(futures::stream::once(async move {
+                let _ = completion_done.await;
+            }));
+
+            select! {
+                Some(evnt) = events.next() =>  {
+                    let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
+                },
+                // chat completion from LLM complete.
+                _ = chat_completion_ended.next() => {}
+            };
+        });
+    }
+
+    let mut stream: ChatCompletionResponseStream = match model.chat_stream(req).await {
+        Ok(strm) => strm,
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            tracing::error!("Error from v1/chat: {e}");
+
+            return openai_error_to_response(e);
+        }
+    };
+
+    // Merge [`ChatCompletionResponseStream`] into joint event & LLM stream.
+    tokio::spawn(async move {
+        while let Some(pkt) = stream.next().await {
+            let _ = tx.send(pkt).await;
+        }
+        // Signal event stream to close.
+        let _ = end_completion.send(());
+    });
+
+    create_sse_response(
+        Box::pin(ReceiverStream::new(rx)),
+        time::Duration::from_secs(30),
+        span,
+    )
+}
+
+#[allow(clippy::cast_possible_truncation, deprecated)]
+pub(crate) fn create_working_stream_payload(
+    content: String,
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+    let created = u32::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+            .as_secs(),
+    )
+    .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+    Ok(CreateChatCompletionStreamResponse {
+        created,
+        service_tier: None,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".to_string(),
+        usage: None,
+        model: String::new(),
+        id: String::new(),
+        choices: vec![ChatChoiceStream {
+            index: 0,
+            finish_reason: None,
+            logprobs: None,
+            delta: ChatCompletionStreamResponseDelta {
+                content: Some(content),
+                function_call: None,
+                tool_calls: None,
+                role: Some(Role::Assistant),
+                refusal: None,
+            },
+        }],
+    })
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
@@ -264,5 +370,149 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
             (status_code, Json(error_response)).into_response()
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
+        model::LLMModelStore,
+    };
+    use async_openai::{
+        error::OpenAIError,
+        types::{
+            ChatCompletionResponseStream, CreateChatCompletionRequest,
+            CreateChatCompletionStreamResponse,
+        },
+    };
+    use tracing::{Level, info, span};
+    use tracing_futures::Instrument;
+
+    use super::create_working_stream_payload;
+    use async_trait::async_trait;
+    use axum::{
+        extract::{Extension, Json},
+        http::{HeaderMap, HeaderValue},
+    };
+    use http_body_util::BodyExt;
+    use llms::chat::{Chat, nsql::SqlGeneration};
+    use serde_json::json;
+    use tokio::sync::RwLock;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    pub struct DummyChat;
+
+    #[async_trait]
+    impl Chat for DummyChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            tracing::info!(
+                target: "task_history",
+                progress = "A nice little test",
+            );
+            Ok(Box::pin(futures::stream::once(async move {
+                create_working_stream_payload("payload".to_string())
+            })))
+        }
+    }
+    async fn run_post(progress_header: Option<&'static str>) -> Vec<String> {
+        let mut store = LLMModelStore::new();
+        store.insert("dummy".to_string(), Arc::new(DummyChat {}));
+        let llms = Arc::new(RwLock::new(store));
+
+        let mut headers = HeaderMap::new();
+        if let Some(v) = progress_header {
+            headers.insert(
+                SPICE_COMPLETION_PROGRESS_HEADER,
+                HeaderValue::from_static(v),
+            );
+        }
+
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "dummy",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .expect("Failed to make test request payload.");
+
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(event_stream::EventStreamLayer::new("progress")),
+        );
+        let span = span!(Level::INFO, "test_span");
+        span.in_scope(|| {
+            info!(
+                target: "task_history",
+                progress = "A nice test message",
+            );
+        });
+        let _enter = span.enter();
+
+        let response = post(Extension(llms), headers, Json(req_payload))
+            .instrument(span.clone())
+            .await;
+
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("Failed to collect SSE response from 'post'.");
+
+        let body_str = String::from_utf8(body_bytes.to_bytes().to_vec()).expect("Invalid utf8");
+        body_str
+            .split("\n\n")
+            .filter_map(|e| {
+                let resp: CreateChatCompletionStreamResponse =
+                    serde_json::from_str(e.strip_prefix("data: ")?)
+                        .expect("Failed to deserialise SSE event");
+                resp.choices
+                    .first()
+                    .expect("Expected a choice in SSE event")
+                    .delta
+                    .content
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_post_streaming_enabled() {
+        assert_eq!(
+            run_post(Some("enabled")).await,
+            vec![
+                "A nice little test".to_string(), // From the event stream
+                "payload".to_string()             // From the LLM stream.
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_streaming_disabled() {
+        assert_eq!(
+            run_post(Some("disabled")).await,
+            vec![
+                "payload".to_string() // From the LLM stream.
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_streaming_none() {
+        assert_eq!(
+            run_post(None).await,
+            vec![
+                "payload".to_string() // From the LLM stream.
+            ]
+        );
     }
 }

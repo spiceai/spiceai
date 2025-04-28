@@ -318,6 +318,11 @@ pub enum Error {
 
     #[snafu(display("Force shutdown requested"))]
     ForceTerminated,
+
+    #[snafu(display(
+        "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
+    ))]
+    AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
 }
 
 const HTTP_SERVER: &str = "http_server";

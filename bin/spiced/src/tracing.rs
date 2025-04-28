@@ -127,6 +127,11 @@ pub(crate) async fn init_tracing(
         .with(filter)
         .with(datafusion_task_history_tracing(df, app, config).await?)
         .with(
+            event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(
+                |metadata| metadata.target() == "task_history",
+            )),
+        )
+        .with(
             fmt::layer()
                 .with_ansi(true)
                 .with_filter(filter::filter_fn(|metadata| {
