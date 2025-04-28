@@ -9,7 +9,7 @@ datasets:
         Driver={Databricks ODBC Driver};
         Host=${ env:NEW_DATABRICKS_HOST };
         Port=443;
-        HTTPPath=${ env:NEW_DATABRICKS_ODBC_PATH };
+        HTTPPath=${ env:DATABRICKS_ODBC_PATH };
         SSL=1;
         ThriftTransport=2;
         AuthMech=3;

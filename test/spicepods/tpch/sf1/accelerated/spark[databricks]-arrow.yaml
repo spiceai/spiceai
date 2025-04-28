@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spark[databricks]-arrow
+  name: spark[databricks]-arrow
 datasets:
   - from: spark:spiceai_sandbox.tpch.customer
     name: customer
