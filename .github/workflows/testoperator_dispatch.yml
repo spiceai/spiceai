@@ -85,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
         run: |
@@ -93,7 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         run: |
@@ -101,7 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
   dispatch-input:
     name: Dispatch tests - Input
@@ -143,7 +143,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -152,7 +152,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -161,7 +161,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -170,4 +170,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
