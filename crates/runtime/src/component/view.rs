@@ -19,13 +19,13 @@ use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::component::view as spicepod_view;
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
     dataset::{
-        Dataset,
+        Dataset, ReadyState,
         acceleration::{self, Acceleration},
     },
     validate_identifier,
@@ -39,6 +39,7 @@ pub struct View {
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub ready_state: ReadyState,
     pub runtime: Arc<Runtime>,
     pub app: Arc<App>,
 }
@@ -50,6 +51,7 @@ impl PartialEq for View {
             && self.metadata == other.metadata
             && self.columns == other.columns
             && self.acceleration == other.acceleration
+            && self.ready_state == other.ready_state
     }
 }
 
@@ -61,6 +63,7 @@ impl std::fmt::Debug for View {
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
             .field("acceleration", &self.acceleration)
+            .field("ready_state", &self.ready_state)
             .finish_non_exhaustive()
     }
 }
@@ -80,6 +83,44 @@ impl View {
 
         false
     }
+
+    #[must_use]
+    pub fn refresh_check_interval(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_check_interval;
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn refresh_max_jitter(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if acceleration.refresh_jitter_enabled {
+                // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
+                return match acceleration.refresh_jitter_max {
+                    Some(jitter) => Some(jitter),
+                    None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
+                };
+            }
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn refresh_retry_enabled(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_retry_enabled;
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_retry_max_attempts;
+        }
+        None
+    }
 }
 
 pub struct ViewBuilder {
@@ -88,6 +129,7 @@ pub struct ViewBuilder {
     pub metadata: HashMap<String, Value>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub ready_state: ReadyState,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -113,12 +155,39 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
 
+        // verify that the acceleration configuration is fully supported
+        if let Some(acc) = &acceleration {
+            if acc.refresh_mode.is_some()
+                && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
+            {
+                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                    view_name: view.name.to_string(),
+                    reason: "Only 'refresh_mode: full' is supported".to_string(),
+                });
+            }
+
+            if acc.refresh_sql.is_some() {
+                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                    view_name: view.name.to_string(),
+                    reason: "'refresh_sql' is not supported".to_string(),
+                });
+            }
+
+            if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
+                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
+                    view_name: view.name.to_string(),
+                    reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
+                });
+            }
+        }
+
         Ok(ViewBuilder {
             name: table_reference,
             sql,
             metadata: view.metadata,
             columns: view.columns,
             acceleration,
+            ready_state: ReadyState::from(view.ready_state),
         })
     }
 }
@@ -160,6 +229,7 @@ impl ViewBuilder {
             metadata: HashMap::default(),
             columns: vec![],
             acceleration: None,
+            ready_state: ReadyState::default(),
         }
     }
 
@@ -171,6 +241,7 @@ impl ViewBuilder {
             metadata: self.metadata,
             columns: self.columns,
             acceleration: self.acceleration,
+            ready_state: self.ready_state,
             runtime,
             app,
         }

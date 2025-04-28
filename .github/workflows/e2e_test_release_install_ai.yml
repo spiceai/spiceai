@@ -1,18 +1,18 @@
-name: E2E Test Release Installation(AI)
+name: E2E Test Release Installation (AI)
 on:
   workflow_dispatch:
     inputs:
-        platform_option:
-          description: "Which platform do you want to run on? (Default is ALL)"
-          required: false
-          type: choice
-          options:
-            - "all"
-            - "macOS aarch64 (GPU M4)"
-            - "Linux aarch64"
-            - "macOS aarch64"
-            - "Windows x64"
-          default: "all"
+      platform_option:
+        description: 'Which platform do you want to run on? (Default is all)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'macOS aarch64 (GPU M4)'
+          - 'Linux aarch64'
+          - 'macOS aarch64'
+          - 'Windows x64'
+        default: 'all'
 
 jobs:
   setup-matrix:
@@ -210,7 +210,7 @@ jobs:
           echo ($response | ConvertTo-Json -Depth 10)
           if (-not $response.matches) { exit 1 }
           echo "Passed"
-          
+
           echo "Verifying chat functionality"
           $url = "http://127.0.0.1:8090/v1/chat/completions"
           $body = @{ messages = @(@{ role = "user"; content = "What datasets you have access to?" }); model = "openai-gpt"; stream = $false } | ConvertTo-Json

@@ -102,6 +102,12 @@
       "items": {
         "$ref": "#/definitions/ComponentOrReference_for_View"
       }
+    },
+    "workers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ComponentOrReference_for_Worker"
+      }
     }
   },
   "definitions": {
@@ -577,6 +583,16 @@
         }
       ]
     },
+    "ComponentOrReference_for_Worker": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Worker"
+        },
+        {
+          "$ref": "#/definitions/ComponentReference"
+        }
+      ]
+    },
     "ComponentReference": {
       "type": "object",
       "required": [
@@ -883,6 +899,17 @@
         }
       }
     },
+    "Flight": {
+      "type": "object",
+      "properties": {
+        "max_message_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "IndexType": {
       "type": "string",
       "enum": [
@@ -1154,6 +1181,55 @@
         }
       }
     },
+    "RouterConfig": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "from",
+            "order"
+          ],
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "order": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "from",
+            "weight"
+          ],
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "weight": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "from"
+          ],
+          "properties": {
+            "from": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
     "Runtime": {
       "type": "object",
       "properties": {
@@ -1178,6 +1254,23 @@
           "format": "uint",
           "minimum": 0.0
         },
+        "flight": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Flight"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memory_limit": {
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk for supported queries larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "params": {
           "type": "object",
           "additionalProperties": {
@@ -1186,6 +1279,13 @@
         },
         "results_cache": {
           "$ref": "#/definitions/ResultsCache"
+        },
+        "shutdown_timeout": {
+          "description": "Configures how long the runtime waits for connections to be gracefully drained and components to shut down cleanly during runtime termination",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "task_history": {
           "$ref": "#/definitions/TaskHistory"
@@ -1457,6 +1557,16 @@
         "name"
       ],
       "properties": {
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "columns": {
           "type": "array",
           "items": {
@@ -1495,6 +1605,33 @@
             "string",
             "null"
           ]
+        }
+      }
+    },
+    "Worker": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RouterConfig"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
         }
       }
     },
