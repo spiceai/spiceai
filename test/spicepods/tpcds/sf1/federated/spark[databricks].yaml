@@ -2,76 +2,76 @@ version: v1
 kind: Spicepod
 name: spark[databricks]-federated
 datasets:
-  - from: spark:spiceai_sandbox.tpcds.catalog_sales
+  - from: spark:spiceai_sandbox.tpcds_sf1.catalog_sales
     name: catalog_sales
     params: &spark_params
       spark_remote: sc://${ env:NEW_DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:NEW_DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:NEW_DATABRICKS_CLUSTER_ID };
-  - from: spark:spiceai_sandbox.tpcds.catalog_returns
+  - from: spark:spiceai_sandbox.tpcds_sf1.catalog_returns
     name: catalog_returns
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.inventory
+  - from: spark:spiceai_sandbox.tpcds_sf1.inventory
     name: inventory
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store_sales
+  - from: spark:spiceai_sandbox.tpcds_sf1.store_sales
     name: store_sales
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store_returns
+  - from: spark:spiceai_sandbox.tpcds_sf1.store_returns
     name: store_returns
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_sales
+  - from: spark:spiceai_sandbox.tpcds_sf1.web_sales
     name: web_sales
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_returns
+  - from: spark:spiceai_sandbox.tpcds_sf1.web_returns
     name: web_returns
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer
+  - from: spark:spiceai_sandbox.tpcds_sf1.customer
     name: customer
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer_address
+  - from: spark:spiceai_sandbox.tpcds_sf1.customer_address
     name: customer_address
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.customer_demographics
+  - from: spark:spiceai_sandbox.tpcds_sf1.customer_demographics
     name: customer_demographics
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.date_dim
+  - from: spark:spiceai_sandbox.tpcds_sf1.date_dim
     name: date_dim
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.household_demographics
+  - from: spark:spiceai_sandbox.tpcds_sf1.household_demographics
     name: household_demographics
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.item
+  - from: spark:spiceai_sandbox.tpcds_sf1.item
     name: item
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.promotion
+  - from: spark:spiceai_sandbox.tpcds_sf1.promotion
     name: promotion
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.ship_mode
+  - from: spark:spiceai_sandbox.tpcds_sf1.ship_mode
     name: ship_mode
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.store
+  - from: spark:spiceai_sandbox.tpcds_sf1.store
     name: store
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.time_dim
+  - from: spark:spiceai_sandbox.tpcds_sf1.time_dim
     name: time_dim
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.warehouse
+  - from: spark:spiceai_sandbox.tpcds_sf1.warehouse
     name: warehouse
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_page
+  - from: spark:spiceai_sandbox.tpcds_sf1.web_page
     name: web_page
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.web_site
+  - from: spark:spiceai_sandbox.tpcds_sf1.web_site
     name: web_site
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.reason
+  - from: spark:spiceai_sandbox.tpcds_sf1.reason
     name: reason
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.call_center
+  - from: spark:spiceai_sandbox.tpcds_sf1.call_center
     name: call_center
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.income_band
+  - from: spark:spiceai_sandbox.tpcds_sf1.income_band
     name: income_band
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpcds.catalog_page
+  - from: spark:spiceai_sandbox.tpcds_sf1.catalog_page
     name: catalog_page
     params: *spark_params
