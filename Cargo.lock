@@ -4324,6 +4324,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "event_stream"
+version = "1.2.0-unstable"
+dependencies = [
+ "futures",
+ "futures-util",
+ "snafu",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "eventsource-client"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10783,6 +10796,7 @@ dependencies = [
  "azure_storage_blobs",
  "base64 0.22.1",
  "bollard",
+ "byte-unit",
  "bytes",
  "cache",
  "chrono",
@@ -10801,6 +10815,7 @@ dependencies = [
  "document_parse",
  "dotenvy",
  "duckdb",
+ "event_stream",
  "flight_client",
  "flightrepl",
  "fundu",
@@ -11956,6 +11971,7 @@ version = "1.2.0-unstable"
 dependencies = [
  "app",
  "clap",
+ "event_stream",
  "flightrepl",
  "futures",
  "mimalloc",
@@ -14849,6 +14865,7 @@ dependencies = [
  "arrow",
  "async-openai",
  "async-trait",
+ "futures",
  "llms",
  "rand 0.9.0",
  "secrecy",

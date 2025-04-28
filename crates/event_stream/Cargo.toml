@@ -1,0 +1,18 @@
+[package]
+description = "Stream events as they are emitted from a span"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "event_stream"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+futures.workspace = true
+futures-util = "0.3.31"
+snafu.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

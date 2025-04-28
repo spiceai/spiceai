@@ -20,6 +20,7 @@ use async_openai::{
         ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };
+use futures::{TryStreamExt, stream::StreamExt};
 use llms::chat::{Chat, nsql::SqlGeneration};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
@@ -84,7 +85,8 @@ impl Chat for RouterModel {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        match self.models_cfg.first() {
+        let public_name = self.router_name.clone();
+        Ok(Box::pin(match self.models_cfg.first() {
             Some(worker::RouterConfig::RoundRobin { .. }) => {
                 // This cannot be `None` as by this point, there is at least one model.
                 let name = self.select_from_round_robin().unwrap_or_default();
@@ -120,8 +122,17 @@ impl Chat for RouterModel {
                         )));
                     };
 
-                    if let Ok(resp) = model.chat_stream(req.clone()).await {
-                        return Ok(resp);
+                    match model.chat_stream(req.clone()).await {
+                        Err(_) => continue,
+
+                        // Check if first item in stream is `Err` since this is a common error by providers.
+                        Ok(stream) => {
+                            let mut peekable = Box::pin(Box::pin(stream).peekable());
+                            match peekable.as_mut().peek().await.as_ref() {
+                                Some(Err(_)) => continue,
+                                None | Some(Ok(_)) => return Ok(peekable),
+                            }
+                        }
                     }
                 }
                 Err(OpenAIError::ApiError(ApiError {
@@ -140,7 +151,11 @@ impl Chat for RouterModel {
                 param: None,
                 code: None,
             })),
-        }
+        }?
+        .map_ok(move |mut ss| {
+            ss.model.clone_from(&public_name);
+            ss
+        })))
     }
 
     #[allow(deprecated)]
@@ -205,6 +220,10 @@ impl Chat for RouterModel {
                 code: None,
             })),
         }
+        .map(|mut r| {
+            r.model.clone_from(&self.router_name);
+            r
+        })
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {

@@ -27,7 +27,7 @@ runs:
         choco install make -y
 
     - name: Install make (macOS)
-      if: inputs.os == 'macos'
+      if: inputs.os == 'macos' && matrix.target.runner != 'spiceai-macos'
       shell: bash
       run: |
         # Check if make is already installed

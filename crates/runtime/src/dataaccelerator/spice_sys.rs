@@ -18,6 +18,8 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
+use super::AccelerationSource;
+
 #[cfg(feature = "postgres")]
 use {
     datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool,
@@ -35,7 +37,7 @@ use {
     datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
 };
 
-use crate::component::dataset::{Dataset, acceleration::Engine};
+use crate::component::dataset::acceleration::Engine;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -53,15 +55,12 @@ enum AccelerationConnection {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn acceleration_connection(
-    dataset: &Dataset,
+    source: &dyn AccelerationSource,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
-    let runtime = dataset.runtime();
+    let runtime = source.runtime();
 
-    let acceleration = dataset
-        .acceleration
-        .as_ref()
-        .ok_or("Dataset acceleration not enabled")?;
+    let acceleration = source.acceleration().ok_or("Acceleration is not enabled")?;
     match acceleration.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
@@ -75,13 +74,13 @@ async fn acceleration_connection(
                 .downcast_ref::<DuckDBAccelerator>()
                 .ok_or("Accelerator is not a DuckDBAccelerator")?;
 
-            let duckdb_file = duckdb_accelerator.duckdb_file_path(dataset)?;
+            let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
             if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
                 return Err("DuckDB file does not exist.".into());
             }
 
             let pool = duckdb_accelerator
-                .get_shared_pool(dataset)
+                .get_shared_pool(source)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -101,12 +100,12 @@ async fn acceleration_connection(
                 .downcast_ref::<SqliteAccelerator>()
                 .ok_or("Accelerator is not a SqliteAccelerator")?;
 
-            let sqlite_file = sqlite_accelerator.sqlite_file_path(dataset)?;
+            let sqlite_file = sqlite_accelerator.sqlite_file_path(source)?;
             if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
                 return Err("Sqlite file does not exist.".into());
             }
 
-            let conn = sqlite_accelerator.get_shared_pool(dataset).await?;
+            let conn = sqlite_accelerator.get_shared_pool(source).await?;
 
             Ok(AccelerationConnection::SQLite(conn))
         }
@@ -114,10 +113,6 @@ async fn acceleration_connection(
         Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
         #[cfg(feature = "postgres")]
         Engine::PostgreSQL => {
-            let Some(acceleration) = &dataset.acceleration else {
-                return Err("Dataset is not accelerated.".into());
-            };
-
             let secret_map = to_secret_map(acceleration.params.clone());
 
             let pool = PostgresConnectionPool::new(secret_map)

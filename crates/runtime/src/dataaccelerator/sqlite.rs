@@ -29,16 +29,13 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Engine, Mode},
-    },
+    component::dataset::acceleration::{Engine, Mode},
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
 
-use super::{DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -107,12 +104,12 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
-    pub fn sqlite_file_path(&self, dataset: &Dataset) -> Result<String> {
-        if !dataset.is_file_accelerated() {
+    pub fn sqlite_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+        if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
             })
-        } else if let Some(acceleration) = dataset.acceleration.as_ref() {
+        } else if let Some(acceleration) = source.acceleration() {
             let mut acceleration_params = acceleration.params.clone();
 
             acceleration_params.insert("data_directory".to_string(), spice_data_base_path());
@@ -128,8 +125,8 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
-    pub fn sqlite_busy_timeout(&self, dataset: &Dataset) -> Result<Duration> {
-        if let Some(acceleration) = dataset.acceleration.as_ref() {
+    pub fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
+        if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
             return self
                 .sqlite_factory
@@ -140,22 +137,22 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
-        let sqlite_file = self.sqlite_file_path(dataset)?;
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<SqliteConnectionPool> {
+        let sqlite_file = self.sqlite_file_path(source)?;
 
-        let acceleration = dataset
-            .acceleration
-            .as_ref()
-            .context(AccelerationNotEnabledSnafu {
-                dataset: dataset.name.to_string(),
-            })?;
+        let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
+            dataset: source.name().to_string(),
+        })?;
 
         let mode = match acceleration.mode {
             Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
-        let busy_timeout = self.sqlite_busy_timeout(dataset)?;
+        let busy_timeout = self.sqlite_busy_timeout(source)?;
 
         let pool = self
             .sqlite_factory
@@ -188,20 +185,20 @@ impl DataAccelerator for SqliteAccelerator {
         vec!["sqlite", "db"]
     }
 
-    fn file_path(&self, dataset: &Dataset) -> Result<String, DataAcceleratorError> {
-        self.sqlite_file_path(dataset)
+    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        self.sqlite_file_path(source)
             .map_err(|err| DataAcceleratorError::InvalidConfiguration {
                 msg: err.to_string(),
             })
     }
 
-    fn is_initialized(&self, dataset: &Dataset) -> bool {
-        if !dataset.is_file_accelerated() {
+    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
+        if !source.is_file_accelerated() {
             return true; // memory mode SQLite is always initialized
         }
 
         // otherwise, we're initialized if the file exists
-        self.has_existing_file(dataset)
+        self.has_existing_file(source)
     }
 
     /// Initializes an SQLite database for the dataset
@@ -210,19 +207,19 @@ impl DataAccelerator for SqliteAccelerator {
     /// Federation then requires that all attached databases exist before dataset registration.
     async fn init(
         &self,
-        dataset: &Dataset,
+        source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !dataset.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(source)?;
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(dataset) {
+            } else if !self.is_valid_file(source) {
                 if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -239,7 +236,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            self.get_shared_pool(dataset).await?;
+            self.get_shared_pool(source).await?;
         }
 
         Ok(())
@@ -249,23 +246,24 @@ impl DataAccelerator for SqliteAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
-        dataset: Option<&Dataset>,
+        source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = cmd.clone();
 
-        if let Some(this_dataset) = dataset {
-            if this_dataset.is_file_accelerated() {
+        if let Some(source) = source {
+            if source.is_file_accelerated() {
                 // If the user didn't specify a SQLite file and this is a file-mode SQLite,
                 // then use the shared SQLite file `accelerated_sqlite.db`
                 if !cmd.options.contains_key("file") {
-                    let sqlite_file = self.sqlite_file_path(this_dataset)?;
+                    let sqlite_file = self.sqlite_file_path(source)?;
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
 
-                let datasets = Arc::clone(&this_dataset.runtime)
-                    .get_initialized_datasets(&this_dataset.app, crate::LogErrors(false))
+                let datasets = source
+                    .runtime()
+                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
                     .await;
-                let self_path = self.file_path(this_dataset)?;
+                let self_path = self.file_path(source)?;
                 let attach_databases = datasets
                     .iter()
                     .filter_map(|other_dataset| {
@@ -274,10 +272,10 @@ impl DataAccelerator for SqliteAccelerator {
                             .as_ref()
                             .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
                         {
-                            if **other_dataset == *this_dataset {
+                            if other_dataset.name() == source.name() {
                                 None
                             } else {
-                                let other_path = self.file_path(other_dataset);
+                                let other_path = self.file_path(other_dataset.as_ref());
                                 other_path.ok().filter(|p| p != &self_path)
                             }
                         } else {
