@@ -33,7 +33,7 @@ on:
         description: 'Validate results?'
         required: false
         type: boolean
-        default: false
+        default: true
       all_benchmarks:
         description: 'Run all benchmarks?'
         required: false
