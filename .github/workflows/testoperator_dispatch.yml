@@ -51,7 +51,7 @@ jobs:
       matrix:
         commit:
           - '' # empty string - find latest
-          - '00e9d7d671ca9dd28eac1e78ba1253b1ae33fe76' # release/1.1
+          - '9ac1a25bdc849edde0eff5379a5ea212644c66fe' # release/1.1
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
