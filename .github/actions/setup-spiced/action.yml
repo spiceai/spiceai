@@ -31,7 +31,7 @@ runs:
         git fetch --depth=10 origin ${{ inputs.ref }}
         echo "Fetching latest 10 commits from ${{ inputs.ref }}"
 
-        commit_hashes=($(git log ${{ inputs.ref }} --pretty=format:"%H" -n 10))
+        commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
         
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
           features="odbc_models"
