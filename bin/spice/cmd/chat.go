@@ -225,15 +225,15 @@ spice chat --model <model> "What is Spice.ai?"
 			cmd.Printf("Using model: %s\n", selectedModel)
 			model = selectedModel
 		} else {
-			is_configured := false
+			modelIsConfigured := false
 			for _, m := range models.Data {
 				if m.Id == model {
-					is_configured = true
+					modelIsConfigured = true
 					break
 				}
 			}
 
-			if !is_configured {
+			if !modelIsConfigured {
 				ids := make([]string, len(models.Data))
 				for i, m := range models.Data {
 					ids[i] = m.Id
@@ -245,14 +245,14 @@ spice chat --model <model> "What is Spice.ai?"
 				os.Exit(1)
 			}
 
-			is_available := false
+			modelIsReady := false
 			for _, m := range availableModels {
 				if m == model {
-					is_available = true
+					modelIsReady = true
 					break
 				}
 			}
-			if !is_available {
+			if !modelIsReady {
 				slog.Error(fmt.Sprintf("model %s is not ready — try again later or use an available model: %s",
 					model, strings.Join(availableModels, ", ")))
 				os.Exit(1)
