@@ -45,12 +45,12 @@ jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
     runs-on: spiceai-runners
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true' }}
+    if: ${{ github.event_name == 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
         commit:
-          - '' # empty string - find latest
+          - '' # empty string - find latest built spiced
           - '9ac1a25bdc849edde0eff5379a5ea212644c66fe' # release/1.1
     concurrency:
       group: testoperator-dispatch-scheduled
@@ -106,7 +106,7 @@ jobs:
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-runners
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test_files_path != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'unset' }}
       cancel-in-progress: false
@@ -133,13 +133,40 @@ jobs:
         uses: ./.github/actions/build-testoperator
 
       - name: Dispatch Testoperator - Input
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test_files_path != '' }}
+        if: ${{ github.event.inputs.test_files_path != '' }}
         run: |
           testoperator dispatch \
             ${{ github.event.inputs.test_files_path }} \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }} \
             --validate=${{ github.event.inputs.validate }} \
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH
+        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
