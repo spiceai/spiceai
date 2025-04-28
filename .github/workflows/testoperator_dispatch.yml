@@ -87,7 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.commit }}
+          WORKFLOW_COMMIT: ${{ github.ref }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true' }}
