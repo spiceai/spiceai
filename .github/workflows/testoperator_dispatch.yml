@@ -45,7 +45,7 @@ jobs:
     name: Dispatch tests
     runs-on: spiceai-runners
     concurrency:
-      group: testoperator-dispatch
+      group: testoperator-dispatch-${{ github.events.inputs.test_files_path || 'scheduled' }
       cancel-in-progress: false
     strategy:
       matrix:
