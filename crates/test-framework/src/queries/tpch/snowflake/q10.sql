@@ -28,4 +28,5 @@ group by
     "C_ADDRESS",
     "C_COMMENT"
 order by
-    "REVENUE" desc;
+    "REVENUE" desc
+limit 20;
