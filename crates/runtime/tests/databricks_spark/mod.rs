@@ -43,15 +43,15 @@ fn get_params() -> Params {
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:DATABRICKS_HOST }".to_string(),
+                "${ env:NEW_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:DATABRICKS_TOKEN }".to_string(),
+                "${ env:NEW_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_cluster_id".to_string(),
-                "${ env:DATABRICKS_CLUSTER_ID }".to_string(),
+                "${ env:NEW_DATABRICKS_CLUSTER_ID }".to_string(),
             ),
             ("mode".to_string(), "spark_connect".to_string()),
         ]
