@@ -220,7 +220,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
         run: |
           brew install expect
 
@@ -290,7 +290,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
         run: |
           brew install expect
 
