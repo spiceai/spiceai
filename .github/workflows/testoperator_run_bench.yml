@@ -1,4 +1,5 @@
 name: benchmark e2e tests
+run-name: benchmark e2e tests - [${{ inputs.query_set }}] ${{ inputs.spicepod_path }} ${{ inputs.query_overrides != '' && inputs.query_overrides || '' }}
 
 on:
   workflow_dispatch:
