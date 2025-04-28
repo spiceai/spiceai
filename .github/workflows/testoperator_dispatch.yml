@@ -50,8 +50,8 @@ jobs:
       fail-fast: false
       matrix:
         branch:
-          - 'refs/remotes/origin/trunk'
-          - 'refs/remotes/origin/release/1.1'
+          - 'trunk'
+          - 'release/1.1'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
