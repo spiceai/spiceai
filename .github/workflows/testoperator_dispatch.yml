@@ -49,16 +49,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        commit:
-          - '' # empty string - find latest built spiced
-          - '9ac1a25bdc849edde0eff5379a5ea212644c66fe' # release/1.1
+        branch:
+          - 'trunk'
+          - 'release/1.1'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.commit }}
+          ref: ${{ matrix.branch }}
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -71,7 +71,7 @@ jobs:
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
-          spiced_commit: ${{ matrix.commit }}
+          ref: ${{ matrix.branch }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -85,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
         run: |
@@ -93,7 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         run: |
@@ -101,7 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
 
   dispatch-input:
     name: Dispatch tests - Input
@@ -125,6 +125,7 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          ref: ${{ github.event.ref }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -143,7 +144,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -152,7 +153,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -161,7 +162,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
@@ -170,4 +171,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
