@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: odbc[databricks]-federated
 datasets:
-  - from: odbc:spiceai_sandbox.tpch.customer
+  - from: odbc:spiceai_sandbox.tpch_sf1.customer
     name: customer
     params: &odbc_params
       odbc_connection_string: |
@@ -15,24 +15,24 @@ datasets:
         AuthMech=3;
         UID=token;
         PWD=${ env:NEW_DATABRICKS_TOKEN };
-  - from: odbc:spiceai_sandbox.tpch.lineitem
+  - from: odbc:spiceai_sandbox.tpch_sf1.lineitem
     name: lineitem
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.nation
+  - from: odbc:spiceai_sandbox.tpch_sf1.nation
     name: nation
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.orders
+  - from: odbc:spiceai_sandbox.tpch_sf1.orders
     name: orders
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.part
+  - from: odbc:spiceai_sandbox.tpch_sf1.part
     name: part
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.partsupp
+  - from: odbc:spiceai_sandbox.tpch_sf1.partsupp
     name: partsupp
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.region
+  - from: odbc:spiceai_sandbox.tpch_sf1.region
     name: region
     params: *odbc_params
-  - from: odbc:spiceai_sandbox.tpch.supplier
+  - from: odbc:spiceai_sandbox.tpch_sf1.supplier
     name: supplier
     params: *odbc_params
