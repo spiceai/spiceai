@@ -2,8 +2,8 @@ name: testoperator dispatch
 
 on:
   schedule:
-    # Every 2nd day, at 9:00 AM UTC
-    - cron: '0 9 */2 * *'
+    # Every day, at 0900 UTC (0200 PDT)
+    - cron: '0 9 * * *'
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -44,8 +44,18 @@ jobs:
   dispatch-tests:
     name: Dispatch tests
     runs-on: spiceai-runners
+    concurrency:
+      group: testoperator-dispatch
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        commit:
+          - ${{ github.event.inputs.spiced_commit || '' }}
+          - '00e9d7d671ca9dd28eac1e78ba1253b1ae33fe76' # release/1.1
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.commit }}
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -53,19 +63,19 @@ jobs:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
-      
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
-          spiced_commit: ${{ github.event.inputs.spiced_commit }}
-      
+          spiced_commit: ${{ matrix.commit }}
+
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
-      
+
       - name: Dispatch Testoperator - Input
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test_files_path != '' }}
         run: |
@@ -77,7 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.ref }}
+          WORKFLOW_COMMIT: ${{ matrix.commit }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true' }}
