@@ -1310,7 +1310,7 @@ impl DataFusion {
 
         // If accelerated view depends on other tables, wait until they are ready; this is required to complete
         // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
-        wait_untill_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
+        wait_until_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
 
         let schema = view_table.schema();
         let federated_table = FederatedTable::new(Arc::new(view_table) as Arc<dyn TableProvider>);
@@ -1525,7 +1525,7 @@ impl Drop for DataFusion {
     }
 }
 
-async fn wait_untill_dependent_tables_are_ready(
+async fn wait_until_dependent_tables_are_ready(
     table: &TableReference,
     dependent_tables: &[TableReference],
     runtime_status: &Arc<status::RuntimeStatus>,
