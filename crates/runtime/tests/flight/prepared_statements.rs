@@ -50,6 +50,42 @@ async fn test_basic_binding() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+async fn test_question_mark_placeholder() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (channel, _df) = start_spice_test_app(None, None).await?;
+
+            let mut client = FlightSqlServiceClient::new(channel);
+            let param_batch = create_param_batch(
+                vec![("$1", arrow::datatypes::DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![41])) as Arc<dyn arrow::array::Array>],
+            )?;
+
+            let results =
+                execute_prepared_statement(&mut client, "SELECT ? + 1 AS the_answer", param_batch)
+                    .await?;
+
+            assert_eq!(results.len(), 1);
+            let record = results.first().expect("1 record batch only");
+            let (i, _) = record
+                .schema()
+                .column_with_name("the_answer")
+                .expect("the_answer column");
+            let column = record
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("the_answer is Int64Array");
+            assert_eq!(column.len(), 1);
+            assert_eq!(column.value(0), 42);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
 async fn test_multiple_parameters() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
