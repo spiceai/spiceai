@@ -91,7 +91,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.ref }}
+          WORKFLOW_COMMIT: ${{ matrix.commit }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true' }}
@@ -100,6 +100,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.commit }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
         if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true'  }}
@@ -108,6 +109,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.commit }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         if: ${{ github.event_name == 'schedule' || github.event.inputs.all_benchmarks == 'true'  }}
@@ -116,3 +118,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.commit }}
