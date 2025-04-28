@@ -136,7 +136,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.5"
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3" } # spiceai
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "ca5c06a6dcb25c7507e110d0a6cd3e0a9ebcbf3b" } # spiceai
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tempfile = "3"
