@@ -2,28 +2,28 @@ version: v1
 kind: Spicepod
 name: spark[databricks]-federated
 datasets:
-  - from: spark:spiceai_sandbox.tpch_sf1.customer
+  - from: spark:spiceai_sandbox.tpch_sf100.customer
     name: customer
     params: &spark_params
       spark_remote: sc://${ env:NEW_DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:NEW_DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:NEW_DATABRICKS_CLUSTER_ID };
-  - from: spark:spiceai_sandbox.tpch_sf1.lineitem
+  - from: spark:spiceai_sandbox.tpch_sf100.lineitem
     name: lineitem
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.nation
+  - from: spark:spiceai_sandbox.tpch_sf100.nation
     name: nation
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.orders
+  - from: spark:spiceai_sandbox.tpch_sf100.orders
     name: orders
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.part
+  - from: spark:spiceai_sandbox.tpch_sf100.part
     name: part
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.partsupp
+  - from: spark:spiceai_sandbox.tpch_sf100.partsupp
     name: partsupp
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.region
+  - from: spark:spiceai_sandbox.tpch_sf100.region
     name: region
     params: *spark_params
-  - from: spark:spiceai_sandbox.tpch_sf1.supplier
+  - from: spark:spiceai_sandbox.tpch_sf100.supplier
     name: supplier
     params: *spark_params

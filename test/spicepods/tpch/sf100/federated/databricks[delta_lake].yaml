@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: databricks[delta_lake]-federated
 datasets:
-  - from: databricks:spiceai_sandbox.tpch_sf1.partsupp
+  - from: databricks:spiceai_sandbox.tpch_sf100.partsupp
     name: partsupp
     params: &databricks_delta_params
       mode: delta_lake
@@ -12,24 +12,24 @@ datasets:
       databricks_aws_secret_access_key: ${ secrets:NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }
       databricks_token: ${ secrets:NEW_DATABRICKS_TOKEN }
       databricks_endpoint: ${ secrets:NEW_DATABRICKS_HOST }
-  - from: databricks:spiceai_sandbox.tpch_sf1.customer
+  - from: databricks:spiceai_sandbox.tpch_sf100.customer
     name: customer
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.lineitem
+  - from: databricks:spiceai_sandbox.tpch_sf100.lineitem
     name: lineitem
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.nation
+  - from: databricks:spiceai_sandbox.tpch_sf100.nation
     name: nation
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.orders
+  - from: databricks:spiceai_sandbox.tpch_sf100.orders
     name: orders
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.region
+  - from: databricks:spiceai_sandbox.tpch_sf100.region
     name: region
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.supplier
+  - from: databricks:spiceai_sandbox.tpch_sf100.supplier
     name: supplier
     params: *databricks_delta_params
-  - from: databricks:spiceai_sandbox.tpch_sf1.part
+  - from: databricks:spiceai_sandbox.tpch_sf100.part
     name: part
     params: *databricks_delta_params

@@ -6,12 +6,12 @@ datasets:
     name: customer
     params: &spark_params
       spark_remote: |
-        sc://${ env:DATABRICKS_HOST }:443/;
+        sc://${ env:NEW_DATABRICKS_HOST }:443/;
         use_ssl=true;
         user_id=spice.ai;
         session_id=spark_tpch_test;
-        token=${ env:DATABRICKS_TOKEN };
-        x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
+        token=${ env:NEW_DATABRICKS_TOKEN };
+        x-databricks-cluster-id=${ env:NEW_DATABRICKS_CLUSTER_ID };
     acceleration: &acceleration
       enabled: true
       engine: arrow
