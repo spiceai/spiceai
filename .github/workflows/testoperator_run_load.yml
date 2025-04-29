@@ -23,6 +23,7 @@ on:
         type: choice
         options:
           - 'tpch'
+          - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
       query_overrides:
