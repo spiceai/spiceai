@@ -46,6 +46,7 @@ use crate::Runtime;
 use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::SpiceModelTool;
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
+use llms::progress::Progress;
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
@@ -200,6 +201,15 @@ impl ToolUsingChat {
 
         let mut tool_and_response_content = vec![];
         for t in spiced_tools.clone() {
+            tracing::info!(
+                target: "task_history",
+                progress = Progress::log()
+                    .id(t.id.clone())
+                    .title(format!("Calling '{}' tool", t.function.name))
+                    .content(t.function.arguments.clone())
+                    .to_jsonl(),
+            );
+
             let content = self.call_tool(&t.function).await;
             tool_and_response_content.push((t, content));
         }
@@ -207,6 +217,17 @@ impl ToolUsingChat {
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
         );
+
+        for (tool_call, response) in &tool_and_response_content {
+            tracing::info!(
+                target: "task_history",
+                progress = Progress::log()
+                    .id(tool_call.id.clone())
+                    .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                    .json_content(response.clone())
+                    .to_jsonl(),
+            );
+        }
 
         // Tell model the assistant used these tools, and provided result.
         let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content

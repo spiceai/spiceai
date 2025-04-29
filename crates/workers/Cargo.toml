@@ -22,3 +22,4 @@ serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
+tracing.workspace = true
