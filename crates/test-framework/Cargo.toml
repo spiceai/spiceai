@@ -12,6 +12,7 @@ version.workspace = true
 anyhow = "1.0.95"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

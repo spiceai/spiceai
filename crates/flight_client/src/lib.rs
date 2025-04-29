@@ -604,6 +604,10 @@ impl FlightClient {
         };
         Some(username)
     }
+
+    pub fn client(&self) -> &FlightServiceClient<Channel> {
+        &self.flight_client
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
