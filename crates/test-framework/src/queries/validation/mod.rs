@@ -113,7 +113,11 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
             }
 
             // Store the batches in the map
-            map.insert(query_name.into(), batches);
+            map.insert(query_name.into(), batches.clone());
+            map.insert(
+                query_name.replace("tpch_", "tpch[parameterized]_").into(),
+                batches,
+            );
         }
 
         map
