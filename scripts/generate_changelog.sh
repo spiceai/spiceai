@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# Ensure the script is run with a tag argument
-if [ -z "$1" ]; then
-  echo "Usage: $0 <tag> <base-branch>"
-  exit 1
+tag=$1
+branch=$2
+owner=spiceai
+repo=spiceai
+
+if [ -z "$tag" ] || [ -z "$branch" ]; then
+    echo "Usage: $0 <tag> <branch>"
+    exit 1
 fi
 
 # Ensure the `gh` CLI is installed and authenticated
@@ -18,40 +22,30 @@ if ! gh auth status &> /dev/null; then
   exit 1
 fi
 
-TAG="$1"
-BASE_BRANCH="${2:-trunk}"
+# Fetch PR data
+gh pr list --state merged --base "$branch" --limit 10000 --json number,mergeCommit,author --repo "$owner/$repo" > pr_data.json
 
-# Update the local repository to fetch all remote commits
-git fetch --all
+# Create mapping file: commit_hash pr_number username
+jq -r '.[] | .mergeCommit.oid + " " + (.number | tostring) + " " + .author.login' pr_data.json > pr_mapping.txt
 
-# Get the commit range between the tag and the base branch
-COMMIT_RANGE="$(git rev-parse $TAG)..$(git rev-parse $BASE_BRANCH)"
-
-# Temporary file to store cherry-picked commits
-TEMP_FILE=$(mktemp)
-
-# Populate the temporary file with cherry-picked commits (if applicable)
-git log "$COMMIT_RANGE" --cherry-pick --pretty=format:"%H" > "$TEMP_FILE"
+# Get commits in trunk not cherry-picked into the release branch
+git cherry "$tag" "$branch" | grep '^+' | awk '{print $2}' > cherry_commits.txt
 
 # Generate changelog
 echo "### Changelog"
 echo ""
 
-# Process git log output, handling tabs and special characters
-git log "$COMMIT_RANGE" --pretty=format:"%an	%s" | while IFS=$'\t' read -r author message; do
-  # Skip empty lines or lines with missing fields
-  if [ -z "$author" ] || [ -z "$message" ]; then
-    continue
-  fi
+while read -r hash; do
+    mapping=$(grep "^$hash " pr_mapping.txt)
+    if [ -n "$mapping" ]; then
+        pr_number=$(echo "$mapping" | cut -d' ' -f2)
+        username=$(echo "$mapping" | cut -d' ' -f3)
+        subject=$(git log --format=%s -n 1 "$hash")
+        echo "- $subject by @$username in https://github.com/$owner/$repo/pull/$pr_number"
+    else
+        echo "Warning: No PR found for commit $hash" >&2
+    fi
+done < cherry_commits.txt
 
-  # Check if the commit is in the cherry-picked list
-  commit_hash=$(git log -1 --pretty=format:"%H" --grep="$message")
-  if grep -q "$commit_hash" "$TEMP_FILE"; then
-    echo "- $message by $author"
-  else
-    echo "- [$author] $message"
-  fi
-done
-
-# Clean up temporary file
-rm -f "$TEMP_FILE"
+# Clean up
+rm pr_data.json pr_mapping.txt cherry_commits.txt
