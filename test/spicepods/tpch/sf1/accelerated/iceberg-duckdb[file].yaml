@@ -1,0 +1,44 @@
+version: v1beta1
+kind: Spicepod
+name: iceberg-duckdb[file]
+
+datasets:
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/partsupp
+    name: partsupp
+    params: &iceberg_params
+      iceberg_s3_endpoint: ${secrets:S3_ENDPOINT}
+      iceberg_s3_access_key_id: ${secrets:S3_KEY}
+      iceberg_s3_secret_access_key: ${secrets:S3_SECRET}
+      iceberg_s3_region: us-east-1
+    acceleration: &acceleration
+      enabled: true
+      engine: duckdb
+      mode: file
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/customer
+    name: customer
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/lineitem
+    name: lineitem
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/nation
+    name: nation
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/orders
+    name: orders
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/region
+    name: region
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/supplier
+    name: supplier
+    params: *iceberg_params
+    acceleration: *acceleration
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces/tpch_sf1/tables/part
+    name: part
+    params: *iceberg_params
+    acceleration: *acceleration
