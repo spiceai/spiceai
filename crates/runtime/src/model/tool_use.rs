@@ -142,18 +142,45 @@ impl ToolUsingChat {
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
-    async fn call_tool(&self, func: &FunctionCall) -> Value {
-        match self.tools.iter().find(|t| t.name() == func.name) {
+    async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
+        match self
+            .tools
+            .iter()
+            .find(|t| t.name() == tool_call.function.name)
+        {
             Some(t) => {
                 match t
-                    .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
+                    .call(
+                        &tool_call.function.arguments,
+                        Arc::<Runtime>::clone(&self.rt),
+                    )
                     .await
                 {
-                    Ok(v) => v,
-                    Err(e) => Value::String(format!(
-                        "Failed to call the tool {}.\nAn error occurred: {e}",
-                        t.name()
-                    )),
+                    Ok(v) => {
+                        tracing::info!(
+                            target: "task_history",
+                            progress = Progress::log()
+                                .id(tool_call.id.clone())
+                                .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                                .json_content(v.clone())
+                                .to_jsonl(),
+                        );
+                        v
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            target: "task_history",
+                            progress = Progress::error()
+                                .id(tool_call.id.clone())
+                                .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                                .content(e.to_string())
+                                .to_jsonl(),
+                        );
+                        Value::String(format!(
+                            "Failed to call the tool {}.\nAn error occurred: {e}",
+                            t.name()
+                        ))
+                    }
                 }
             }
             None => Value::Null,
@@ -210,24 +237,14 @@ impl ToolUsingChat {
                     .to_jsonl(),
             );
 
-            let content = self.call_tool(&t.function).await;
+            let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
         }
+
         tracing::debug!(
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
         );
-
-        for (tool_call, response) in &tool_and_response_content {
-            tracing::info!(
-                target: "task_history",
-                progress = Progress::log()
-                    .id(tool_call.id.clone())
-                    .title(format!("'{}' tool completed successfully", tool_call.function.name))
-                    .json_content(response.clone())
-                    .to_jsonl(),
-            );
-        }
 
         // Tell model the assistant used these tools, and provided result.
         let tool_messages: Vec<ChatCompletionRequestMessage> = tool_and_response_content

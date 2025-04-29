@@ -27,7 +27,7 @@ use opentelemetry_sdk::{
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
 use std::time::Duration;
-use tracing::{Subscriber, field::Field};
+use tracing::Subscriber;
 use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
 
 pub enum LogVerbosity {

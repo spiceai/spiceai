@@ -390,7 +390,7 @@ mod tests {
             CreateChatCompletionStreamResponse,
         },
     };
-    use tracing::{Level, info, span};
+    use tracing::{Level, span};
     use tracing_futures::Instrument;
 
     use super::create_working_stream_payload;

@@ -46,12 +46,15 @@ pub struct Progress {
 }
 
 impl Progress {
+    #[must_use]
     pub fn log() -> Self {
         Self::new(ProgressType::Log)
     }
+    #[must_use]
     pub fn error() -> Self {
         Self::new(ProgressType::Error)
     }
+    #[must_use]
     pub fn warning() -> Self {
         Self::new(ProgressType::Warning)
     }
@@ -66,35 +69,42 @@ impl Progress {
         }
     }
 
+    #[must_use]
     pub fn id(mut self, id: String) -> Self {
         self.id = Some(id);
         self
     }
 
+    #[must_use]
     pub fn parent_id(mut self, parent_id: String) -> Self {
         self.parent_id = Some(parent_id);
         self
     }
 
+    #[must_use]
     pub fn title(mut self, title: String) -> Self {
         self.title = Some(title);
         self
     }
 
+    #[must_use]
     pub fn json_content(mut self, content: Value) -> Self {
         self.content = Some(content);
         self
     }
+    #[must_use]
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(Value::String(content));
         self
     }
 
+    #[must_use]
     pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.tags.insert(key.into(), value.into());
         self
     }
 
+    #[must_use]
     pub fn to_jsonl(&self) -> String {
         let raw_json = match serde_json::to_string(self) {
             Ok(json) => json,
