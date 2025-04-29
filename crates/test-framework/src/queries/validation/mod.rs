@@ -516,7 +516,7 @@ mod test {
     #[test]
     fn test_tpch_answers() {
         // Check that the TPCH answers are loaded correctly
-        assert_eq!(TPCH_ANSWERS.len(), 22);
+        assert_eq!(TPCH_ANSWERS.len(), 44);
         assert_eq!(
             TPCH_ANSWERS
                 .get("tpch_q1")
