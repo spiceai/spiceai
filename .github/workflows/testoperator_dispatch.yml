@@ -111,7 +111,7 @@ jobs:
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-runners
-    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.test_files_path || github.event.inputs.all_benchmarks) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.test_files_path != '' || github.event.inputs.all_benchmarks == 'true') }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'unset' }}-${{ github.event.ref }}
       cancel-in-progress: false
