@@ -22,7 +22,8 @@ use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, Mode};
+use crate::component::dataset::{Dataset, Mode, ReadyState};
+use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
@@ -34,6 +35,8 @@ use crate::dataupdate::{
 };
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
+use crate::tracing_util::view_registered_trace;
+use crate::view::create_view_table;
 use crate::{status, view};
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -52,7 +55,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{TableReference, sqlparser};
+use datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
@@ -64,6 +67,8 @@ use tokio::spawn;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 pub mod query;
 
@@ -248,7 +253,6 @@ pub enum Table {
         data_connector: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
     },
-    View(String),
 }
 
 struct PendingSinkRegistration {
@@ -435,7 +439,6 @@ impl DataFusion {
                 self.register_federated_table(&dataset, data_connector, federated_read_table)
                     .await?;
             }
-            Table::View(sql) => self.register_view(dataset_table_ref.clone(), sql)?,
         }
 
         if matches!(dataset_mode, Mode::ReadWrite) {
@@ -1168,14 +1171,20 @@ impl DataFusion {
         Ok(())
     }
 
-    pub(crate) fn register_view(&self, table: TableReference, view: String) -> Result<()> {
-        let table_exists = self.ctx.table_exist(table.clone()).unwrap_or(false);
+    pub(crate) fn register_view(
+        self: &Arc<Self>,
+        view: Arc<View>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<()> {
+        tracing::info!("Initializing view {}", &view.name);
+
+        let table_exists = self.ctx.table_exist(view.name.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
-        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &table)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &view.name)?;
 
-        let statements = DFParser::parse_sql_with_dialect(view.as_str(), &PostgreSqlDialect {})
+        let statements = DFParser::parse_sql_with_dialect(&view.sql, &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
@@ -1189,6 +1198,10 @@ impl DataFusion {
         }
 
         let ctx = Arc::clone(&self.ctx);
+        let df_ref = Arc::clone(self);
+        let dependent_table_names = view::get_dependent_table_names(&statements[0]);
+        let status = self.runtime_status();
+
         spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
@@ -1196,8 +1209,10 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<TableReference> = None;
-            let dependent_table_names = view::get_dependent_table_names(&statements[0]);
-            for dependent_table_name in dependent_table_names {
+
+            let table = &view.name;
+
+            for dependent_table_name in &dependent_table_names {
                 let mut attempts = 0;
 
                 if unresolved_dependent_table.is_some() {
@@ -1231,30 +1246,148 @@ impl DataFusion {
                 tracing::error!(
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
+                status.update_view(table, status::ComponentStatus::Error);
                 return;
             }
 
-            let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
-                Ok(plan) => plan,
-                Err(e) => {
-                    tracing::error!("Failed to create view: {e}");
-                    return;
-                }
-            };
-
-            let view_table = match ViewTable::try_new(plan, Some(view)) {
+            let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
+            {
                 Ok(view_table) => view_table,
                 Err(e) => {
                     tracing::error!("Failed to create view: {e}");
+                    status.update_view(table, status::ComponentStatus::Error);
                     return;
                 }
             };
+
+            if let Some(acceleration) = &view.acceleration {
+                if acceleration.enabled {
+                    if let Err(e) = df_ref
+                        .create_accelerated_view(&view, view_table, &dependent_table_names, secrets)
+                        .await
+                    {
+                        tracing::error!("Failed to create view: {e}");
+                        status.update_view(table, status::ComponentStatus::Error);
+                    }
+                    return;
+                }
+            }
+
+            // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
                 tracing::error!("Failed to create view: {e}");
+                status.update_view(table, status::ComponentStatus::Error);
+                return;
             };
-
-            tracing::info!("Created view {table}");
+            tracing::info!("{}", view_registered_trace(table, None));
+            status.update_view(table, status::ComponentStatus::Ready);
         });
+
+        Ok(())
+    }
+
+    pub async fn create_accelerated_view(
+        self: &Arc<Self>,
+        view: &View,
+        view_table: ViewTable,
+        dependent_tables: &[TableReference],
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<()> {
+        let table = &view.name;
+
+        tracing::debug!(
+            "Creating accelerated view {table} with dependent tables {dependent_tables:?}"
+        );
+
+        let acceleration =
+            view.acceleration
+                .as_ref()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: table.to_string(),
+                })?;
+
+        let runtime_status = self.runtime_status();
+
+        // If accelerated view depends on other tables, wait until they are ready; this is required to complete
+        // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
+        wait_until_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
+
+        let schema = view_table.schema();
+        let federated_table = FederatedTable::new(Arc::new(view_table) as Arc<dyn TableProvider>);
+
+        let accelerated_table_provider = self
+            .accelerator_engine_registry()
+            .create_accelerator_table(
+                table.clone(),
+                schema,
+                None,
+                acceleration,
+                secrets,
+                Some(view),
+            )
+            .await
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format!("Failed to create view acceleration: {e}"),
+            })?;
+
+        // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
+        let mut initial_load_complete = false;
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(view).await {
+            if checkpoint.exists().await {
+                initial_load_complete = true;
+            }
+        }
+
+        let mut refresh = Refresh::new(RefreshMode::Full).with_retry(
+            view.refresh_retry_enabled(),
+            view.refresh_retry_max_attempts(),
+        );
+        if let Some(refresh_check_interval) = acceleration.refresh_check_interval {
+            refresh = refresh.check_interval(refresh_check_interval);
+        }
+
+        if let Some(max_jitter) = view.refresh_max_jitter() {
+            refresh = refresh.max_jitter(max_jitter);
+        }
+
+        let mut builder = AcceleratedTable::builder(
+            Arc::clone(&runtime_status),
+            table.clone(),
+            federated_table.into(),
+            "view".to_string(),
+            accelerated_table_provider,
+            refresh,
+        );
+        builder.initial_load_complete(initial_load_complete);
+        builder.cache_provider(self.cache_provider());
+        builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
+        builder.refresh_on_startup(acceleration.refresh_on_startup);
+        builder.ready_state(view.ready_state);
+
+        let (accelerated_table, _) =
+            builder
+                .build()
+                .await
+                .context(UnableToBuildAcceleratedTableSnafu {
+                    dataset_name: table.to_string(),
+                })?;
+
+        self.ctx
+            .register_table(
+                table.clone(),
+                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
+            )
+            .map_err(|e| Error::UnableToCreateView {
+                reason: format!("Failed to registed view: {e}"),
+            })?;
+
+        tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
+
+        // if initial load completed, mark view as ready; otherwise, ready status will be updated by acceleration
+        if initial_load_complete || view.ready_state == ReadyState::OnRegistration {
+            self.runtime_status
+                .update_view(&view.name, status::ComponentStatus::Ready);
+        }
 
         Ok(())
     }
@@ -1347,7 +1480,7 @@ impl DataFusion {
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let key = CacheKey::String(sql).as_raw_key();
+        let key = CacheKey::Query(sql, None).as_raw_key();
 
         if let Some(plan) = self.cached_plans.get(&key).await {
             tracing::trace!("using cached plan for {sql}");
@@ -1372,6 +1505,12 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
     }
 }
 
+// Normalizes a table reference to a full table reference with catalog, schema, and table name
+// so it can be used for comparison.
+fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
+    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
 #[must_use]
 pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG
@@ -1384,6 +1523,43 @@ impl Drop for DataFusion {
     fn drop(&mut self) {
         tracing::debug!("DataFusion resources cleanup");
     }
+}
+
+async fn wait_until_dependent_tables_are_ready(
+    table: &TableReference,
+    dependent_tables: &[TableReference],
+    runtime_status: &Arc<status::RuntimeStatus>,
+) {
+    // Exponential retry with max duration of 10 seconds between retries
+    let retry_strategy = FibonacciBackoffBuilder::new()
+        .max_retries(None)
+        .max_duration(Some(Duration::from_secs(10)))
+        .build();
+    let dependent_tables = dependent_tables
+        .iter()
+        .cloned()
+        .map(resolve_table_reference)
+        .collect::<Vec<_>>();
+
+    let _ = retry(retry_strategy, || async {
+        let statuses = runtime_status
+            .get_dataset_statuses()
+            .into_iter()
+            .map(|(key, value)| (resolve_table_reference(key), value))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        if let Some(not_ready_table) = dependent_tables.iter().find(|dependent_table| {
+            statuses.get(dependent_table) != Some(&status::ComponentStatus::Ready)
+        }) {
+            tracing::debug!(
+                "Dependent table {not_ready_table} is not ready for {table}. Retrying..."
+            );
+
+            return Err(RetryError::transient(()));
+        }
+        Ok(())
+    })
+    .await;
 }
 
 #[cfg(test)]

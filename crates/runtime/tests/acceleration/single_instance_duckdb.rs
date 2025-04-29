@@ -24,10 +24,8 @@ use futures::TryStreamExt;
 
 use anyhow::anyhow;
 use runtime::{Runtime, component::dataset::DatasetBuilder};
-use spicepod::component::dataset::{
-    Dataset,
-    acceleration::{Acceleration, Mode, RefreshMode},
-};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
 use crate::{

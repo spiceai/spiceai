@@ -23,9 +23,9 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use futures::TryStreamExt;
 use runtime::{Runtime, component::dataset::DatasetBuilder};
-use spicepod::component::dataset::{
-    Dataset,
+use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
+    component::dataset::Dataset,
 };
 use std::sync::Arc;
 

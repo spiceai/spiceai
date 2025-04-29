@@ -29,10 +29,8 @@ use runtime::{
     },
     request::{Protocol, RequestContext, UserAgent},
 };
-use spicepod::component::{
-    dataset::acceleration::{self, Acceleration},
-    embeddings::EmbeddingChunkConfig,
-};
+use spicepod::acceleration::{self, Acceleration};
+use spicepod::component::embeddings::EmbeddingChunkConfig;
 use tokio::time::Instant;
 use utils::runtime_ready_check;
 

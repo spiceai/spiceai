@@ -22,10 +22,8 @@ use reqwest::{Client, header::HeaderMap};
 use runtime::{Runtime, config::Config, get_params_with_secrets};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::{
-    component::dataset::{Dataset, acceleration::Acceleration},
-    param::Params,
-};
+use spicepod::acceleration::Acceleration;
+use spicepod::{component::dataset::Dataset, param::Params};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -88,7 +86,7 @@ mod nsql {
         // Check task_history table for expected rows.
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
 
         // With `sample_data_enabled`, tools run concurrently, so for deterministic results, order by task and input for verification instead of start time.
         let query = if ts

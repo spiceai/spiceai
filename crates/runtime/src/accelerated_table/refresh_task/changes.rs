@@ -72,7 +72,7 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
-        self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Refreshing)
+        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
         let mut ready_sender = ready_sender;
@@ -107,7 +107,7 @@ impl RefreshTask {
                             }
                         }
                         Err(e) => {
-                            self.mark_dataset_status(
+                            self.set_refresh_status(
                                 refresh.read().await.sql.clone().as_deref(),
                                 status::ComponentStatus::Error,
                             )
@@ -118,7 +118,7 @@ impl RefreshTask {
                 }
                 Err(e) => {
                     tracing::error!("Changes stream error for {dataset_name}: {e}");
-                    self.mark_dataset_status(
+                    self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),
                         status::ComponentStatus::Error,
                     )

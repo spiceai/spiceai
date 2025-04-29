@@ -28,6 +28,7 @@ use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
 use crate::{
+    flight::ExtendedTestFlightClient,
     metrics::QueryStatus,
     queries::{
         Query,
@@ -371,7 +372,10 @@ impl SpiceTestQueryWorker {
         validate: bool,
     ) -> Result<()> {
         let query_start = Instant::now();
-        let mut result_stream = self.flight_client.query(&query.sql).await?;
+        let mut result_stream = self
+            .flight_client
+            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
+            .await?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];

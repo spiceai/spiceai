@@ -17,7 +17,7 @@ limitations under the License.
 use runtime::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
-use spicepod::{component::dataset::acceleration::Mode, param::Params};
+use spicepod::{acceleration::Mode, param::Params};
 
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;

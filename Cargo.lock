@@ -1307,7 +1307,7 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rustls 0.21.12",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
@@ -1768,7 +1768,7 @@ dependencies = [
  "bitflags 2.8.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -4093,8 +4093,8 @@ dependencies = [
 
 [[package]]
 name = "duckdb"
-version = "1.2.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=b850ae60dbe67209320c86daeadf47b51f937660#b850ae60dbe67209320c86daeadf47b51f937660"
+version = "1.1.3"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=2e24b958e44ec7419290249e27a15f1a19703fff#2e24b958e44ec7419290249e27a15f1a19703fff"
 dependencies = [
  "arrow",
  "cast",
@@ -4321,6 +4321,19 @@ checksum = "3c3e4e0dd3673c1139bf041f3008816d9cf2946bbfac2945c09e523b8d7b05b2"
 dependencies = [
  "event-listener 5.4.0",
  "pin-project-lite",
+]
+
+[[package]]
+name = "event_stream"
+version = "1.2.0-unstable"
+dependencies = [
+ "futures",
+ "futures-util",
+ "snafu",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5875,7 +5888,7 @@ dependencies = [
  "hyper 1.6.0",
  "hyper-util",
  "log",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
@@ -6843,8 +6856,8 @@ checksum = "b5aba8db14291edd000dfcc4d620c7ebfb122c613afb886ca8803fa4e128a20a"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.2.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=b850ae60dbe67209320c86daeadf47b51f937660#b850ae60dbe67209320c86daeadf47b51f937660"
+version = "1.1.3"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=2e24b958e44ec7419290249e27a15f1a19703fff#2e24b958e44ec7419290249e27a15f1a19703fff"
 dependencies = [
  "autocfg",
  "cc",
@@ -6895,6 +6908,16 @@ name = "libm"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8355be11b20d696c8f18f6cc018c4e372165b1fa8126cef092399c9951984ffa"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec9d6fac27761dabcd4ee73571cdb06b7022dc99089acbe5435691edffaac0f4"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "libredox"
@@ -7539,6 +7562,15 @@ checksum = "884adb57038347dfbaf2d5065887b6cf4312330dc8e94bc30a1a839bd79d3261"
 dependencies = [
  "ahash 0.8.11",
  "portable-atomic",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "995942f432bbb4822a7e9c3faa87a695185b0d09273ba85f097b54f4e458f2af"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -9640,7 +9672,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -9673,7 +9705,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.98",
@@ -9944,7 +9976,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.1",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "socket2",
  "thiserror 2.0.12",
  "tokio",
@@ -9962,7 +9994,7 @@ dependencies = [
  "rand 0.8.5",
  "ring",
  "rustc-hash 2.1.1",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.12",
@@ -10507,7 +10539,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-native-certs 0.8.1",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -10765,6 +10797,7 @@ dependencies = [
  "azure_storage_blobs",
  "base64 0.22.1",
  "bollard",
+ "byte-unit",
  "bytes",
  "cache",
  "chrono",
@@ -10783,6 +10816,7 @@ dependencies = [
  "document_parse",
  "dotenvy",
  "duckdb",
+ "event_stream",
  "flight_client",
  "flightrepl",
  "fundu",
@@ -10838,7 +10872,7 @@ dependencies = [
  "reqwest 0.12.12",
  "runtime-auth",
  "rusqlite",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-pemfile 2.2.0",
  "schemars",
  "scopeguard",
@@ -10876,6 +10910,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid 1.13.1",
  "winver",
+ "workers",
  "x509-certificate",
 ]
 
@@ -11060,16 +11095,16 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.22"
+version = "0.23.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fb9263ab4eb695e42321db096e3b8fbd715a59b154d5c88d82db2175b681ba7"
+checksum = "df51b5869f3a441595eac5e8ff14d486ff285f7b8c0df8770e49c3b56351f0f0"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.102.8",
+ "rustls-webpki 0.103.1",
  "subtle",
  "zeroize",
 ]
@@ -11137,9 +11172,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.102.8"
+version = "0.103.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+checksum = "fef8b8769aaccf73098557a87cd1816b4f9c7c16811c9c77142aa695c16f2c03"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -11827,7 +11862,7 @@ dependencies = [
 [[package]]
 name = "snowflake-api"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3#0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=ca5c06a6dcb25c7507e110d0a6cd3e0a9ebcbf3b#ca5c06a6dcb25c7507e110d0a6cd3e0a9ebcbf3b"
 dependencies = [
  "arrow",
  "async-stream",
@@ -11950,8 +11985,10 @@ version = "1.2.0-unstable"
 dependencies = [
  "app",
  "clap",
+ "event_stream",
  "flightrepl",
  "futures",
+ "mimalloc",
  "opentelemetry 0.27.1",
  "opentelemetry-http",
  "opentelemetry-prometheus",
@@ -11962,7 +11999,7 @@ dependencies = [
  "reqwest 0.12.12",
  "runtime",
  "runtime-auth",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-pemfile 2.2.0",
  "serde_json",
  "serde_yaml",
@@ -11970,6 +12007,7 @@ dependencies = [
  "snmalloc-rs",
  "spice-cloud",
  "telemetry",
+ "tikv-jemallocator",
  "tokio",
  "tpc-extension",
  "tracing",
@@ -12545,6 +12583,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "arrow-flight",
  "async-openai",
  "async-trait",
  "chrono",
@@ -12563,7 +12602,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.12",
  "rstest",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "secrecy",
  "serde",
  "serde_json",
@@ -12667,7 +12706,7 @@ dependencies = [
  "once_cell",
  "pulldown-cmark 0.12.2",
  "regex",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "strum 0.26.3",
  "thiserror 2.0.12",
  "tiktoken-rs",
@@ -12789,6 +12828,26 @@ dependencies = [
  "parking_lot 0.12.3",
  "regex",
  "rustc-hash 1.1.0",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.0+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd3c60906412afa9c2b5b5a48ca6a5abe5736aec9eb48ad05037a677e52e4e2d"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cec5ff18518d81584f477e9bfdf957f5bb0979b0bac3af4ca30b5b3ae2d2865"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
@@ -13004,7 +13063,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f6d0975eaace0cf0fcadee4e4aaa5da15b5c079146f2cffb67c113be122bf37"
 dependencies = [
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "tokio",
 ]
 
@@ -13916,7 +13975,7 @@ dependencies = [
  "log",
  "native-tls",
  "once_cell",
- "rustls 0.23.22",
+ "rustls 0.23.26",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -14817,6 +14876,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3268f3d866458b787f390cf61f4bbb563b922d091359f9608842999eaee3943c"
 dependencies = [
  "bitflags 2.8.0",
+]
+
+[[package]]
+name = "workers"
+version = "1.2.0-unstable"
+dependencies = [
+ "arrow",
+ "async-openai",
+ "async-trait",
+ "futures",
+ "llms",
+ "rand 0.9.0",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
 ]
 
 [[package]]

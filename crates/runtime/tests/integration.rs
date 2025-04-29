@@ -69,7 +69,7 @@ mod spiceai;
 mod sqlite;
 mod tls;
 mod utils;
-
+mod view;
 // MySQL is required for the rehydration tests
 #[cfg(feature = "mysql")]
 mod rehydration;

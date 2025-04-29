@@ -32,6 +32,7 @@ use spicepod::{
         secret::Secret,
         tool::Tool,
         view::View,
+        worker::Worker,
     },
     extension::Extension,
 };
@@ -59,6 +60,8 @@ pub struct App {
     pub evals: Vec<Eval>,
 
     pub tools: Vec<Tool>,
+
+    pub workers: Vec<Worker>,
 
     pub spicepods: Vec<Spicepod>,
 
@@ -99,6 +102,7 @@ pub struct AppBuilder {
     embeddings: Vec<Embeddings>,
     evals: Vec<Eval>,
     tools: Vec<Tool>,
+    workers: Vec<Worker>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
 }
@@ -116,6 +120,7 @@ impl AppBuilder {
             embeddings: vec![],
             evals: vec![],
             tools: vec![],
+            workers: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
         }
@@ -133,6 +138,7 @@ impl AppBuilder {
         self.embeddings.extend(spicepod.embeddings.clone());
         self.evals.extend(spicepod.evals.clone());
         self.tools.extend(spicepod.tools.clone());
+        self.workers.extend(spicepod.workers.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -192,6 +198,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_worker(mut self, worker: Worker) -> AppBuilder {
+        self.workers.push(worker);
+        self
+    }
+
+    #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
         self.runtime.results_cache = results_cache;
         self
@@ -240,11 +252,13 @@ impl AppBuilder {
             embeddings: self.embeddings,
             evals: self.evals,
             tools: self.tools,
+            workers: self.workers,
             spicepods: self.spicepods,
             runtime: self.runtime,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let spicepod_root =
@@ -259,6 +273,7 @@ impl AppBuilder {
         let mut embeddings: Vec<Embeddings> = vec![];
         let mut evals: Vec<Eval> = vec![];
         let mut tools: Vec<Tool> = vec![];
+        let mut workers: Vec<Worker> = vec![];
 
         for catalog in &spicepod_root.catalogs {
             catalogs.push(catalog.clone());
@@ -286,6 +301,10 @@ impl AppBuilder {
 
         for tool in &spicepod_root.tools {
             tools.push(tool.clone());
+        }
+
+        for worker in &spicepod_root.workers {
+            workers.push(worker.clone());
         }
 
         let root_spicepod_name = spicepod_root.name.clone();
@@ -320,6 +339,11 @@ impl AppBuilder {
             for tool in &dependent_spicepod.tools {
                 tools.push(tool.clone());
             }
+
+            for worker in &dependent_spicepod.workers {
+                workers.push(worker.clone());
+            }
+
             spicepods.push(dependent_spicepod);
         }
 
@@ -336,6 +360,7 @@ impl AppBuilder {
             embeddings,
             evals,
             tools,
+            workers,
             spicepods,
             runtime,
         })

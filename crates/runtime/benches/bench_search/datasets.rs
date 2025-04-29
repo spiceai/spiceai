@@ -16,9 +16,12 @@ limitations under the License.
 
 use app::AppBuilder;
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
-use spicepod::component::{
-    dataset::{Dataset, acceleration::Acceleration},
-    embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig},
+use spicepod::{
+    acceleration::Acceleration,
+    component::{
+        dataset::Dataset,
+        embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig},
+    },
 };
 
 /// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.

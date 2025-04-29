@@ -113,7 +113,11 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
             }
 
             // Store the batches in the map
-            map.insert(query_name.into(), batches);
+            map.insert(query_name.into(), batches.clone());
+            map.insert(
+                query_name.replace("tpch_", "tpch[parameterized]_").into(),
+                batches,
+            );
         }
 
         map
@@ -512,7 +516,7 @@ mod test {
     #[test]
     fn test_tpch_answers() {
         // Check that the TPCH answers are loaded correctly
-        assert_eq!(TPCH_ANSWERS.len(), 22);
+        assert_eq!(TPCH_ANSWERS.len(), 44);
         assert_eq!(
             TPCH_ANSWERS
                 .get("tpch_q1")

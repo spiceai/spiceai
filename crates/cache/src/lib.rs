@@ -29,8 +29,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use byte_unit::Byte;
+use datafusion::common::ParamValues;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
 use lru_cache::LruCache;
@@ -87,22 +89,41 @@ pub enum QueryResultsCacheStatus {
     CacheMiss,
 }
 
-#[derive(Hash, Eq, PartialEq)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
-    String(&'a str),
+    Query(&'a str, Option<&'a ParamValues>),
 }
 
 impl CacheKey<'_> {
     #[must_use]
     pub fn as_raw_key(&self) -> RawCacheKey {
         let mut hasher = DefaultHasher::new();
-        (*self).hash(&mut hasher);
+        match self {
+            Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
+            Self::Query(sql, param_values) => {
+                sql.hash(&mut hasher);
+                if let Some(params) = param_values {
+                    match params {
+                        ParamValues::List(vec) => vec.hash(&mut hasher),
+                        ParamValues::Map(hash_map) => {
+                            // implementing Hash for HashMap
+                            let mut pairs: Vec<(&String, &ScalarValue)> = hash_map.iter().collect();
+                            pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
+
+                            for (key, value) in pairs {
+                                key.hash(&mut hasher);
+                                value.hash(&mut hasher);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RawCacheKey(hasher.finish())
     }
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Hash, Clone, Copy, Eq, PartialEq)]
 pub struct RawCacheKey(u64);
 
 impl QueryResult {
@@ -128,6 +149,7 @@ pub struct CachedQueryResult {
 #[async_trait]
 pub trait QueryResultCache {
     async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>>;
+    async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>>;
     async fn put<'a>(&self, key: CacheKey<'a>, result: CachedQueryResult) -> Result<()>;
     async fn put_raw_key(&self, raw_key: RawCacheKey, result: CachedQueryResult) -> Result<()>;
     async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()>;
@@ -192,8 +214,16 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
+        let raw_key = key.as_raw_key();
+        self.get_raw_key(raw_key).await
+    }
+
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>> {
         metrics::REQUESTS.add(1, &[]);
-        match self.cache.get(key).await {
+        match self.cache.get_raw_key(raw_key).await {
             Ok(Some(cached_result)) => {
                 metrics::HITS.add(1, &[]);
                 Ok(Some(cached_result))
