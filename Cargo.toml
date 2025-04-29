@@ -43,7 +43,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.85"
-version = "1.2.0-unstable"
+version = "1.2.0"
 
 [workspace.dependencies]
 arrow = { version = "=54.2.1", features = ["prettyprint"] }
