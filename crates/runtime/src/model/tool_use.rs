@@ -148,40 +148,33 @@ impl ToolUsingChat {
             .iter()
             .find(|t| t.name() == tool_call.function.name)
         {
-            Some(t) => {
-                match t
-                    .call(
-                        &tool_call.function.arguments,
-                    )
-                    .await
-                {
-                    Ok(v) => {
-                        tracing::info!(
-                            target: "task_history",
-                            progress = Progress::log()
-                                .id(tool_call.id.clone())
-                                .title(format!("'{}' tool completed successfully", tool_call.function.name))
-                                .json_content(v.clone())
-                                .to_jsonl(),
-                        );
-                        v
-                    }
-                    Err(e) => {
-                        tracing::info!(
-                            target: "task_history",
-                            progress = Progress::error()
-                                .id(tool_call.id.clone())
-                                .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
-                                .content(e.to_string())
-                                .to_jsonl(),
-                        );
-                        Value::String(format!(
-                            "Failed to call the tool {}.\nAn error occurred: {e}",
-                            t.name()
-                        ))
-                    }
+            Some(t) => match t.call(&tool_call.function.arguments).await {
+                Ok(v) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::log()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                            .json_content(v.clone())
+                            .to_jsonl(),
+                    );
+                    v
                 }
-            }
+                Err(e) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::error()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                            .content(e.to_string())
+                            .to_jsonl(),
+                    );
+                    Value::String(format!(
+                        "Failed to call the tool {}.\nAn error occurred: {e}",
+                        t.name()
+                    ))
+                }
+            },
             None => Value::Null,
         }
     }
