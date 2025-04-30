@@ -21,6 +21,7 @@ use spicepod::{component::catalog as spicepod_catalog, param::Params};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{find_first_delimiter, validate_identifier};
+use crate::Runtime;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -35,7 +36,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Catalog {
     pub provider: String,
     pub catalog_id: Option<String>,
@@ -46,6 +47,23 @@ pub struct Catalog {
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
     pub app: Arc<App>,
+    pub runtime: Arc<Runtime>,
+}
+
+impl std::fmt::Debug for Catalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Catalog")
+            .field("provider", &self.provider)
+            .field("catalog_id", &self.catalog_id)
+            .field("from", &self.from)
+            .field("name", &self.name)
+            .field("orig_include", &self.orig_include)
+            .field("include", &self.include)
+            .field("params", &self.params)
+            .field("dataset_params", &self.dataset_params)
+            .field("app", &self.app)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for Catalog {
@@ -62,6 +80,11 @@ impl Catalog {
     #[must_use]
     pub fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
+    }
+
+    #[must_use]
+    pub fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
     }
 
     /// Returns the catalog provider - the first part of the `from` field before the first '://', ':', or '/'.
@@ -130,6 +153,7 @@ pub struct CatalogBuilder {
     pub params: HashMap<String, String>,
     pub dataset_params: HashMap<String, String>,
     pub app: Option<Arc<App>>,
+    pub runtime: Option<Arc<Runtime>>,
 }
 
 impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
@@ -176,6 +200,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
             app: None,
+            runtime: None,
         })
     }
 }
@@ -197,6 +222,7 @@ impl CatalogBuilder {
             params: HashMap::default(),
             dataset_params: HashMap::default(),
             app: None,
+            runtime: None,
         })
     }
 
@@ -206,10 +232,20 @@ impl CatalogBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     pub fn build(self) -> Result<Catalog> {
         let app = self.app.ok_or(Error::UnableToBuildCatalog {
             catalog: self.name.to_string(),
             missing_component: "app".to_string(),
+        })?;
+        let runtime = self.runtime.ok_or(Error::UnableToBuildCatalog {
+            catalog: self.name.to_string(),
+            missing_component: "runtime".to_string(),
         })?;
 
         let catalog = Catalog {
@@ -222,6 +258,7 @@ impl CatalogBuilder {
             params: self.params,
             dataset_params: self.dataset_params,
             app,
+            runtime,
         };
 
         Ok(catalog)
