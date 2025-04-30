@@ -79,15 +79,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let app_name = app.name.clone();
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("benchmark.name", app_name.clone()),
-        KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
-        KeyValue::new("benchmark.query_set", query_set.to_string()),
-        KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
-        KeyValue::new("benchmark.branch_name", metrics.branch_name.clone()),
-        KeyValue::new(
-            "benchmark.scale_factor",
-            args.scale_factor.unwrap_or(1.0).to_string(),
-        ),
+        KeyValue::new("type", "benchmark_query"),
+        KeyValue::new("name", app_name.clone()),
+        KeyValue::new("spiced_version", spiced_version.clone()),
+        KeyValue::new("query_set", query_set.to_string()),
+        KeyValue::new("spiced_commit_sha", commit_sha.clone()),
+        KeyValue::new("branch_name", metrics.branch_name.clone()),
+        KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
     ]);
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
@@ -95,12 +93,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     for query in &metrics.metrics {
         let query_name = query.query_name.clone();
         let row_count = row_counts.get(&query_name).unwrap_or(&0);
-        let attributes = vec![
-            KeyValue::new("query_name", query_name),
-            KeyValue::new("spiced_commit_sha", commit_sha.clone()),
-            KeyValue::new("spiced_version", spiced_version.clone()),
-            KeyValue::new("query_set", query_set.to_string()),
-        ];
+        let attributes = vec![KeyValue::new("query_name", query_name)];
 
         let status: u64 = u64::from(match query.query_status {
             QueryStatus::Passed => true,
