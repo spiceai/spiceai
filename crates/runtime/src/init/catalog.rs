@@ -36,7 +36,7 @@ impl Runtime {
             return;
         };
 
-        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(true));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
         drop(app_lock);
         let mut futures = vec![];
         for catalog in &valid_catalogs {
@@ -105,7 +105,10 @@ impl Runtime {
         Ok(catalog_connector)
     }
 
-    fn catalogs_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + '_ {
+    fn catalogs_iter(
+        self: Arc<Self>,
+        app: &Arc<App>,
+    ) -> impl Iterator<Item = Result<Catalog>> + '_ {
         app.catalogs
             .clone()
             .into_iter()
@@ -113,18 +116,24 @@ impl Runtime {
             .map(move |catalog_builder_result| {
                 catalog_builder_result.and_then(|catalog_builder| {
                     let catalog_name = catalog_builder.name.to_string();
-                    catalog_builder.with_app(Arc::clone(app)).build().context(
-                        UnableToBuildCatalogSnafu {
+                    catalog_builder
+                        .with_app(Arc::clone(app))
+                        .with_runtime(Arc::clone(&self))
+                        .build()
+                        .context(UnableToBuildCatalogSnafu {
                             catalog: catalog_name,
-                        },
-                    )
+                        })
                 })
             })
     }
 
     /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.
-    pub(crate) fn get_valid_catalogs(app: &Arc<App>, log_errors: LogErrors) -> Vec<Catalog> {
-        Self::catalogs_iter(app)
+    pub(crate) fn get_valid_catalogs(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Catalog> {
+        self.catalogs_iter(app)
             .zip(&app.catalogs)
             .filter_map(|(catalog, spicepod_catalog)| match catalog {
                 Ok(catalog) => Some(catalog),
@@ -193,8 +202,8 @@ impl Runtime {
         current_app: &Arc<App>,
         new_app: &Arc<App>,
     ) {
-        let valid_catalogs = Self::get_valid_catalogs(new_app, LogErrors(true));
-        let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(new_app, LogErrors(true));
+        let existing_catalogs = Arc::clone(&self).get_valid_catalogs(current_app, LogErrors(false));
 
         for catalog in &valid_catalogs {
             if let Some(current_catalog) = existing_catalogs.iter().find(|c| c.name == catalog.name)
