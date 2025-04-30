@@ -57,7 +57,6 @@ assignees: ''
    - [ ] Verify [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
-       - Run Schedule: Yes
        - All other values left empty.
    - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
      - Parameters: Branch: `trunk`
@@ -65,7 +64,6 @@ assignees: ''
    - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
-       - Run Schedule: Yes
        - All other values left empty.
 
 1. **Documentation Review**

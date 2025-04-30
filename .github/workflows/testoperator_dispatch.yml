@@ -11,10 +11,6 @@ on:
         description: 'An optional commit hash to use for spiced'
         required: false
         type: string
-      test_files_path:
-        description: 'path to load test files to dispatch'
-        required: false
-        type: string
       workflow_type:
         description: 'the workflow to execute (bench, throughput, load, etc)'
         required: true
@@ -27,11 +23,6 @@ on:
           - 'http-consistency'
       update_snapshots:
         description: 'Update snapshots?'
-        required: false
-        type: boolean
-        default: false
-      all_benchmarks:
-        description: 'Run all benchmarks?'
         required: false
         type: boolean
         default: false
@@ -106,9 +97,9 @@ jobs:
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-runners
-    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.test_files_path != '' || github.event.inputs.all_benchmarks == 'true') }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
-      group: testoperator-dispatch-${{ github.event.inputs.test_files_path || 'unset' }}-${{ github.event.ref }}
+      group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -133,20 +124,7 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
-      - name: Dispatch Testoperator - Input
-        if: ${{ github.event.inputs.test_files_path != '' }}
-        run: |
-          testoperator dispatch \
-            ${{ github.event.inputs.test_files_path }} \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.ref }}
-
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH
-        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -157,7 +135,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS
-        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -168,7 +145,6 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
-        if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
