@@ -151,11 +151,11 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - Scheduled Bench - TPCH
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
-            --workflow bench \
+            --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }} \
             --validate=${{ github.event.inputs.validate }}
         env:
@@ -163,11 +163,11 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 \
-            --workflow bench \
+            --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }} \
             --validate=${{ github.event.inputs.validate }}
         env:
@@ -175,11 +175,11 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
         if: ${{ github.event.inputs.all_benchmarks == 'true' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
-            --workflow bench \
+            --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }} \
             --validate=${{ github.event.inputs.validate }}
         env:
