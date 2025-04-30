@@ -1,0 +1,34 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch[parameterized]_q5"
+---
++---------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type           | plan                                                                                                                                                                                                  |
++---------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan        | Sort: revenue DESC NULLS FIRST                                                                                                                                                                        |
+|                     |   Projection: nation.n_name, sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount) AS revenue                                                                                                |
+|                     |     Aggregate: groupBy=[[nation.n_name]], aggr=[[sum(lineitem.l_extendedprice * (Decimal128(Some(1),20,0) - lineitem.l_discount)) AS sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)]] |
+|                     |       Projection: lineitem.l_extendedprice, lineitem.l_discount, nation.n_name                                                                                                                        |
+|                     |         Inner Join: nation.n_regionkey = region.r_regionkey                                                                                                                                           |
+|                     |           Projection: lineitem.l_extendedprice, lineitem.l_discount, nation.n_name, nation.n_regionkey                                                                                                |
+|                     |             Inner Join: supplier.s_nationkey = nation.n_nationkey                                                                                                                                     |
+|                     |               Projection: lineitem.l_extendedprice, lineitem.l_discount, supplier.s_nationkey                                                                                                         |
+|                     |                 Inner Join: lineitem.l_suppkey = supplier.s_suppkey, customer.c_nationkey = supplier.s_nationkey                                                                                      |
+|                     |                   Projection: customer.c_nationkey, lineitem.l_suppkey, lineitem.l_extendedprice, lineitem.l_discount                                                                                 |
+|                     |                     Inner Join: orders.o_orderkey = lineitem.l_orderkey                                                                                                                               |
+|                     |                       Projection: customer.c_nationkey, orders.o_orderkey                                                                                                                             |
+|                     |                         Inner Join: customer.c_custkey = orders.o_custkey                                                                                                                             |
+|                     |                           BytesProcessedNode                                                                                                                                                          |
+|                     |                             TableScan: customer projection=[c_custkey, c_nationkey]                                                                                                                   |
+|                     |                           BytesProcessedNode                                                                                                                                                          |
+|                     |                             TableScan: orders projection=[o_orderkey, o_custkey], full_filters=[orders.o_orderdate >= Date32("1994-01-01"), orders.o_orderdate < Date32("1995-01-01")]                |
+|                     |                       BytesProcessedNode                                                                                                                                                              |
+|                     |                         TableScan: lineitem projection=[l_orderkey, l_suppkey, l_extendedprice, l_discount]                                                                                           |
+|                     |                   BytesProcessedNode                                                                                                                                                                  |
+|                     |                     TableScan: supplier projection=[s_suppkey, s_nationkey]                                                                                                                           |
+|                     |               BytesProcessedNode                                                                                                                                                                      |
+|                     |                 TableScan: nation projection=[n_nationkey, n_name, n_regionkey]                                                                                                                       |
+|                     |           BytesProcessedNode                                                                                                                                                                          |
+|                     |             TableScan: region projection=[r_regionkey], full_filters=[region.r_name = $1]                                                                                                             |
+| physical_plan_error | Execution error: Placeholder '$1' was not provided a value for execution.                                                                                                                             |
++---------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
