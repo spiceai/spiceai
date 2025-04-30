@@ -31,7 +31,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers,
+    tracers,
 };
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
