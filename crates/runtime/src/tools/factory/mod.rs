@@ -104,6 +104,9 @@ pub async fn unregister_all_factories(rt: &Runtime) {
     let tool_factories = rt.tool_factories();
     let mut registry = tool_factories.lock().await;
     registry.clear();
+
+    let tools = rt.tools.write().await;
+    tools.clear();
 }
 
 /// Get all catalogs available by default in the spice runtime.
