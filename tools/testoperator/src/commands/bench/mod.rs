@@ -75,7 +75,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
     let commit_sha = metrics.commit_sha.clone();
-    let spiced_commit_sha = std::env::var("SPICED_COMMIT")?;
+    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
     let benchmark_resource = Resource::new(vec![
