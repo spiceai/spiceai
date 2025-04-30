@@ -157,10 +157,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| {
-            f1.name().to_lowercase() == f2.name().to_lowercase()
-                && datatype_equivalent(f1.data_type().clone(), f2.data_type().clone())
-        })
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
 }
 
 macro_rules! downcast_and_stringify {

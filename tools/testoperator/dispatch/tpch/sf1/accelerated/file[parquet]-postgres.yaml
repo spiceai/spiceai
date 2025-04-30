@@ -5,6 +5,7 @@ tests:
     query_overrides: postgresql
     runner_type: spiceai-runners
     ready_wait: 300
+    validate_results: true
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/file[parquet]-postgres.yaml
     query_set: tpch
