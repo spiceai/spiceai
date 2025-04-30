@@ -145,13 +145,13 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const all_benchmarks = ${{ github.event.inputs.all_benchmarks }};
-            const test_files_path = "${{ github.event.inputs.test_files_path }}";
-            const workflow_type = "${{ github.event.inputs.workflow_type }}";
-            const update_snapshots = ${{ github.event.inputs.update_snapshots }};
-            const validate = ${{ github.event.inputs.validate }};
-            const spiced_commit = "${{ steps.setup-spiced.outputs.SPICED_COMMIT }}";
-            const ref = "${{ github.event.ref }}";
+            const all_benchmarks = ${{ github.event.inputs.all_benchmarks }}
+            const test_files_path = ${{ github.event.inputs.test_files_path }}
+            const workflow_type = ${{ github.event.inputs.workflow_type }}
+            const update_snapshots = ${{ github.event.inputs.update_snapshots }}
+            const validate = ${{ github.event.inputs.validate }}
+            const spiced_commit = ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+            const ref = ${{ github.event.ref }}
 
             if (all_benchmarks) {
               return [
@@ -182,7 +182,7 @@ jobs:
                   spiced_commit,
                   ref
                 }
-              ];
+              ]
             } else {
               return [
                 {
@@ -194,7 +194,7 @@ jobs:
                   spiced_commit,
                   ref
                 }
-              ];
+              ]
             }
       
   dispatch-matrix:
