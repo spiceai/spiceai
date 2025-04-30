@@ -30,11 +30,6 @@ on:
         required: false
         type: boolean
         default: false
-      validate:
-        description: 'Validate results?'
-        required: false
-        type: boolean
-        default: false
       all_benchmarks:
         description: 'Run all benchmarks?'
         required: false
@@ -144,8 +139,7 @@ jobs:
           testoperator dispatch \
             ${{ github.event.inputs.test_files_path }} \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
-            --validate=${{ github.event.inputs.validate }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -156,8 +150,7 @@ jobs:
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
-            --validate=${{ github.event.inputs.validate }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -168,8 +161,7 @@ jobs:
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
-            --validate=${{ github.event.inputs.validate }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -180,8 +172,7 @@ jobs:
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
-            --validate=${{ github.event.inputs.validate }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
