@@ -618,7 +618,7 @@ impl ConnectorParamsBuilder {
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
                     factory.prefix(),
                     factory.parameters(),
-                    None,
+                    Some(Arc::clone(&catalog.app)),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {

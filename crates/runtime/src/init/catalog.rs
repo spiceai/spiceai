@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
-    LogErrors, Result, Runtime, UnableToInitializeCatalogConnectorSnafu,
+    LogErrors, Result, Runtime, UnableToBuildCatalogSnafu, UnableToInitializeCatalogConnectorSnafu,
     UnableToLoadCatalogConnectorSnafu,
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
-    component::catalog::Catalog,
+    component::catalog::{Catalog, CatalogBuilder},
     dataconnector::ConnectorParamsBuilder,
     metrics, status, warn_spaced,
 };
@@ -105,8 +105,21 @@ impl Runtime {
         Ok(catalog_connector)
     }
 
-    fn catalogs_iter<'a>(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + 'a {
-        app.catalogs.clone().into_iter().map(Catalog::try_from)
+    fn catalogs_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + '_ {
+        app.catalogs
+            .clone()
+            .into_iter()
+            .map(CatalogBuilder::try_from)
+            .map(move |catalog_builder_result| {
+                catalog_builder_result.and_then(|catalog_builder| {
+                    let catalog_name = catalog_builder.name.to_string();
+                    catalog_builder.with_app(Arc::clone(app)).build().context(
+                        UnableToBuildCatalogSnafu {
+                            catalog: catalog_name,
+                        },
+                    )
+                })
+            })
     }
 
     /// Returns a list of valid catalogs from the given App, skipping any that fail to parse and logging an error for them.

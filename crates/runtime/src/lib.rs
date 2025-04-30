@@ -307,6 +307,12 @@ pub enum Error {
         source: crate::component::dataset::Error,
     },
 
+    #[snafu(display("Unable to build catalog: {catalog}: {source}"))]
+    UnableToBuildCatalog {
+        catalog: String,
+        source: crate::component::catalog::Error,
+    },
+
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
 
