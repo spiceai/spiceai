@@ -39,7 +39,7 @@ use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
 
-use super::{DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
 const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
@@ -93,12 +93,12 @@ impl DuckDBAccelerator {
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
-    pub fn duckdb_file_path(&self, dataset: &Dataset) -> Result<String> {
-        if !dataset.is_file_accelerated() {
+    pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+        if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
             })
-        } else if let Some(acceleration) = dataset.acceleration.as_ref() {
+        } else if let Some(acceleration) = source.acceleration().as_ref() {
             let mut params = acceleration.params.clone();
             params.insert("data_directory".to_string(), spice_data_base_path());
 
@@ -117,22 +117,22 @@ impl DuckDBAccelerator {
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<DuckDbConnectionPool> {
-        let duckdb_file = self.duckdb_file_path(dataset);
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<DuckDbConnectionPool> {
+        let duckdb_file = self.duckdb_file_path(source);
 
-        let acceleration = dataset
-            .acceleration
-            .as_ref()
-            .context(AccelerationNotEnabledSnafu {
-                dataset: dataset.name.to_string(),
-            })?;
+        let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
+            dataset: source.name().to_string(),
+        })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
-                    &dataset.app(),
-                    dataset.runtime(),
+                    &source.app(),
+                    source.runtime(),
                 );
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
@@ -146,7 +146,7 @@ impl DuckDBAccelerator {
             }
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, &dataset.app(), dataset.runtime());
+                    self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
@@ -185,7 +185,7 @@ impl DuckDBAccelerator {
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
                     if acceleration.mode == Mode::File {
-                        if let Ok(file_path) = self.file_path(&ds) {
+                        if let Ok(file_path) = self.file_path(ds.as_ref()) {
                             if this_file_path == file_path {
                                 instance_usage += 1;
                             }
@@ -235,36 +235,36 @@ impl DataAccelerator for DuckDBAccelerator {
         vec!["db", "ddb", "duckdb"]
     }
 
-    fn file_path(&self, dataset: &Dataset) -> Result<String, DataAcceleratorError> {
-        self.duckdb_file_path(dataset)
+    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        self.duckdb_file_path(source)
             .map_err(|e| DataAcceleratorError::InvalidConfiguration { msg: e.to_string() })
     }
 
-    fn is_initialized(&self, dataset: &Dataset) -> bool {
-        if !dataset.is_file_accelerated() {
+    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
+        if !source.is_file_accelerated() {
             return true; // memory mode DuckDB is always initialized
         }
 
         // otherwise, we're initialized if the file exists
-        self.has_existing_file(dataset)
+        self.has_existing_file(source)
     }
 
     async fn init(
         &self,
-        dataset: &Dataset,
+        source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !dataset.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(source)?;
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
-            } else if !self.is_valid_file(dataset) {
+            } else if !self.is_valid_file(source) {
                 if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -281,7 +281,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            self.get_shared_pool(dataset).await?;
+            self.get_shared_pool(source).await?;
         }
 
         Ok(())
@@ -291,7 +291,7 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn create_external_table(
         &self,
         cmd: &CreateExternalTable,
-        dataset: Option<&Dataset>,
+        source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = cmd.clone();
         if let Some(duckdb_file) = cmd.options.remove("file") {
@@ -299,24 +299,24 @@ impl DataAccelerator for DuckDBAccelerator {
                 .insert("open".to_string(), duckdb_file.to_string());
         }
 
-        if let Some(this_dataset) = dataset {
-            if let Some(temp_directory) = &this_dataset.app.runtime.temp_directory.clone() {
+        if let Some(source) = source {
+            if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
                 cmd.options
                     .insert("temp_directory".to_string(), temp_directory.to_string());
             }
 
-            if this_dataset.is_file_accelerated() {
+            if source.is_file_accelerated() {
                 // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
                 // then use the shared DuckDB file `accelerated_duckdb.db`
                 if !cmd.options.contains_key("open") {
-                    let duckdb_file = self.duckdb_file_path(this_dataset)?;
+                    let duckdb_file = self.duckdb_file_path(source)?;
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                let datasets = Arc::clone(&this_dataset.runtime)
-                    .get_initialized_datasets(&this_dataset.app, crate::LogErrors(false))
+                let datasets: Vec<Arc<Dataset>> = Arc::clone(&source.runtime())
+                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
                     .await;
-                let self_path = self.file_path(this_dataset)?;
+                let self_path = self.file_path(source)?;
                 let attach_databases = datasets
                     .iter()
                     .filter_map(|other_dataset| {
@@ -325,10 +325,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             .as_ref()
                             .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
                         {
-                            if **other_dataset == *this_dataset {
+                            if other_dataset.name() == source.name() {
                                 None
                             } else {
-                                let other_path = self.file_path(other_dataset);
+                                let other_path = self.file_path(other_dataset.as_ref());
                                 other_path.ok().filter(|p| p != &self_path)
                             }
                         } else {

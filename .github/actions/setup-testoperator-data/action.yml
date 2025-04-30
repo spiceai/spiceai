@@ -8,6 +8,7 @@ inputs:
     type: choice
     options:
       - 'tpch'
+      - 'tpch[parameterized]'
       - 'tpcds'
       - 'clickbench'
 
@@ -23,7 +24,7 @@ runs:
 
     - name: Download DuckDB TPCH Data
       shell: bash
-      if: inputs.query_set == 'tpch'
+      if: inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/duckdb/tpch.db ./
@@ -37,7 +38,7 @@ runs:
 
     - name: Download File Connector TPCH Data
       shell: bash
-      if: inputs.query_set == 'tpch'
+      if: inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive

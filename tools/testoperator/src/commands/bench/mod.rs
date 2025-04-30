@@ -83,6 +83,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
         KeyValue::new("benchmark.query_set", query_set.to_string()),
         KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
+        KeyValue::new("benchmark.branch_name", metrics.branch_name.clone()),
         KeyValue::new(
             "benchmark.scale_factor",
             args.scale_factor.unwrap_or(1.0).to_string(),

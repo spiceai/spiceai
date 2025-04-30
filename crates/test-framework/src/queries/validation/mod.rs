@@ -113,7 +113,11 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
             }
 
             // Store the batches in the map
-            map.insert(query_name.into(), batches);
+            map.insert(query_name.into(), batches.clone());
+            map.insert(
+                query_name.replace("tpch_", "tpch[parameterized]_").into(),
+                batches,
+            );
         }
 
         map
@@ -153,7 +157,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .iter()
         .zip(actual_schema.fields().iter())
         .all(|(f1, f2)| {
-            f1.name() == f2.name()
+            f1.name().to_lowercase() == f2.name().to_lowercase()
                 && datatype_equivalent(f1.data_type().clone(), f2.data_type().clone())
         })
 }
@@ -512,7 +516,7 @@ mod test {
     #[test]
     fn test_tpch_answers() {
         // Check that the TPCH answers are loaded correctly
-        assert_eq!(TPCH_ANSWERS.len(), 22);
+        assert_eq!(TPCH_ANSWERS.len(), 44);
         assert_eq!(
             TPCH_ANSWERS
                 .get("tpch_q1")

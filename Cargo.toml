@@ -7,6 +7,7 @@ members = [
     "crates/arrow_tools",
     "crates/data_components",
     "crates/document_parse",
+    "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
     "crates/llms",
@@ -22,6 +23,7 @@ members = [
     "crates/test-framework",
     "crates/tools",
     "crates/util",
+    "crates/workers",
     "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
@@ -42,7 +44,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.85"
-version = "1.2.0-unstable"
+version = "1.2.1-unstable"
 
 [workspace.dependencies]
 arrow = { version = "=54.2.1", features = ["prettyprint"] }
@@ -64,8 +66,8 @@ axum = { version = "0.7", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
-bytes = "1.10.0"
 byte-unit = "5.1.4"
+bytes = "1.10.0"
 charset = "0.1.5"
 chrono = "0.4.38"
 clap = { version = "4.5.36", features = ["derive", "env"] }
@@ -82,7 +84,7 @@ datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-feder
 datafusion-functions-json = "0.45"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
-duckdb = "1.2.2"
+duckdb = "1.1.3"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
@@ -135,7 +137,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.5"
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3" } # spiceai
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "ca5c06a6dcb25c7507e110d0a6cd3e0a9ebcbf3b" } # spiceai
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tempfile = "3"
@@ -181,19 +183,19 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a31aef39aea666f2150c8568f8f5737addc81996" } # spiceai-45
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" } # spiceai-45
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" }                      # spiceai-45
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1713e9af2729f686aac46aef63e8c84545083e29" } # spiceai
 
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b850ae60dbe67209320c86daeadf47b51f937660" } # spiceai-1.2.2
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2e24b958e44ec7419290249e27a15f1a19703fff" } # spiceai-1.1.3-backported-arrow-54
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" }              # spiceai-0.4.0-df-45
 iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" } # spiceai-0.4.0-df-45
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "e0a591f76b4b4ab5f3d1a9167961c1586422543f" }   # spiceai-0.4.0-df-45
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

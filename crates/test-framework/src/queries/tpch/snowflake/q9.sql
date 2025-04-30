@@ -22,7 +22,7 @@ from
           and "P_PARTKEY" = "L_PARTKEY"
           and "O_ORDERKEY" = "L_ORDERKEY"
           and "S_NATIONKEY" = "N_NATIONKEY"
-          and "P_NAME" like '%"GREEN"%'
+          and "P_NAME" like '%green%'
     ) as "PROFIT"
 group by
     "NATION",

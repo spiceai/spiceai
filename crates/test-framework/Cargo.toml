@@ -12,6 +12,7 @@ version.workspace = true
 anyhow = "1.0.95"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -30,7 +31,7 @@ octocrab = "0.43.0"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
-rand = "0.9.0"
+rand = "0.9.1"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

@@ -10,7 +10,7 @@ from
             customer
             left outer join orders on
                         "C_CUSTKEY" = "O_CUSTKEY"
-                    and "O_COMMENT" not like '%"SPECIAL"%"REQUESTS"%'
+                    and "O_COMMENT" not like '%special%requests%'
         group by
             "C_CUSTKEY"
     ) as c_orders

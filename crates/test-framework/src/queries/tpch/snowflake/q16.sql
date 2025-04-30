@@ -9,7 +9,7 @@ from
 where
         "P_PARTKEY" = "PS_PARTKEY"
   and "P_BRAND" <> 'Brand#45'
-  and "P_TYPE" not like 'MEDIUM "POLISHED"%'
+  and "P_TYPE" not like 'MEDIUM POLISHED%'
   and "P_SIZE" in (49, 14, 23, 45, 19, 3, 36, 9)
   and "PS_SUPPKEY" not in (
     select
@@ -17,7 +17,7 @@ where
     from
         supplier
     where
-        "S_COMMENT" like '%"CUSTOMER"%"COMPLAINTS"%'
+        "S_COMMENT" like '%Customer%Complaints%'
 )
 group by
     "P_BRAND",
