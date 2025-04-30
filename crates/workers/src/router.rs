@@ -160,7 +160,7 @@ impl Chat for RouterModel {
                         Err(e) => {
                             tracing::error!(
                                 target: "task_history",
-                                progress = Progress::log()
+                                progress = Progress::error()
                                 .title(format!(
                                     "Error occured in model '{name}'"
                                 ))
@@ -177,7 +177,7 @@ impl Chat for RouterModel {
                                 Some(Err(e)) => {
                                     tracing::error!(
                                         target: "task_history",
-                                        progress = Progress::log()
+                                        progress = Progress::error()
                                         .title(format!(
                                             "Error occured in model '{name}'"
                                         ))
@@ -247,7 +247,7 @@ impl Chat for RouterModel {
                         Err(e) => {
                             tracing::error!(
                                 target: "task_history",
-                                progress = Progress::log()
+                                progress = Progress::error()
                                 .title(format!(
                                     "Error occured in model '{name}'"
                                 ))
