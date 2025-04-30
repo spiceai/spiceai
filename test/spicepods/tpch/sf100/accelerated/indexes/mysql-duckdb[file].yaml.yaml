@@ -1,9 +1,26 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-duckdb[file]-indexes
+name: mysql-duckdb[file]
+
+# Define common anchors
+definitions:
+  # Common mysql parameters
+  - &mysql_params
+    mysql_host: ${env:MYSQL_HOST}
+    mysql_tcp_port: ${env:MYSQL_TCP_PORT}
+    mysql_db: ${env:MYSQL_DB_SF100}
+    mysql_user: ${env:MYSQL_USER}
+    mysql_pass: ${env:MYSQL_PASSWORD}
+    mysql_sslmode: disabled
+  - &acceleration
+    enabled: true
+    engine: duckdb
+    mode: file
+
 datasets:
-  - from: file:data/customer.parquet
+  - from: mysql:customer
     name: customer
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
@@ -12,8 +29,10 @@ datasets:
       indexes:
         c_phone: enabled
         c_acctbal: enabled
-  - from: file:data/lineitem.parquet
+
+  - from: mysql:lineitem
     name: lineitem
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
@@ -27,8 +46,10 @@ datasets:
         l_partkey: enabled
         l_quantity: enabled
         (l_shipdate, l_receiptdate): enabled
-  - from: file:data/nation.parquet
+
+  - from: mysql:nation
     name: nation
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
@@ -36,8 +57,10 @@ datasets:
       primary_key: n_nationkey
       indexes:
         (n_nationkey, n_regionkey): enabled
-  - from: file:data/orders.parquet
+
+  - from: mysql:orders
     name: orders
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
@@ -47,8 +70,10 @@ datasets:
         o_orderdate: enabled
         o_custkey: enabled
         (o_orderdate, o_custkey): enabled
-  - from: file:data/part.parquet
+
+  - from: mysql:part
     name: part
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
@@ -58,22 +83,28 @@ datasets:
         p_brand: enabled
         p_container: enabled
         (p_brand, p_container): enabled
-  - from: file:data/partsupp.parquet
+
+  - from: mysql:partsupp
     name: partsupp
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
       mode: file
       primary_key: (ps_partkey, ps_suppkey)
-  - from: file:data/region.parquet
+
+  - from: mysql:region
     name: region
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
       mode: file
       primary_key: r_regionkey
-  - from: file:data/supplier.parquet
+
+  - from: mysql:supplier
     name: supplier
+    params: *mysql_params
     acceleration:
       enabled: true
       engine: duckdb
