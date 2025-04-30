@@ -55,18 +55,16 @@ assignees: ''
    - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
    - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and the release branch.
    - [ ] Verify [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, but input the spiced commit SHA for the release branch.
-       - Branch: `trunk`
-       - Commit Hash: latest built spiced commit SHA from release branch
-       - Path to load test files: Run a workflow for each of `./tools/testoperator/dispatch/tpch`, `./tools/testoperator/dispatch/tpcds`, and `./tools/testoperator/dispatch/clickbench`
-       - The workflow to execute: `bench`
-       - Update snapshots: No
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
+       - Workflow to execute: `bench`
+       - All other values left empty.
    - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
      - Parameters: Branch: `trunk`
      - Build CLI: `true`
    - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
-     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow.
-     - Use the same parameters from the benchmark test, but specify the `throughput` workflow. Throughput tests are only supported for `./tools/testoperator/dispatch/tpch` and `./tools/testoperator/dispatch/tpcds`.
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
+       - Workflow to execute: `throughput`
+       - All other values left empty.
 
 1. **Documentation Review**
 
