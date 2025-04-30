@@ -1592,6 +1592,9 @@
         "name": {
           "type": "string"
         },
+        "ready_state": {
+          "$ref": "#/definitions/ReadyState"
+        },
         "sql": {
           "description": "Inline SQL that describes a view.",
           "type": [
