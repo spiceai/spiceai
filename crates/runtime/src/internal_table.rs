@@ -101,7 +101,7 @@ async fn get_local_table_provider(
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {
         sink = sink.with_primary_key(&pk);
-    };
+    }
 
     let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 

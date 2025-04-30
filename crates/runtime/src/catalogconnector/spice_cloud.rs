@@ -121,7 +121,7 @@ impl SpiceCloudPlatformCatalog {
         let mut props = HashMap::new();
         if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
             props.insert("token".to_string(), api_key.to_string());
-        };
+        }
 
         let catalog_config = RestCatalogConfig::builder()
             .uri(endpoint.to_string())

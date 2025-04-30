@@ -85,7 +85,6 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                     .await;
 
             let cloned_rt = Arc::new(rt.clone());
-
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

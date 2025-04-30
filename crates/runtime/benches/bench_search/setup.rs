@@ -49,7 +49,7 @@ pub(crate) type QueryRelevance = HashMap<String, HashMap<String, i32>>;
 pub(crate) async fn setup_benchmark(
     config: &SearchBenchmarkConfiguration,
     upload_results_dataset: Option<&String>,
-) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
+) -> Result<(Arc<Runtime>, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
         "runtime=DEBUG,task_history=WARN,runtime::embeddings=WARN,INFO",
     ));
@@ -88,7 +88,7 @@ pub(crate) async fn setup_benchmark(
         () = cloned_rt.load_components() => {}
     }
 
-    Ok((rt, benchmark_result))
+    Ok((rt.into(), benchmark_result))
 }
 
 pub(crate) async fn load_search_queries(rt: &Runtime) -> Result<Vec<Query>, String> {

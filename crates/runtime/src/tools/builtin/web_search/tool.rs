@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap};
 
-use crate::{
-    Runtime,
-    tools::{SpiceModelTool, utils::parameters},
-};
+use crate::tools::{SpiceModelTool, utils::parameters};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -38,12 +35,12 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     pub fn try_new(
         name: &str,
-        description: Option<String>,
+        description: Option<&str>,
         params: &HashMap<String, SecretString>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             name: Some(name.to_string()),
-            description,
+            description: description.map(ToString::to_string),
             engine: SearchEngine::try_from(params)?,
         })
     }
@@ -69,11 +66,7 @@ impl SpiceModelTool for WebSearchTool {
         parameters::<WebSearchParams>()
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        _rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::websearch", tool = self.name().to_string(), input = arg);
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {

@@ -70,7 +70,7 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
             Key::new("user"),
             Value::String(user.to_string().into()),
         ));
-    };
+    }
 
     if let Some(ref dim) = req.dimensions {
         labels.push(KeyValue::new(

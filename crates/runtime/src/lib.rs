@@ -15,14 +15,16 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use ::tools::SpiceModelTool;
+use ::tools::rename::with_name;
 use async_stream::stream;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
+use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
@@ -47,7 +49,7 @@ use futures::future::{join_all, try_join_all};
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
-use crate::tools::{SpiceModelTool, with_name};
+use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -59,8 +61,6 @@ use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
-use tools::factory::default_available_catalogs;
-use tools::{Tooling, catalog::SpiceToolCatalog};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
@@ -307,6 +307,12 @@ pub enum Error {
         source: crate::component::dataset::Error,
     },
 
+    #[snafu(display("Unable to build catalog: {catalog}: {source}"))]
+    UnableToBuildCatalog {
+        catalog: String,
+        source: crate::component::catalog::Error,
+    },
+
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
 
@@ -348,6 +354,7 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
     eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
@@ -395,6 +402,11 @@ impl Runtime {
     #[must_use]
     pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
         Arc::clone(&self.app)
+    }
+
+    #[must_use]
+    pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
+        Arc::clone(&self.tool_factories)
     }
 
     #[must_use]
@@ -613,9 +625,9 @@ impl Runtime {
                     .update_tool(&tool.name, ComponentStatus::Initializing);
             }
 
-            for tool_catalog in default_available_catalogs() {
+            for catalog_name in default_catalog_names() {
                 self.status
-                    .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+                    .update_tool_catalog(catalog_name, ComponentStatus::Initializing);
             }
 
             for model in &app.models {
@@ -624,7 +636,7 @@ impl Runtime {
             }
         }
 
-        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
@@ -683,9 +695,12 @@ impl Runtime {
 
         let models_and_evals = tokio::spawn({
             let self_clone = Arc::clone(&self);
-            async move {
-                self_clone.load_models().await;
 
+            // This cannot be done earlier since we must have a `Arc<Runtime>` to provide to factories.
+            tools::factory::register_all_factories(Arc::clone(&self_clone)).await;
+
+            async move {
+                Arc::clone(&self_clone).load_models().await;
                 let app_ref = Arc::clone(&self_clone).app();
                 let app_lock = app_ref.read().await;
 
@@ -833,7 +848,8 @@ impl Runtime {
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
         self.accelerator_engine_registry.unregister_all().await;
-        tools::factory::unregister_all_factories().await;
+        tools::factory::unregister_all_factories(self).await;
+
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
@@ -881,7 +897,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs();
+        let default_catalogs = default_available_catalogs(Arc::clone(self));
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;

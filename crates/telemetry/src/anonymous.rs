@@ -116,7 +116,7 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
 
     if let Err(err) = initial_reader.collect(&mut rm) {
         tracing::trace!("Failed to collect initial telemetry: {:?}", err);
-    };
+    }
 
     oss_telemetry_exporter
         .export(&mut rm)

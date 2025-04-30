@@ -201,7 +201,7 @@ impl ListingTableConnector for File {
                     tracing::error!("Failed to watch file: {e}");
                     return;
                 }
-            };
+            }
 
             let mut last_refresh = Instant::now();
             loop {

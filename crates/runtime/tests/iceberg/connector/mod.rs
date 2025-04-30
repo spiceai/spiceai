@@ -153,7 +153,6 @@ async fn run_iceberg_test(
         .with_datafusion_configuration_fn(configure_test_datafusion)
         .build()
         .await;
-
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {

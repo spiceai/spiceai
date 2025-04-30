@@ -29,32 +29,33 @@ use crate::{
 
 pub struct ListDatasetsTool {
     name: String,
-    description: Option<String>,
+    description: String,
     table_allowlist: Option<Vec<String>>,
+    rt: Arc<Runtime>,
 }
 
 impl ListDatasetsTool {
     #[must_use]
     pub fn new(
-        name: &str,
-        description: Option<String>,
+        name: Option<&str>,
+        description: Option<&str>,
         table_allowlist: Option<Vec<&str>>,
+        rt: Arc<Runtime>,
     ) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            rt,
+            name: name.unwrap_or("list_datasets").to_string(),
+            description: description
+                .unwrap_or("List all SQL tables available.")
+                .to_string(),
             table_allowlist: table_allowlist.map(|t| t.iter().map(ToString::to_string).collect()),
         }
     }
 }
 
-impl Default for ListDatasetsTool {
-    fn default() -> Self {
-        Self::new(
-            "list_datasets",
-            Some("List all SQL tables available.".to_string()),
-            None,
-        )
+impl From<&Arc<Runtime>> for ListDatasetsTool {
+    fn from(rt: &Arc<Runtime>) -> Self {
+        Self::new(None, None, None, Arc::clone(rt))
     }
 }
 
@@ -65,21 +66,17 @@ impl SpiceModelTool for ListDatasetsTool {
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(&self.description))
     }
 
     fn parameters(&self) -> Option<Value> {
         None
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
-        let elements = get_dataset_elements(Arc::clone(&rt), self.table_allowlist.as_deref())
+        let elements = get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
             .await
             .iter()
             .map(serde_json::value::to_value)

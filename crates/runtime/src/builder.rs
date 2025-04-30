@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     Runtime, catalogconnector,
@@ -31,7 +31,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers,
+    tracers,
 };
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
@@ -139,7 +139,6 @@ impl RuntimeBuilder {
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
-        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
         let memory_limit = self
@@ -196,6 +195,7 @@ impl RuntimeBuilder {
             evals: Arc::new(RwLock::new(evals)),
             eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -218,7 +218,7 @@ impl RuntimeBuilder {
                 eprintln!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.insert(extension_name.into(), extension.into());
-            };
+            }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
@@ -232,7 +232,7 @@ impl RuntimeBuilder {
         if let Some(app) = app {
             if let Err(e) = secrets.load_from(&app.secrets).await {
                 eprintln!("Error loading secret stores: {e}");
-            };
+            }
         }
 
         secrets

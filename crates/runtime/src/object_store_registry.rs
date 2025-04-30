@@ -105,7 +105,7 @@ impl SpiceObjectStoreRegistry {
                     )));
                 }
             }
-        };
+        }
         s3_builder = s3_builder.with_client_options(client_options);
 
         Ok(Arc::new(s3_builder.build()?))

@@ -135,7 +135,7 @@ mod tests {
         let result = task_future.await;
         assert!(matches!(
             result,
-            Err(Error::AcceleratedReadWriteTableWithoutReplication { .. })
+            Err(Error::AcceleratedReadWriteTableWithoutReplication)
         ));
     }
 

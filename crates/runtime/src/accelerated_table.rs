@@ -653,45 +653,43 @@ impl AcceleratedTable {
                     .delete_from(&ctx.state(), &vec![expr])
                     .await;
                 match plan {
-                    Ok(plan) => {
-                        match collect(plan, ctx.task_ctx()).await {
-                            Err(e) => {
-                                tracing::error!("[retention] Error running retention check: {e}");
+                    Ok(plan) => match collect(plan, ctx.task_ctx()).await {
+                        Err(e) => {
+                            tracing::error!("[retention] Error running retention check: {e}");
+                        }
+                        Ok(deleted) => {
+                            let num_records = deleted.first().map_or(0, |f| {
+                                f.column(0)
+                                    .as_any()
+                                    .downcast_ref::<UInt64Array>()
+                                    .map_or(0, |v| v.values().first().map_or(0, |f| *f))
+                            });
+
+                            if is_spice_internal_dataset(&dataset_name) {
+                                tracing::trace!(
+                                    "[retention] Evicted {num_records} records for {dataset_name}"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "[retention] Evicted {num_records} records for {dataset_name}"
+                                );
                             }
-                            Ok(deleted) => {
-                                let num_records = deleted.first().map_or(0, |f| {
-                                    f.column(0)
-                                        .as_any()
-                                        .downcast_ref::<UInt64Array>()
-                                        .map_or(0, |v| v.values().first().map_or(0, |f| *f))
-                                });
 
-                                if is_spice_internal_dataset(&dataset_name) {
-                                    tracing::trace!(
-                                        "[retention] Evicted {num_records} records for {dataset_name}"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "[retention] Evicted {num_records} records for {dataset_name}"
-                                    );
-                                }
-
-                                if num_records > 0 {
-                                    if let Some(cache_provider) = &cache_provider {
-                                        if let Err(e) = cache_provider
-                                            .invalidate_for_table(dataset_name.clone())
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                "Failed to invalidate cached results for dataset {}: {e}",
-                                                &dataset_name
-                                            );
-                                        }
+                            if num_records > 0 {
+                                if let Some(cache_provider) = &cache_provider {
+                                    if let Err(e) = cache_provider
+                                        .invalidate_for_table(dataset_name.clone())
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to invalidate cached results for dataset {}: {e}",
+                                            &dataset_name
+                                        );
                                     }
                                 }
                             }
-                        };
-                    }
+                        }
+                    },
                     Err(e) => {
                         tracing::error!("[retention] Error running retention check: {e}");
                     }

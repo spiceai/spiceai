@@ -134,6 +134,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
+tools = { path = "../tools" }
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -198,7 +199,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
-mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server"]
+mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server", "tools/mcp"]
 metal = ["llms/metal"]
 models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]

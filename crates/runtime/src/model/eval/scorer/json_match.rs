@@ -74,7 +74,7 @@ impl Scorer for JsonMatch {
 
         if ideal_strs.len() != actual_str.len() {
             return Ok(0.0);
-        };
+        }
 
         let is_match = actual_str.iter().zip(ideal_strs).all(|(a, i)| {
             let Ok(actual_json) = serde_json::from_str::<Value>(a) else {

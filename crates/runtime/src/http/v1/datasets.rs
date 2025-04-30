@@ -307,7 +307,7 @@ pub(crate) async fn refresh(
             }),
         )
             .into_response();
-    };
+    }
 
     match df
         .refresh_table(

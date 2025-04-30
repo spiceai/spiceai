@@ -206,5 +206,5 @@ pub fn path(from: &str) -> String {
 #[must_use]
 pub fn version(from: &str) -> String {
     let path = path(from);
-    path.split(':').last().unwrap_or("").to_string()
+    path.split(':').next_back().unwrap_or("").to_string()
 }

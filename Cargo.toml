@@ -21,6 +21,7 @@ members = [
     "crates/spicepod",
     "crates/telemetry",
     "crates/test-framework",
+    "crates/tools",
     "crates/util",
     "crates/workers",
     "tools/evalconverter",
