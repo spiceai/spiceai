@@ -105,7 +105,7 @@ pub async fn unregister_all_factories(rt: &Runtime) {
     let mut registry = tool_factories.lock().await;
     registry.clear();
 
-    let tools = rt.tools.write().await;
+    let mut tools = rt.tools.write().await;
     tools.clear();
 }
 
