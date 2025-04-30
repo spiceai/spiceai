@@ -85,7 +85,7 @@ pub enum Error {
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
     #[snafu(display(
-        "Fail to build dataset '{dataset}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuildDataset {
         dataset: String,
