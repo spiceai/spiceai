@@ -167,5 +167,6 @@ jobs:
             -s $GITHUB_WORKSPACE/spiced \
             -p ${{ matrix.target.spicepod }} \
             --model ${{ matrix.target.name }} \
-            --ready-wait 180
+            --ready-wait 180 \
+            --metrics
   

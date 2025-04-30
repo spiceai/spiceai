@@ -18,10 +18,7 @@ use crate::args::EvalsTestArgs;
 
 use super::get_app_and_start_request;
 use serde_json::json;
-use std::{
-    env,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 use test_framework::{
     anyhow,
     arrow::{
@@ -168,7 +165,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     // Record benchamrk results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "model_eval"),
+        KeyValue::new("type", "model_benchmark"),
         KeyValue::new("spiced_version", spiced_instance.version().to_string()),
         KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
@@ -179,7 +176,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     let attributes = vec![
         KeyValue::new("model_name", model.to_string()),
-        KeyValue::new("eval_name", eval.to_string()),
+        KeyValue::new("benchmark_name", eval.to_string()),
     ];
     crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
     crate::metrics::SCORE.record(metrics.score, &attributes);
