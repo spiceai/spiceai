@@ -323,7 +323,7 @@ pub fn transform_stream(
                         if let ContentBlock::ToolUse(t) = &content_block {
                             state.tool_id_to_content_block.insert(index, t.clone());
                             state.tool_id_to_tool_delta_idx.insert(index, 0);
-                        };
+                        }
                         Some(create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),

@@ -145,14 +145,14 @@ impl AcceleratorEngineRegistry {
                 msg: format!("{e}"),
             }
             .fail()?;
-        };
+        }
 
         if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
             InvalidConfigurationSnafu {
                 msg: format!("{e}"),
             }
             .fail()?;
-        };
+        }
 
         let cloned_secrets = Arc::clone(&secrets);
         let secret_guard = cloned_secrets.read().await;
@@ -208,7 +208,7 @@ impl AcceleratorEngineRegistry {
                 })?
         {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
-        };
+        }
 
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {

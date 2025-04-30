@@ -29,7 +29,7 @@ from
           and "R_NAME" = 'AMERICA'
           and "S_NATIONKEY" = n2."N_NATIONKEY"
           and "O_ORDERDATE" between date '1995-01-01' and date '1996-12-31'
-          and "P_TYPE" = 'ECONOMY "ANODIZED" STEEL'
+          and "P_TYPE" = 'ECONOMY ANODIZED STEEL'
     ) as "ALL_NATIONS"
 group by
     "O_YEAR"

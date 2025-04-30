@@ -14,46 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroU32,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use crate::{
-    configure_test_datafusion, init_tracing,
-    utils::{test_request_context, wait_until_true},
+    flight::{
+        RepeatingStream, create_flight_client, large_test_record_batch, start_spice_test_app,
+        test_record_batch, write_record_batches,
+    },
+    init_tracing,
+    utils::test_request_context,
 };
-use arrow::array::{Int32Array, RecordBatch, StringArray};
+use arrow::array::RecordBatch;
 use arrow_flight::{
-    FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
+    FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::TableReference;
-use futures::{
-    Stream,
-    stream::{self, TryStreamExt},
-};
+
+use futures::stream::{self, TryStreamExt};
 use governor::Quota;
-use rand::Rng;
-use runtime::{
-    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
-};
+use runtime::flight::RateLimits;
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
-use tokio::{
-    sync::RwLock,
-    time::{sleep, timeout},
-};
+use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
-use tonic::transport::Channel;
-
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[tokio::test]
 async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
@@ -359,205 +341,4 @@ async fn test_do_put_read_timeout() -> Result<(), Box<dyn std::error::Error>> {
     insta::assert_snapshot!("read_timeout_table_content", results_str);
 
     Ok(())
-}
-
-async fn write_record_batches(
-    client: &mut FlightClient,
-    batches: impl Iterator<Item = RecordBatch>,
-) -> Result<Vec<PutResult>, FlightError> {
-    let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
-    let flight_data_stream = FlightDataEncoderBuilder::new()
-        .with_flight_descriptor(Some(flight_descriptor))
-        .build(futures::stream::iter(batches.map(Ok).collect::<Vec<_>>()));
-
-    let response: Vec<PutResult> = client
-        .do_put(flight_data_stream)
-        .await?
-        .try_collect()
-        .await?;
-
-    Ok(response)
-}
-
-fn create_flight_client(
-    channel: Channel,
-    api_key: Option<&str>,
-) -> Result<FlightClient, anyhow::Error> {
-    let mut client = FlightClient::new(channel);
-
-    if let Some(api_key) = api_key {
-        client
-            .add_header("authorization", &format!("Bearer {api_key}"))
-            .map_err(anyhow::Error::from)?;
-    };
-
-    Ok(client)
-}
-
-async fn start_spice_test_app(
-    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
-    rate_limits: Option<RateLimits>,
-) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
-    let mut rng = rand::rng();
-    let http_port: u16 = rng.random_range(50000..60000);
-    let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
-
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
-
-    let api_config = Config::new()
-        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
-
-    let registry = prometheus::Registry::new();
-
-    let mut rt_builder = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-        .with_datafusion_configuration_fn(configure_test_datafusion);
-
-    if let Some(rate_limits) = rate_limits {
-        rt_builder = rt_builder.with_rate_limits(rate_limits);
-    }
-
-    let app = app::AppBuilder::new("test_app").build();
-    let rt = Arc::new(rt_builder.with_app(app).build().await);
-
-    let df = rt.datafusion();
-
-    let test_record_batch = test_record_batch()?;
-
-    register_test_table(
-        &df,
-        test_record_batch.schema(),
-        TableReference::parse_str("public.my_table"),
-        Arc::clone(&rt),
-    )
-    .await?;
-
-    let mut auth = EndpointAuth::default();
-
-    if let Some(flight_auth) = flight_auth {
-        auth = auth.with_flight_basic_auth(flight_auth);
-    }
-
-    // Start the servers
-    tokio::spawn(async move { Box::pin(rt.start_servers(api_config, None, auth)).await });
-
-    // Wait for the servers to start
-    tracing::info!("Waiting for servers to start...");
-    wait_until_true(Duration::from_secs(10), || async {
-        reqwest::get(format!("http://localhost:{http_port}/health"))
-            .await
-            .is_ok()
-    })
-    .await;
-
-    // HTTP server readiness doesn't essentially mean the flight server is ready
-    // Validate the flight server readiness by sending a handshake request
-    let start_time = std::time::Instant::now();
-    let channel = loop {
-        if start_time.elapsed() > std::time::Duration::from_secs(30) {
-            return Err(anyhow::anyhow!(
-                "Flight server not ready within 30 seconds timeout"
-            ));
-        }
-
-        // Attempt to connect
-        match Channel::from_shared(format!("http://localhost:{flight_port}"))
-            .map_err(anyhow::Error::from)?
-            .connect()
-            .await
-        {
-            Ok(channel) => {
-                break channel;
-            }
-            Err(_) => {
-                // Wait before next attempt
-                sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    };
-
-    Ok((channel, df))
-}
-
-fn test_record_batch() -> Result<RecordBatch, anyhow::Error> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int32, false),
-        Field::new("b", DataType::Utf8, false),
-    ]));
-
-    RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["a", "b", "c"])),
-        ],
-    )
-    .map_err(anyhow::Error::from)
-}
-
-fn large_test_record_batch() -> Result<RecordBatch, anyhow::Error> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int32, false),
-        Field::new("b", DataType::Utf8, false),
-    ]));
-
-    // Generate 35,000 rows of data
-    let int_column = (1..=35_000).collect::<Vec<i32>>();
-    let string_column = (1..=35_000)
-        .map(|i| format!("row_{i}"))
-        .collect::<Vec<String>>();
-
-    RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int32Array::from(int_column)),
-            Arc::new(StringArray::from(string_column)),
-        ],
-    )
-    .map_err(anyhow::Error::from)
-}
-
-async fn register_test_table(
-    datafusion: &Arc<DataFusion>,
-    schema: SchemaRef,
-    table_name: TableReference,
-    runtime: Arc<Runtime>,
-) -> Result<(), anyhow::Error> {
-    let table = create_internal_accelerated_table(
-        datafusion.runtime_status(),
-        table_name.clone(),
-        schema,
-        None,
-        Acceleration::default(),
-        Refresh::default(),
-        None,
-        Arc::new(RwLock::new(Secrets::default())),
-        runtime,
-    )
-    .await
-    .map_err(anyhow::Error::from)?;
-
-    datafusion
-        .register_table_as_writable_and_with_schema(table_name, table)
-        .map_err(anyhow::Error::from)?;
-
-    Ok(())
-}
-
-struct RepeatingStream {
-    batch: RecordBatch,
-}
-
-impl Stream for RepeatingStream {
-    type Item = Result<RecordBatch, FlightError>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(Ok(self.batch.clone())))
-    }
 }

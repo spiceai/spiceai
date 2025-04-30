@@ -94,7 +94,7 @@ impl Acceleration {
 
                     table_constraints.push(tc);
                 }
-            };
+            }
         }
 
         if let Some(primary_key) = &self.primary_key {

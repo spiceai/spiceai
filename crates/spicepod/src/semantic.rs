@@ -167,7 +167,7 @@ mod tests {
                 e.to_string(),
                 "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"
             ),
-        };
+        }
 
         match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
@@ -180,7 +180,7 @@ mod tests {
                 e.to_string(),
                 "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"
             ),
-        };
+        }
 
         match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
@@ -193,7 +193,7 @@ mod tests {
                 e.to_string(),
                 "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"
             ),
-        };
+        }
     }
 
     #[test]

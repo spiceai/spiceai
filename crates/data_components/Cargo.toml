@@ -16,7 +16,7 @@ arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { version = "1.6.0", optional = true }
+aws-config = { version = "1.6.1", optional = true }
 aws-sdk-dynamodb = { version = "1.65.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }

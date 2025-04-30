@@ -315,7 +315,7 @@ impl DataFusion {
     pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
         if let Ok(mut a) = self.cache_provider.write() {
             *a = Some(Arc::new(cache_provider));
-        };
+        }
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
@@ -900,7 +900,7 @@ impl DataFusion {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
-            };
+            }
         }
 
         // If this is a localpod accelerated table, attempt to synchronize refreshes with the parent table
@@ -1167,7 +1167,7 @@ impl DataFusion {
                 )
                 .map_err(find_datafusion_root)
                 .context(UnableToRegisterTableToDataFusionSnafu)?;
-        };
+        }
         Ok(())
     }
 

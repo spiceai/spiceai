@@ -424,7 +424,7 @@ impl SearchRequest {
                 } else {
                     tracing::trace!("vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}");
                     return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
-                };
+                }
 
                 // Ensure the expression is the last token.
                 let next_token = parser.next_token();

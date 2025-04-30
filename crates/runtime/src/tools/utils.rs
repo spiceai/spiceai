@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use crate::Runtime;
 
-use super::{SpiceModelTool, Tooling, options::SpiceToolsOptions};
+use super::{Tooling, options::SpiceToolsOptions};
+use tools::SpiceModelTool;
 
 /// Creates the messages that would be sent and received if a language model were to request the `tool`
 /// to be called (via an assistant message), with defined `arg`, and the response from running the
@@ -37,7 +38,6 @@ use super::{SpiceModelTool, Tooling, options::SpiceToolsOptions};
 /// Useful for constructing [`Vec<ChatCompletionRequestMessage>`], simulating a model already
 /// having requested specific tools.
 pub async fn create_tool_use_messages(
-    rt: Arc<Runtime>,
     tool: &dyn SpiceModelTool,
     id: &str,
     params: &impl serde::Serialize,
@@ -46,7 +46,7 @@ pub async fn create_tool_use_messages(
         serde_json::to_string(params).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
     let resp = tool
-        .call(arg.as_str(), rt)
+        .call(arg.as_str())
         .await
         .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 

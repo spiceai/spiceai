@@ -542,8 +542,7 @@ async fn run_ready_state_test(
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
-                .await
-        ;
+                .await;
 
         let cloned_rt = Arc::new(rt.clone());
 

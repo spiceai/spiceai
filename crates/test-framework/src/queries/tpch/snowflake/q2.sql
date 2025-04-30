@@ -40,4 +40,5 @@ order by
     "S_ACCTBAL" desc,
     "N_NAME",
     "S_NAME",
-    "P_PARTKEY";
+    "P_PARTKEY"
+limit 100;

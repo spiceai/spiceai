@@ -96,8 +96,7 @@ async fn sample_messages(
             async move {
                 let method = SampleTableMethod::from(&params);
                 create_tool_use_messages(
-                    rt,
-                    &SampleDataTool::new(method.clone()),
+                    &SampleDataTool::new(rt.datafusion(), method.clone()),
                     format!("sample-{method:?}").as_str(),
                     &params,
                 )
@@ -264,8 +263,7 @@ pub(crate) async fn post(
 
     // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
     let schema_messages = match create_tool_use_messages(
-        Arc::clone(&rt),
-        &TableSchemaTool::default(),
+        &TableSchemaTool::new(Arc::clone(&rt), None, None),
         "schemas-nsql",
         &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
     )
@@ -386,6 +384,6 @@ pub(crate) async fn post(
                 tracing::error!("Error running NSQL model: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
-        };
+        }
     }
 }

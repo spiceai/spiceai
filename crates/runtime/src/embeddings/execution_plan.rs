@@ -193,7 +193,7 @@ fn to_sendable_stream(
                             yield Err(DataFusionError::External(e.to_string().into()));
 
                         },
-                    };
+                    }
                 },
                 Err(e) => {
                     tracing::debug!("Error in underlying base stream: {e:?}");

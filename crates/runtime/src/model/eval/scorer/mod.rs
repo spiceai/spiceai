@@ -96,7 +96,7 @@ pub(crate) async fn score_results(
                 scorer_results.push(s);
             } else {
                 aggregate.insert((*name).to_string(), vec![s]);
-            };
+            }
         }
     }
     Ok(aggregate)

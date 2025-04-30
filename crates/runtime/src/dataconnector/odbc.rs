@@ -186,7 +186,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 fn driver_is_file(driver: &str) -> bool {
     driver
         .split('=')
-        .last()
+        .next_back()
         // if the file doesn't yet exist, the connector will fail registration
         // when the connector re-tries, if the file exists it will fail again
         .filter(|s| std::fs::metadata(s).is_ok())

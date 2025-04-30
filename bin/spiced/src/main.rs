@@ -76,7 +76,7 @@ fn main() {
     if args.repl {
         if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
-        };
+        }
         return;
     }
 

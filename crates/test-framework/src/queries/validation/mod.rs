@@ -157,7 +157,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .iter()
         .zip(actual_schema.fields().iter())
         .all(|(f1, f2)| {
-            f1.name() == f2.name()
+            f1.name().to_lowercase() == f2.name().to_lowercase()
                 && datatype_equivalent(f1.data_type().clone(), f2.data_type().clone())
         })
 }
@@ -394,12 +394,12 @@ pub fn validate_batches_as_strings(
                             let trimmed_actual_val = trimmed_actual_val.trim_end_matches('0');
                             if expected_val.starts_with(trimmed_actual_val) {
                                 let expected_trailing = if expected_val.contains('.') {
-                                    expected_val.split('.').last().unwrap_or("")
+                                    expected_val.split('.').next_back().unwrap_or("")
                                 } else {
                                     ""
                                 };
                                 let actual_trailing = if trimmed_actual_val.contains('.') {
-                                    trimmed_actual_val.split('.').last().unwrap_or("")
+                                    trimmed_actual_val.split('.').next_back().unwrap_or("")
                                 } else {
                                     ""
                                 };

@@ -97,7 +97,7 @@ pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
                 return Err(Error::InvalidDriveFormat {
                     input: drive.to_string(),
                 });
-            };
+            }
             PublicDrivePtr::Me
         }
         Some(("siteId", id)) => PublicDrivePtr::SiteId(id.to_string()),
@@ -120,7 +120,7 @@ pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
                 return Err(Error::InvalidDriveFormat {
                     input: item.to_string(),
                 });
-            };
+            }
             DriveItemPtr::Root
         }
         Some(("id", id)) => DriveItemPtr::ItemId(id.to_string()),
@@ -338,7 +338,7 @@ impl SharepointClient {
         // LIMIT `value`
         if let Some(value) = limit {
             req = req.top(value.to_string());
-        };
+        }
 
         // TODO: Implement the following to improve efficiency.
         // req.filter() // `WHERE <expr>`

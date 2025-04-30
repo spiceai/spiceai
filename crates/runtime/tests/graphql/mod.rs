@@ -225,7 +225,7 @@ fn make_graphql_dataset(
 
     if let Some(unnest_depth) = unnest_depth {
         params.insert("unnest_depth".to_string(), unnest_depth.to_string());
-    };
+    }
 
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -326,14 +326,12 @@ async fn test_graphql_pagination() -> Result<(), String> {
                 None
             ))
             .build();
-
         let mut rt =
             Runtime::builder()
                 .with_app(app)
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
-                .await
-        ;
+                .await;
 
         let cloned_rt = Arc::new(rt.clone());
 
