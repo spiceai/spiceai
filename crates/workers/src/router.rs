@@ -74,7 +74,7 @@ impl RouterModel {
     async fn select_from_weighted(&self) -> Result<Arc<dyn Chat>, OpenAIError> {
         let Some(name) = select_from_weighted(&self.models_cfg) else {
             return Err(OpenAIError::InvalidArgument(format!(
-                "Model router '{}' incorrectly initialised",
+                "Model router '{}' incorrectly initialized",
                 self.router_name
             )));
         };
@@ -96,14 +96,14 @@ impl RouterModel {
     async fn select_from_round_robin(&self) -> Result<Arc<dyn Chat>, OpenAIError> {
         let RouterState::RoundRobin { incr } = &self.state else {
             return Err(OpenAIError::InvalidArgument(format!(
-                "Model router '{}' incorrectly initialised",
+                "Model router '{}' incorrectly initialized",
                 self.router_name
             )));
         };
 
         let Some(name) = select_from_round_robin(incr, self.models_cfg.as_slice()) else {
             return Err(OpenAIError::InvalidArgument(format!(
-                "Model router '{}' incorrectly initialised",
+                "Model router '{}' incorrectly initialized",
                 self.router_name
             )));
         };
