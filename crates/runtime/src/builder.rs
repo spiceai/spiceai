@@ -209,7 +209,6 @@ impl RuntimeBuilder {
             }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
-        tools::factory::register_all_factories(Arc::new(rt.clone())).await;
 
         rt
     }

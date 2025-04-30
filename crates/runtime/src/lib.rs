@@ -680,6 +680,10 @@ impl Runtime {
 
         let models_and_evals = tokio::spawn({
             let self_clone = Arc::clone(&self);
+
+            // This cannot be done earlier since we must have a `Arc<Runtime>` to provide to factories.
+            tools::factory::register_all_factories(Arc::clone(&self_clone)).await;
+
             async move {
                 Arc::clone(&self_clone).load_models().await;
                 let app_ref = Arc::clone(&self_clone).app();
