@@ -125,11 +125,11 @@ fn get_params() -> Params {
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:OLD_DATABRICKS_HOST }".to_string(),
+                "${ env:TEST_DATABRICKSCKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:OLD_DATABRICKS_TOKEN }".to_string(),
+                "${ env:TEST_DATABRICKSCKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_aws_secret_access_key".to_string(),
