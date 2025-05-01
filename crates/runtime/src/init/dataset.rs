@@ -129,7 +129,7 @@ impl Runtime {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Error);
                 continue;
-            };
+            }
         }
 
         let mut spawned_tasks = vec![];
@@ -284,7 +284,7 @@ impl Runtime {
                     return Err(RetryError::permanent(err));
                 }
                 return Err(RetryError::transient(err));
-            };
+            }
 
             Ok(())
         })
@@ -381,7 +381,7 @@ impl Runtime {
                             "Unable to add dataset {} for availability monitoring: {err}",
                             &ds.name
                         );
-                    };
+                    }
                 }
                 let engine = ds.acceleration.as_ref().map_or_else(
                     || "None".to_string(),

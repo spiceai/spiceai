@@ -40,12 +40,13 @@ use pin_project::pin_project;
 use serde_json::Value;
 
 use tokio::sync::mpsc;
+use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::Runtime;
 use crate::request::{AsyncMarker, RequestContext};
-use crate::tools::SpiceModelTool;
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
+use llms::progress::Progress;
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
@@ -96,7 +97,7 @@ impl ToolUsingChat {
             let mut list_dataset_messages = self.create_list_dataset_messages().await?;
             list_dataset_messages.extend_from_slice(req.messages.as_slice());
             req.messages = list_dataset_messages;
-        };
+        }
 
         Ok(req)
     }
@@ -106,9 +107,9 @@ impl ToolUsingChat {
     async fn create_list_dataset_messages(
         &self,
     ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t = ListDatasetsTool::default();
+        let t = ListDatasetsTool::from(&self.rt);
         let t_resp = t
-            .call("", Arc::<Runtime>::clone(&self.rt))
+            .call("")
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
         Ok(vec![
@@ -141,20 +142,39 @@ impl ToolUsingChat {
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
-    async fn call_tool(&self, func: &FunctionCall) -> Value {
-        match self.tools.iter().find(|t| t.name() == func.name) {
-            Some(t) => {
-                match t
-                    .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => Value::String(format!(
+    async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
+        match self
+            .tools
+            .iter()
+            .find(|t| t.name() == tool_call.function.name)
+        {
+            Some(t) => match t.call(&tool_call.function.arguments).await {
+                Ok(v) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::log()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                            .json_content(v.clone())
+                            .to_jsonl(),
+                    );
+                    v
+                }
+                Err(e) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::error()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                            .content(e.to_string())
+                            .to_jsonl(),
+                    );
+                    Value::String(format!(
                         "Failed to call the tool {}.\nAn error occurred: {e}",
                         t.name()
-                    )),
+                    ))
                 }
-            }
+            },
             None => Value::Null,
         }
     }
@@ -200,9 +220,19 @@ impl ToolUsingChat {
 
         let mut tool_and_response_content = vec![];
         for t in spiced_tools.clone() {
-            let content = self.call_tool(&t.function).await;
+            tracing::info!(
+                target: "task_history",
+                progress = Progress::log()
+                    .id(t.id.clone())
+                    .title(format!("Calling '{}' tool", t.function.name))
+                    .content(t.function.arguments.clone())
+                    .to_jsonl(),
+            );
+
+            let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
         }
+
         tracing::debug!(
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
@@ -249,14 +279,14 @@ impl ToolUsingChat {
             {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             if recursion_limit.is_some_and(|f| f == 0) {
                 tracing::debug!(
                     "Tool-use recursion limit reached. Will call model, but not process further"
                 );
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             // Append spiced runtime tools to the request.
             let inner_req = self.add_runtime_tools(&req);
@@ -320,14 +350,14 @@ impl ToolUsingChat {
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
         let updated_req = self.add_runtime_tools(&req);
@@ -672,7 +702,7 @@ fn make_a_stream(
                                         }
                                         return;
                                     }
-                                };
+                                }
                             } else if matches!(finish_reason, FinishReason::Stop)
                                 || matches!(finish_reason, FinishReason::Length)
                             {

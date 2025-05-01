@@ -16,11 +16,9 @@ limitations under the License.
 use async_trait::async_trait;
 use secrecy::SecretString;
 use spicepod::component::tool::Tool;
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-};
-use tokio::sync::Mutex;
+use std::{collections::HashMap, sync::Arc};
+
+use crate::Runtime;
 
 #[cfg(feature = "mcp")]
 use super::mcp::factory::McpCatalogFactory;
@@ -84,18 +82,16 @@ pub trait ToolCatalogFactory: Send + Sync {
     ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-static TOOL_SHED_FACTORY: LazyLock<Mutex<HashMap<String, ToolFactory>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub async fn register_all_factories() {
-    let mut registry = TOOL_SHED_FACTORY.lock().await;
+pub async fn register_all_factories(rt: Arc<Runtime>) {
+    let tool_factories = rt.tool_factories();
+    let mut registry = tool_factories.lock().await;
     registry.insert(
         "builtin".to_string(),
-        ToolFactory::Tool(Arc::new(BuiltinToolCatalog {})),
+        ToolFactory::Tool(Arc::new(BuiltinToolCatalog::new(Arc::clone(&rt)))),
     );
     registry.insert(
         "memory".to_string(),
-        ToolFactory::Tool(Arc::new(MemoryToolCatalog {})),
+        ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(rt))),
     );
     #[cfg(feature = "mcp")]
     registry.insert(
@@ -104,18 +100,27 @@ pub async fn register_all_factories() {
     );
 }
 
-pub async fn unregister_all_factories() {
-    let mut registry = TOOL_SHED_FACTORY.lock().await;
+pub async fn unregister_all_factories(rt: &Runtime) {
+    let tool_factories = rt.tool_factories();
+    let mut registry = tool_factories.lock().await;
     registry.clear();
+
+    let mut tools = rt.tools.write().await;
+    tools.clear();
 }
 
 /// Get all catalogs available by default in the spice runtime.
 #[must_use]
-pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
+pub fn default_available_catalogs(rt: Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
     vec![
-        Arc::new(BuiltinToolCatalog {}),
-        Arc::new(MemoryToolCatalog {}),
+        Arc::new(BuiltinToolCatalog::new(Arc::clone(&rt))),
+        Arc::new(MemoryToolCatalog::new(rt)),
     ]
+}
+
+#[must_use]
+pub fn default_catalog_names<'a>() -> Vec<&'a str> {
+    vec![MemoryToolCatalog::name(), BuiltinToolCatalog::name()]
 }
 
 /// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].
@@ -123,6 +128,7 @@ pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
 pub async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,
+    rt: Arc<Runtime>,
     env: HashMap<String, SecretString>,
 ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
     let from_source = component
@@ -130,7 +136,8 @@ pub async fn forge(
         .split_once(':')
         .map_or("builtin", |(a, _b)| a);
 
-    let registry = TOOL_SHED_FACTORY.lock().await;
+    let tool_factories = rt.tool_factories();
+    let registry = tool_factories.lock().await;
 
     match registry.get(from_source) {
         Some(factory) => factory.construct(component, secrets, env).await,

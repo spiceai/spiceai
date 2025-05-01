@@ -147,7 +147,7 @@ impl ChatWrapper {
                 // If request `store` is not set, remove metadata.
                 if !req.store.is_some_and(|s| s) {
                     req.metadata = None;
-                };
+                }
 
                 match template_system_prompt(prompt.as_str(), &ctx) {
                     Ok(templated_prompt) => Some(templated_prompt),
@@ -311,7 +311,7 @@ impl Chat for ChatWrapper {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, id=resp.id, "labels");
-                };
+                }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
                     Ok(output) => {
@@ -450,7 +450,7 @@ fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
     let mut t = Tera::default();
     if t.add_raw_template("system_prompt", prompt).is_err() {
         return false;
-    };
+    }
 
     let Ok(tt) = t.get_template("system_prompt") else {
         return false;

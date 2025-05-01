@@ -75,6 +75,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
     let commit_sha = metrics.commit_sha.clone();
+    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
     let benchmark_resource = Resource::new(vec![
@@ -83,7 +84,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("name", app_name.clone()),
         KeyValue::new("spiced_version", spiced_version.clone()),
         KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("spiced_commit_sha", commit_sha.clone()),
+        KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
         KeyValue::new("branch_name", metrics.branch_name.clone()),
         KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
     ]);

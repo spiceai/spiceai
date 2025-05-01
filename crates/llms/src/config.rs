@@ -144,7 +144,7 @@ impl Config for HostedModelConfig {
                                 "Invalid bearer token given for 'Authorization' header. Will not use"
                             );
                         }
-                    };
+                    }
                 }
             }
         }

@@ -66,6 +66,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "spice_cloud",
     "llms",
     "tpc_extension",
+    "workers",
 ];
 
 const OFF_FILTERS: &str =

@@ -38,7 +38,7 @@ impl Runtime {
                 "Cannot load embedding models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
             );
             return;
-        };
+        }
 
         if let Some(app) = app_opt.as_ref() {
             for in_embed in &app.embeddings {

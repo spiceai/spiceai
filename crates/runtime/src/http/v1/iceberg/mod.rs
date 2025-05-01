@@ -307,7 +307,7 @@ pub(crate) async fn list_tables(
                     "Catalog '{catalog_name}' does not exist"
                 ))
                 .into_response();
-            };
+            }
             (
                 status::StatusCode::OK,
                 Json(ListTablesResponse {

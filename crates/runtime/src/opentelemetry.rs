@@ -122,10 +122,7 @@ impl MetricsService for Service {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
                         let existing_schema =
-                            match self.datafusion.get_arrow_schema(metric.name.as_str()).await {
-                                Ok(schema) => Some(schema),
-                                Err(_) => None,
-                            };
+                            (self.datafusion.get_arrow_schema(metric.name.as_str()).await).ok();
                         let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                             metric.name.as_str(),
                             &data,
@@ -146,7 +143,7 @@ impl MetricsService for Service {
                                     );
                                     rejected_data_points += data_points_count;
                                     continue;
-                                };
+                                }
 
                                 let schema = record_batch.schema();
                                 let data_update = DataUpdate {
@@ -166,7 +163,7 @@ impl MetricsService for Service {
                                 {
                                     write_failed = true;
                                     tracing::debug!("Failed to add OpenTelemetry data: {e}");
-                                };
+                                }
 
                                 if write_failed {
                                     rejected_data_points += data_points_count;
@@ -502,7 +499,7 @@ fn attributes_to_fields_and_columns(
                     "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
                 );
                 append_null(&mut fields, &mut columns, key_str);
-            };
+            }
         }
 
         // If an attribute previously existed but is missing from this metric, append a null value.

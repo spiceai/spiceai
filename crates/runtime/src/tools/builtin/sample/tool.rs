@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    Runtime,
+    datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };
 use arrow::util::pretty::pretty_format_batches;
@@ -36,6 +36,8 @@ use super::{
 pub struct SampleDataTool {
     method: SampleTableMethod,
 
+    df: Arc<DataFusion>,
+
     // Overrides
     name: Option<String>,
     description: Option<String>,
@@ -43,8 +45,9 @@ pub struct SampleDataTool {
 
 impl SampleDataTool {
     #[must_use]
-    pub fn new(method: SampleTableMethod) -> Self {
+    pub fn new(df: Arc<DataFusion>, method: SampleTableMethod) -> Self {
         Self {
+            df,
             method,
             name: None,
             description: None,
@@ -83,16 +86,12 @@ impl SpiceModelTool for SampleDataTool {
         }
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params = self.method.parse_args(arg).boxed()?;
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 
         async {
-            let mut batch = params.sample(rt.datafusion()).await?;
+            let mut batch = params.sample(Arc::clone(&self.df)).await?;
 
             // truncate large text fields
             batch = truncate_string_columns(&batch, 512)?;

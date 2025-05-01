@@ -72,21 +72,21 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
             Key::new("tool_choice"),
             Value::String(choice_str),
         ));
-    };
+    }
 
     if let Some(ref user) = req.user {
         labels.push(KeyValue::new(
             Key::new("user"),
             Value::String(user.clone().into()),
         ));
-    };
+    }
 
     if let Some(ref metadata) = req.metadata {
         labels.push(KeyValue::new(
             Key::new("metadata"),
             Value::String(metadata.to_string().into()),
         ));
-    };
+    }
 
     labels
 }

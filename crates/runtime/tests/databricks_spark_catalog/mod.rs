@@ -56,7 +56,7 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = cloned_rt.load_components() => {}
+() = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

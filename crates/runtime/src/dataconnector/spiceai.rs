@@ -423,7 +423,7 @@ pub fn subscribe_to_append_stream(
                                     Err(e) => {
                                         yield Err(cdc::StreamError::SerdeJsonError(e.to_string()))
                                     }
-                                };
+                                }
                             }
                         },
                         Err(e) => {

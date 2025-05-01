@@ -226,7 +226,7 @@ pub trait ListingTableConnector: DataConnector {
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_file_compression_type(compression);
-        };
+        }
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -238,7 +238,7 @@ pub trait ListingTableConnector: DataConnector {
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
-        };
+        }
 
         Ok(Arc::new(format))
     }
@@ -741,7 +741,7 @@ async fn verify_schema_source_path(
             if format!(".{ext}") == extension {
                 return Ok(());
             }
-        };
+        }
 
         scanned_files += 1;
         if scanned_files > SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT {
@@ -751,7 +751,7 @@ async fn verify_schema_source_path(
                 "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
             );
             return Ok(());
-        };
+        }
     }
 
     Err(DataConnectorError::InvalidConfigurationNoSource {

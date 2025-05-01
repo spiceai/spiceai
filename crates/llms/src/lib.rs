@@ -21,4 +21,5 @@ pub mod config;
 pub mod embeddings;
 pub mod openai;
 pub mod perplexity;
+pub mod progress;
 pub mod xai;

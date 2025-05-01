@@ -58,7 +58,7 @@ impl PerplexitySonar {
                     if let Some(p) = k.strip_prefix("perplexity_") {
                         return Some((p.to_string(), v.expose_secret().to_string()));
                     }
-                };
+                }
                 None
             })
             .collect();

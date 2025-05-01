@@ -87,6 +87,7 @@ spiceai,spiceai
 ))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(filter): Query<CatalogFilter>,
     accept: Option<TypedHeader<Accept>>,
 ) -> Response {
@@ -99,7 +100,7 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_catalogs = Runtime::get_valid_catalogs(readable_app, LogErrors(false));
+    let valid_catalogs = rt.get_valid_catalogs(readable_app, LogErrors(false));
     let catalogs: Vec<Catalog> = match filter.from {
         Some(provider) => valid_catalogs
             .into_iter()

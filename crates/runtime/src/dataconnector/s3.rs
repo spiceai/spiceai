@@ -249,7 +249,7 @@ impl DataConnectorFactory for S3Factory {
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
-            };
+            }
 
             let s3 = S3 {
                 params: params.parameters,

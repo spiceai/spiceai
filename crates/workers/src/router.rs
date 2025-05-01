@@ -21,7 +21,10 @@ use async_openai::{
     },
 };
 use futures::{TryStreamExt, stream::StreamExt};
-use llms::chat::{Chat, nsql::SqlGeneration};
+use llms::{
+    chat::{Chat, nsql::SqlGeneration},
+    progress::Progress,
+};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
     rng,
@@ -32,6 +35,7 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 use tokio::sync::RwLock;
+use tracing::{Instrument, Span};
 
 pub struct RouterModel {
     router_name: String,
@@ -67,14 +71,56 @@ impl RouterModel {
         }
     }
 
-    pub fn select_from_round_robin(&self) -> Option<String> {
-        let RouterState::RoundRobin { incr } = &self.state else {
-            return None;
+    async fn select_from_weighted(&self) -> Result<Arc<dyn Chat>, OpenAIError> {
+        let Some(name) = select_from_weighted(&self.models_cfg) else {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model router '{}' incorrectly initialized",
+                self.router_name
+            )));
         };
-        let idx = incr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.models_cfg
-            .get(idx % self.models_cfg.len())
-            .map(spicepod::component::worker::RouterConfig::from)
+        tracing::info!(
+            target: "task_history",
+            progress = Progress::log().title(format!(
+                "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
+            )).to_jsonl(),
+        );
+        let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model router '{}' expects a model '{name}' to exist, but does not",
+                self.router_name
+            )));
+        };
+        Ok(model)
+    }
+
+    async fn select_from_round_robin(&self) -> Result<Arc<dyn Chat>, OpenAIError> {
+        let RouterState::RoundRobin { incr } = &self.state else {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model router '{}' incorrectly initialized",
+                self.router_name
+            )));
+        };
+
+        let Some(name) = select_from_round_robin(incr, self.models_cfg.as_slice()) else {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model router '{}' incorrectly initialized",
+                self.router_name
+            )));
+        };
+
+        tracing::info!(
+            target: "task_history",
+            progress = Progress::log().title(format!(
+                "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
+            )).to_jsonl(),
+        );
+        let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+            return Err(OpenAIError::InvalidArgument(format!(
+                "Model router '{}' expects a model '{name}' to exist, but does not",
+                self.router_name
+            )));
+        };
+        Ok(model)
     }
 }
 
@@ -85,51 +131,61 @@ impl Chat for RouterModel {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let span = Span::current();
         let public_name = self.router_name.clone();
         Ok(Box::pin(match self.models_cfg.first() {
             Some(worker::RouterConfig::RoundRobin { .. }) => {
-                // This cannot be `None` as by this point, there is at least one model.
-                let name = self.select_from_round_robin().unwrap_or_default();
-
-                let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
-                    return Err(OpenAIError::InvalidArgument(format!(
-                        "Model router '{}' expects a model '{name}' to exist, but does not",
-                        self.router_name
-                    )));
-                };
-
-                model.chat_stream(req).await
+                self.select_from_round_robin().await?.chat_stream(req).instrument(span.clone()).await
             }
-            Some(worker::RouterConfig::Weighted { from, .. }) => {
-                // `select_from_weighted` should be `Some(T)` since `self.models_cfg` isn't empty.
-                let name = select_from_weighted(&self.models_cfg).unwrap_or(from.clone());
-                let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
-                    return Err(OpenAIError::InvalidArgument(format!(
-                        "Model router '{}' expects a model '{name}' to exist, but does not",
-                        self.router_name
-                    )));
-                };
-
-                model.chat_stream(req).await
+            Some(worker::RouterConfig::Weighted { .. }) => {
+                self.select_from_weighted().await?.chat_stream(req).instrument(span.clone()).await
             }
             Some(worker::RouterConfig::Fallback { .. }) => {
                 let fallbacks = into_ordered_fallbacks(&self.models_cfg);
                 for (name, _) in fallbacks {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::log().title(format!(
+                            "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
+                        )).to_jsonl(),
+                    );
                     let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
                         return Err(OpenAIError::InvalidArgument(format!(
                             "Model router '{}' expects a model '{name}' to exist, but does not",
-                            self.router_name
+                            self.router_name.clone()
                         )));
                     };
 
-                    match model.chat_stream(req.clone()).await {
-                        Err(_) => continue,
+                    match model.chat_stream(req.clone()).instrument(span.clone()).await {
+                        Err(e) => {
+                            tracing::error!(
+                                target: "task_history",
+                                progress = Progress::error()
+                                .title(format!(
+                                    "Error occured in model '{name}'"
+                                ))
+                                .content(e.to_string())
+                                .to_jsonl(),
+                            );
+                            continue
+                        },
 
                         // Check if first item in stream is `Err` since this is a common error by providers.
                         Ok(stream) => {
                             let mut peekable = Box::pin(Box::pin(stream).peekable());
                             match peekable.as_mut().peek().await.as_ref() {
-                                Some(Err(_)) => continue,
+                                Some(Err(e)) => {
+                                    tracing::error!(
+                                        target: "task_history",
+                                        progress = Progress::error()
+                                        .title(format!(
+                                            "Error occured in model '{name}'"
+                                        ))
+                                        .content(e.to_string())
+                                        .to_jsonl(),
+                                    );
+                                    continue
+                                },
                                 None | Some(Ok(_)) => return Ok(peekable),
                             }
                         }
@@ -163,44 +219,45 @@ impl Chat for RouterModel {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let span = Span::current();
         match self.models_cfg.first() {
             Some(worker::RouterConfig::RoundRobin { .. }) => {
-                // This cannot be `None` as by this point, there is at least one model.
-                let name = self.select_from_round_robin().unwrap_or_default();
-
-                let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
-                    return Err(OpenAIError::InvalidArgument(format!(
-                        "Model router '{}' expects a model '{name}' to exist, but does not",
-                        self.router_name
-                    )));
-                };
-
-                model.chat_request(req).await
+                self.select_from_round_robin().await?.chat_request(req).instrument(span.clone()).await
             }
-            Some(worker::RouterConfig::Weighted { from, .. }) => {
-                // `select_from_weighted` should be `Some(T)` since `self.models_cfg` isn't empty.
-                let name = select_from_weighted(&self.models_cfg).unwrap_or(from.clone());
-                let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
-                    return Err(OpenAIError::InvalidArgument(format!(
-                        "Model router '{}' expects a model '{name}' to exist, but does not",
-                        self.router_name
-                    )));
-                };
-
-                model.chat_request(req).await
+            Some(worker::RouterConfig::Weighted { .. }) => {
+                self.select_from_weighted().await?.chat_request(req).instrument(span.clone()).await
             }
             Some(worker::RouterConfig::Fallback { .. }) => {
                 let fallbacks = into_ordered_fallbacks(&self.models_cfg);
                 for (name, _) in fallbacks {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::log().title(format!(
+                            "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
+                        )).to_jsonl(),
+                    );
                     let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
                         return Err(OpenAIError::InvalidArgument(format!(
                             "Model router '{}' expects a model '{name}' to exist, but does not",
-                            self.router_name
+                            self.router_name.clone()
                         )));
                     };
 
-                    if let Ok(resp) = model.chat_request(req.clone()).await {
-                        return Ok(resp);
+                    match model.chat_request(req.clone()).instrument(span.clone()).await {
+                        Err(e) => {
+                            tracing::error!(
+                                target: "task_history",
+                                progress = Progress::error()
+                                .title(format!(
+                                    "Error occured in model '{name}'"
+                                ))
+                                .content(e.to_string())
+                                .to_jsonl(),
+                            );
+                            continue
+                        },
+
+                        Ok(resp) => return Ok(resp),
                     }
                 }
                 Err(OpenAIError::ApiError(ApiError {
@@ -272,6 +329,13 @@ fn into_ordered_fallbacks(cfg: &[worker::RouterConfig]) -> Vec<(String, u32)> {
     fallbacks
 }
 
+fn select_from_round_robin(incr: &AtomicUsize, models: &[worker::RouterConfig]) -> Option<String> {
+    let idx = incr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    models
+        .get(idx % models.len())
+        .map(spicepod::component::worker::RouterConfig::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,32 +388,29 @@ mod tests {
         use super::*;
         #[test]
         fn test_select_from_round_robin() {
-            let rtr = RouterModel::new(
-                "foo".to_string(),
-                vec![
-                    worker::RouterConfig::RoundRobin {
-                        from: "example1.com".to_string(),
-                    },
-                    worker::RouterConfig::RoundRobin {
-                        from: "example2.com".to_string(),
-                    },
-                ],
-                Arc::new(RwLock::new(HashMap::new())),
-            );
+            let cfg = vec![
+                worker::RouterConfig::RoundRobin {
+                    from: "example1.com".to_string(),
+                },
+                worker::RouterConfig::RoundRobin {
+                    from: "example2.com".to_string(),
+                },
+            ];
+            let incr = AtomicUsize::new(0);
             assert_eq!(
-                rtr.select_from_round_robin(),
+                select_from_round_robin(&incr, cfg.as_slice()),
                 Some("example1.com".to_string())
             );
             assert_eq!(
-                rtr.select_from_round_robin(),
+                select_from_round_robin(&incr, cfg.as_slice()),
                 Some("example2.com".to_string())
             );
             assert_eq!(
-                rtr.select_from_round_robin(),
+                select_from_round_robin(&incr, cfg.as_slice()),
                 Some("example1.com".to_string())
             );
             assert_eq!(
-                rtr.select_from_round_robin(),
+                select_from_round_robin(&incr, cfg.as_slice()),
                 Some("example2.com".to_string())
             );
         }

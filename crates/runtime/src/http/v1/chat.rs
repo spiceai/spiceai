@@ -198,14 +198,16 @@ async fn handle_streaming(
             let mut chat_completion_ended = Box::pin(futures::stream::once(async move {
                 let _ = completion_done.await;
             }));
-
-            select! {
-                Some(evnt) = events.next() =>  {
-                    let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
-                },
-                // chat completion from LLM complete.
-                _ = chat_completion_ended.next() => {}
-            };
+            loop {
+                select! {
+                    Some(evnt) = events.next() =>  {
+                        let _ = tx_clone.send(create_working_stream_payload(evnt)).await;
+                    },
+                    _ = chat_completion_ended.next() => {
+                        break;
+                    },
+                };
+            }
         });
     }
 
@@ -388,7 +390,7 @@ mod tests {
             CreateChatCompletionStreamResponse,
         },
     };
-    use tracing::{Level, info, span};
+    use tracing::{Level, span};
     use tracing_futures::Instrument;
 
     use super::create_working_stream_payload;
@@ -418,6 +420,10 @@ mod tests {
             tracing::info!(
                 target: "task_history",
                 progress = "A nice little test",
+            );
+            tracing::info!(
+                target: "task_history",
+                progress = "Another nice little test",
             );
             Ok(Box::pin(futures::stream::once(async move {
                 create_working_stream_payload("payload".to_string())
@@ -450,12 +456,7 @@ mod tests {
             tracing_subscriber::registry().with(event_stream::EventStreamLayer::new("progress")),
         );
         let span = span!(Level::INFO, "test_span");
-        span.in_scope(|| {
-            info!(
-                target: "task_history",
-                progress = "A nice test message",
-            );
-        });
+
         let _enter = span.enter();
 
         let response = post(Extension(llms), headers, Json(req_payload))
@@ -490,8 +491,9 @@ mod tests {
         assert_eq!(
             run_post(Some("enabled")).await,
             vec![
-                "A nice little test".to_string(), // From the event stream
-                "payload".to_string()             // From the LLM stream.
+                "A nice little test".to_string(),       // From the event stream
+                "Another nice little test".to_string(), // From the event stream
+                "payload".to_string()                   // From the LLM stream.
             ]
         );
     }

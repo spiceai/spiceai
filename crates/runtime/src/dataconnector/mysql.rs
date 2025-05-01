@@ -149,7 +149,7 @@ impl DataConnectorFactory for MySQLFactory {
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(pool) => Arc::new(pool),
                 Err(error) => match error {
-                    mysqlpool::Error::InvalidUsernameOrPassword { .. } => {
+                    mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(
                             DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                                 dataconnector: "mysql".to_string(),

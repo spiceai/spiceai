@@ -123,7 +123,7 @@ pub(crate) async fn post(
         return not_found(format!("Tool '{tool_name}' not found").as_str());
     };
 
-    match tool.call(body.as_str(), Arc::clone(&rt)).await {
+    match tool.call(body.as_str()).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

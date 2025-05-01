@@ -75,7 +75,7 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = cloned_rt.load_components() => {}
+() = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

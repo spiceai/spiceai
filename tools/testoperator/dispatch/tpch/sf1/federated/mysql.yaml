@@ -4,6 +4,7 @@ tests:
     query_set: tpch
     query_overrides: mysql
     runner_type: spiceai-runners
+    validate_results: true
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/mysql.yaml
     query_set: tpch
