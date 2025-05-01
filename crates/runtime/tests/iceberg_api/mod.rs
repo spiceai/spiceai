@@ -84,7 +84,7 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
                 }
                 () = Arc::clone(&rt).load_components() => {}
             }
-            
+
             // Connect to the server
             let http_client = reqwest::Client::builder().build()?;
 
