@@ -21,8 +21,11 @@ use snafu::prelude::*;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::token_provider::{Result, TokenProvider};
+
+const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -83,9 +86,12 @@ impl DatabricksM2MTokenProvider {
         let secret = client_secret.clone();
 
         let handle = tokio::spawn(async move {
-            // schedule the first refresh at 90% of `expires_in`
-            #[allow(clippy::cast_precision_loss)]
-            let mut next_wait = Duration::from_secs_f64(expires_in as f64 * 0.9);
+            // Databricks M2M access token lifespan is one hour. Schedule a refresh five minutes before expiration
+            let mut next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
+
+            let mut backoff = FibonacciBackoffBuilder::new()
+                .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+                .build();
 
             loop {
                 sleep(next_wait).await;
@@ -104,15 +110,17 @@ impl DatabricksM2MTokenProvider {
                     }) => {
                         tracing::info!("M2M token refreshed; expires in {}", expires_in);
                         let _ = cloned_tx.send(access_token.clone());
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            next_wait = Duration::from_secs_f64(expires_in as f64);
-                        }
+                        next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
                     }
                     Err(e) => {
-                        tracing::error!("M2M token refresh failed: {}", e);
-                        // back‑off 60s on error
-                        next_wait = Duration::from_secs(60);
+                        let backoff_duration =
+                            backoff.next_duration().unwrap_or(Duration::from_secs(300));
+                        tracing::error!(
+                            "Databricks M2M token refresh failed: {}. Retrying in {:.2?}",
+                            e,
+                            backoff_duration
+                        );
+                        next_wait = backoff_duration;
                     }
                 }
             }
