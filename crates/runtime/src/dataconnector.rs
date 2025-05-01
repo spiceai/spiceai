@@ -718,8 +718,8 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
+    use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
     async fn test_connector_params_builder_unsupported_type_action() {

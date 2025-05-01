@@ -25,8 +25,9 @@ use crate::{
     UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
-        self, Dataset, DatasetBuilder,
+        self, Dataset,
         acceleration::{Acceleration, RefreshMode},
+        builder::DatasetBuilder,
     },
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,

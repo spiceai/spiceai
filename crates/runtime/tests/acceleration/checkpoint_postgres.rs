@@ -20,7 +20,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::{Runtime, component::dataset::DatasetBuilder};
+use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;

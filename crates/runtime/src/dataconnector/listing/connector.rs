@@ -791,7 +791,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
     use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;

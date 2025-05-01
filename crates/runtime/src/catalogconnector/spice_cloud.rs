@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
-use crate::component::dataset::DatasetBuilder;
+use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
     component::{catalog::Catalog, dataset::Dataset},

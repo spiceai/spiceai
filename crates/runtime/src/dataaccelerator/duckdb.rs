@@ -379,7 +379,7 @@ impl DataAccelerator for DuckDBAccelerator {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},

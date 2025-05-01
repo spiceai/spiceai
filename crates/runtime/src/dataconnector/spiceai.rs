@@ -451,7 +451,7 @@ impl CommitChange for SpiceAIChangeCommiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]

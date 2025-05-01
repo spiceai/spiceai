@@ -22,7 +22,7 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
 use futures::TryStreamExt;
-use runtime::{Runtime, component::dataset::DatasetBuilder};
+use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::acceleration::Mode;
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;

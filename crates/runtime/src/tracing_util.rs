@@ -126,8 +126,8 @@ pub fn random_trace_id() -> TraceId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::acceleration::Engine;
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::DataConnectorResult;
     use async_trait::async_trait;
     use datafusion::datasource::TableProvider;

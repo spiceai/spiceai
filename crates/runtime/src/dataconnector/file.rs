@@ -235,7 +235,7 @@ fn get_path(dataset: &Dataset) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
     async fn test_get_path() {
