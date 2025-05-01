@@ -36,7 +36,7 @@ Spice provides four industry standard APIs in a lightweight, portable runtime (s
 
 Spice is primarily used for:
 
-- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/federated-queries).
+- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/query-federation).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
