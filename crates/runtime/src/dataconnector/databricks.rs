@@ -180,7 +180,7 @@ impl Databricks {
             }
             _ => {
                 InvalidConfigurationSnafu {
-                    message: format!("Invalid authentication configuration: {:?}", params),
+                    message: format!("Invalid authentication configuration: {params:?}"),
                 }
                 .fail()
             }
@@ -236,17 +236,14 @@ impl Databricks {
         token_provider_registry: &Arc<TokenProviderRegistry>,
     ) -> Result<Arc<dyn TokenProvider>> {
         token_provider_registry
-            .get_or_create_provider(
-                format!("databricks_m2m_{}", client_id.to_string()),
-                || async {
-                    DatabricksM2MTokenProvider::try_new(
-                        endpoint.to_string(),
-                        client_id.to_string(),
-                        client_secret.clone(),
-                    )
-                    .await
-                },
-            )
+            .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                DatabricksM2MTokenProvider::try_new(
+                    endpoint.to_string(),
+                    client_id.to_string(),
+                    client_secret.clone(),
+                )
+                .await
+            })
             .await
             .map_err(|_| Error::UnableToGetToken {})
     }
