@@ -47,6 +47,7 @@ mod flight;
 mod github;
 mod graphql;
 mod iceberg;
+mod metadata;
 #[cfg(feature = "mssql")]
 mod mssql;
 #[cfg(feature = "mysql")]

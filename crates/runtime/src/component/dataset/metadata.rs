@@ -23,7 +23,7 @@ impl Dataset {
     /// Returns which `ListingTable` metadata columns are enabled for this dataset.
     #[must_use]
     pub fn listing_table_metadata_columns(&self, schema: &Schema) -> Option<Vec<MetadataColumn>> {
-        let needs_last_modified = self.needs_last_modified();
+        let needs_last_modified = self.needs_last_modified(schema);
         // Handle the common case where no metadata columns are enabled
         if !needs_last_modified && self.metadata.is_empty() {
             return None;
@@ -52,7 +52,7 @@ impl Dataset {
         }
     }
 
-    fn needs_last_modified(&self) -> bool {
+    fn needs_last_modified(&self, schema: &Schema) -> bool {
         let needs_last_modified_time_col = self
             .time_column
             .as_ref()
@@ -63,6 +63,10 @@ impl Dataset {
                 .is_some_and(|col| col == MetadataColumn::LastModified.name());
 
         needs_last_modified_time_col
+            && schema
+                .fields()
+                .find(MetadataColumn::LastModified.name())
+                .is_none()
     }
 
     // Checks if the metadata column is enabled for the dataset and if it is not already present in the schema
@@ -109,7 +113,8 @@ mod tests {
             .with_runtime(test_runtime().await)
             .build()
             .expect("to build dataset");
-        assert!(!dataset.needs_last_modified());
+        let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
+        assert!(!dataset.needs_last_modified(&schema));
     }
 
     #[tokio::test]
@@ -121,7 +126,8 @@ mod tests {
             .with_time_column("last_modified".to_string())
             .build()
             .expect("to build dataset");
-        assert!(dataset.needs_last_modified());
+        let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
+        assert!(dataset.needs_last_modified(&schema));
     }
 
     #[tokio::test]
@@ -133,7 +139,8 @@ mod tests {
             .with_time_column("unrelated".to_string())
             .build()
             .expect("to build dataset");
-        assert!(!dataset.needs_last_modified());
+        let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
+        assert!(!dataset.needs_last_modified(&schema));
     }
 
     #[tokio::test]
@@ -145,7 +152,8 @@ mod tests {
             .with_time_partition_column("last_modified".to_string())
             .build()
             .expect("to build dataset");
-        assert!(dataset.needs_last_modified());
+        let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
+        assert!(dataset.needs_last_modified(&schema));
     }
 
     #[tokio::test]
@@ -477,11 +485,7 @@ mod tests {
             Field::new("test", DataType::Utf8, false),
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
         ]);
-        let columns = dataset
-            .listing_table_metadata_columns(&schema)
-            .expect("to get columns");
-        assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0], MetadataColumn::LastModified);
+        assert!(dataset.listing_table_metadata_columns(&schema).is_none());
     }
 
     #[tokio::test]

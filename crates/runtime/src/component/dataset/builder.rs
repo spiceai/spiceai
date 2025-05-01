@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{collections::HashMap, sync::Arc};
+
 use super::{
     Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
     replication, validate_identifier,
@@ -21,6 +23,7 @@ use super::{
 use crate::Runtime;
 use app::App;
 use datafusion::sql::TableReference;
+use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
@@ -28,7 +31,6 @@ use spicepod::{
     param::Params,
     semantic::Column,
 };
-use std::{collections::HashMap, sync::Arc};
 
 pub struct DatasetBuilder {
     pub from: String,
@@ -89,7 +91,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metadata: dataset
                 .metadata
                 .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
+                .map(|(k, v)| (k.clone(), value_to_string(v)))
                 .collect(),
             columns: dataset.columns,
             has_metadata_table: dataset
@@ -223,5 +225,12 @@ impl DatasetBuilder {
         };
 
         Ok(dataset)
+    }
+}
+
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        _ => value.to_string(),
     }
 }
