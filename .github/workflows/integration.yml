@@ -140,12 +140,13 @@ jobs:
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          # old dbc instance
+          OLD_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          OLD_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          OLD_DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          # new dbc cluster
+          # new dbc instance
           NEW_DATABRICKS_HOST: ${{ secrets.NEW_DATABRICKS_HOST }}
           NEW_DATABRICKS_CLUSTER_ID: ${{ secrets.NEW_DATABRICKS_CLUSTER_ID }}
           NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}

@@ -35,23 +35,24 @@ fn make_catalog(path: &str, name: &str) -> Catalog {
 #[allow(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
-    let _ = std::env::var("DATABRICKS_HOST").expect("DATABRICKS_HOST is not set");
-    let _ = std::env::var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN is not set");
-    let _ = std::env::var("DATABRICKS_CLUSTER_ID").expect("DATABRICKS_CLUSTER_ID is not set");
+    let _ = std::env::var("OLD_DATABRICKS_HOST").expect("OLD_DATABRICKS_HOST is not set");
+    let _ = std::env::var("OLD_DATABRICKS_TOKEN").expect("OLD_DATABRICKS_TOKEN is not set");
+    let _ =
+        std::env::var("OLD_DATABRICKS_CLUSTER_ID").expect("OLD_DATABRICKS_CLUSTER_ID is not set");
 
     Params::from_string_map(
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:DATABRICKS_HOST }".to_string(),
+                "${ env:OLD_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:DATABRICKS_TOKEN }".to_string(),
+                "${ env:OLD_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_cluster_id".to_string(),
-                "${ env:DATABRICKS_CLUSTER_ID }".to_string(),
+                "${ env:OLD_DATABRICKS_CLUSTER_ID }".to_string(),
             ),
             ("mode".to_string(), "spark_connect".to_string()),
         ]
