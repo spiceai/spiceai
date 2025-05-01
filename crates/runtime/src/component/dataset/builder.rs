@@ -160,6 +160,24 @@ impl DatasetBuilder {
     }
 
     #[must_use]
+    pub fn with_time_column(mut self, time_column: String) -> Self {
+        self.time_column = Some(time_column);
+        self
+    }
+
+    #[must_use]
+    pub fn with_time_partition_column(mut self, time_partition_column: String) -> Self {
+        self.time_partition_column = Some(time_partition_column);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
     pub fn with_app(mut self, app: Arc<App>) -> Self {
         self.app = Some(app);
         self
