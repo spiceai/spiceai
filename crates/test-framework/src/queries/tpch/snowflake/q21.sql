@@ -36,4 +36,5 @@ group by
     "S_NAME"
 order by
     "NUMWAIT" desc,
-    "S_NAME";
+    "S_NAME"
+limit 100;

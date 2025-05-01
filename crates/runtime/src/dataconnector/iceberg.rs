@@ -22,14 +22,15 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use iceberg::{Catalog, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::RestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
 
 use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
-        map_param_name_to_iceberg_prop, parse_table_url, verify_s3_endpoint,
+        get_rest_catalog_config, map_param_name_to_iceberg_prop, parse_table_url,
+        verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
@@ -138,10 +139,7 @@ impl DataConnector for IcebergDataConnector {
                 })?;
         }
 
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build();
+        let catalog_config = get_rest_catalog_config(base_uri, props);
 
         let catalog_client = RestCatalog::new(catalog_config);
         let catalog_client = Arc::new(catalog_client);

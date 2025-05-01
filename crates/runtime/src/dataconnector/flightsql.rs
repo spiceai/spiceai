@@ -130,7 +130,7 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .handshake(username, password)
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
-            };
+            }
             let flightsql_factory = DataComponentFlightSQLFactory::new(client, endpoint);
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })

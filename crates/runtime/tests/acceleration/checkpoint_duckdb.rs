@@ -22,7 +22,7 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{Runtime, component::dataset::DatasetBuilder};
+use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::Dataset,

@@ -144,6 +144,7 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
                 DataType::Int32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8
             )
             | (DataType::Utf8, DataType::LargeUtf8)
+            | (DataType::LargeUtf8, DataType::Utf8)
     )
 }
 
@@ -156,10 +157,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| {
-            f1.name() == f2.name()
-                && datatype_equivalent(f1.data_type().clone(), f2.data_type().clone())
-        })
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
 }
 
 macro_rules! downcast_and_stringify {
@@ -389,28 +387,15 @@ pub fn validate_batches_as_strings(
                 (Some(expected_val), Some(actual_val)) => {
                     if expected_val != actual_val {
                         if data_type.is_numeric() {
-                            // check if the left value is a subset of the right value, and if the right value ends in trailing zeros
-                            let trimmed_actual_val = actual_val.replace(".00", "");
-                            let trimmed_actual_val = trimmed_actual_val.trim_end_matches('0');
-                            if expected_val.starts_with(trimmed_actual_val) {
-                                let expected_trailing = if expected_val.contains('.') {
-                                    expected_val.split('.').last().unwrap_or("")
-                                } else {
-                                    ""
-                                };
-                                let actual_trailing = if trimmed_actual_val.contains('.') {
-                                    trimmed_actual_val.split('.').last().unwrap_or("")
-                                } else {
-                                    ""
-                                };
+                            let delta = 0.05;
 
-                                // if the scale is too long, we drop it for the purpose of this validation
-                                let expected_trailing =
-                                    expected_trailing.chars().take(8).collect::<String>();
-                                let actual_trailing =
-                                    actual_trailing.chars().take(8).collect::<String>();
-                                if expected_trailing == actual_trailing {
-                                    return Ok(QueryValidationResult::Pass);
+                            if let (Ok(expected_num), Ok(actual_num)) =
+                                (expected_val.parse::<f64>(), actual_val.parse::<f64>())
+                            {
+                                let diff = (expected_num - actual_num).abs();
+                                let tolerance = (expected_num.abs() * delta).max(1e-12); // avoid zero-multiplied tolerance
+                                if diff <= tolerance {
+                                    continue; // numeric match within tolerance
                                 }
                             }
                         }

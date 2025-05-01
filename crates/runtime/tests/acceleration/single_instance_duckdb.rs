@@ -23,7 +23,7 @@ use duckdb::AccessMode;
 use futures::TryStreamExt;
 
 use anyhow::anyhow;
-use runtime::{Runtime, component::dataset::DatasetBuilder};
+use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use std::sync::Arc;

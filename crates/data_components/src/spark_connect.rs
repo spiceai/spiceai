@@ -45,6 +45,7 @@ use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
     DataFrame, SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
 };
+use tokio::sync::RwLock;
 
 use std::error::Error;
 
@@ -52,7 +53,7 @@ pub mod federation;
 
 #[derive(Clone)]
 pub struct SparkConnect {
-    session: Arc<SparkSession>,
+    session: Arc<RwLock<SparkSession>>,
     join_push_down_context: String,
 }
 
@@ -65,7 +66,9 @@ impl SparkConnect {
     }
 
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
+        let session = SparkSessionBuilder::remote(connection)?.build().await?;
+
+        let session = Arc::new(RwLock::new(session));
 
         let (host, port, options) = ChannelBuilder::parse_connection_string(connection)?;
         let options = options.unwrap_or_default();
@@ -88,6 +91,11 @@ impl SparkConnect {
             session,
             join_push_down_context,
         })
+    }
+
+    pub async fn set_token(&self, token: &str) {
+        let session = self.session.write().await;
+        session.set_token(Some(token));
     }
 }
 
@@ -115,7 +123,7 @@ impl Read for SparkConnect {
 }
 
 async fn get_table_provider(
-    spark_session: Arc<SparkSession>,
+    spark_session: Arc<RwLock<SparkSession>>,
     table_reference: TableReference,
     schema: Option<SchemaRef>,
     join_push_down_context: String,
@@ -134,7 +142,11 @@ async fn get_table_provider(
             format!("`{catalog}`.`{schema}`.`{table}`")
         }
     };
-    let dataframe = spark_session.table(spark_table_reference.as_str())?;
+
+    let session_guard = spark_session.read().await;
+    let session = Arc::new(session_guard.clone());
+    let dataframe = session.table(spark_table_reference.as_str())?;
+
     let arrow_schema = match schema {
         Some(schema) => schema,
         None => dataframe.clone().limit(0).collect().await?.schema(),

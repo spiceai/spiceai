@@ -229,10 +229,7 @@ impl CatalogConnector for IcebergCatalog {
                 })?;
         }
 
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build();
+        let catalog_config = get_rest_catalog_config(base_uri, props);
 
         let catalog_client = RestCatalog::new(catalog_config);
 
@@ -393,6 +390,10 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
         props.insert("prefix".to_string(), prefix);
     }
 
+    if let Some(warehouse) = get_warehouse(&parsed) {
+        props.insert("warehouse".to_string(), warehouse);
+    }
+
     // Auto-detect AWS Glue URLs and set signing region, name, and SigV4 enabled
     if let Some(host_str) = parsed.host_str() {
         if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
@@ -460,6 +461,55 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
             Err(Error::MissingTableSegment)
         }
     }
+}
+
+/// Builds a `RestCatalogConfig` from a base URI and properties.
+///
+/// This function takes a base URI and a map of properties, and builds a `RestCatalogConfig`
+/// with the given properties. If a "warehouse" property is present, it will be used to set the
+/// warehouse for the catalog.
+#[must_use]
+pub fn get_rest_catalog_config(
+    base_uri: String,
+    mut props: HashMap<String, String, std::hash::RandomState>,
+) -> RestCatalogConfig {
+    if let Some(warehouse) = props.remove("warehouse") {
+        RestCatalogConfig::builder()
+            .uri(base_uri)
+            .props(props)
+            .warehouse(warehouse)
+            .build()
+    } else {
+        RestCatalogConfig::builder()
+            .uri(base_uri)
+            .props(props)
+            .build()
+    }
+}
+
+// Parse out the catalog id from the Glue URL if it exists, i.e.
+// https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/big_datasets/tables/tpch_sf100_lineitem
+// should return "211125479522"
+fn get_warehouse(url: &Url) -> Option<String> {
+    if let Some(host_str) = url.host_str() {
+        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
+            let path_segments: Vec<_> = url
+                .path_segments()
+                .map(Iterator::collect)
+                .unwrap_or_default();
+
+            if path_segments.len() >= 4
+                && path_segments[0] == "iceberg"
+                && path_segments[1] == "v1"
+                && path_segments[2] == "catalogs"
+                && path_segments[3].len() == 12
+                && path_segments[3].chars().all(|c| c.is_ascii_digit())
+            {
+                return Some(path_segments[3].to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -639,5 +689,53 @@ mod tests {
             result.expect_err("Failed to parse table URL"),
             Error::MissingTableSegment
         ));
+    }
+
+    #[test]
+    fn test_get_warehouse_valid_glue_url() {
+        let url = "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/big_datasets/tables/tpch_sf100_lineitem";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, Some("211125479522".to_string()));
+    }
+
+    #[test]
+    fn test_get_warehouse_invalid_glue_url_missing_catalog() {
+        let url = "https://glue.us-east-1.amazonaws.com/iceberg/v1/namespaces/big_datasets/tables/tpch_sf100_lineitem";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_get_warehouse_invalid_glue_url_invalid_catalog_id() {
+        let url = "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/not-a-number/namespaces/big_datasets";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_get_warehouse_invalid_glue_url_catalog_id_too_short() {
+        let url = "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/12345678901/namespaces/big_datasets";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_get_warehouse_invalid_glue_url_catalog_id_too_long() {
+        let url = "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/1234567890123/namespaces/big_datasets";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, None);
+    }
+
+    #[test]
+    fn test_get_warehouse_non_glue_url() {
+        let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
+        let parsed_url = Url::parse(url).expect("Failed to parse URL");
+        let warehouse = get_warehouse(&parsed_url);
+        assert_eq!(warehouse, None);
     }
 }

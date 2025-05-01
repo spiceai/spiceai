@@ -25,9 +25,7 @@ pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
-pub mod databricks_delta;
-#[cfg(feature = "databricks")]
-pub mod databricks_spark;
+pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "debezium")]

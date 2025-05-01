@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
 use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
@@ -581,6 +582,8 @@ pub struct ConnectorParams {
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
     pub(crate) app: Option<Arc<App>>,
+    #[allow(dead_code)] // will be utilized in https://github.com/spiceai/spiceai/pull/5542
+    pub(crate) runtime: Option<Arc<Runtime>>,
 }
 
 pub struct ConnectorParamsBuilder {
@@ -603,7 +606,7 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters, app) = match &self.component {
+        let (params, prefix, parameters, app, runtime) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
@@ -618,7 +621,8 @@ impl ConnectorParamsBuilder {
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
                     factory.prefix(),
                     factory.parameters(),
-                    None,
+                    Some(catalog.app()),
+                    Some(catalog.runtime()),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -646,7 +650,8 @@ impl ConnectorParamsBuilder {
                     params,
                     factory.prefix(),
                     factory.parameters(),
-                    Some(Arc::clone(&dataset.app)),
+                    Some(dataset.app()),
+                    Some(dataset.runtime()),
                 )
             }
         };
@@ -665,6 +670,7 @@ impl ConnectorParamsBuilder {
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
             app,
+            runtime,
         })
     }
 }
@@ -712,8 +718,8 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
+    use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
     async fn test_connector_params_builder_unsupported_type_action() {

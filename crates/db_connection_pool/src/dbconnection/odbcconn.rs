@@ -221,12 +221,12 @@ where
                         message: "process is terminated".to_string(),
                     }
                     .into());
-                };
+                }
                 blocking_channel_send(&batch_tx, batch.context(ArrowSnafu)?)?;
             }
             if !cloned_token.is_cancelled() {
                 cloned_token.cancel();
-            };
+            }
 
             Ok::<_, GenericError>(())
         });

@@ -4,3 +4,4 @@ tests:
     query_set: tpch
     runner_type: spiceai-runners
     query_overrides: spicecloud-catalog
+    validate_results: true

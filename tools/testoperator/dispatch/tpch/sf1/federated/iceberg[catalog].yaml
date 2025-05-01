@@ -4,3 +4,4 @@ tests:
     query_set: tpch
     query_overrides: iceberg-sf1
     runner_type: spiceai-runners
+    validate_results: true

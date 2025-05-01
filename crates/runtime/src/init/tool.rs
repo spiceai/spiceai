@@ -30,26 +30,26 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     #[allow(clippy::implicit_hasher)]
-    pub(crate) async fn load_tools(&self) {
+    pub(crate) async fn load_tools(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for tool in &app.tools {
                 tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
-                self.load_tool(tool).await;
+                Arc::clone(&self).load_tool(tool).await;
             }
         }
 
         let mut spawned_tasks = vec![];
-        let cloned_self = self.clone();
+        let cloned_self = Arc::clone(&self);
 
         // Load all built-in tools, regardless if they are in the spicepod.
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
         //   `tools: models, builtin`
         //   `tools: sql, load_memory`
-        for ctlg in default_available_catalogs() {
+        for ctlg in default_available_catalogs(Arc::clone(&self)) {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                let cloned_self = cloned_self.clone();
+                let cloned_self = Arc::clone(&cloned_self);
                 let handle = tokio::spawn(async move {
                     cloned_self.insert_tool(tool.into()).await;
                 });
@@ -82,7 +82,7 @@ impl Runtime {
             .update_tool(&name, status::ComponentStatus::Ready);
     }
 
-    async fn load_tool(&self, tool: &Tool) {
+    async fn load_tool(self: Arc<Self>, tool: &Tool) {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(None)
             .max_duration(Some(Duration::from_secs(60)))
@@ -97,9 +97,14 @@ impl Runtime {
             let env_with_secrets: HashMap<String, SecretString> =
                 get_params_with_secrets(self.secrets(), &tool.env).await;
 
-            match tools::factory::forge(tool, params_with_secrets, env_with_secrets)
-                .await
-                .context(UnableToInitializeLlmToolSnafu)
+            match tools::factory::forge(
+                tool,
+                params_with_secrets,
+                Arc::clone(&self),
+                env_with_secrets,
+            )
+            .await
+            .context(UnableToInitializeLlmToolSnafu)
             {
                 Ok(t) => {
                     self.insert_tool(t).await;

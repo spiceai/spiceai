@@ -17,8 +17,8 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks_delta::DatabricksDelta;
-use data_components::databricks_spark::DatabricksSparkConnect;
+use data_components::databricks::delta::DatabricksDelta;
+use data_components::databricks::spark_connect::DatabricksSparkConnect;
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;

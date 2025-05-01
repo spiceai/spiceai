@@ -71,7 +71,7 @@ impl Xai {
                     content.replace(ChatCompletionRequestAssistantMessageContent::Text(
                         String::new(),
                     ));
-                };
+                }
 
                 // xAI requires tool calls with empty parameters used to be `{}` not ``.
                 for t in tool_calls.iter_mut() {

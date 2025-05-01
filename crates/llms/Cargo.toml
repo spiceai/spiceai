@@ -43,7 +43,7 @@ tiktoken-rs = "0.6.0"
 
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "027c8da1a8fbd3a65bcf8e60d6e30264f41bc194" }
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "027c8da1a8fbd3a65bcf8e60d6e30264f41bc194", package = "mistralrs-core" }
-rand = "0.9.0"
+rand = "0.9.1"
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", features = [
     "candle",
 ] }
@@ -54,7 +54,7 @@ tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai
 cudarc = { version = "0.12.2", optional = true, features = [
     "cuda-version-from-build-system",
 ] }
-either = "1.13.0"
+either = "1.15.0"
 indexmap.workspace = true
 tempfile.workspace = true
 

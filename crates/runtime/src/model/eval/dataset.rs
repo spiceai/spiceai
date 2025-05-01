@@ -250,7 +250,7 @@ impl DatasetInput {
                         ),
                     });
                 }
-            };
+            }
         }
 
         Ok(result)
@@ -357,7 +357,7 @@ impl DatasetOutput {
                         ),
                     });
                 }
-            };
+            }
         }
 
         Ok(result)

@@ -106,7 +106,6 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                     .build()
                     .await,
             );
-
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {

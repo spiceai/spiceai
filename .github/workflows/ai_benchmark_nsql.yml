@@ -178,9 +178,11 @@ jobs:
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
             -p ${{ matrix.target.spicepod }} \
             -d $GITHUB_WORKSPACE/${{ matrix.target.data }} \
-            --ready-wait 180
+            --ready-wait 180 \
+            --metrics

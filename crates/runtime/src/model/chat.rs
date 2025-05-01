@@ -207,7 +207,7 @@ fn huggingface(
             if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension()) {
                 if ext.eq_ignore_ascii_case("gguf") {
                     return PathBuf::from_str(p.as_str()).ok();
-                };
+                }
             }
             None
         });
@@ -218,7 +218,7 @@ fn huggingface(
             component.name,
             path.display()
         );
-    };
+    }
     llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
 }
 

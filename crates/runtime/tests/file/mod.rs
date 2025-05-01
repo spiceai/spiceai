@@ -57,7 +57,6 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
-
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

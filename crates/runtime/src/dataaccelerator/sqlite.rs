@@ -341,9 +341,9 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
 
-    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]

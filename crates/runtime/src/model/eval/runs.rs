@@ -196,7 +196,7 @@ pub async fn update_eval_run_status(
 
     if let Some(err) = err_msg {
         updates.insert("error_message", Arc::new(StringArray::from(vec![err])));
-    };
+    }
     update_eval_run(df, id, updates).await
 }
 
