@@ -55,6 +55,9 @@ pub enum Error {
     InvalidCredentialsOrPermissions { message: String },
 
     #[snafu(display("{message}"))]
+    ResourceNotFound { message: String },
+
+    #[snafu(display("{message}"))]
     RateLimited { message: String },
 
     #[snafu(display("Query response transformation failed.\n{source}"))]

@@ -1005,6 +1005,13 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     ),
                 });
             }
+            if error_type.to_lowercase() == "not_found" {
+                return Err(Error::ResourceNotFound {
+                    message: format!(
+                        "The API returned a 'NOT_FOUND' error.\nVerify the requsted resource exists and is accessible.\n{message}"
+                    ),
+                });
+            }
         }
 
         return match location {
