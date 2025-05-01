@@ -1,0 +1,8 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch[parameterized]_q19"
+---
++-----------+------+
+| plan_type | plan |
++-----------+------+
++-----------+------+

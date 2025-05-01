@@ -144,7 +144,7 @@ tract-core = "0.21.10"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }

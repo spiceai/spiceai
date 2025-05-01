@@ -68,6 +68,10 @@ jobs:
         run: |
           make install
 
+      - name: make install-dev
+        run: |
+          make install-dev
+
       - name: make install-with-models
         run: |
           make install-with-models
