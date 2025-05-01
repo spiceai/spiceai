@@ -1,0 +1,24 @@
+---
+source: crates/runtime/tests/iceberg_api/mod.rs
+expression: schemas
+---
+[
+  {
+    "schema-id": 0,
+    "type": "struct",
+    "fields": [
+      {
+        "id": 0,
+        "name": "category",
+        "required": false,
+        "type": "string"
+      },
+      {
+        "id": 1,
+        "name": "value",
+        "required": false,
+        "type": "long"
+      }
+    ]
+  }
+]
