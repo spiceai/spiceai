@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use registry::token_provider::TokenProviderRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -92,6 +93,7 @@ pub mod objectstore;
 mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
+mod registry;
 pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
@@ -371,6 +373,7 @@ pub struct Runtime {
     status: Arc<status::RuntimeStatus>,
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 }
 
 impl Runtime {
@@ -412,6 +415,11 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
+        Arc::clone(&self.token_provider_registry)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.

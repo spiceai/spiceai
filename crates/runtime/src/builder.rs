@@ -28,6 +28,7 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
+    registry::token_provider::TokenProviderRegistry,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -48,6 +49,7 @@ pub struct RuntimeBuilder {
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 }
 
 impl RuntimeBuilder {
@@ -64,6 +66,7 @@ impl RuntimeBuilder {
             rate_limits: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
+            token_provider_registry: Arc::new(TokenProviderRegistry::new()),
         }
     }
 
@@ -208,6 +211,7 @@ impl RuntimeBuilder {
             status: self.runtime_status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
+            token_provider_registry: self.token_provider_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
