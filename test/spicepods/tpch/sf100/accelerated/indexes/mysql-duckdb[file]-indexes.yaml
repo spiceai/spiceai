@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql-duckdb[file]
+name: mysql-duckdb[file]-indexes
 
 # Define common anchors
 definitions:
