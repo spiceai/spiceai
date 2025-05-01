@@ -141,6 +141,8 @@ impl Github {
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
+        owner: &str,
+        repo: &str,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -158,9 +160,24 @@ impl Github {
             provider_builder
         };
 
+        // Add a sanity check to ensure the endpoint exists
+        let introspection_query_string = format!(
+            r#"{{
+            repositoryCheck: repository(owner: "{owner}", name: "{repo}") {{
+                id
+                nameWithOwner  # Add extra field to confirm it's the right repo
+            }}
+        }}"#,
+            owner = owner,
+            repo = repo
+        );
+
         Ok(Arc::new(
             provider_builder
-                .build(table_args.get_graphql_values().query.as_ref())
+                .build(
+                    table_args.get_graphql_values().query.as_ref(),
+                    Some(introspection_query_string),
+                )
                 .await
                 .map_err(|e| {
                     if matches!(e, graphql::Error::RateLimited { .. }) {
@@ -424,6 +441,8 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    owner,
+                    repo,
                 )
                 .await
             }
@@ -436,6 +455,8 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    owner,
+                    repo,
                 )
                 .await
             }
@@ -449,6 +470,8 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    owner,
+                    repo,
                 )
                 .await
             }
@@ -458,7 +481,7 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component: ConnectorComponent::from(dataset),
                 });
-                self.create_gql_table_provider(table_args, None).await
+                self.create_gql_table_provider(table_args, None, owner, repo).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)

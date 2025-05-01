@@ -309,7 +309,7 @@ impl PaginationParameters {
     ///      node {
     ///        id
     ///        name
-    ///        email   
+    ///        email
     ///      }
     ///      pageInfo {
     ///        hasNextPage
@@ -326,7 +326,7 @@ impl PaginationParameters {
     ///      node {
     ///        id
     ///        name
-    ///        email   
+    ///        email
     ///      }
     ///      edges {
     ///        friends {

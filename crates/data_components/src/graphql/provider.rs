@@ -69,13 +69,33 @@ impl GraphQLTableProviderBuilder {
         self
     }
 
-    pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
+    pub async fn build(
+        self,
+        query_string: &str,
+        introspection_query_string: Option<String>,
+    ) -> Result<GraphQLTableProvider> {
         let query_string: Arc<str> = Arc::from(query_string);
         let mut query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
 
         if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
             return Err(super::Error::NoJsonPointerFound {});
         }
+
+        if let Some(introspection_query) = introspection_query_string {
+            let query_arc = Arc::from(introspection_query);
+            let mut inspection_query = GraphQLQuery::try_from(query_arc)?;
+
+            let _ = self
+                .client
+                .execute(
+                    &mut inspection_query,
+                    None,
+                    None,
+                    None,
+                    self.context.clone().and_then(|o| o.error_checker()),
+                )
+                .await?;
+        };
 
         let result = self
             .client
