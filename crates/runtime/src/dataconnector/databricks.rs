@@ -98,12 +98,13 @@ impl Databricks {
             .get("endpoint")
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-        let token = params
-            .get("token")
-            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
         match mode {
             "delta_lake" => {
+                let token = params
+                    .get("token")
+                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+
                 let databricks_delta = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
                     token.clone(),
