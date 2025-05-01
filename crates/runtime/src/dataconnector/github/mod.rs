@@ -161,22 +161,30 @@ impl Github {
         };
 
         // Add a sanity check to ensure the endpoint exists
-        let introspection_query_string = format!(
+        let inspection_query_string = format!(
             r#"{{
             repositoryCheck: repository(owner: "{owner}", name: "{repo}") {{
                 id
-                nameWithOwner  # Add extra field to confirm it's the right repo
+                nameWithOwner
             }}
         }}"#,
-            owner = owner,
-            repo = repo
         );
+
+        let query_arc = Arc::from(inspection_query_string);
+        let mut inspection_query = GraphQLQuery::try_from(query_arc).map_err(|e| {
+            DataConnectorError::InternalWithSource {
+                dataconnector: "github".to_string(),
+                connector_component: table_args.get_component(),
+                source: e.into(),
+            }
+        })?;
+        inspection_query.json_pointer = Some(Arc::from("/data/repositoryCheck"));
 
         Ok(Arc::new(
             provider_builder
                 .build(
                     table_args.get_graphql_values().query.as_ref(),
-                    Some(introspection_query_string),
+                    Some(inspection_query),
                 )
                 .await
                 .map_err(|e| {
