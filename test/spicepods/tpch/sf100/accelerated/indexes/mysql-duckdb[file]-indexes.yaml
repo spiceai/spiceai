@@ -39,13 +39,9 @@ datasets:
       mode: file
       primary_key: (l_orderkey, l_linenumber)
       indexes:
-        l_orderkey: enabled
         l_suppkey: enabled
-        l_discount: enabled
         l_shipdate: enabled
         l_partkey: enabled
-        l_quantity: enabled
-        (l_shipdate, l_receiptdate): enabled
 
   - from: mysql:nation
     name: nation
