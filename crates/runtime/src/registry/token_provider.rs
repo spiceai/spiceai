@@ -38,7 +38,6 @@ impl TokenProviderRegistry {
     /// # Arguments
     ///
     /// * `key` - The key to use for the token provider.
-    /// * `provider_type` - The type of token provider to create.
     /// * `factory` - The factory function to use to create the token provider.
     ///
     /// # Returns
@@ -47,7 +46,6 @@ impl TokenProviderRegistry {
     pub async fn get_or_create_provider<P, E, F, Fut>(
         &self,
         key: String,
-        provider_type: &str,
         factory: F,
     ) -> Result<Arc<dyn TokenProvider>, E>
     where
@@ -55,41 +53,27 @@ impl TokenProviderRegistry {
         Fut: std::future::Future<Output = Result<P, E>> + Send,
         F: FnOnce() -> Fut + Send,
     {
-        let registry_key = format!("{provider_type}:{key}");
-
         {
             let registry = self.token_provider_registry.read().await;
-            if let Some(provider) = registry.get(&registry_key) {
-                tracing::debug!(
-                    "Using existing {} token provider for key: {}",
-                    provider_type,
-                    key
-                );
+            if let Some(provider) = registry.get(&key) {
+                tracing::debug!("Using existing token provider for key: {key}",);
                 return Ok(Arc::clone(provider));
             }
         }
 
         let mut registry = self.token_provider_registry.write().await;
 
-        if let Some(provider) = registry.get(&registry_key) {
-            tracing::debug!(
-                "Using existing {} token provider for key: {}",
-                provider_type,
-                key
-            );
+        if let Some(provider) = registry.get(&key) {
+            tracing::debug!("Using existing token provider for key: {key}",);
             return Ok(Arc::clone(provider));
         }
 
-        tracing::debug!(
-            "Creating new {} token provider for key: {}",
-            provider_type,
-            key
-        );
+        tracing::debug!("Creating new token provider for key: {key}",);
 
         let provider = factory().await?;
         let provider_arc = Arc::new(provider) as Arc<dyn TokenProvider>;
 
-        registry.insert(registry_key, Arc::clone(&provider_arc));
+        registry.insert(key, Arc::clone(&provider_arc));
 
         Ok(provider_arc)
     }
