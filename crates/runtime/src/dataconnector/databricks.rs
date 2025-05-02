@@ -181,7 +181,7 @@ impl Databricks {
             }
             _ => {
                 InvalidConfigurationSnafu {
-                    message: format!("Invalid authentication configuration: {params:?}"),
+                    message: format!("Invalid authentication configuration. Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`"),
                 }
                 .fail()
             }
