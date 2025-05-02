@@ -20,7 +20,7 @@ description: "Query: tpch_simple_q2"
 |               |         BytesProcessedExec                                                                                                          |
 |               |           SchemaCastScanExec                                                                                                        |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                   |
-|               |               MemoryExec: partitions=1, partition_sizes=[1501]                                                                      |
+|               |               DataSourceExec: partitions=1, partition_sizes=[1501]                                                                  |
 |               |     CoalesceBatchesExec: target_batch_size=8192                                                                                     |
 |               |       RepartitionExec: partitioning=Hash([max(lineitem.l_linenumber)@0], 24), input_partitions=1                                    |
 |               |         AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                                                        |
@@ -29,6 +29,6 @@ description: "Query: tpch_simple_q2"
 |               |               BytesProcessedExec                                                                                                    |
 |               |                 SchemaCastScanExec                                                                                                  |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                             |
-|               |                     MemoryExec: partitions=1, partition_sizes=[1501]                                                                |
+|               |                     DataSourceExec: partitions=1, partition_sizes=[1501]                                                            |
 |               |                                                                                                                                     |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------+
