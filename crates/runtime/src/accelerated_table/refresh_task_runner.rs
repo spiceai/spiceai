@@ -52,14 +52,18 @@ impl RefreshTaskRunner {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        disable_federation: bool,
     ) -> Self {
-        let refresh_task = Arc::new(RefreshTask::new(
-            runtime_status,
-            dataset_name.clone(),
-            federated,
-            federated_source,
-            accelerator,
-        ));
+        let refresh_task = Arc::new(
+            RefreshTask::new(
+                runtime_status,
+                dataset_name.clone(),
+                federated,
+                federated_source,
+                accelerator,
+            )
+            .with_disable_federation(disable_federation),
+        );
 
         Self {
             dataset_name,
