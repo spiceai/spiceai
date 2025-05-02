@@ -106,7 +106,7 @@ impl DatabricksM2MTokenProvider {
                         expires_in,
                         ..
                     }) => {
-                        tracing::info!("M2M token refreshed; expires in {}", expires_in);
+                        tracing::debug!("M2M token refreshed; expires in {}", expires_in);
                         let _ = cloned_tx.send(access_token.clone());
                         next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
                     }
