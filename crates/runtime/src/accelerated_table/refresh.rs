@@ -426,7 +426,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
 
     initial_load_completed: Arc<AtomicBool>,
-    disable_refresh_federation: bool,
+    disable_federation: bool,
 }
 
 impl Refresher {
@@ -451,7 +451,7 @@ impl Refresher {
             refresh_on_startup: RefreshOnStartup::default(),
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
-            disable_refresh_federation: false,
+            disable_federation: false,
         }
     }
 
@@ -483,8 +483,8 @@ impl Refresher {
     }
 
     /// Disable refresh queries federation for this refresher
-    pub fn disable_refresh_federation(&mut self, disable: bool) -> &mut Self {
-        self.disable_refresh_federation = disable;
+    pub fn disable_federation(&mut self, disable: bool) -> &mut Self {
+        self.disable_federation = disable;
         self
     }
 
@@ -568,7 +568,7 @@ impl Refresher {
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
-            self.disable_refresh_federation,
+            self.disable_federation,
         );
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
@@ -711,7 +711,7 @@ impl Refresher {
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
             )
-            .with_disable_refresh_federation(self.disable_refresh_federation),
+            .with_disable_federation(self.disable_federation),
         );
 
         let refresh_defaults = Arc::clone(&self.refresh);
@@ -747,7 +747,7 @@ impl Refresher {
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
             )
-            .with_disable_refresh_federation(self.disable_refresh_federation),
+            .with_disable_federation(self.disable_federation),
         );
 
         let cache_provider = self.cache_provider.clone();

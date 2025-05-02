@@ -238,8 +238,7 @@ pub struct Builder {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
-    disable_query_push_down: bool,
-    disable_refresh_federation: bool,
+    disable_federation: bool,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
@@ -270,9 +269,8 @@ impl Builder {
             append_stream: None,
             checkpointer: None,
             synchronize_with: None,
-            disable_query_push_down: false,
+            disable_federation: false,
             initial_load_complete: false,
-            disable_refresh_federation: false,
         }
     }
 
@@ -304,13 +302,8 @@ impl Builder {
         self
     }
 
-    pub fn disable_query_push_down(&mut self) -> &mut Self {
-        self.disable_query_push_down = true;
-        self
-    }
-
-    pub fn disable_refresh_federation(&mut self) -> &mut Self {
-        self.disable_refresh_federation = true;
+    pub fn disable_federation(&mut self) -> &mut Self {
+        self.disable_federation = true;
         self
     }
 
@@ -449,7 +442,7 @@ impl Builder {
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
-        refresher.disable_refresh_federation(self.disable_refresh_federation);
+        refresher.disable_federation(self.disable_federation);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
@@ -491,7 +484,7 @@ impl Builder {
                 ready_state: self.ready_state,
                 refresh_params,
                 refresher,
-                disable_query_push_down: self.disable_query_push_down,
+                disable_query_push_down: self.disable_federation,
                 synchronized_with: self.synchronize_with,
             },
             is_ready,

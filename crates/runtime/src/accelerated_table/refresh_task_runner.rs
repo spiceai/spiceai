@@ -52,7 +52,7 @@ impl RefreshTaskRunner {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
-        disable_refresh_federation: bool,
+        disable_federation: bool,
     ) -> Self {
         let refresh_task = Arc::new(
             RefreshTask::new(
@@ -62,7 +62,7 @@ impl RefreshTaskRunner {
                 federated_source,
                 accelerator,
             )
-            .with_disable_refresh_federation(disable_refresh_federation),
+            .with_disable_federation(disable_federation),
         );
 
         Self {

@@ -280,9 +280,7 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
-    pub disable_query_push_down: bool,
-
-    pub disable_refresh_federation: bool,
+    pub disable_federation: bool,
 }
 
 impl Acceleration {
@@ -296,7 +294,6 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
-    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -361,17 +358,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let mut params = acceleration.params.clone();
 
-        let disable_query_push_down = match params
+        let disable_federation = match params
             .as_mut()
-            .and_then(|x| x.data.remove("disable_query_push_down"))
-        {
-            Some(spicepod::param::ParamValue::Bool(value)) => value,
-            _ => false,
-        };
-
-        let disable_refresh_federation = match params
-            .as_mut()
-            .and_then(|x| x.data.remove("disable_refresh_federation"))
+            .and_then(|x| x.data.remove("disable_federation"))
         {
             Some(spicepod::param::ParamValue::Bool(value)) => value,
             _ => false,
@@ -409,8 +398,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             retention_period: acceleration.retention_period,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
-            disable_query_push_down,
-            disable_refresh_federation,
+            disable_federation,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
             indexes,
             primary_key,
@@ -442,8 +430,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            disable_query_push_down: false,
-            disable_refresh_federation: false,
+            disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
         }
     }

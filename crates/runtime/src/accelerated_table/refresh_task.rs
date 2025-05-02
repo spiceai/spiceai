@@ -89,7 +89,7 @@ pub struct RefreshTask {
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
-    disable_refresh_federation: bool,
+    disable_federation: bool,
 }
 
 impl RefreshTask {
@@ -108,12 +108,13 @@ impl RefreshTask {
             federated_source,
             accelerator: Arc::clone(&accelerator),
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
-            disable_refresh_federation: false,
+            disable_federation: false,
         }
     }
-    /// Sets the `disable_refresh_federation` flag
-    pub fn with_disable_refresh_federation(mut self, disable: bool) -> RefreshTask {
-        self.disable_refresh_federation = disable;
+    /// Sets the `disable_federation` flag
+    #[must_use]
+    pub fn with_disable_federation(mut self, disable: bool) -> RefreshTask {
+        self.disable_federation = disable;
         self
     }
 
@@ -515,7 +516,7 @@ impl RefreshTask {
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx = if self.disable_refresh_federation {
+        let ctx = if self.disable_federation {
             SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env())
         } else {
             let mut state = SessionStateBuilder::new()
