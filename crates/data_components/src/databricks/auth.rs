@@ -40,9 +40,7 @@ pub struct DatabricksM2MTokenProvider {
     endpoint: String,
     client_id: String,
 
-    #[allow(dead_code)]
     tx: watch::Sender<String>,
-    #[allow(dead_code)]
     rx: watch::Receiver<String>,
 
     _handle: Arc<JoinHandle<()>>,
