@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use data_components::Read;
 use data_components::databricks::auth::{AuthCredentials, DatabricksM2MTokenProvider};
 use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
-use data_components::token_provider::TokenProvider;
+use data_components::token_provider::{StaticTokenProvider, TokenProvider};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -99,24 +99,38 @@ impl Databricks {
             .expose()
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
+        let auth_credentials = Self::build_auth_credentials(&params)?;
+
         match mode {
             "delta_lake" => {
-                let token = params
-                    .get("token")
-                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+                let storage_options = params.to_secret_map();
+                let token_provider = match auth_credentials {
+                    AuthCredentials::Token(token) => {
+                        let token = token.expose_secret();
+                        Arc::new(StaticTokenProvider::new(token.into()))
+                    }
+                    AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                        Self::get_m2m_token_provider(
+                            endpoint,
+                            client_id,
+                            client_secret,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
+                };
 
-                let databricks_delta = DatabricksDelta::new(
+                let read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
-                    token.clone(),
-                    params.to_secret_map(),
+                    storage_options,
+                    token_provider,
                 );
+
                 Ok(Self {
-                    read_provider: Arc::new(databricks_delta.clone()),
+                    read_provider: Arc::new(read_provider),
                 })
             }
             "spark_connect" => {
-                let auth_credentials = Self::build_auth_credentials(&params)?;
-
                 let cluster_id = params
                     .get("cluster_id")
                     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;

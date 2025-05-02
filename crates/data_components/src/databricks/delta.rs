@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::Read;
+use crate::token_provider::TokenProvider;
 use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use arrow::datatypes::SchemaRef;
@@ -28,7 +29,7 @@ use std::{collections::HashMap, sync::Arc};
 #[derive(Clone)]
 pub struct DatabricksDelta {
     endpoint: Endpoint,
-    token: SecretString,
+    token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
 }
 
@@ -45,15 +46,14 @@ pub enum Error {
 }
 
 impl DatabricksDelta {
-    #[must_use]
     pub fn new(
         endpoint: Endpoint,
-        token: SecretString,
         storage_options: HashMap<String, SecretString>,
+        token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
         Self {
             endpoint,
-            token,
+            token_provider,
             storage_options,
         }
     }
@@ -89,7 +89,10 @@ impl DatabricksDelta {
         &self,
         table_reference: TableReference,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let uc_client = UnityCatalog::new(self.endpoint.clone(), Some(self.token.clone()));
+        let token = self.token_provider.get_token().await?;
+
+        let uc_client =
+            UnityCatalog::new(self.endpoint.clone(), Some(SecretString::new(token.into())));
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
