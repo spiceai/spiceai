@@ -48,7 +48,7 @@ pub struct DatabricksM2MTokenProvider {
 
 impl fmt::Debug for DatabricksM2MTokenProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("M2mTokenProvider")
+        f.debug_struct("DatabricksM2MTokenProvider")
             .field("endpoint", &self.endpoint)
             .field("client_id", &self.client_id)
             .field("tx", &"<watch::Sender>")
