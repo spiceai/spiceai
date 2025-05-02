@@ -83,6 +83,12 @@ impl Backoff for FibonacciBackoff {
     }
 }
 
+impl FibonacciBackoff {
+    pub fn next_duration(&mut self) -> Option<Duration> {
+        self.next_backoff()
+    }
+}
+
 fn get_random_value_from_interval(
     randomization_factor: f64,
     random: f64,

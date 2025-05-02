@@ -33,10 +33,10 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
             "spark_remote".to_string(),
             format!(
                 "sc://{}:443/;use_ssl=true;user_id=spice.ai;session_id={};token={};x-databricks-cluster-id={}",
-                std::env::var("DATABRICKS_HOST").unwrap_or_default(),
+                std::env::var("TEST_DATABRICKS_HOST").unwrap_or_default(),
                 uuid::Uuid::new_v4(),
-                std::env::var("DATABRICKS_TOKEN").unwrap_or_default(),
-                std::env::var("DATABRICKS_CLUSTER_ID").unwrap_or_default(),
+                std::env::var("TEST_DATABRICKS_TOKEN").unwrap_or_default(),
+                std::env::var("TEST_DATABRICKS_CLUSTER_ID").unwrap_or_default(),
             ),
         )]
             .into_iter()

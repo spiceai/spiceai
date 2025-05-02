@@ -70,6 +70,10 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
 
+    // Databricks M2M Service Principal credentials
+    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+
     // S3 storage options
     ParameterSpec::component("aws_region")
         .description("The AWS region to use for S3 storage.")
@@ -180,7 +184,7 @@ impl CatalogConnector for Databricks {
             )
         } else {
             let dataset_databricks =
-                match DatabricksDataConnector::new(params)
+                match DatabricksDataConnector::new(params, runtime.token_provider_registry())
                     .await
                     .map_err(|source| super::Error::UnableToGetCatalogProvider {
                         connector: "databricks".to_string(),

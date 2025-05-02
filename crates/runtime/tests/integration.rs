@@ -36,6 +36,8 @@ mod databricks_delta_catalog;
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark_m2m;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
