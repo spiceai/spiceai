@@ -203,7 +203,7 @@ impl Query {
                     e,
                     SchemaMismatch
                 )
-            };
+            }
 
             let final_stream = if cache_manager.should_cache_results() {
                 if let Some(raw_cache_key) = cache_manager.raw_cache_key {

@@ -114,3 +114,19 @@ pub static MEDIAN_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("mb")
         .build()
 });
+
+pub static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("status")
+        .with_description("Test execution status.")
+        .with_unit("status")
+        .build()
+});
+
+pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("score")
+        .with_description("Test score.")
+        .with_unit("score")
+        .build()
+});

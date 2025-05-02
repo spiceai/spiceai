@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use snafu::prelude::*;
+use tokio::sync::watch;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -33,6 +34,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait TokenProvider: Send + Sync + Debug {
     async fn get_token(&self) -> Result<String>;
+
+    /// Returns a `watch::Receiver` of new tokens, if the provider supports refresh.
+    ///
+    /// The default implementation gives no updates.
+    fn subscribe(&self) -> Option<watch::Receiver<String>> {
+        None
+    }
 }
 
 pub struct StaticTokenProvider {

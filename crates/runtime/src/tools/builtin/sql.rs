@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    Runtime,
+    datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
@@ -36,25 +36,18 @@ pub struct SqlToolParams {
 }
 pub struct SqlTool {
     name: String,
-    description: Option<String>,
+    description: String,
+    df: Arc<DataFusion>,
 }
 
 impl SqlTool {
     #[must_use]
-    pub fn new(name: &str, description: Option<String>) -> Self {
+    pub fn new(df: Arc<DataFusion>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            df,
+            name: name.unwrap_or("sql").to_string(),
+            description: description.unwrap_or("Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix.").to_string(),
         }
-    }
-}
-
-impl Default for SqlTool {
-    fn default() -> Self {
-        Self::new(
-            "sql",
-            Some(r#"Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: "catalog"."schema"."table". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix."#.to_string()),
-        )
     }
 }
 
@@ -65,24 +58,20 @@ impl SpiceModelTool for SqlTool {
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(&self.description))
     }
 
     fn parameters(&self) -> Option<Value> {
         parameters::<SqlToolParams>()
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
-            let query_result = rt
-                .datafusion()
+            let query_result = self
+                .df
                 .query_builder(&req.query)
                 .build()
                 .run()

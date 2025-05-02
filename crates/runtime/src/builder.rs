@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     Runtime, catalogconnector,
@@ -28,10 +28,11 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
+    registry::token_provider::TokenProviderRegistry,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers,
+    tracers,
 };
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
@@ -48,6 +49,7 @@ pub struct RuntimeBuilder {
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 }
 
 impl RuntimeBuilder {
@@ -64,6 +66,7 @@ impl RuntimeBuilder {
             rate_limits: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
+            token_provider_registry: Arc::new(TokenProviderRegistry::new()),
         }
     }
 
@@ -139,7 +142,6 @@ impl RuntimeBuilder {
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
-        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
         let memory_limit = self
@@ -196,6 +198,7 @@ impl RuntimeBuilder {
             evals: Arc::new(RwLock::new(evals)),
             eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -208,6 +211,7 @@ impl RuntimeBuilder {
             status: self.runtime_status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
+            token_provider_registry: self.token_provider_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -218,7 +222,7 @@ impl RuntimeBuilder {
                 eprintln!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.insert(extension_name.into(), extension.into());
-            };
+            }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
@@ -232,7 +236,7 @@ impl RuntimeBuilder {
         if let Some(app) = app {
             if let Err(e) = secrets.load_from(&app.secrets).await {
                 eprintln!("Error loading secret stores: {e}");
-            };
+            }
         }
 
         secrets

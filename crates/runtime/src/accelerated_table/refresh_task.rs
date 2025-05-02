@@ -342,7 +342,7 @@ impl RefreshTask {
                     converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
                 );
             }
-        };
+        }
 
         self.get_data_update(filters, &refresh).await
     }
@@ -367,7 +367,7 @@ impl RefreshTask {
                 .await;
 
             return Ok(());
-        };
+        }
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
             .map_err(find_datafusion_root)
@@ -516,7 +516,7 @@ impl RefreshTask {
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
-        };
+        }
 
         if let Err(e) = ctx.register_table(self.dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
@@ -689,7 +689,7 @@ impl RefreshTask {
                 )
                 | None => unreachable!("refresh.validate_time_format should've returned error"),
             }
-        };
+        }
 
         let refresh_append_value = refresh
             .append_overlap
@@ -748,7 +748,7 @@ impl RefreshTask {
                 let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
                 if let Some(sql) = sql {
                     labels.push(KeyValue::new("sql", sql.to_string()));
-                };
+                }
 
                 metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
             }

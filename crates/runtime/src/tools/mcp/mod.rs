@@ -21,12 +21,9 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
-use async_trait::async_trait;
 use mcp_client::{Error as McpError, transport::Error as TransportError};
-use mcp_core::protocol::CallToolResult;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
@@ -113,14 +110,4 @@ impl MCPConfig {
             MCPType::Https(url) => Self::Https { url },
         }
     }
-}
-
-/// [`McpProxy`] is the minimal interface from [`mcp_client::McpClientTrait`] for tools that are fundamentally proxies around MCP tools.
-///
-/// This trait lets Spice pass through all details from the underlying MCP server in its (i.e. Spiced's) MCP server implementation.
-///
-#[async_trait]
-pub trait McpProxy: Send + Sync {
-    /// Unlike [`mcp_client::McpClientTrait`], the implementation should track the appropriate underlying tool name.
-    async fn call_tool(&self, arguments: Value) -> Result<CallToolResult, mcp_client::Error>;
 }

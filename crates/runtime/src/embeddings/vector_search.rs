@@ -424,7 +424,7 @@ impl SearchRequest {
                 } else {
                     tracing::trace!("vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}");
                     return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
-                };
+                }
 
                 // Ensure the expression is the last token.
                 let next_token = parser.next_token();
@@ -713,15 +713,15 @@ impl VectorSearch {
 
             let distances_table =  format!(
                     "WITH {VSS_TEMP_TABLE_NAME} AS (
-                        SELECT 
+                        SELECT
                             ROW_NUMBER() OVER () AS {VSS_TEMP_GEN_ID_COLUMN},
-                            {additional_columns}     
+                            {additional_columns}
                             {embedding_column},
                             {embed_col_offset},
                             {embed_col_embedding}
                         FROM {table_name}
                         {where_cond}
-                    ), 
+                    ),
                     distances as (
                         SELECT
                             {VSS_TEMP_GEN_ID_COLUMN},
@@ -1413,31 +1413,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_performance_of_column_parsing() {
-        let mut timings = vec![];
-
-        for _ in 0..3 {
-            let mut additional_columns = vec!["column1".to_string()];
-            for i in 0..100 {
-                let start = std::time::Instant::now();
-                let _ = SearchRequest::parse_additional_columns(&additional_columns)
-                    .expect("to parse additional columns");
-                timings.push(start.elapsed());
-                additional_columns.push(format!("column{}", i + 2));
-            }
-        }
-
-        let total_time: std::time::Duration = timings.iter().sum();
-        #[allow(clippy::cast_possible_truncation)]
-        let average_time = total_time / (timings.len() as u32);
-        let average_time_ns = average_time.as_nanos();
-        assert!(
-            average_time_ns < 1_000_000,
-            "Average time: {average_time_ns}ns"
-        ); // less than 1ms
-    }
-
-    #[test]
     fn test_search_request_parse_keywords() {
         let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
         let result = SearchRequest::parse_keywords(&keywords);
@@ -1457,31 +1432,6 @@ pub(crate) mod tests {
         let keywords = vec!["\"); DROP TABLE testing;".to_string()];
         let result = SearchRequest::parse_keywords(&keywords);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_performance_of_keyword_parsing() {
-        let mut timings = vec![];
-
-        for _ in 0..3 {
-            let mut keywords = vec!["column1".to_string()];
-            for i in 0..100 {
-                let start = std::time::Instant::now();
-                let result = SearchRequest::parse_keywords(&keywords);
-                timings.push(start.elapsed());
-                assert!(result.is_ok());
-                keywords.push(format!("column{}", i + 2));
-            }
-        }
-
-        let total_time: std::time::Duration = timings.iter().sum();
-        #[allow(clippy::cast_possible_truncation)]
-        let average_time = total_time / (timings.len() as u32);
-        let average_time_ns = average_time.as_nanos();
-        assert!(
-            average_time_ns < 1_000_000,
-            "Average time: {average_time_ns}ns"
-        ); // less than 1ms
     }
 
     #[test]

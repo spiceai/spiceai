@@ -174,7 +174,6 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
-
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

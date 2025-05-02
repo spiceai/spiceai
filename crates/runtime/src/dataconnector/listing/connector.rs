@@ -227,7 +227,7 @@ pub trait ListingTableConnector: DataConnector {
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_file_compression_type(compression);
-        };
+        }
 
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
@@ -239,7 +239,7 @@ pub trait ListingTableConnector: DataConnector {
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
-        };
+        }
 
         Ok(Arc::new(format))
     }
@@ -475,9 +475,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
-        // Add the `last_modified` metadata column if it is defined as a `time_column` or
-        // `time_partition_column` and it doesn't already exist in the schema.
-        options = add_last_modified_metadata_column_if_required(options, &expanded_schema, dataset);
+        options = add_metadata_columns_if_required(options, &expanded_schema, dataset);
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
@@ -573,28 +571,18 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
-fn add_last_modified_metadata_column_if_required(
+fn add_metadata_columns_if_required(
     mut options: ListingOptions,
     schema: &Schema,
     dataset: &Dataset,
 ) -> ListingOptions {
-    const LAST_MODIFIED_COLUMN: &str = "last_modified";
-    let needs_last_modified = dataset
-        .time_column
-        .as_ref()
-        .is_some_and(|col| col == LAST_MODIFIED_COLUMN)
-        || dataset
-            .time_partition_column
-            .as_ref()
-            .is_some_and(|col| col == LAST_MODIFIED_COLUMN);
-
-    if needs_last_modified
-        && !schema
-            .fields
-            .iter()
-            .any(|field| field.name() == LAST_MODIFIED_COLUMN)
-    {
-        options = options.with_metadata_cols(vec![MetadataColumn::LastModified]);
+    if let Some(columns) = dataset.listing_table_metadata_columns(schema) {
+        tracing::debug!(
+            "Enabling metadata columns for '{}': {:?}",
+            dataset.name,
+            columns
+        );
+        options = options.with_metadata_cols(columns);
     }
 
     options
@@ -742,7 +730,7 @@ async fn verify_schema_source_path(
             if format!(".{ext}") == extension {
                 return Ok(());
             }
-        };
+        }
 
         scanned_files += 1;
         if scanned_files > SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT {
@@ -752,7 +740,7 @@ async fn verify_schema_source_path(
                 "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
             );
             return Ok(());
-        };
+        }
     }
 
     Err(DataConnectorError::InvalidConfigurationNoSource {
@@ -792,7 +780,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
     use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;

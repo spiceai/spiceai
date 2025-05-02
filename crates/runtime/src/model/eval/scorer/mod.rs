@@ -19,6 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use snafu::Snafu;
 use tokio::sync::RwLock;
+use tracing_futures::Instrument;
 
 use super::{DatasetInput, DatasetOutput};
 
@@ -84,19 +85,31 @@ pub(crate) async fn score_results(
     let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
     for ((input, actual), expected) in input.iter().zip(actual.iter()).zip(expected.iter()) {
         for (name, scorer) in scorers {
-            let s =
-                scorer
-                    .score(input, actual, expected)
-                    .await
-                    .map_err(|e| Error::ScorerFailed {
+            let span = tracing::span!(
+                target: "task_history",
+                tracing::Level::INFO,
+                "run_scorer", // This is immediately overriden by `task_override`.
+                input = %serde_json::to_string(&input).unwrap_or_default(),
+            );
+            span.in_scope(
+                || tracing::info!(target: "task_history", task_override = %format!("run_scorer::{name}"), "labels"),
+            );
+            let s = scorer
+                .score(input, actual, expected)
+                .instrument(span.clone())
+                .await
+                .map_err(|e| {
+                    tracing::error!(target: "task_history", parent: &span, "{e}");
+                    Error::ScorerFailed {
                         name: name.clone(),
                         source: Box::new(e),
-                    })?;
+                    }
+                })?;
             if let Some(scorer_results) = aggregate.get_mut(name) {
                 scorer_results.push(s);
             } else {
                 aggregate.insert((*name).to_string(), vec![s]);
-            };
+            }
         }
     }
     Ok(aggregate)

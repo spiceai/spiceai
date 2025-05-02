@@ -46,6 +46,8 @@ pub enum QuerySetArg {
     Tpch,
     Tpcds,
     Clickbench,
+    #[value(name = "tpch[parameterized]")]
+    ParameterizedTpch,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -84,6 +86,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
+            QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
         }
     }
 }

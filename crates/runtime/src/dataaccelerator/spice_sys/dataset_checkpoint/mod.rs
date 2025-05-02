@@ -93,7 +93,7 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
             _ => return Err("No acceleration connection available".into()),
-        };
+        }
 
         // Then add the schema column if it doesn't exist
         match connection {
@@ -105,7 +105,7 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
             #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
             _ => return Err("No acceleration connection available".into()),
-        };
+        }
 
         Ok(())
     }

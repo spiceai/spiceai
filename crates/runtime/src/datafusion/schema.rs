@@ -102,7 +102,7 @@ pub(crate) fn ensure_schema_exists(
     // If the schema exists, nothing to do.
     if catalog_provider.schema(schema_name).is_some() {
         return Ok(());
-    };
+    }
 
     // Create the schema
     let schema_provider = Arc::new(SpiceSchemaProvider::new());

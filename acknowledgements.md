@@ -35,7 +35,7 @@ github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.6/LICENSE, BSD-
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.24.0:LICENSE, BSD-3-Clause
-golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.31.0:LICENSE, BSD-3-Clause
+golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.32.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
 gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
@@ -48,31 +48,31 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - anyhow 1.0.95, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
-- arrow 53.4.1, Apache-2.0 
+- arrow 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-buffer 53.4.1, Apache-2.0 
+- arrow-buffer 54.3.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-cast 53.4.1, Apache-2.0 
+- arrow-cast 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-csv 53.4.0, Apache-2.0 
+- arrow-csv 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-flight 53.4.0, Apache-2.0 
+- arrow-flight 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-ipc 53.4.0, Apache-2.0 
+- arrow-ipc 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-json 53.4.1, Apache-2.0 
+- arrow-json 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-odbc 11.2.0, MIT 
+- arrow-odbc 16.0.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
-- arrow-schema 53.4.0, Apache-2.0 
+- arrow-schema 54.3.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - async-graphql 7.0.15, Apache-2.0 OR MIT 
@@ -90,7 +90,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.86, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.5.16, Apache-2.0 
+- aws-config 1.6.0, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-sdk-dynamodb 1.67.0, Apache-2.0 
@@ -162,7 +162,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.10.1, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.31, Apache-2.0 OR MIT 
+- clap 4.5.36, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -170,6 +170,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - csv 1.3.1, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
+
+- ctrlc 3.4.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/Detegr/rust-ctrlc.git
 
 - cudarc 0.12.2, Apache-2.0 OR MIT 
   <br/>https://github.com/coreylowman/cudarc
@@ -180,7 +183,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 43.0.0, Apache-2.0 
+- datafusion 45.0.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.1.6, Apache-2.0 
@@ -189,13 +192,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-federation-sql 0.1.6, Apache-2.0 
   <br/>
 
-- datafusion-functions-json 0.43.0, Apache-2.0 
+- datafusion-functions-json 0.45.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
 - datafusion-table-providers 0.1.0,  
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
-- delta_kernel 0.6.0, Apache-2.0 
+- delta_kernel 0.9.0, Apache-2.0 
   <br/>https://github.com/delta-io/delta-kernel-rs
 
 - dirs 5.0.1, Apache-2.0 OR MIT 
@@ -228,6 +231,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - futures 0.3.31, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
+- futures-util 0.3.31, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/futures-rs
+
 - globset 0.4.16, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
@@ -246,6 +252,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hf-hub 0.3.2, Apache-2.0 
   <br/>https://github.com/huggingface/hf-hub
 
+- hf-hub 0.4.2, Apache-2.0 
+  <br/>https://github.com/huggingface/hf-hub
+
 - hostname 0.3.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
@@ -255,7 +264,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - http 0.2.12, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
-- http 1.2.0, Apache-2.0 OR MIT 
+- http 1.3.1, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
 - http-body-util 0.1.2, MIT 
@@ -288,7 +297,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.7.1, Apache-2.0 OR MIT 
+- indexmap 2.9.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
 - indicatif 0.17.11, MIT 
@@ -321,7 +330,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - keyring 3.6.2, Apache-2.0 OR MIT 
   <br/>https://github.com/hwchen/keyring-rs.git
 
-- log 0.4.26, Apache-2.0 OR MIT 
+- log 0.4.27, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/log
 
 - logos 0.15.0, Apache-2.0 OR MIT 
@@ -342,16 +351,19 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - mediatype 0.19.18, MIT 
   <br/>https://github.com/picoHz/mediatype
 
-- mistralrs 0.4.0, MIT 
+- mimalloc 0.1.46, MIT 
+  <br/>https://github.com/purpleprotocol/mimalloc_rust
+
+- mistralrs 0.5.0, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- mistralrs-core 0.4.0, MIT 
+- mistralrs-core 0.5.0, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
 - moka 0.12.10, Apache-2.0 OR MIT 
   <br/>https://github.com/moka-rs/moka
 
-- mysql_async 0.34.2, Apache-2.0 OR MIT 
+- mysql_async 0.35.1, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
 
 - ndarray 0.15.6, Apache-2.0 OR MIT 
@@ -366,23 +378,23 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 8.0.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
-- object_store 0.11.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/apache/arrow-rs/tree/master/object_store
+- object_store 0.11.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/apache/arrow-rs/tree/main/object_store
 
 - octocrab 0.43.0, Apache-2.0 OR MIT 
   <br/>https://github.com/XAMPPRocky/octocrab.git
 
-- odbc-api 8.1.2, MIT 
+- odbc-api 12.0.1, MIT 
   <br/>https://github.com/pacman82/odbc-api
 
-- once_cell 1.20.3, Apache-2.0 OR MIT 
+- once_cell 1.21.3, Apache-2.0 OR MIT 
   <br/>https://github.com/matklad/once_cell
 
 - opentelemetry 0.27.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry 0.28.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry 0.29.1, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
 
 - opentelemetry-http 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
@@ -390,7 +402,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - opentelemetry-prometheus 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry-proto 0.28.0, Apache-2.0 
+- opentelemetry-proto 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
 - opentelemetry-zipkin 0.27.0, Apache-2.0 
@@ -399,10 +411,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - opentelemetry_sdk 0.27.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry_sdk 0.28.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry_sdk 0.29.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk
 
-- parquet 53.4.0, Apache-2.0 
+- parquet 54.2.1, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - paste 1.0.15, Apache-2.0 OR MIT 
@@ -423,6 +435,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - pkcs8 0.10.2, Apache-2.0 OR MIT 
   <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
 
+- postcard 1.1.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/jamesmunns/postcard
+
 - prometheus 0.13.4, Apache-2.0 
   <br/>https://github.com/tikv/rust-prometheus
 
@@ -439,6 +454,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/tokio-rs/prost
 
 - pulldown-cmark 0.12.2, MIT 
+  <br/>https://github.com/raphlinus/pulldown-cmark
+
+- pulldown-cmark 0.13.0, MIT 
   <br/>https://github.com/raphlinus/pulldown-cmark
 
 - rand 0.7.3, Apache-2.0 OR MIT 
@@ -465,6 +483,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - reqwest-eventsource 0.6.0, Apache-2.0 OR MIT 
   <br/>https://github.com/jpopesculian/reqwest-eventsource
 
+- rstest 0.25.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/la10736/rstest
+
 - rusqlite 0.31.0, MIT 
   <br/>https://github.com/rusqlite/rusqlite
 
@@ -489,7 +510,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustyline 15.0.0, MIT 
   <br/>https://github.com/kkawakam/rustyline
 
-- schemars 0.8.21, MIT 
+- schemars 0.8.22, MIT 
   <br/>https://github.com/GREsau/schemars
 
 - scopeguard 1.2.0, Apache-2.0 OR MIT 
@@ -498,7 +519,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.10.3, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.217, Apache-2.0 OR MIT 
+- serde 1.0.219, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
@@ -569,6 +590,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tiktoken-rs 0.6.0, MIT 
   <br/>https://github.com/zurawiki/tiktoken-rs
+
+- tikv-jemallocator 0.6.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/tikv/jemallocator
 
 - tokenizers 0.21.0, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
@@ -657,6 +681,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - zip 1.1.4, MIT 
   <br/>https://github.com/zip-rs/zip2.git
 
-- zip 2.2.3, MIT 
+- zip 2.3.0, MIT 
   <br/>https://github.com/zip-rs/zip2.git
 

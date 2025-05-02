@@ -386,7 +386,7 @@ async fn test_connectivity(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::component::dataset::DatasetBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::{builder::RuntimeBuilder, status::RuntimeStatus};
     use arrow::datatypes::{DataType, Field, Schema};

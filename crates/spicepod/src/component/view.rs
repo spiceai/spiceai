@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Nameable, WithDependsOn};
+use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
 use crate::{acceleration::Acceleration, semantic::Column};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +49,9 @@ pub struct View {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<Acceleration>,
 
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: ReadyState,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
@@ -71,6 +74,7 @@ impl View {
             sql: None,
             sql_ref: None,
             acceleration: None,
+            ready_state: ReadyState::default(),
             depends_on: Vec::default(),
         }
     }
@@ -86,6 +90,7 @@ impl WithDependsOn<View> for View {
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             acceleration: self.acceleration.clone(),
+            ready_state: self.ready_state,
             depends_on: depends_on.to_vec(),
         }
     }

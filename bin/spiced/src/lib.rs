@@ -378,7 +378,7 @@ fn apply_overrides(
                 }
                 .fail();
             }
-        };
+        }
     }
 
     match serde_yaml::from_value(yaml) {

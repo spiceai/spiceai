@@ -115,7 +115,7 @@ where
                     None => {
                         process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
                     }
-                };
+                }
             },
             () = shutdown_signal.cancelled() => {
                 tracing::debug!("Received shutdown signal");

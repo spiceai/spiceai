@@ -1,0 +1,110 @@
+version: v1
+kind: Spicepod
+name: mysql-duckdb[file]-indexes
+
+# Define common anchors
+definitions:
+  # Common mysql parameters
+  - &mysql_params
+    mysql_host: ${env:MYSQL_HOST}
+    mysql_tcp_port: ${env:MYSQL_TCP_PORT}
+    mysql_db: ${env:MYSQL_DB_SF100}
+    mysql_user: ${env:MYSQL_USER}
+    mysql_pass: ${env:MYSQL_PASSWORD}
+    mysql_sslmode: disabled
+  - &acceleration
+    enabled: true
+    engine: duckdb
+    mode: file
+
+datasets:
+  - from: mysql:customer
+    name: customer
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: c_custkey
+      indexes:
+        c_phone: enabled
+        c_acctbal: enabled
+
+  - from: mysql:lineitem
+    name: lineitem
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: (l_orderkey, l_linenumber)
+      indexes:
+        l_suppkey: enabled
+        l_shipdate: enabled
+        l_partkey: enabled
+
+  - from: mysql:nation
+    name: nation
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: n_nationkey
+      indexes:
+        (n_nationkey, n_regionkey): enabled
+
+  - from: mysql:orders
+    name: orders
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: o_orderkey
+      indexes:
+        o_orderdate: enabled
+        o_custkey: enabled
+        (o_orderdate, o_custkey): enabled
+
+  - from: mysql:part
+    name: part
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: p_partkey
+      indexes:
+        p_brand: enabled
+        p_container: enabled
+        (p_brand, p_container): enabled
+
+  - from: mysql:partsupp
+    name: partsupp
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: (ps_partkey, ps_suppkey)
+
+  - from: mysql:region
+    name: region
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: r_regionkey
+
+  - from: mysql:supplier
+    name: supplier
+    params: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      primary_key: s_suppkey
+      indexes:
+        s_nationkey: enabled

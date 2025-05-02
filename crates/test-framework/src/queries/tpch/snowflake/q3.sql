@@ -19,4 +19,5 @@ group by
     "O_SHIPPRIORITY"
 order by
     "REVENUE" desc,
-    "O_ORDERDATE";
+    "O_ORDERDATE"
+limit 10;

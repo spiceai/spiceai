@@ -161,10 +161,12 @@ jobs:
         env:
           SPICEAI_FINANCEBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_FINANCEBENCH_API_KEY}}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
             -p ${{ matrix.target.spicepod }} \
             --model ${{ matrix.target.name }} \
-            --ready-wait 180
+            --ready-wait 180 \
+            --metrics
   

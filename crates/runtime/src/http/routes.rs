@@ -192,7 +192,10 @@ pub(crate) fn routes(
             .route("/v1/tools/*name", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
             .route("/v1/tool/:name", post(v1::tools::post))
-            .route("/v1/evals/:name", post(v1::eval::post))
+            .route(
+                "/v1/evals/:name",
+                post(v1::eval::post).layer(ModelContextLayer),
+            )
             .route("/v1/evals", get(v1::eval::list))
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.llms)))

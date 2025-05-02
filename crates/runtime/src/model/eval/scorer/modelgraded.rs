@@ -36,19 +36,25 @@ use super::{DatasetInput, DatasetOutput, Error, Scorer};
 /// The [`DatasetInput`] and both [`DatasetOutput`]s are provided to the [`Chat`] model via request metadata (i.e. [`CreateChatCompletionRequest`]'s metadata field]).
 pub struct ModelGradedScorer {
     model: Arc<dyn Chat>,
+    model_name: String,
 }
 
 impl ModelGradedScorer {
-    pub fn new(model: Arc<dyn Chat>) -> Self {
-        Self { model }
+    pub fn new(model: Arc<dyn Chat>, name: String) -> Self {
+        Self {
+            model,
+            model_name: name,
+        }
     }
 
     fn construct_request(
+        &self,
         input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         CreateChatCompletionRequestArgs::default()
+            .model(self.model_name.clone())
             .metadata(json!({
                 "input": input,
                 "actual": actual,
@@ -111,14 +117,15 @@ impl Scorer for ModelGradedScorer {
         ideal: &DatasetOutput,
     ) -> super::Result<f32> {
         let req =
-            Self::construct_request(input, actual, ideal).map_err(|e| Error::ErrorScoringCase {
-                input: input.clone(),
-                actual: actual.clone(),
-                ideal: ideal.clone(),
-                source: Box::from(format!(
-                    "Failed to build request for model graded scorer: {e}"
-                )),
-            })?;
+            self.construct_request(input, actual, ideal)
+                .map_err(|e| Error::ErrorScoringCase {
+                    input: input.clone(),
+                    actual: actual.clone(),
+                    ideal: ideal.clone(),
+                    source: Box::from(format!(
+                        "Failed to build request for model graded scorer: {e}"
+                    )),
+                })?;
 
         let mut score =
             self.attempt_score(&req)

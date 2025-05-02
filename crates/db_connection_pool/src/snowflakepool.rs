@@ -155,7 +155,7 @@ impl SnowflakeConnectionPool {
                         .contains("error decoding response body")
                     {
                         return Err(Error::UnableToAuthenticateGeneric {});
-                    };
+                    }
 
                     return Err(Error::UnableToAuthenticate {
                         source: SnowflakeApiError::AuthError(auth_err),

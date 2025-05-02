@@ -52,7 +52,10 @@ impl Runtime {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(
                 model_name.clone(),
-                Arc::new(ModelGradedScorer::new(Arc::clone(model))),
+                Arc::new(ModelGradedScorer::new(
+                    Arc::clone(model),
+                    model_name.clone(),
+                )),
             );
         }
 
@@ -86,7 +89,7 @@ impl Runtime {
                     == eval_dataset
             }) {
                 continue;
-            };
+            }
 
             // Check if it is a view
             if app_lock.views.iter().any(|v| {
@@ -96,7 +99,7 @@ impl Runtime {
                     == eval_dataset
             }) {
                 continue;
-            };
+            }
             tracing::warn!(
                 "Eval '{}' expects table '{}', but it does not exist.",
                 eval.name.clone(),

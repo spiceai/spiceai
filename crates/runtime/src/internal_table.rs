@@ -24,8 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::acceleration::Acceleration;
-use crate::component::dataset::{DatasetBuilder, Mode};
+use crate::component::dataset::{Mode, acceleration::Acceleration, builder::DatasetBuilder};
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
@@ -101,7 +100,7 @@ async fn get_local_table_provider(
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {
         sink = sink.with_primary_key(&pk);
-    };
+    }
 
     let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 

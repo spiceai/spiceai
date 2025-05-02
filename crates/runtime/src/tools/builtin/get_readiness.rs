@@ -17,31 +17,25 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::Runtime;
-use crate::tools::SpiceModelTool;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
+use tools::SpiceModelTool;
 
 pub struct GetReadinessTool {
     name: String,
-    description: Option<String>,
+    description: String,
+    rt: Arc<Runtime>,
 }
 
 impl GetReadinessTool {
     #[must_use]
-    pub fn new(name: &str, description: Option<String>) -> Self {
+    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            name: name.unwrap_or("get_readiness").to_string(),
+            description: description.unwrap_or("Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.").to_string(),
+            rt,
         }
-    }
-}
-impl Default for GetReadinessTool {
-    fn default() -> Self {
-        Self::new(
-            "get_readiness",
-            Some("Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.".to_string()),
-        )
     }
 }
 
@@ -51,20 +45,16 @@ impl SpiceModelTool for GetReadinessTool {
         Cow::Borrowed(&self.name)
     }
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(&self.description))
     }
     fn parameters(&self) -> Option<Value> {
         None
     }
 
-    async fn call(
-        &self,
-        _arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name().to_string());
 
-        let statuses = rt.status().get_all_statuses();
+        let statuses = self.rt.status().get_all_statuses();
         let statuses_map: serde_json::Map<String, Value> = statuses
             .iter()
             .map(|(k, v)| (k.clone(), Value::String(v.to_string())))

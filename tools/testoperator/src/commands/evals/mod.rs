@@ -18,14 +18,77 @@ use crate::args::EvalsTestArgs;
 
 use super::get_app_and_start_request;
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use test_framework::{
     anyhow,
-    arrow::{array::RecordBatch, util::pretty::pretty_format_batches},
+    arrow::{
+        array::{Float64Array, RecordBatch, StringArray},
+        util::pretty::pretty_format_batches,
+    },
     flight_client::FlightClient,
     futures::TryStreamExt,
+    git,
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
+    telemetry::Telemetry,
 };
+
+/// Status of an evaluation run
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalStatus {
+    Finished,
+    Failed,
+}
+
+impl EvalStatus {
+    /// Convert a status string to `EvalStatus`
+    pub fn from_str(status: &str) -> Self {
+        match status.to_lowercase().as_str() {
+            "completed" => EvalStatus::Finished,
+            _ => EvalStatus::Failed,
+        }
+    }
+
+    /// Convert `EvalStatus` to a boolean value for metrics recording
+    pub fn to_u64(&self) -> u64 {
+        match self {
+            EvalStatus::Finished => 1,
+            EvalStatus::Failed => 0,
+        }
+    }
+}
+
+/// Metrics from an evaluation run
+#[derive(Debug, Clone)]
+pub struct EvalMetrics {
+    pub status: EvalStatus,
+    pub score: f64,
+}
+
+impl EvalMetrics {
+    pub fn from_record_batch(batch: &[RecordBatch]) -> anyhow::Result<Self> {
+        if batch.is_empty() || batch[0].num_rows() == 0 {
+            return Err(anyhow::anyhow!("No evaluation metrics found"));
+        }
+        let record = &batch[0];
+
+        let status_str = record
+            .column_by_name("status")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract status"))?
+            .value(0);
+        let status = EvalStatus::from_str(status_str);
+
+        let score = record
+            .column_by_name("score")
+            .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract score"))?
+            .value(0);
+
+        Ok(EvalMetrics { status, score })
+    }
+}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
@@ -55,12 +118,16 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let url = format!("http://localhost:8090/v1/evals/{eval}");
     let body = json!({"model": model}).to_string();
 
+    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+
     let response = http_client
         .post(&url)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await?;
+
+    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
     let response_status = response.status();
     let response_msq = response.text().await?;
@@ -78,6 +145,9 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let eval_result = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
 
+    // Extract metrics from the evaluation result
+    let metrics = EvalMetrics::from_record_batch(&eval_result)?;
+
     let tasks_calls = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
     println!(
         "Executed tasks:\n{}\n",
@@ -91,6 +161,31 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
     // json format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
+
+    // Record benchamrk results
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "model_benchmark"),
+        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+        KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
+        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+        KeyValue::new("branch_name", git::get_branch_name()),
+    ]);
+
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    let attributes = vec![
+        KeyValue::new("model_name", model.to_string()),
+        KeyValue::new("benchmark_name", eval.to_string()),
+    ];
+    crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
+    crate::metrics::SCORE.record(metrics.score, &attributes);
+    crate::metrics::TEST_DURATION.record(
+        u64::try_from((finished_at - started_at).as_millis())?,
+        &attributes,
+    );
+
+    telemetry.emit().await?;
 
     spiced_instance.stop()?;
 

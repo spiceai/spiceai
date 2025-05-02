@@ -109,7 +109,7 @@ impl otel_arrow::ArrowExporter for TelemetryExporter {
             .await
         {
             tracing::trace!("Unable to publish telemetry: {e}");
-        };
+        }
 
         Ok(())
     }

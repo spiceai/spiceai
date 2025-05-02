@@ -23,6 +23,7 @@ on:
         type: choice
         options:
           - 'tpch'
+          - 'tpch[parameterized]'
           - 'tpcds'
           - 'clickbench'
       query_overrides:
@@ -37,11 +38,14 @@ on:
           - 'mysql'
           - 'dremio'
           - 'odbc-athena'
+          - 'odbc-databricks'
           - 'duckdb'
+          - 'duckdb-zero-results'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

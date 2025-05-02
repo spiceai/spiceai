@@ -243,7 +243,14 @@ async fn run_eval(
         })?;
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
-        run_model(eval.name.as_str(), &**model, &input, first_ideal).await?
+        run_model(
+            eval.name.as_str(),
+            model_name.as_str(),
+            &**model,
+            &input,
+            first_ideal,
+        )
+        .await?
     } else {
         // Not an error, no data in dataset
         vec![]
@@ -340,6 +347,7 @@ async fn write_results(
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
 async fn run_model(
     eval_name: &str,
+    model_name: &str,
     model: &dyn Chat,
     inputs: &[DatasetInput],
     output_format: &DatasetOutput,
@@ -352,7 +360,7 @@ async fn run_model(
             "eval_step",
             input = %serde_json::to_string(&input).unwrap_or_default(),
         );
-        match run_eval_step(eval_name, model, input, output_format)
+        match run_eval_step(eval_name, model_name, model, input, output_format)
             .instrument(span.clone())
             .await
         {
@@ -361,7 +369,7 @@ async fn run_model(
                     tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
                 } else {
                     tracing::warn!("Failed to serialize output for logging");
-                };
+                }
                 outputs.push(output);
             }
             Err(e) => {
@@ -375,15 +383,16 @@ async fn run_model(
 
 async fn run_eval_step(
     eval_name: &str,
+    model_name: &str,
     model: &dyn Chat,
     input: &DatasetInput,
     output_format: &DatasetOutput,
 ) -> Result<DatasetOutput> {
-    let req =
+    let mut req =
         TryInto::<CreateChatCompletionRequest>::try_into(input).context(FailedToRunModelSnafu {
             eval_name: eval_name.to_string(),
         })?;
-
+    req.model.clone_from(&model_name.to_string());
     let resp = model
         .chat_request(req)
         .await

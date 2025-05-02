@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
 opentelemetry.workspace = true

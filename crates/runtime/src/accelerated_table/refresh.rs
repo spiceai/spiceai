@@ -372,7 +372,7 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::RunEndEncoded(_, _) => {
             invalid = true;
         }
-    };
+    }
 
     if invalid {
         return Err(Error::TimeFormatMismatch {
@@ -381,7 +381,7 @@ fn validate_time_partition_format(
             expected_time_format: time_format.to_string(),
             actual_time_format: data_type.to_string(),
         });
-    };
+    }
 
     Ok(())
 }
@@ -641,7 +641,7 @@ impl Refresher {
                             if let Some(checkpointer) = &checkpointer {
                                 if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
                                     tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
-                                };
+                                }
                             }
                         }
 
@@ -777,7 +777,7 @@ async fn notify_refresh_done(
 ) {
     if let Some(sender) = ready_sender.take() {
         sender.send(()).ok();
-    };
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -787,7 +787,7 @@ async fn notify_refresh_done(
     let refresh_guard = refresh.read().await;
     if let Some(sql) = &refresh_guard.sql {
         labels.push(KeyValue::new("sql", sql.to_string()));
-    };
+    }
 
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
 }

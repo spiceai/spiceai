@@ -28,8 +28,9 @@ use runtime::{
         AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
     component::dataset::{
-        DatasetBuilder, Mode, TimeFormat,
+        Mode, TimeFormat,
         acceleration::{Acceleration, RefreshMode},
+        builder::DatasetBuilder,
         replication::Replication,
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},

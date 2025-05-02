@@ -66,6 +66,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "spice_cloud",
     "llms",
     "tpc_extension",
+    "workers",
 ];
 
 const OFF_FILTERS: &str =
@@ -126,6 +127,11 @@ pub(crate) async fn init_tracing(
     let subscriber = tracing_subscriber::registry()
         .with(filter)
         .with(datafusion_task_history_tracing(df, app, config).await?)
+        .with(
+            event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(
+                |metadata| metadata.target() == "task_history",
+            )),
+        )
         .with(
             fmt::layer()
                 .with_ansi(true)

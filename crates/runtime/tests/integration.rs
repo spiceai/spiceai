@@ -47,6 +47,8 @@ mod flight;
 mod github;
 mod graphql;
 mod iceberg;
+mod iceberg_api;
+mod metadata;
 #[cfg(feature = "mssql")]
 mod mssql;
 #[cfg(feature = "mysql")]
@@ -69,7 +71,7 @@ mod spiceai;
 mod sqlite;
 mod tls;
 mod utils;
-
+mod view;
 // MySQL is required for the rehydration tests
 #[cfg(feature = "mysql")]
 mod rehydration;

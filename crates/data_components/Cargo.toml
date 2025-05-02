@@ -16,7 +16,7 @@ arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { version = "1.6.0", optional = true }
+aws-config = { version = "1.6.1", optional = true }
 aws-sdk-dynamodb = { version = "1.65.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
@@ -65,7 +65,7 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "f6e07191d1432184c4f447f4f1ab187d8abd33df", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "e4ebb95b89811db7500d1a39fc960e5f395861a6", features = [
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }

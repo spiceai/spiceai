@@ -40,6 +40,6 @@ impl Runtime {
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
             }
-        };
+        }
     }
 }

@@ -17,8 +17,8 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks_delta::DatabricksDelta;
-use data_components::databricks_spark::DatabricksSparkConnect;
+use data_components::databricks::delta::DatabricksDelta;
+use data_components::databricks::spark_connect::DatabricksSparkConnect;
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -177,6 +177,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("The AWS endpoint allow http scheme")
         .secret(),
 
     // Azure storage options

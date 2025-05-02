@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: delta_lake
+datasets:
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/partsupp/
+    name: partsupp
+    params: &delta_lake_params
+      delta_lake_aws_access_key_id: ${secrets:S3_KEY}
+      delta_lake_aws_secret_access_key: ${secrets:S3_SECRET}
+      delta_lake_aws_endpoint: ${secrets:S3_ENDPOINT}
+      delta_lake_aws_allow_http: true
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/customer/
+    name: customer
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/lineitem/
+    name: lineitem
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/nation/
+    name: nation
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/orders/
+    name: orders
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/region/
+    name: region
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/supplier/
+    name: supplier
+    params: *delta_lake_params
+  - from: delta_lake:s3://benchmarks/delta/tpch_sf1000/part/
+    name: part
+    params: *delta_lake_params

@@ -4,3 +4,4 @@ tests:
     query_set: tpch
     query_overrides: spark
     runner_type: spiceai-runners
+    validate_results: true
