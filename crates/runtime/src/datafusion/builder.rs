@@ -221,7 +221,8 @@ impl DataFusionBuilder {
 /// as opposed to when underlying federated query engines will execute the query.
 ///
 /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
-fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+#[must_use]
+pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(InlineTableScan::new()),
         Arc::new(ExpandWildcardRule::new()),

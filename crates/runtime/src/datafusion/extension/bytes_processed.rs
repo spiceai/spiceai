@@ -111,6 +111,7 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
 }
 
 impl BytesProcessedOptimizerRule {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

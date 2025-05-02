@@ -75,7 +75,7 @@ pub mod query;
 pub mod builder;
 pub mod dialect;
 pub mod error;
-mod extension;
+pub mod extension;
 pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -884,6 +884,9 @@ impl DataFusion {
             accelerated_table_builder.disable_query_push_down();
         }
 
+        // Datasets don't support using federation logic for data refresh yet.
+        accelerated_table_builder.disable_refresh_federation();
+
         if refresh_mode == RefreshMode::Changes {
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
@@ -1363,6 +1366,12 @@ impl DataFusion {
         builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
+        if acceleration.disable_query_push_down {
+            builder.disable_query_push_down();
+        }
+        if acceleration.disable_refresh_federation {
+            builder.disable_refresh_federation();
+        }
 
         let (accelerated_table, _) =
             builder
