@@ -202,7 +202,7 @@ impl DataConnector for GraphQL {
 
         Ok(Arc::new(
             GraphQLTableProviderBuilder::new(client)
-                .build(query, None)
+                .build(query)
                 .await
                 .map_err(|e| {
                     if matches!(e, graphql::Error::InvalidGraphQLQuery { .. }) {

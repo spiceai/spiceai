@@ -657,6 +657,12 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
 
 impl GraphQLQuery {
     #[must_use]
+    pub fn with_json_pointer(mut self, json_pointer: Arc<str>) -> Self {
+        self.json_pointer = Some(json_pointer);
+        self
+    }
+
+    #[must_use]
     pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> String {
         let query = self.ast.to_string();
 
