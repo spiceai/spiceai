@@ -2,18 +2,20 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q3"
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                            |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)), count(Int64(1)) AS count(*), avg(CAST(hits.ResolutionWidth AS Float64))]] |
-|               |   BytesProcessedNode                                                                                                                            |
-|               |     TableScan: hits projection=[ResolutionWidth, AdvEngineID]                                                                                   |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(hits.AdvEngineID), count(*), avg(hits.ResolutionWidth)]                                            |
-|               |   CoalescePartitionsExec                                                                                                                        |
-|               |     AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(*), avg(hits.ResolutionWidth)]                                      |
-|               |       BytesProcessedExec                                                                                                                        |
-|               |         SchemaCastScanExec                                                                                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                 |
-|               |             MemoryExec: partitions=1, partition_sizes=[12218]                                                                                   |
-|               |                                                                                                                                                 |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                             |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: sum(hits.AdvEngineID), count(Int64(1)) AS count(*), avg(hits.ResolutionWidth)                                                                        |
+|               |   Aggregate: groupBy=[[]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)), count(Int64(1)), avg(CAST(hits.ResolutionWidth AS Float64))]]                            |
+|               |     BytesProcessedNode                                                                                                                                           |
+|               |       TableScan: hits projection=[ResolutionWidth, AdvEngineID]                                                                                                  |
+| physical_plan | ProjectionExec: expr=[sum(hits.AdvEngineID)@0 as sum(hits.AdvEngineID), count(Int64(1))@1 as count(*), avg(hits.ResolutionWidth)@2 as avg(hits.ResolutionWidth)] |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                                    |
+|               |     CoalescePartitionsExec                                                                                                                                       |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                              |
+|               |         BytesProcessedExec                                                                                                                                       |
+|               |           SchemaCastScanExec                                                                                                                                     |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                |
+|               |               DataSourceExec: partitions=1, partition_sizes=[12218]                                                                                              |
+|               |                                                                                                                                                                  |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+

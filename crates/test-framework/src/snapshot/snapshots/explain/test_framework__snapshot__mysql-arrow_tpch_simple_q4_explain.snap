@@ -20,6 +20,6 @@ description: "Query: tpch_simple_q4"
 |               |               BytesProcessedExec                                                                                                         |
 |               |                 SchemaCastScanExec                                                                                                       |
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                  |
-|               |                     MemoryExec: partitions=1, partition_sizes=[1501]                                                                     |
+|               |                     DataSourceExec: partitions=1, partition_sizes=[1501]                                                                 |
 |               |                                                                                                                                          |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------+
