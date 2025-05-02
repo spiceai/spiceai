@@ -387,3 +387,134 @@ impl DataConnector for Databricks {
             })?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    #[test]
+    fn test_build_auth_credentials_token_only() {
+        let token = "test_token";
+        let params_vec = vec![("token".to_string(), SecretString::from(token))];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_ok(),
+            "Databricks::build_auth_credentials should return an Ok result"
+        );
+        if let Ok(AuthCredentials::Token(t)) = result {
+            assert_eq!(t.expose_secret(), token);
+        } else {
+            panic!("Expected Token variant");
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_service_principal() {
+        let client_id = "test_client_id";
+        let client_secret = "test_client_secret";
+        let params_vec = vec![
+            ("client_id".to_string(), SecretString::from(client_id)),
+            (
+                "client_secret".to_string(),
+                SecretString::from(client_secret),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_ok(),
+            "Databricks::build_auth_credentials should return an Ok result"
+        );
+        if let Ok(AuthCredentials::ServicePrincipal(id, secret)) = result {
+            assert_eq!(id, client_id);
+            assert_eq!(secret.expose_secret(), client_secret);
+        } else {
+            panic!("Expected ServicePrincipal variant");
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_missing_all() {
+        let params_vec = vec![];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_err(),
+            "Databricks::build_auth_credentials should return an error"
+        );
+        if let Err(error) = result {
+            assert!(error.to_string().contains("Missing `databricks_token` or `databricks_client_id` and `databricks_client_secret` parameters"));
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_missing_client_secret() {
+        let client_id = "test_client_id";
+        let params_vec = vec![("client_id".to_string(), SecretString::from(client_id))];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_err(),
+            "Databricks::build_auth_credentials should return an error"
+        );
+        if let Err(error) = result {
+            assert!(error.to_string().contains("`databricks_client_secret`"));
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_missing_client_id() {
+        let client_secret = "test_client_secret";
+        let params_vec = vec![(
+            "client_secret".to_string(),
+            SecretString::from(client_secret),
+        )];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_err(),
+            "Databricks::build_auth_credentials should return an error"
+        );
+        if let Err(error) = result {
+            assert!(error.to_string().contains("databricks_client_id"));
+        }
+    }
+
+    #[test]
+    fn test_build_auth_credentials_all_provided() {
+        let token = "test_token";
+        let client_id = "test_client_id";
+        let client_secret = "test_client_secret";
+        let params_vec = vec![
+            ("token".to_string(), SecretString::from(token)),
+            ("client_id".to_string(), SecretString::from(client_id)),
+            (
+                "client_secret".to_string(),
+                SecretString::from(client_secret),
+            ),
+        ];
+        let parameters = Parameters::new(params_vec, "databricks", PARAMETERS);
+
+        let result = Databricks::build_auth_credentials(&parameters);
+
+        assert!(
+            result.is_err(),
+            "Databricks::build_auth_credentials should return an error"
+        );
+        if let Err(error) = result {
+            assert!(error.to_string().contains("Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`"));
+        }
+    }
+}
