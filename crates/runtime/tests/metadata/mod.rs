@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use datafusion::datasource::listing::MetadataColumn;
+use datafusion_datasource::metadata::MetadataColumn;
 use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
