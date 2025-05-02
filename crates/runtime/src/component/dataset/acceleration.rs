@@ -360,8 +360,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = match params
             .as_mut()
-            .and_then(|x| x.data.remove("disable_federation"))
-        {
+            // support `disable_query_push_down` for backward compatibility
+            .and_then(|x| {
+                x.data
+                    .remove("disable_federation")
+                    .or_else(|| x.data.remove("disable_query_push_down"))
+            }) {
             Some(spicepod::param::ParamValue::Bool(value)) => value,
             _ => false,
         };

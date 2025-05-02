@@ -185,7 +185,7 @@ pub struct AcceleratedTable {
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
-    disable_query_push_down: bool,
+    disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
 }
 
@@ -198,7 +198,7 @@ impl std::fmt::Debug for AcceleratedTable {
             .field("zero_results_action", &self.zero_results_action)
             .field("ready_state", &self.ready_state)
             .field("refresh_params", &self.refresh_params)
-            .field("disable_query_push_down", &self.disable_query_push_down)
+            .field("disable_federation", &self.disable_federation)
             .field("synchronized_with", &self.synchronized_with)
             .finish_non_exhaustive()
     }
@@ -484,7 +484,7 @@ impl Builder {
                 ready_state: self.ready_state,
                 refresh_params,
                 refresher,
-                disable_query_push_down: self.disable_federation,
+                disable_federation: self.disable_federation,
                 synchronized_with: self.synchronize_with,
             },
             is_ready,
