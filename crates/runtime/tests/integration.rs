@@ -75,9 +75,9 @@ mod tls;
 mod utils;
 mod view;
 // MySQL is required for the rehydration tests
+mod podswatcher;
 #[cfg(feature = "mysql")]
 mod rehydration;
-
 mod shutdown;
 
 // /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
