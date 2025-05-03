@@ -32,6 +32,7 @@ pub mod bytes_processed;
 pub struct SpiceQueryPlanner {}
 
 impl SpiceQueryPlanner {
+    #[must_use]
     pub fn new() -> Self {
         SpiceQueryPlanner {}
     }
@@ -58,6 +59,7 @@ impl QueryPlanner for SpiceQueryPlanner {
 pub struct SpiceExtensionPlanner {}
 
 impl SpiceExtensionPlanner {
+    #[must_use]
     pub fn new() -> Self {
         SpiceExtensionPlanner {}
     }

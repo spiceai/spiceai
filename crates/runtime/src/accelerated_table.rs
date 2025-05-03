@@ -185,7 +185,7 @@ pub struct AcceleratedTable {
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
-    disable_query_push_down: bool,
+    disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
 }
 
@@ -198,7 +198,7 @@ impl std::fmt::Debug for AcceleratedTable {
             .field("zero_results_action", &self.zero_results_action)
             .field("ready_state", &self.ready_state)
             .field("refresh_params", &self.refresh_params)
-            .field("disable_query_push_down", &self.disable_query_push_down)
+            .field("disable_federation", &self.disable_federation)
             .field("synchronized_with", &self.synchronized_with)
             .finish_non_exhaustive()
     }
@@ -238,7 +238,7 @@ pub struct Builder {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
-    disable_query_push_down: bool,
+    disable_federation: bool,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
@@ -269,7 +269,7 @@ impl Builder {
             append_stream: None,
             checkpointer: None,
             synchronize_with: None,
-            disable_query_push_down: false,
+            disable_federation: false,
             initial_load_complete: false,
         }
     }
@@ -302,8 +302,8 @@ impl Builder {
         self
     }
 
-    pub fn disable_query_push_down(&mut self) -> &mut Self {
-        self.disable_query_push_down = true;
+    pub fn disable_federation(&mut self) -> &mut Self {
+        self.disable_federation = true;
         self
     }
 
@@ -442,6 +442,7 @@ impl Builder {
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
+        refresher.disable_federation(self.disable_federation);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
@@ -483,7 +484,7 @@ impl Builder {
                 ready_state: self.ready_state,
                 refresh_params,
                 refresher,
-                disable_query_push_down: self.disable_query_push_down,
+                disable_federation: self.disable_federation,
                 synchronized_with: self.synchronize_with,
             },
             is_ready,

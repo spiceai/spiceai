@@ -22,6 +22,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use datafusion::datasource::TableType;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
@@ -33,8 +34,9 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
-use crate::datafusion::builder::get_df_default_config;
+use crate::datafusion::builder::{get_analyzer_rules, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
+use crate::datafusion::extension::SpiceQueryPlanner;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
@@ -87,6 +89,7 @@ pub struct RefreshTask {
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
+    disable_federation: bool,
 }
 
 impl RefreshTask {
@@ -105,7 +108,14 @@ impl RefreshTask {
             federated_source,
             accelerator: Arc::clone(&accelerator),
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
+            disable_federation: false,
         }
+    }
+    /// Sets the `disable_federation` flag
+    #[must_use]
+    pub fn with_disable_federation(mut self, disable: bool) -> RefreshTask {
+        self.disable_federation = disable;
+        self
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
@@ -506,8 +516,23 @@ impl RefreshTask {
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx =
-            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
+        let ctx = if self.disable_federation {
+            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env())
+        } else {
+            let mut state = SessionStateBuilder::new()
+                .with_config(get_df_default_config())
+                .with_runtime_env(default_runtime_env())
+                .with_default_features()
+                .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
+                .with_analyzer_rules(get_analyzer_rules())
+                .build();
+
+            if let Err(e) = datafusion_functions_json::register_all(&mut state) {
+                tracing::error!("Unable to register JSON functions: {e}");
+            }
+
+            SessionContext::new_with_state(state)
+        };
 
         let ctx_state = ctx.state();
         let default_catalog = &ctx_state.config_options().catalog.default_catalog;

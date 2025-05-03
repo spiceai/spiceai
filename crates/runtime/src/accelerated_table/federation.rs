@@ -44,8 +44,8 @@ impl AcceleratedTable {
         let schema = Arc::clone(&self.schema());
         let accelerated_table_federation_provider = self.get_federation_provider_for_accelerator();
 
-        let enabled = self.zero_results_action != ZeroResultsAction::UseSource
-            && !self.disable_query_push_down;
+        let enabled =
+            self.zero_results_action != ZeroResultsAction::UseSource && !self.disable_federation;
 
         let remote_table_name = accelerated_table_federation_provider
             .as_ref()

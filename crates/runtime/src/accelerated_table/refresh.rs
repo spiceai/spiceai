@@ -426,6 +426,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
 
     initial_load_completed: Arc<AtomicBool>,
+    disable_federation: bool,
 }
 
 impl Refresher {
@@ -450,6 +451,7 @@ impl Refresher {
             refresh_on_startup: RefreshOnStartup::default(),
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
+            disable_federation: false,
         }
     }
 
@@ -477,6 +479,12 @@ impl Refresher {
     /// Synchronize further refreshes with an existing accelerated table after the initial load completes
     pub fn synchronize_with(&mut self, synchronized_table: SynchronizedTable) -> &mut Self {
         self.synchronize_with = Some(synchronized_table);
+        self
+    }
+
+    /// Disable refresh queries federation for this refresher
+    pub fn disable_federation(&mut self, disable: bool) -> &mut Self {
+        self.disable_federation = disable;
         self
     }
 
@@ -560,6 +568,7 @@ impl Refresher {
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
+            self.disable_federation,
         );
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
@@ -694,13 +703,16 @@ impl Refresher {
         &mut self,
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(RefreshTask::new(
-            Arc::clone(&self.runtime_status),
-            self.dataset_name.clone(),
-            Arc::clone(&self.federated),
-            self.federated_source.clone(),
-            Arc::clone(&self.accelerator),
-        ));
+        let refresh_task = Arc::new(
+            RefreshTask::new(
+                Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+                Arc::clone(&self.federated),
+                self.federated_source.clone(),
+                Arc::clone(&self.accelerator),
+            )
+            .with_disable_federation(self.disable_federation),
+        );
 
         let refresh_defaults = Arc::clone(&self.refresh);
 
@@ -727,13 +739,16 @@ impl Refresher {
         changes_stream: ChangesStream,
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(RefreshTask::new(
-            Arc::clone(&self.runtime_status),
-            self.dataset_name.clone(),
-            Arc::clone(&self.federated),
-            self.federated_source.clone(),
-            Arc::clone(&self.accelerator),
-        ));
+        let refresh_task = Arc::new(
+            RefreshTask::new(
+                Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+                Arc::clone(&self.federated),
+                self.federated_source.clone(),
+                Arc::clone(&self.accelerator),
+            )
+            .with_disable_federation(self.disable_federation),
+        );
 
         let cache_provider = self.cache_provider.clone();
         let refresh = Arc::clone(&self.refresh);

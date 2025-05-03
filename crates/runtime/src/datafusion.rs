@@ -75,7 +75,7 @@ pub mod query;
 pub mod builder;
 pub mod dialect;
 pub mod error;
-mod extension;
+pub mod extension;
 pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -880,8 +880,8 @@ impl DataFusion {
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
-        if acceleration_settings.disable_query_push_down {
-            accelerated_table_builder.disable_query_push_down();
+        if acceleration_settings.disable_federation {
+            accelerated_table_builder.disable_federation();
         }
 
         if refresh_mode == RefreshMode::Changes {
@@ -1363,6 +1363,9 @@ impl DataFusion {
         builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
+        if acceleration.disable_federation {
+            builder.disable_federation();
+        }
 
         let (accelerated_table, _) =
             builder

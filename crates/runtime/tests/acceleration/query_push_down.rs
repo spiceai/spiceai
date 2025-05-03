@@ -82,7 +82,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             );
             federated_acc.params = Some(params.clone());
             params.data.insert(
-                "disable_query_push_down".to_string(),
+                "disable_federation".to_string(),
                 spicepod::param::ParamValue::Bool(false),
             );
 
@@ -107,7 +107,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             );
             non_federated_acc.params = Some(non_federated_params.clone());
             non_federated_params.data.insert(
-                "disable_query_push_down".to_string(),
+                "disable_federation".to_string(),
                 spicepod::param::ParamValue::Bool(true),
             );
 
