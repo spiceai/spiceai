@@ -166,6 +166,9 @@ async fn podswatcher_integration_test() -> Result<(), anyhow::Error> {
             .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("pods_watcher_assert_after", pretty_after);
 
+            // Clean up
+            std::fs::remove_dir_all(&spicepod_dir).expect("Failed to remove spicepod directory");
+
             Ok(())
         })
         .await
