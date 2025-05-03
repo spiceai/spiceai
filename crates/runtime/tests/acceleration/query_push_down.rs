@@ -82,8 +82,8 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             );
             federated_acc.params = Some(params.clone());
             params.data.insert(
-                "disable_federation".to_string(),
-                spicepod::param::ParamValue::Bool(false),
+                "query_federation".to_string(),
+                spicepod::param::ParamValue::String("enabled".to_string()),
             );
 
             federated_acc.acceleration = Some(Acceleration {
@@ -107,8 +107,8 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             );
             non_federated_acc.params = Some(non_federated_params.clone());
             non_federated_params.data.insert(
-                "disable_federation".to_string(),
-                spicepod::param::ParamValue::Bool(true),
+                "query_federation".to_string(),
+                spicepod::param::ParamValue::String("disabled".to_string()),
             );
 
             non_federated_acc.acceleration = Some(Acceleration {

@@ -228,6 +228,13 @@ pub enum Error {
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
 
+    #[snafu(display(
+        "An accelerated table has invalid configuration: {source}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    InvalidAccelerationConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
