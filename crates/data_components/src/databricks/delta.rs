@@ -89,10 +89,10 @@ impl DatabricksDelta {
         &self,
         table_reference: TableReference,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let token = self.token_provider.get_token().await?;
-
-        let uc_client =
-            UnityCatalog::new(self.endpoint.clone(), Some(SecretString::new(token.into())));
+        let uc_client = UnityCatalog::new(
+            self.endpoint.clone(),
+            Some(Arc::clone(&self.token_provider)),
+        );
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 

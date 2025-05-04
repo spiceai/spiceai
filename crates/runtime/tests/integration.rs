@@ -33,11 +33,15 @@ mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_catalog;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
+mod databricks_delta_catalog_m2m;
+#[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_catalog;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
 #[cfg(feature = "delta_lake")]

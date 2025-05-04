@@ -26,7 +26,9 @@ use crate::get_params_with_secrets;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
+use data_components::databricks::auth::AuthCredentials;
 use data_components::delta_lake::DeltaTableFactory;
+use data_components::token_provider::StaticTokenProvider;
 use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
 use data_components::unity_catalog::UCTable;
@@ -59,7 +61,6 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The endpoint of the Databricks instance."),
     ParameterSpec::component("token")
-        .required()
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
     ParameterSpec::runtime("mode")
@@ -120,6 +121,7 @@ impl CatalogConnector for Databricks {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,
@@ -140,16 +142,34 @@ impl CatalogConnector for Databricks {
                 connector_component: ConnectorComponent::from(catalog)
             }
         })?;
-        let token = self.params.get("token").ok_or_else(|p| {
-            super::Error::InvalidConfigurationNoSource {
-                connector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
-                connector_component: ConnectorComponent::from(catalog)
+
+        let auth_credentials = DatabricksDataConnector::build_auth_credentials(&self.params)
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
+
+        let token_provider = match auth_credentials {
+            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
+            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                DatabricksDataConnector::get_m2m_token_provider(
+                    endpoint,
+                    client_id,
+                    client_secret,
+                    &runtime.token_provider_registry,
+                )
+                .await
+                .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                })?
             }
-        })?;
+        };
 
         let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token.clone()));
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider));
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override

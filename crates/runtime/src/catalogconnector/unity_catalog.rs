@@ -26,6 +26,8 @@ use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
 use data_components::delta_lake::DeltaTableFactory;
+use data_components::token_provider::StaticTokenProvider;
+use data_components::token_provider::TokenProvider;
 use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
@@ -126,10 +128,11 @@ impl CatalogConnector for UnityCatalog {
             Err(e) => return Err(e),
         };
 
-        let client = Arc::new(UnityCatalogClient::new(
-            endpoint,
-            self.params.get("token").ok().cloned(),
-        ));
+        let token_provider = self.params.get("token").ok().map(|token| {
+            Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
+        });
+
+        let client = Arc::new(UnityCatalogClient::new(endpoint, token_provider));
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =

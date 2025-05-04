@@ -243,7 +243,7 @@ impl Databricks {
         })
     }
 
-    async fn get_m2m_token_provider(
+    pub async fn get_m2m_token_provider(
         endpoint: &str,
         client_id: &str,
         client_secret: &SecretString,
