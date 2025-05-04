@@ -148,6 +148,7 @@ assignees: ''
      - [ ] [Python ADBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/adbc/README.md)
      - [ ] [Java JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/java/README.md)
      - [ ] [Scala JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/scala/README.md)
+
 ## Final Updates
 
 - [ ] Merge any pending [Docs PRs](https://github.com/spiceai/docs/pulls).
