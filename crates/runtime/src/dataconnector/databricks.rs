@@ -106,8 +106,7 @@ impl Databricks {
                 let storage_options = params.to_secret_map();
                 let token_provider = match auth_credentials {
                     AuthCredentials::Token(token) => {
-                        let token = token.expose_secret();
-                        Arc::new(StaticTokenProvider::new(token.into()))
+                        Arc::new(StaticTokenProvider::new(token.clone()))
                     }
                     AuthCredentials::ServicePrincipal(client_id, client_secret) => {
                         Self::get_m2m_token_provider(
