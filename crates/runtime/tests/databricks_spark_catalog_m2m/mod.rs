@@ -62,11 +62,11 @@ async fn databricks_spark_connect_m2m_integration_test_catalog() -> Result<(), a
             runtime_ready_check(&rt).await;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.tpch.lineitem LIMIT 10",
+                "select * from db_uc.tpch.nation order by n_nationkey limit 10",
                 "select_tpch",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 4, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                     }
 
@@ -83,7 +83,7 @@ async fn databricks_spark_connect_m2m_integration_test_catalog() -> Result<(), a
                 })),
             ),
             (
-                "SELECT * FROM db_uc.tpcds.catalog_sales LIMIT 10",
+                "SELECT * FROM db_uc.tpcds.catalog_sales ORDER BY cs_ext_sales_price, cs_order_number ASC LIMIT 10;",
                 "select_tpcds",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
