@@ -353,14 +353,14 @@ impl DataConnectorFactory for GithubFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let token = params.parameters.get("token").expose().ok();
+        let token = params.parameters.get("token").ok();
         let client_id = params.parameters.get("client_id").expose().ok();
         let private_key = params.parameters.get("private_key").expose().ok();
         let installation_id = params.parameters.get("installation_id").expose().ok();
 
         let token_provider: Option<Arc<dyn TokenProvider>> =
             match (token, client_id, private_key, installation_id) {
-                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.into()))),
+                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.clone()))),
 
                 (None, Some(client_id), Some(private_key), Some(installation_id)) => {
                     Some(Arc::new(GitHubAppTokenProvider::new(

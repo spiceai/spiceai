@@ -111,8 +111,8 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
-        let token = self.params.get("auth_token").expose().ok().map(|token| {
-            Arc::new(StaticTokenProvider::new(token.into())) as Arc<dyn TokenProvider>
+        let token = self.params.get("auth_token").ok().map(|token| {
+            Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
         let user = self
