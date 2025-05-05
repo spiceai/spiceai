@@ -6026,7 +6026,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d7a9a31b69afbf6b8f3303b37c4040322a5c7341#d7a9a31b69afbf6b8f3303b37c4040322a5c7341"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2d01d56ffa606022caf4e3b6ce0f5169984ac6ae#2d01d56ffa606022caf4e3b6ce0f5169984ac6ae"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6075,7 +6075,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d7a9a31b69afbf6b8f3303b37c4040322a5c7341#d7a9a31b69afbf6b8f3303b37c4040322a5c7341"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2d01d56ffa606022caf4e3b6ce0f5169984ac6ae#2d01d56ffa606022caf4e3b6ce0f5169984ac6ae"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6101,7 +6101,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=d7a9a31b69afbf6b8f3303b37c4040322a5c7341#d7a9a31b69afbf6b8f3303b37c4040322a5c7341"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=2d01d56ffa606022caf4e3b6ce0f5169984ac6ae#2d01d56ffa606022caf4e3b6ce0f5169984ac6ae"
 dependencies = [
  "anyhow",
  "async-trait",
