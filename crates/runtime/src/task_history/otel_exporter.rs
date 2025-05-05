@@ -40,6 +40,21 @@ macro_rules! extract_attr {
     };
 }
 
+macro_rules! extract_attr_w_hex {
+    ($span:expr, $key:expr) => {
+        $span.events.iter().find_map(|event| {
+            let event_attr_idx = event
+                .attributes
+                .iter()
+                .position(|kv| kv.key.as_str() == $key)?;
+            match &event.attributes[event_attr_idx].value {
+                opentelemetry::Value::I64(n) => Some(format!("{:x}", n).into()),
+                v => Some(v.as_str().into()),
+            }
+        })
+    };
+}
+
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
@@ -93,7 +108,7 @@ impl TaskHistoryExporter {
                 |idx| span.attributes[idx].value.as_str().into(),
             );
 
-        let trace_id_override: Option<Arc<str>> = extract_attr!(span, "trace_id")
+        let trace_id_override: Option<Arc<str>> = extract_attr_w_hex!(span, "trace_id")
             .and_then(|trace_id| if Self::is_valid_traceid(&trace_id) {
                 Some(trace_id)
             } else {
@@ -101,11 +116,11 @@ impl TaskHistoryExporter {
                 None
             });
 
-        let distributed_parent_id: Option<Arc<str>> = extract_attr!(span, "parent_id")
+        let distributed_parent_id: Option<Arc<str>> = extract_attr_w_hex!(span, "parent_id")
             .and_then(|parent_id| if Self::is_valid_span_id(&parent_id) {
                 Some(parent_id)
             } else {
-                tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 32 character hex string.", Arc::clone(&trace_id));
+                tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 16 character hex string.", Arc::clone(&parent_id));
                 None
             });
 
