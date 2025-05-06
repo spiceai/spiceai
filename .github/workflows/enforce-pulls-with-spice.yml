@@ -15,7 +15,7 @@ jobs:
   enforce-pull-with-spice:
     runs-on: spiceai-macos
     steps:
-      - uses: spiceai/pulls-with-spice-action@v1.0.6
+      - uses: spiceai/pulls-with-spice-action@v1.0.7
         if: github.event_name == 'pull_request'
         with:
           require_title_min_length: '10'
