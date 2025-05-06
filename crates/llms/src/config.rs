@@ -21,7 +21,6 @@ use reqwest::header::{
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::sync::LazyLock;
-use token_providers::{StaticTokenProvider, TokenProvider};
 
 static DUMMY_API_KEY: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(String::new()));
 
@@ -103,22 +102,16 @@ impl HostedModelConfig {
 /// A generic authentication mechanism that supports either an API key or a Bearer token.
 #[derive(Clone, Debug)]
 pub enum GenericAuthMechanism {
-    ApiKey(Arc<dyn TokenProvider>),
-    BearerToken(Arc<dyn TokenProvider>),
+    ApiKey(SecretString),
+    BearerToken(SecretString),
 }
 
 impl GenericAuthMechanism {
     pub fn from_api_key<S: Into<String>>(api_key: S) -> Self {
-        GenericAuthMechanism::from_api_key(StaticTokenProvider::new(api_key.into()))
+        Self::ApiKey(SecretBox::from(api_key.into()))
     }
     pub fn from_bearer_token<S: Into<String>>(bearer_token: S) -> Self {
-        GenericAuthMechanism::from_bearer_token(StaticTokenProvider::new(bearer_token.into()))
-    }
-    pub fn from_api_key<S: Arc<dyn TokenProvider>>(provider: S) -> Self {
-        Self::ApiKey(provider)
-    }
-    pub fn from_bearer_token<S: Arc<dyn TokenProvider>>(provider: S) -> Self {
-        Self::BearerToken(provider)
+        Self::BearerToken(SecretBox::from(bearer_token.into()))
     }
 }
 
@@ -129,8 +122,8 @@ impl Config for HostedModelConfig {
         // Insert authentication header if available.
         if let Some(auth) = &self.auth {
             match auth {
-                GenericAuthMechanism::ApiKey(prov) => {
-                    match HeaderValue::from_str(prov.get_token().as_str()) {
+                GenericAuthMechanism::ApiKey(key) => {
+                    match HeaderValue::from_str(key.expose_secret()) {
                         Ok(value) => {
                             headers.insert("x-api-key", value);
                         }
@@ -141,8 +134,8 @@ impl Config for HostedModelConfig {
                         }
                     }
                 }
-                GenericAuthMechanism::BearerToken(prov) => {
-                    match HeaderValue::from_str(&format!("Bearer {}", prov.get_token())) {
+                GenericAuthMechanism::BearerToken(token) => {
+                    match HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())) {
                         Ok(value) => {
                             headers.insert(AUTHORIZATION, value);
                         }

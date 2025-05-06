@@ -7124,7 +7124,6 @@ dependencies = [
  "text-embeddings-core",
  "text-splitter",
  "tiktoken-rs",
- "token_providers",
  "tokenizers",
  "tokio",
  "tracing",
