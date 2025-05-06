@@ -34,11 +34,11 @@ use crate::{
     embeddings::Embed,
 };
 
-/// [`Databricks`] is a chat model for Databricks models.
+/// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
 pub struct Databricks {
     pub model: String,
     client: Client<OpenAIConfig>,
-    // The chat/completion URL for databricks doesn't end with `chat/completions`. Must use separate client. See [`Chat::chat_stream`] for details.
+    // The chat/completion URL for databricks doesn't support streaming. The URL that supports streaming doesn't end with `chat/completions`. Must use separate client. See [`Chat::chat_stream`] for details.
     stream_client: Client<OpenAIConfig>,
 }
 
@@ -65,12 +65,13 @@ impl Chat for Databricks {
         None
     }
 
+    /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
     async fn health(&self) -> super::chat::Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
         if let Err(e) = self
             .chat_request(CreateChatCompletionRequest {
-                // Cannot be set too low. Some providers will error if it cannot complete in < `max_completion_tokens`.
+                // Cannot be set too low. Some providers will error if it cannot complete in < `max_tokens`.
                 max_tokens: Some(100),
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
@@ -97,7 +98,9 @@ impl Chat for Databricks {
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        inner_req.stream_options = None;
+        inner_req.stream_options = None; // Not supported by Databricks.
+
+        // Must use `post_stream` instead of `chat().create(...` to avoid concatenation of `chat/completions`.
         Ok(Box::pin(
             self.stream_client.post_stream("", inner_req).await,
         ))
@@ -119,6 +122,7 @@ impl Embed for Databricks {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
         self.stream_client.post("", req).await
     }
     fn size(&self) -> i32 {

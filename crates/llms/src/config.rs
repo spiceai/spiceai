@@ -97,18 +97,6 @@ impl HostedModelConfig {
         );
         Ok(self)
     }
-
-    pub fn with_byte_header(
-        mut self,
-        key: &'static str,
-        value: &[u8],
-    ) -> Result<Self, InvalidHeaderValue> {
-        self.default_headers.insert(
-            HeaderName::from_static(key),
-            HeaderValue::from_bytes(value)?,
-        );
-        Ok(self)
-    }
 }
 
 /// A generic authentication mechanism that supports either an API key or a Bearer token.
