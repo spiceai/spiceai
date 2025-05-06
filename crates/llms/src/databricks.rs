@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use async_openai::{
     Client,
-    config::{Config, OpenAIConfig},
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
@@ -40,31 +39,45 @@ use crate::{
 };
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
-pub struct Databricks<C: Config> {
+pub struct Databricks {
     pub model: String,
-    client: Client<C>,
+    client: Client<HostedModelConfig>,
 }
 
 #[must_use]
-pub fn from_access_token(
+pub fn try_from_access_token(
     endpoint: &str,
     model: &str,
     access_token: &str,
-) -> Databricks<OpenAIConfig> {
-    Databricks::<OpenAIConfig> {
+    user_agent: Option<&str>,
+) -> Result<Databricks, super::chat::Error> {
+    let mut cfg = HostedModelConfig::from_url(
+        format!("https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations")
+            .as_str(),
+    )
+    .boxed()
+    .map_err(|e| super::chat::Error::FailedToLoadModel { source: e })?;
+
+    if let Some(user_agent) = user_agent {
+        cfg = cfg
+            .with_header("user-agent", user_agent)
+            .boxed()
+            .map_err(|e| super::chat::Error::FailedToLoadModel { source: e })?;
+    };
+
+    Ok(Databricks {
         model: model.to_string(),
-        client: Client::with_config(OpenAIConfig::default().with_api_base(format!(
-            "https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations"
-        ))),
-    }
+        client: Client::with_config(cfg),
+    })
 }
 
 pub fn try_from_token_provider(
     endpoint: &str,
     model: &str,
     token_provider: Arc<dyn TokenProvider>,
-) -> Result<Databricks<HostedModelConfig>, super::chat::Error> {
-    let cfg = HostedModelConfig::from_url(
+    user_agent: Option<&str>,
+) -> Result<Databricks, super::chat::Error> {
+    let mut cfg = HostedModelConfig::from_url(
         format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
     )
     .boxed()
@@ -74,14 +87,21 @@ pub fn try_from_token_provider(
         token_provider,
     ));
 
-    Ok(Databricks::<HostedModelConfig> {
+    if let Some(user_agent) = user_agent {
+        cfg = cfg
+            .with_header("user-agent", user_agent)
+            .boxed()
+            .map_err(|e| super::chat::Error::FailedToLoadModel { source: e })?;
+    };
+
+    Ok(Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
     })
 }
 
 #[async_trait]
-impl<C: Config + Send + Sync> Chat for Databricks<C> {
+impl Chat for Databricks {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
     }
@@ -137,7 +157,7 @@ impl<C: Config + Send + Sync> Chat for Databricks<C> {
 }
 
 #[async_trait]
-impl<C: Config + Send + Sync + std::fmt::Debug> Embed for Databricks<C> {
+impl Embed for Databricks {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
@@ -170,7 +190,7 @@ impl<C: Config + Send + Sync + std::fmt::Debug> Embed for Databricks<C> {
     }
 }
 
-impl<C: Config + std::fmt::Debug> std::fmt::Debug for Databricks<C> {
+impl std::fmt::Debug for Databricks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabricksEmbed")
             .field("inner", &self.client)

@@ -20,6 +20,8 @@ use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
+use crate::dataconnector::listing::infer::infer_partitions_with_types_from_files;
+use crate::dataconnector::listing::infer::infer_partitions_with_types_prefix;
 use crate::parameters::ExposedParamLookup;
 use crate::parameters::Parameters;
 use arrow_schema::Schema;
@@ -56,7 +58,6 @@ use url::Url;
 use crate::object_store_registry::default_runtime_env;
 
 use super::DelimitedFormat;
-use super::infer::infer_partitions_with_types;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
@@ -388,6 +389,7 @@ pub trait ListingTableConnector: DataConnector {
         })?)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,
@@ -411,45 +413,48 @@ pub trait ListingTableConnector: DataConnector {
 
         let ctx: SessionContext = Self::get_session_context();
 
-        let schema_infer_url = if let Some(url) = dataset.params.get("schema_source_path") {
-            let mut url = self.get_object_store_url(dataset, Some(url))?;
-            url.set_fragment(None);
-            let schema_infer_url = ListingTableUrl::parse(url).boxed().context(
-                crate::dataconnector::UnableToGetSchemaInternalSnafu {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            )?;
-            verify_schema_source_path(
-                format!("{self}"),
-                dataset,
-                extension,
-                schema_infer_url.clone(),
-                &ctx,
-                &object_store,
-            )
-            .await?;
-            schema_infer_url
-        } else {
-            // Get the last modified object for the provided ObjectStore to infer the schema.
-            // Report an error if no files matching required extension are found.
-            let last_modified_or_added = get_last_modified(
-                format!("{self}"),
-                dataset,
-                extension,
-                table_path.clone(),
-                &ctx,
-                &object_store,
-            )
-            .await?;
+        let (schema_infer_url, schema_infer_meta) =
+            if let Some(url) = dataset.params.get("schema_source_path") {
+                let url = self.get_object_store_url(dataset, Some(url))?;
+                let schema_infer_url = ListingTableUrl::parse(url).boxed().context(
+                    crate::dataconnector::UnableToGetSchemaInternalSnafu {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                    },
+                )?;
+                let schema_infer_meta = verify_schema_source_path(
+                    format!("{self}"),
+                    dataset,
+                    extension,
+                    schema_infer_url.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+                (schema_infer_url, schema_infer_meta)
+            } else {
+                // Get the last modified object for the provided ObjectStore to infer the schema.
+                // Report an error if no files matching required extension are found.
+                let last_modified_or_added = get_last_modified(
+                    format!("{self}"),
+                    dataset,
+                    extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
 
-            to_listing_table_url(
-                url,
-                &last_modified_or_added.location,
-                dataset,
-                &format!("{self}"),
-            )?
-        };
+                (
+                    to_listing_table_url(
+                        url,
+                        &last_modified_or_added.location,
+                        dataset,
+                        &format!("{self}"),
+                    )?,
+                    None,
+                )
+            };
 
         tracing::debug!(
             "Dataset '{}' schema will be resolved based on {schema_infer_url}",
@@ -478,8 +483,12 @@ pub trait ListingTableConnector: DataConnector {
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
-            let inferred_partitions =
-                infer_partitions_with_types(&ctx.state(), &table_path, extension).await;
+            let inferred_partitions = match schema_infer_meta {
+                Some(meta) => infer_partitions_with_types_from_files(&table_path, &[meta]),
+                None => {
+                    infer_partitions_with_types_prefix(&ctx.state(), &table_path, extension).await
+                }
+            };
             match inferred_partitions {
                 Ok(partitions) => {
                     tracing::debug!(
@@ -695,7 +704,7 @@ async fn verify_schema_source_path(
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
-) -> DataConnectorResult<()> {
+) -> DataConnectorResult<Option<ObjectMeta>> {
     tracing::debug!(
         "Verifying dataset {table_name} schema source path is valid: {schema_source_path}",
         table_name = dataset.name
@@ -727,7 +736,7 @@ async fn verify_schema_source_path(
     {
         if let Some(ext) = file.location.extension() {
             if format!(".{ext}") == extension {
-                return Ok(());
+                return Ok(Some(file));
             }
         }
 
@@ -738,7 +747,7 @@ async fn verify_schema_source_path(
             tracing::warn!(
                 "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
             );
-            return Ok(());
+            return Ok(None);
         }
     }
 

@@ -228,6 +228,7 @@ async fn databricks(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    // Required parameters
     let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
         return Err(LlmError::MissingParamError {
             param_key: "databricks_endpoint",
@@ -239,6 +240,7 @@ async fn databricks(
         });
     };
 
+    // Optional parameters. Either (databricks_client_id, databricks_client_secret ) or databricks_token.
     let token_opt = extract_secret!(params, "databricks_token");
     let client_id = extract_secret!(params, "databricks_client_id");
     let client_secret = extract_secret!(params, "databricks_client_secret");
@@ -264,11 +266,13 @@ async fn databricks(
                 source: "If `databricks_client_id` is provided, `databricks_client_secret` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
+        (Some(token), None, None) => Ok(Arc::new(llms::databricks::try_from_access_token(
             endpoint,
             model_id.as_str(),
             token,
-        )) as Arc<dyn Chat>),
+            Some(data_components::databricks::user_agent().as_str()),
+        ).boxed()
+        .map_err(|e| LlmError::FailedToLoadModel { source: e })?) as Arc<dyn Chat>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
@@ -286,6 +290,7 @@ async fn databricks(
                     endpoint,
                     model_id.as_str(),
                     Arc::new(token_provider),
+                    Some(data_components::databricks::user_agent().as_str()),
                 )
                 .boxed()
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?,

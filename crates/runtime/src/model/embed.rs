@@ -125,16 +125,19 @@ async fn databricks(
                 source: "If `databricks_client_id` is provided, `databricks_client_secret` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
+        (Some(token), None, None) => Ok(Arc::new(llms::databricks::try_from_access_token(
             endpoint,
             model_id.as_str(),
             token,
-        )) as Arc<dyn Embed>),
+            Some(data_components::databricks::user_agent().as_str())
+        ).boxed()
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?
+        ) as Arc<dyn Embed>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
                 client_id.to_string(),
-                client_secret.into(),
+                client_secret.into()
             )
             .await
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
@@ -147,6 +150,7 @@ async fn databricks(
                     endpoint,
                     model_id.as_str(),
                     Arc::new(token_provider),
+                    Some(data_components::databricks::user_agent().as_str())
                 )
                 .boxed()
                 .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?,
