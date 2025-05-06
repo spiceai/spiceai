@@ -28,8 +28,8 @@ aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true
 axum-extra = { version = "0.9.6", features = ["typed-header"] }
 base64.workspace = true
-bytes.workspace = true
 byte-unit.workspace = true
+bytes.workspace = true
 cache = { path = "../cache" }
 chrono = { version = "0.4.38" }
 clap.workspace = true
@@ -127,6 +127,7 @@ suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
+token_providers = { path = "../token_providers" }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"

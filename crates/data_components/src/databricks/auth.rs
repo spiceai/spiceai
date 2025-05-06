@@ -23,7 +23,7 @@ use std::{fmt, sync::Arc};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::token_provider::{Result, TokenProvider};
+use token_providers::{Result, TokenProvider};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -41,7 +41,7 @@ pub struct DatabricksM2MTokenProvider {
     client_id: String,
 
     tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    pub rx: watch::Receiver<String>,
 
     _handle: Arc<JoinHandle<()>>,
 }
@@ -132,12 +132,16 @@ impl DatabricksM2MTokenProvider {
             _handle: Arc::new(handle),
         })
     }
+
+    pub fn get_token(&self) -> String {
+        self.rx.borrow().clone()
+    }
 }
 
 #[async_trait]
 impl TokenProvider for DatabricksM2MTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        Ok(self.rx.borrow().clone())
+        Ok(self.get_token())
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {

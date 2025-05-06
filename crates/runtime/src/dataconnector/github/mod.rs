@@ -29,7 +29,6 @@ use data_components::{
         provider::GraphQLTableProviderBuilder,
     },
     rate_limit::RateLimiter,
-    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
     common::Column,
@@ -52,6 +51,7 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
+use token_providers::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{

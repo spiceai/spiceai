@@ -20,8 +20,8 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::token_provider::TokenProvider;
 use crate::{Read, spark_connect::SparkConnect};
+use token_providers::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnect {

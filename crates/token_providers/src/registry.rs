@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use data_components::token_provider::TokenProvider;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+
+use crate::TokenProvider;
 
 #[derive(Default, Clone)]
 pub struct TokenProviderRegistry {

@@ -16,14 +16,14 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::{
-    graphql::{self, client::GraphQLClient, provider::GraphQLTableProviderBuilder},
-    token_provider::{StaticTokenProvider, TokenProvider},
+use data_components::graphql::{
+    self, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
 use datafusion::datasource::TableProvider;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use token_providers::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{

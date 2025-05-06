@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "token_providers"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+secrecy.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true

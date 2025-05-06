@@ -19,10 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use data_components::token_provider::{Error, Result, TokenProvider};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use token_providers::{Error, Result, TokenProvider};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]

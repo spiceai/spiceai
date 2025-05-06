@@ -28,7 +28,6 @@ use data_components::Read;
 use data_components::RefreshableCatalogProvider;
 use data_components::databricks::auth::AuthCredentials;
 use data_components::delta_lake::DeltaTableFactory;
-use data_components::token_provider::StaticTokenProvider;
 use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
 use data_components::unity_catalog::UCTable;
@@ -40,6 +39,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use token_providers::StaticTokenProvider;
 
 #[derive(Clone)]
 pub struct Databricks {

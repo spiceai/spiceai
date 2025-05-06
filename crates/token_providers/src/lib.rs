@@ -22,6 +22,8 @@ use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
+pub mod registry;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to get token.\n{source}"))]

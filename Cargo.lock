@@ -3205,6 +3205,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "tiberius",
+ "token_providers",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -10905,6 +10906,7 @@ dependencies = [
  "tera",
  "test-framework",
  "tiberius",
+ "token_providers",
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.1",
@@ -12933,6 +12935,17 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "token_providers"
+version = "1.2.1-unstable"
+dependencies = [
+ "async-trait",
+ "secrecy",
+ "snafu",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "tokenizers"
