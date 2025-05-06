@@ -23,7 +23,8 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {
@@ -130,12 +131,13 @@ impl TokenGenerator for GitHubTokenGenerator {
 }
 
 pub struct GitHubAppTokenProvider {
-    token: Arc<RwLock<String>>,
-    expires_at: Arc<RwLock<String>>,
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
     token_generator: Arc<dyn TokenGenerator>,
+    tx: watch::Sender<GitHubToken>,
+    rx: watch::Receiver<GitHubToken>,
+    _handle: Arc<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for GitHubAppTokenProvider {
@@ -149,6 +151,111 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
 }
 
 impl GitHubAppTokenProvider {
+    /// Creates a new GitHubAppTokenProvider and spawns a background token refresher.
+    pub async fn try_new(
+        app_client_id: Arc<str>,
+        private_key: Arc<str>,
+        installation_id: Arc<str>,
+    ) -> Result<Self, GitHubAppError> {
+        let token_generator: Arc<dyn TokenGenerator> = Arc::new(GitHubTokenGenerator {});
+
+        // Get the initial token.
+        let token_response = token_generator
+            .generate_token(
+                Arc::clone(&app_client_id),
+                Arc::clone(&private_key),
+                Arc::clone(&installation_id),
+            )
+            .await?;
+        let init_token = GitHubToken::from_response(token_response)?;
+
+        // Create a watch channel initialized with the token.
+        let (tx, rx) = watch::channel(init_token.clone());
+
+        // Clone necessary parameters for the background refresher.
+        let cloned_app_client_id = Arc::clone(&app_client_id);
+        let cloned_private_key = Arc::clone(&private_key);
+        let cloned_installation_id = Arc::clone(&installation_id);
+        let cloned_token_generator = Arc::clone(&token_generator);
+        let cloned_tx = tx.clone();
+
+        // Optionally, use a Fibonacci backoff strategy. Here we simulate it simply.
+        // For a more elaborate backoff, consider using an external crate.
+        let handle = tokio::spawn(async move {
+            // We'll use a simple backoff: start at 1 sec, double on error up to 300 sec.
+            let mut backoff = Duration::from_secs(1);
+
+            loop {
+                // Calculate remaining duration until the token expires, minus our buffer.
+                let current_token = cloned_tx.borrow().clone();
+                let now = Utc::now();
+                let next_wait = if current_token.expires_at > now {
+                    let diff = current_token
+                        .expires_at
+                        .signed_duration_since(now)
+                        .to_std()
+                        .unwrap_or_else(|_| Duration::from_secs(0));
+                    // If the diff is less than the buffer, refresh immediately.
+                    if diff > Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS) {
+                        diff - Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS)
+                    } else {
+                        Duration::from_secs(0)
+                    }
+                } else {
+                    Duration::from_secs(0)
+                };
+
+                // Wait until it's time to refresh.
+                sleep(next_wait).await;
+
+                // Attempt to refresh the token.
+                match cloned_token_generator
+                    .generate_token(
+                        Arc::clone(&cloned_app_client_id),
+                        Arc::clone(&cloned_private_key),
+                        Arc::clone(&cloned_installation_id),
+                    )
+                    .await
+                {
+                    Ok(token_response) => {
+                        // On success, parse and update the watch channel.
+                        if let Ok(new_token) = GitHubToken::from_response(token_response) {
+                            tracing::debug!(
+                                "GitHub token refreshed; expires at {}",
+                                new_token.expires_at
+                            );
+                            let _ = cloned_tx.send(new_token);
+                            // Reset backoff on success.
+                            backoff = Duration::from_secs(1);
+                        } else {
+                            tracing::error!("Failed to parse refreshed GitHub token.");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "GitHub token refresh failed: {}. Retrying in {:?}",
+                            e,
+                            backoff
+                        );
+                        // On error, sleep for the backoff duration.
+                        sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, Duration::from_secs(300));
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            app_client_id,
+            private_key,
+            installation_id,
+            token_generator,
+            tx,
+            rx,
+            _handle: Arc::new(handle),
+        })
+    }
+
     #[must_use]
     pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
         Self {
@@ -162,51 +269,29 @@ impl GitHubAppTokenProvider {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct GitHubToken {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl GitHubToken {
+    // Try to create a GitHubToken from TokenResponse.
+    pub fn from_response(resp: TokenResponse) -> Result<Self, GitHubAppError> {
+        let expires_at = DateTime::parse_from_rfc3339(&resp.expires_at)
+            .map_err(|_| GitHubAppError::UnableToParseTokenExpiration {})?
+            .with_timezone(&Utc);
+        Ok(Self {
+            token: resp.token,
+            expires_at,
+        })
+    }
+}
+
 #[async_trait]
 impl TokenProvider for GitHubAppTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        let token = {
-            let read_guard = self.token.read().await;
-            read_guard.clone()
-        };
-
-        let expires_at = {
-            let read_guard = self.expires_at.read().await;
-            DateTime::parse_from_rfc3339(read_guard.as_str())
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        };
-
-        // If the token is not empty and not expired, return it
-        if let Some(expires_at) = expires_at {
-            if !token.is_empty() && Utc::now() < expires_at {
-                return Ok(token);
-            }
-        }
-
-        let mut write_guard = self.token.write().await;
-
-        // Otherwise, refresh the token
-        let token_response = self
-            .token_generator
-            .generate_token(
-                Arc::clone(&self.app_client_id),
-                Arc::clone(&self.private_key),
-                Arc::clone(&self.installation_id),
-            )
-            .await
-            .map_err(|e| Error::UnableToGetToken {
-                source: Box::new(e),
-            })?;
-
-        write_guard.clone_from(&token_response.token);
-
-        self.expires_at
-            .write()
-            .await
-            .clone_from(&token_response.expires_at);
-
-        Ok(token_response.token)
+        self.rx.borrow().token.clone()
     }
 }
 
