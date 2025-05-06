@@ -77,7 +77,7 @@ assignees: ''
      - [ ] [AWS RDS Aurora (MySQL Compatible)](https://github.com/spiceai/cookbook/blob/trunk/mysql/rds-aurora/README.md)
      - [ ] [AWS RDS PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/rds/README.md)
      - [ ] [Clickhouse](https://github.com/spiceai/cookbook/blob/trunk/clickhouse/README.md)
-     - [ ] [Databricks Delta Lake](https://github.com/spiceai/cookbook/blob/trunk/databricks/delta_lake/README.md)
+     - [ ] [Databricks](https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md)
      - [ ] [Dremio](https://github.com/spiceai/cookbook/blob/trunk/dremio/README.md)
      - [ ] [DuckDB](https://github.com/spiceai/cookbook/blob/trunk/duckdb/connector/README.md)
      - [ ] [FTP](https://github.com/spiceai/cookbook/blob/trunk/ftp/README.md)
