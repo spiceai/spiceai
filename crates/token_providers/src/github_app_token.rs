@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{Result, TokenProvider};
-
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
@@ -69,6 +68,7 @@ pub struct GitHubAppTokenProvider {
     tx: watch::Sender<String>,
     rx: watch::Receiver<String>,
     _handle: Arc<JoinHandle<()>>,
+
 }
 
 impl std::fmt::Debug for GitHubAppTokenProvider {

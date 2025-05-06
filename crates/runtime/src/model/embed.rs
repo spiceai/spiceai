@@ -61,13 +61,13 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
         EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
         EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
-        EmbeddingPrefix::HuggingFace => huggingface(model_id, component, &params).await,
+        EmbeddingPrefix::HuggingFace => huggingface(model_id, &params).await,
+        EmbeddingPrefix::Databricks => databricks(model_id, &params),
     }
 }
 
 async fn huggingface(
     model_id: Option<String>,
-    component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let hf_token = extract_secret!(params, "hf_token");
@@ -78,10 +78,37 @@ async fn huggingface(
             TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
         ))
     } else {
-        Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("Failed to load model from: {}", component.from).into(),
+        Err(EmbedError::ModelNotProvided {
+            model_source: "huggingface".to_string(),
         })
     }
+}
+
+fn databricks(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
+        return Err(EmbedError::MissingParamError {
+            param_key: "databricks_endpoint",
+        });
+    };
+    let Some(token) = extract_secret!(params, "databricks_token") else {
+        return Err(EmbedError::MissingParamError {
+            param_key: "databricks_token",
+        });
+    };
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "databricks".to_string(),
+        });
+    };
+
+    Ok(Arc::new(llms::databricks::Databricks::from_access_token(
+        endpoint,
+        model_id.as_str(),
+        token,
+    )) as Arc<dyn Embed>)
 }
 
 fn file(
