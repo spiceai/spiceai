@@ -150,10 +150,6 @@ fn strip_prefix<'a, 'b: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::SessionContext;
-    use object_store::memory::InMemory;
-    use std::sync::Arc;
-    use url::Url;
 
     fn create_test_object_meta(path: &str, size: usize) -> ObjectMeta {
         ObjectMeta {
