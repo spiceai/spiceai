@@ -26,14 +26,11 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use base64::{Engine, prelude::BASE64_STANDARD};
-use serde_json::json;
 use snafu::ResultExt;
 use tracing::Instrument;
 
 use crate::{
     chat::{Chat, nsql::SqlGeneration},
-    config::HostedModelConfig,
     embeddings::Embed,
 };
 
@@ -122,7 +119,7 @@ impl Embed for Databricks {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
-        self.client.embeddings().create(req).await
+        self.stream_client.post("", req).await
     }
     fn size(&self) -> i32 {
         -1
