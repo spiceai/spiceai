@@ -50,8 +50,13 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let token = token_provider.get_token().await?;
-        let result = Self::new(endpoint, cluster_id, token, databricks_use_ssl).await?;
+        let result = Self::new(
+            endpoint,
+            cluster_id,
+            token_provider.get_token(),
+            databricks_use_ssl,
+        )
+        .await?;
 
         // subscribe to token updates and pass down to spark session
         if let Some(mut rx) = token_provider.subscribe() {

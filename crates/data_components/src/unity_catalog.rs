@@ -269,12 +269,8 @@ impl UnityCatalog {
         let mut builder = self.client.get(full_url);
 
         if let Some(token_provider) = &self.token_provider {
-            let token = token_provider
-                .get_token()
-                .await
-                .context(UnableToGetTokenSnafu)?;
             tracing::debug!("Adding bearer token to request");
-            builder = builder.bearer_auth(token);
+            builder = builder.bearer_auth(token_provider.get_token());
         }
         Ok(builder)
     }

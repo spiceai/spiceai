@@ -15,7 +15,6 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -135,10 +134,9 @@ impl DatabricksM2MTokenProvider {
     }
 }
 
-#[async_trait]
 impl TokenProvider for DatabricksM2MTokenProvider {
-    async fn get_token(&self) -> Result<String> {
-        Ok(self.rx.borrow().clone())
+    fn get_token(&self) -> String {
+        self.rx.borrow().clone()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {

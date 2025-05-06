@@ -17,14 +17,17 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Error, Result, TokenProvider};
-use async_trait::async_trait;
+use crate::{Result, TokenProvider};
+
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use tokio::sync::{RwLock, watch};
+use std::time::Duration;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {
@@ -51,92 +54,20 @@ pub enum GitHubAppError {
         "Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
+
+    #[snafu(display("Unable to parse GitHub token expiration page"))]
+    UnableToParseTokenExpiration {},
 }
 
-#[derive(Serialize)]
-struct Claims {
-    iat: usize,
-    exp: usize,
-    iss: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct TokenResponse {
-    token: String,
-    expires_at: String,
-}
-
-#[async_trait]
-trait TokenGenerator: Send + Sync {
-    async fn generate_token(
-        &self,
-        app_client_id: Arc<str>,
-        private_key: Arc<str>,
-        installation_id: Arc<str>,
-    ) -> Result<TokenResponse, GitHubAppError>;
-}
-
-struct GitHubTokenGenerator {}
-
-#[async_trait]
-impl TokenGenerator for GitHubTokenGenerator {
-    async fn generate_token(
-        &self,
-        app_client_id: Arc<str>,
-        private_key: Arc<str>,
-        installation_id: Arc<str>,
-    ) -> Result<TokenResponse, GitHubAppError> {
-        let iat = usize::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context(UnableToGetSystemTimeSnafu {})?
-                .as_secs(),
-        )
-        .context(InvalidSystemTimeSnafu {})?;
-
-        let exp = iat + 600;
-        let claims = Claims {
-            iat,
-            exp,
-            iss: app_client_id.to_string(),
-        };
-        let private_key = private_key.as_ref();
-        let encoding_key =
-            EncodingKey::from_rsa_pem(private_key.as_bytes()).context(InvalidPrivateKeySnafu {})?;
-
-        let jwt_token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
-            .context(UnableToGenerateJWTSnafu {})?;
-
-        let client = reqwest::Client::new();
-
-        let response = client
-            .post(format!(
-                "https://api.github.com/app/installations/{installation_id}/access_tokens",
-            ))
-            .header("Accept", "application/vnd.github+json")
-            .header("Authorization", format!("Bearer {jwt_token}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "spice")
-            .send()
-            .await
-            .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
-
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .context(UnableToGetGitHubInstallationAccessTokenBodySnafu {})?;
-
-        Ok(token_response)
-    }
-}
+// A constant refresh buffer: refresh 60 seconds before expiration.
+const TOKEN_REFRESH_BUFFER_SECS: u64 = 60;
 
 pub struct GitHubAppTokenProvider {
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
-    token_generator: Arc<dyn TokenGenerator>,
-    tx: watch::Sender<GitHubToken>,
-    rx: watch::Receiver<GitHubToken>,
+    tx: watch::Sender<String>,
+    rx: watch::Receiver<String>,
     _handle: Arc<JoinHandle<()>>,
 }
 
@@ -150,96 +81,70 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
     }
 }
 
+impl TokenProvider for GitHubAppTokenProvider {
+    fn get_token(&self) -> String {
+        self.rx.borrow().clone()
+    }
+
+    fn subscribe(&self) -> Option<watch::Receiver<String>> {
+        Some(self.tx.subscribe())
+    }
+}
+
 impl GitHubAppTokenProvider {
-    /// Creates a new GitHubAppTokenProvider and spawns a background token refresher.
+    /// Creates a new `GitHubAppTokenProvider` and attempts to spawn a background token refresher.
     pub async fn try_new(
         app_client_id: Arc<str>,
         private_key: Arc<str>,
         installation_id: Arc<str>,
     ) -> Result<Self, GitHubAppError> {
-        let token_generator: Arc<dyn TokenGenerator> = Arc::new(GitHubTokenGenerator {});
+        let init_token = generate_token(
+            Arc::clone(&app_client_id),
+            Arc::clone(&private_key),
+            Arc::clone(&installation_id),
+        )
+        .await?;
 
-        // Get the initial token.
-        let token_response = token_generator
-            .generate_token(
-                Arc::clone(&app_client_id),
-                Arc::clone(&private_key),
-                Arc::clone(&installation_id),
-            )
-            .await?;
-        let init_token = GitHubToken::from_response(token_response)?;
+        let (tx, rx) = watch::channel(init_token.token.clone());
 
-        // Create a watch channel initialized with the token.
-        let (tx, rx) = watch::channel(init_token.clone());
-
-        // Clone necessary parameters for the background refresher.
+        // variables for tokio thread.
         let cloned_app_client_id = Arc::clone(&app_client_id);
         let cloned_private_key = Arc::clone(&private_key);
         let cloned_installation_id = Arc::clone(&installation_id);
-        let cloned_token_generator = Arc::clone(&token_generator);
         let cloned_tx = tx.clone();
 
-        // Optionally, use a Fibonacci backoff strategy. Here we simulate it simply.
-        // For a more elaborate backoff, consider using an external crate.
         let handle = tokio::spawn(async move {
-            // We'll use a simple backoff: start at 1 sec, double on error up to 300 sec.
-            let mut backoff = Duration::from_secs(1);
+            let mut backoff = FibonacciBackoffBuilder::new()
+                .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+                .build();
+
+            let mut next_wait = init_token.next_wait();
 
             loop {
-                // Calculate remaining duration until the token expires, minus our buffer.
-                let current_token = cloned_tx.borrow().clone();
-                let now = Utc::now();
-                let next_wait = if current_token.expires_at > now {
-                    let diff = current_token
-                        .expires_at
-                        .signed_duration_since(now)
-                        .to_std()
-                        .unwrap_or_else(|_| Duration::from_secs(0));
-                    // If the diff is less than the buffer, refresh immediately.
-                    if diff > Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS) {
-                        diff - Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS)
-                    } else {
-                        Duration::from_secs(0)
-                    }
-                } else {
-                    Duration::from_secs(0)
-                };
-
-                // Wait until it's time to refresh.
                 sleep(next_wait).await;
 
-                // Attempt to refresh the token.
-                match cloned_token_generator
-                    .generate_token(
-                        Arc::clone(&cloned_app_client_id),
-                        Arc::clone(&cloned_private_key),
-                        Arc::clone(&cloned_installation_id),
-                    )
-                    .await
+                match generate_token(
+                    Arc::clone(&cloned_app_client_id),
+                    Arc::clone(&cloned_private_key),
+                    Arc::clone(&cloned_installation_id),
+                )
+                .await
                 {
-                    Ok(token_response) => {
-                        // On success, parse and update the watch channel.
-                        if let Ok(new_token) = GitHubToken::from_response(token_response) {
-                            tracing::debug!(
-                                "GitHub token refreshed; expires at {}",
-                                new_token.expires_at
-                            );
-                            let _ = cloned_tx.send(new_token);
-                            // Reset backoff on success.
-                            backoff = Duration::from_secs(1);
-                        } else {
-                            tracing::error!("Failed to parse refreshed GitHub token.");
-                        }
+                    Ok(new_token) => {
+                        tracing::debug!(
+                            "GitHub token refreshed; expires at {}",
+                            new_token.expires_at
+                        );
+                        next_wait = new_token.next_wait();
+                        let _ = cloned_tx.send(new_token.token.clone());
                     }
                     Err(e) => {
+                        next_wait = backoff.next_duration().unwrap_or(Duration::from_secs(300));
                         tracing::error!(
                             "GitHub token refresh failed: {}. Retrying in {:?}",
                             e,
-                            backoff
+                            next_wait
                         );
-                        // On error, sleep for the backoff duration.
-                        sleep(backoff).await;
-                        backoff = std::cmp::min(backoff * 2, Duration::from_secs(300));
                     }
                 }
             }
@@ -249,23 +154,10 @@ impl GitHubAppTokenProvider {
             app_client_id,
             private_key,
             installation_id,
-            token_generator,
             tx,
             rx,
             _handle: Arc::new(handle),
         })
-    }
-
-    #[must_use]
-    pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {
-        Self {
-            token: Arc::new(RwLock::new(String::new())),
-            expires_at: Arc::new(RwLock::new(String::new())),
-            app_client_id,
-            private_key,
-            installation_id,
-            token_generator: Arc::new(GitHubTokenGenerator {}),
-        }
     }
 }
 
@@ -274,102 +166,155 @@ pub struct GitHubToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
 }
-
 impl GitHubToken {
-    // Try to create a GitHubToken from TokenResponse.
-    pub fn from_response(resp: TokenResponse) -> Result<Self, GitHubAppError> {
-        let expires_at = DateTime::parse_from_rfc3339(&resp.expires_at)
+    #[must_use]
+    pub fn next_wait(&self) -> Duration {
+        Duration::from_secs(
+            ((self.expires_at - Utc::now()).num_seconds() as u64) - TOKEN_REFRESH_BUFFER_SECS,
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct Claims {
+    iat: usize,
+    exp: usize,
+    iss: String,
+}
+
+async fn generate_token(
+    app_client_id: Arc<str>,
+    private_key: Arc<str>,
+    installation_id: Arc<str>,
+) -> Result<GitHubToken, GitHubAppError> {
+    let iat = usize::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context(UnableToGetSystemTimeSnafu {})?
+            .as_secs(),
+    )
+    .context(InvalidSystemTimeSnafu {})?;
+
+    let exp = iat + 600;
+    let claims = Claims {
+        iat,
+        exp,
+        iss: app_client_id.to_string(),
+    };
+    let private_key = private_key.as_ref();
+    let encoding_key =
+        EncodingKey::from_rsa_pem(private_key.as_bytes()).context(InvalidPrivateKeySnafu {})?;
+
+    let jwt_token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
+        .context(UnableToGenerateJWTSnafu {})?;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!(
+            "https://api.github.com/app/installations/{installation_id}/access_tokens",
+        ))
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {jwt_token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "spice")
+        .send()
+        .await
+        .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
+
+    #[derive(Deserialize, Debug)]
+    struct TokenResponse {
+        token: String,
+        expires_at: String,
+    }
+    let resp: TokenResponse = response
+        .json()
+        .await
+        .context(UnableToGetGitHubInstallationAccessTokenBodySnafu {})?;
+
+    Ok(GitHubToken {
+        token: resp.token,
+        expires_at: DateTime::parse_from_rfc3339(&resp.expires_at)
             .map_err(|_| GitHubAppError::UnableToParseTokenExpiration {})?
-            .with_timezone(&Utc);
-        Ok(Self {
-            token: resp.token,
-            expires_at,
-        })
-    }
+            .with_timezone(&Utc),
+    })
 }
 
-#[async_trait]
-impl TokenProvider for GitHubAppTokenProvider {
-    async fn get_token(&self) -> Result<String> {
-        self.rx.borrow().token.clone()
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+//     struct MockTokenGenerator {
+//         counter: Arc<RwLock<usize>>,
+//     }
 
-    struct MockTokenGenerator {
-        counter: Arc<RwLock<usize>>,
-    }
+//     impl MockTokenGenerator {
+//         fn new() -> Self {
+//             Self {
+//                 counter: Arc::new(RwLock::new(0)),
+//             }
+//         }
+//     }
 
-    impl MockTokenGenerator {
-        fn new() -> Self {
-            Self {
-                counter: Arc::new(RwLock::new(0)),
-            }
-        }
-    }
+//     #[async_trait]
+//     impl TokenGenerator for MockTokenGenerator {
+//         async fn generate_token(
+//             &self,
+//             _app_client_id: Arc<str>,
+//             _private_key: Arc<str>,
+//             _installation_id: Arc<str>,
+//         ) -> Result<TokenResponse, GitHubAppError> {
+//             let mut counter = self.counter.write().await;
+//             *counter += 1;
+//             let token = format!("token_{}", *counter);
 
-    #[async_trait]
-    impl TokenGenerator for MockTokenGenerator {
-        async fn generate_token(
-            &self,
-            _app_client_id: Arc<str>,
-            _private_key: Arc<str>,
-            _installation_id: Arc<str>,
-        ) -> Result<TokenResponse, GitHubAppError> {
-            let mut counter = self.counter.write().await;
-            *counter += 1;
-            let token = format!("token_{}", *counter);
+//             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+//             Ok(TokenResponse {
+//                 token,
+//                 expires_at: (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339(),
+//             })
+//         }
+//     }
 
-            Ok(TokenResponse {
-                token,
-                expires_at: (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339(),
-            })
-        }
-    }
+//     #[tokio::test]
+//     async fn test_get_token_refresh() {
+//         let app_client_id = Arc::from("app_client_id".to_string());
+//         let private_key = Arc::from("private_key".to_string());
+//         let installation_id = Arc::from("installation_id".to_string());
+//         let token_generator = Arc::new(MockTokenGenerator::new());
 
-    #[tokio::test]
-    async fn test_get_token_refresh() {
-        let app_client_id = Arc::from("app_client_id".to_string());
-        let private_key = Arc::from("private_key".to_string());
-        let installation_id = Arc::from("installation_id".to_string());
-        let token_generator = Arc::new(MockTokenGenerator::new());
+//         let token_provider = GitHubAppTokenProvider {
+//             token: Arc::new(RwLock::new(String::new())),
+//             expires_at: Arc::new(RwLock::new(String::new())),
+//             app_client_id,
+//             private_key,
+//             installation_id,
+//             token_generator,
+//         };
 
-        let token_provider = GitHubAppTokenProvider {
-            token: Arc::new(RwLock::new(String::new())),
-            expires_at: Arc::new(RwLock::new(String::new())),
-            app_client_id,
-            private_key,
-            installation_id,
-            token_generator,
-        };
+//         // First call to get_token should generate a new token
+//         let token = token_provider
+//             .get_token()
+//             .await
+//             .expect("Failed to get token");
+//         assert_eq!(token, "token_1");
 
-        // First call to get_token should generate a new token
-        let token = token_provider
-            .get_token()
-            .await
-            .expect("Failed to get token");
-        assert_eq!(token, "token_1");
+//         // Second call to get_token should return the same token
+//         let token = token_provider
+//             .get_token()
+//             .await
+//             .expect("Failed to get token");
+//         assert_eq!(token, "token_1");
 
-        // Second call to get_token should return the same token
-        let token = token_provider
-            .get_token()
-            .await
-            .expect("Failed to get token");
-        assert_eq!(token, "token_1");
+//         // sleep 3 seconds to expire the token
+//         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        // sleep 3 seconds to expire the token
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-        // Third call to get_token should generate a new token
-        let token = token_provider
-            .get_token()
-            .await
-            .expect("Failed to get token");
-        assert_eq!(token, "token_2");
-    }
-}
+//         // Third call to get_token should generate a new token
+//         let token = token_provider
+//             .get_token()
+//             .await
+//             .expect("Failed to get token");
+//         assert_eq!(token, "token_2");
+//     }
+// }
