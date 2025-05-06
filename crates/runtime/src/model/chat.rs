@@ -246,7 +246,7 @@ fn databricks(
         });
     };
 
-    let config = DatabricksConfig::new(endpoint.to_string(), token.clone());
+    let config = DatabricksConfig::new(endpoint, token.clone());
 
     Ok(Arc::new(llms::openai::new_openai_client_with_config(
         model_id, config,
@@ -381,7 +381,7 @@ struct DatabricksConfig {
 }
 
 impl DatabricksConfig {
-    pub fn new(databricks_endpoint: String, token: SecretString) -> Self {
+    pub fn new(databricks_endpoint: &str, token: SecretString) -> Self {
         Self {
             api_base: format!("https://{databricks_endpoint}/serving-endpoints"),
             token,
