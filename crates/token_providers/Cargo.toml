@@ -9,7 +9,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 chrono = "0.4.38"
 jsonwebtoken = "9.3.0"
 reqwest.workspace = true

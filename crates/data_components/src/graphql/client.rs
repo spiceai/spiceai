@@ -769,7 +769,7 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
-        request = request_with_auth(request, self.auth.as_ref()).await;
+        request = request_with_auth(request, self.auth.as_ref());
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let response_headers = response.headers().clone();
@@ -936,14 +936,11 @@ fn get_json_schema(
     Ok(Arc::new(schema))
 }
 
-async fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> RequestBuilder {
+fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> RequestBuilder {
     match auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
         Some(Auth::Bearer(token_provider)) => {
-            if let Ok(token) = token_provider.get_token().await {
-                return request_builder.bearer_auth(&token);
-            }
-            request_builder
+            request_builder.bearer_auth(token_provider.get_token())
         }
         _ => request_builder,
     }

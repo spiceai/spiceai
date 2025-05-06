@@ -294,9 +294,7 @@ impl GithubRestClient {
             HeaderValue::from_static("application/vnd.github.v3+json"),
         );
 
-        let token = self.token.get_token().await?;
-
-        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
+        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token.get_token())) {
             headers.insert(AUTHORIZATION, header);
         }
 
@@ -369,9 +367,7 @@ impl GithubRestClient {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
 
-        let token = self.token.get_token().await?;
-
-        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
+        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token.get_token())) {
             headers.insert(AUTHORIZATION, header);
         }
 

@@ -352,27 +352,47 @@ impl DataConnectorFactory for GithubFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let token = params.parameters.get("token").ok();
-        let client_id = params.parameters.get("client_id").expose().ok();
-        let private_key = params.parameters.get("private_key").expose().ok();
-        let installation_id = params.parameters.get("installation_id").expose().ok();
-
-        let token_provider: Option<Arc<dyn TokenProvider>> =
-            match (token, client_id, private_key, installation_id) {
-                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.clone()))),
-
-                (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                    Some(Arc::new(GitHubAppTokenProvider::new(
-                        Arc::from(client_id),
-                        Arc::from(private_key),
-                        Arc::from(installation_id),
-                    )))
-                }
-
-                _ => None,
-            };
+        let token = params.parameters.get("token").ok().cloned();
+        let client_id = params
+            .parameters
+            .get("client_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let private_key = params
+            .parameters
+            .get("private_key")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let installation_id = params
+            .parameters
+            .get("installation_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
 
         Box::pin(async move {
+            let token_provider: Option<Arc<dyn TokenProvider>> =
+                match (token, client_id, private_key, installation_id) {
+                    (Some(token), _, _, _) => {
+                        Some(Arc::new(StaticTokenProvider::new(token.clone())))
+                    }
+
+                    (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                        Some(Arc::new(
+                            GitHubAppTokenProvider::try_new(
+                                client_id.into(),
+                                private_key.into(),
+                                installation_id.into(),
+                            )
+                            .await?,
+                        ))
+                    }
+
+                    _ => None,
+                };
+
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
