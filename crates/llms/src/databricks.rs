@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ pub struct Databricks<C: Config> {
     client: Client<C>,
 }
 
+#[must_use]
 pub fn from_access_token(
     endpoint: &str,
     model: &str,
@@ -63,9 +65,7 @@ pub fn try_from_token_provider(
     token_provider: Arc<dyn TokenProvider>,
 ) -> Result<Databricks<HostedModelConfig>, super::chat::Error> {
     let cfg = HostedModelConfig::from_url(
-        format!("https://{endpoint}/serving-endpoints/{model}/invocations")
-            .as_str()
-            .into(),
+        format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
     )
     .boxed()
     .map_err(|e| super::chat::Error::FailedToLoadModel { source: e })?

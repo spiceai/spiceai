@@ -170,7 +170,7 @@ impl Config for HostedModelConfig {
         let base = match &self.auth {
             Some(GenericAuthMechanism::HttpUsername(username, provider)) => {
                 let mut base = self.base_url.clone();
-                if let Err(_) = base.set_username(username.as_str()) {
+                if let Err(()) = base.set_username(username.as_str()) {
                     tracing::warn!("Failed to set username in URL '{base}'");
                 };
                 let _ = base.set_password(Some(provider.get_token().as_str()));
@@ -191,8 +191,8 @@ impl Config for HostedModelConfig {
 
     fn api_key(&self) -> SecretString {
         match &self.auth {
-            Some(GenericAuthMechanism::ApiKey(prov)) => SecretString::from(prov.get_token()),
-            Some(GenericAuthMechanism::BearerToken(prov)) => SecretString::from(prov.get_token()),
+            Some(GenericAuthMechanism::BearerToken(prov) |
+GenericAuthMechanism::ApiKey(prov)) => SecretString::from(prov.get_token()),
             _ => DUMMY_API_KEY.clone(),
         }
     }

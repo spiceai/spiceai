@@ -244,25 +244,25 @@ async fn databricks(
     let client_secret = extract_secret!(params, "databricks_client_secret");
 
     match (token_opt, client_id, client_secret) {
-        (Some(_), Some(_), Some(_)) | (Some(_), Some(_), None) | (Some(_), None, Some(_)) => {
-            return Err(LlmError::FailedToLoadModel {
+        (Some(_), Some(_) | None, Some(_)) | (Some(_), Some(_), None) => {
+            Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
-            });
+            })
         }
         (None, None, None) => {
-            return Err(LlmError::FailedToLoadModel {
+            Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
-            });
+            })
         }
         (None, None, Some(_client_secret)) => {
-            return Err(LlmError::FailedToLoadModel {
+            Err(LlmError::FailedToLoadModel {
                 source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
-            });
+            })
         }
         (None, Some(_client_id), None) => {
-            return Err(LlmError::FailedToLoadModel {
+            Err(LlmError::FailedToLoadModel {
                 source: "If `databricks_client_id` is provided, `databricks_client_secret` must also be provided.".into(),
-            });
+            })
         }
         (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
             endpoint,
