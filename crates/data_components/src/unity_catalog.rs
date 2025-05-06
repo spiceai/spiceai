@@ -261,7 +261,6 @@ impl UnityCatalog {
             tracing::debug!("Adding bearer token to request");
             builder = builder.bearer_auth(token_provider.get_token());
         }
-
         if let Some(user_agent) = &self.user_agent {
             builder = builder.header("User-Agent", user_agent);
         }

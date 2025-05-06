@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -166,6 +167,7 @@ pub struct GitHubToken {
     pub expires_at: DateTime<Utc>,
 }
 impl GitHubToken {
+    #[allow(clippy::cast_sign_loss)]
     #[must_use]
     pub fn next_wait(&self) -> Duration {
         Duration::from_secs(
@@ -221,6 +223,7 @@ async fn generate_token(
         .await
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
+    #[allow(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
     struct TokenResponse {
         token: String,
