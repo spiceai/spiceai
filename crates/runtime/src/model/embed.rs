@@ -78,9 +78,9 @@ async fn huggingface(
             TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
         ))
     } else {
-        return Err(EmbedError::ModelNotProvided {
+        Err(EmbedError::ModelNotProvided {
             model_source: "huggingface".to_string(),
-        });
+        })
     }
 }
 

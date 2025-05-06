@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::{
     Client,
-    config::{Config, OpenAIConfig},
+    config::OpenAIConfig,
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
@@ -38,8 +38,6 @@ use crate::{
 pub struct Databricks {
     pub model: String,
     client: Client<OpenAIConfig>,
-    // The chat/completion URL for databricks doesn't support streaming. The URL that supports streaming doesn't end with `chat/completions`. Must use separate client. See [`Chat::chat_stream`] for details.
-    stream_client: Client<OpenAIConfig>,
 }
 
 impl Databricks {
@@ -47,12 +45,7 @@ impl Databricks {
     pub fn from_access_token(endpoint: &str, model: &str, access_token: &str) -> Self {
         Self {
             model: model.to_string(),
-            client: Client::with_config(
-                OpenAIConfig::default()
-                    .with_api_base(format!("https://{endpoint}/serving-endpoints"))
-                    .with_api_key(access_token),
-            ),
-            stream_client: Client::with_config(OpenAIConfig::default().with_api_base(format!(
+            client: Client::with_config(OpenAIConfig::default().with_api_base(format!(
                 "https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations"
             ))),
         }
@@ -66,6 +59,7 @@ impl Chat for Databricks {
     }
 
     /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
+    #[allow(deprecated)]
     async fn health(&self) -> super::chat::Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -101,9 +95,7 @@ impl Chat for Databricks {
         inner_req.stream_options = None; // Not supported by Databricks.
 
         // Must use `post_stream` instead of `chat().create(...` to avoid concatenation of `chat/completions`.
-        Ok(Box::pin(
-            self.stream_client.post_stream("", inner_req).await,
-        ))
+        Ok(Box::pin(self.client.post_stream("", inner_req).await))
     }
 
     async fn chat_request(
@@ -112,7 +104,7 @@ impl Chat for Databricks {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        self.client.chat().create(inner_req).await
+        self.client.post("", inner_req).await
     }
 }
 
@@ -123,7 +115,7 @@ impl Embed for Databricks {
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
-        self.stream_client.post("", req).await
+        self.client.post("", req).await
     }
     fn size(&self) -> i32 {
         -1
@@ -152,9 +144,8 @@ impl Embed for Databricks {
 
 impl std::fmt::Debug for Databricks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DatabricksEmbedd")
+        f.debug_struct("DatabricksEmbed")
             .field("inner", &self.client)
-            .field("inner_streaming", &self.stream_client)
             .finish_non_exhaustive()
     }
 }
