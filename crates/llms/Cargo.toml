@@ -57,7 +57,7 @@ cudarc = { version = "0.12.2", optional = true, features = [
 either = "1.15.0"
 indexmap.workspace = true
 tempfile.workspace = true
-
+token_providers = { path = "../token_providers" }
 
 [dev-dependencies]
 anyhow = "1.0.86"
