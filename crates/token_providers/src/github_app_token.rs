@@ -68,7 +68,6 @@ pub struct GitHubAppTokenProvider {
     tx: watch::Sender<String>,
     rx: watch::Receiver<String>,
     _handle: Arc<JoinHandle<()>>,
-
 }
 
 impl std::fmt::Debug for GitHubAppTokenProvider {
@@ -239,82 +238,3 @@ async fn generate_token(
             .with_timezone(&Utc),
     })
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     struct MockTokenGenerator {
-//         counter: Arc<RwLock<usize>>,
-//     }
-
-//     impl MockTokenGenerator {
-//         fn new() -> Self {
-//             Self {
-//                 counter: Arc::new(RwLock::new(0)),
-//             }
-//         }
-//     }
-
-//     #[async_trait]
-//     impl TokenGenerator for MockTokenGenerator {
-//         async fn generate_token(
-//             &self,
-//             _app_client_id: Arc<str>,
-//             _private_key: Arc<str>,
-//             _installation_id: Arc<str>,
-//         ) -> Result<TokenResponse, GitHubAppError> {
-//             let mut counter = self.counter.write().await;
-//             *counter += 1;
-//             let token = format!("token_{}", *counter);
-
-//             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-//             Ok(TokenResponse {
-//                 token,
-//                 expires_at: (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339(),
-//             })
-//         }
-//     }
-
-//     #[tokio::test]
-//     async fn test_get_token_refresh() {
-//         let app_client_id = Arc::from("app_client_id".to_string());
-//         let private_key = Arc::from("private_key".to_string());
-//         let installation_id = Arc::from("installation_id".to_string());
-//         let token_generator = Arc::new(MockTokenGenerator::new());
-
-//         let token_provider = GitHubAppTokenProvider {
-//             token: Arc::new(RwLock::new(String::new())),
-//             expires_at: Arc::new(RwLock::new(String::new())),
-//             app_client_id,
-//             private_key,
-//             installation_id,
-//             token_generator,
-//         };
-
-//         // First call to get_token should generate a new token
-//         let token = token_provider
-//             .get_token()
-//             .await
-//             .expect("Failed to get token");
-//         assert_eq!(token, "token_1");
-
-//         // Second call to get_token should return the same token
-//         let token = token_provider
-//             .get_token()
-//             .await
-//             .expect("Failed to get token");
-//         assert_eq!(token, "token_1");
-
-//         // sleep 3 seconds to expire the token
-//         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-//         // Third call to get_token should generate a new token
-//         let token = token_provider
-//             .get_token()
-//             .await
-//             .expect("Failed to get token");
-//         assert_eq!(token, "token_2");
-//     }
-// }
