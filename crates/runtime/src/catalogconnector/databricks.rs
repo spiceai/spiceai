@@ -168,8 +168,11 @@ impl CatalogConnector for Databricks {
             }
         };
 
-        let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider));
+        let unity_catalog = UnityCatalogClient::new(
+            Endpoint(endpoint.to_string()),
+            Some(token_provider),
+            Some(Runtime::user_agent()),
+        );
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -203,17 +206,20 @@ impl CatalogConnector for Databricks {
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
-            let dataset_databricks =
-                match DatabricksDataConnector::new(params, runtime.token_provider_registry())
-                    .await
-                    .map_err(|source| super::Error::UnableToGetCatalogProvider {
-                        connector: "databricks".to_string(),
-                        source: source.into(),
-                        connector_component: ConnectorComponent::from(catalog),
-                    }) {
-                    Ok(dataset_databricks) => dataset_databricks,
-                    Err(e) => return Err(e),
-                };
+            let dataset_databricks = match DatabricksDataConnector::new(
+                params,
+                runtime.token_provider_registry(),
+                Runtime::user_agent(),
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            }) {
+                Ok(dataset_databricks) => dataset_databricks,
+                Err(e) => return Err(e),
+            };
 
             (
                 dataset_databricks.read_provider(),

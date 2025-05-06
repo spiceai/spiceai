@@ -79,6 +79,7 @@ pub struct UnityCatalog {
     endpoint: String,
     token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +91,11 @@ pub struct CatalogId(pub String);
 impl UnityCatalog {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Self {
+    pub fn new(
+        endpoint: Endpoint,
+        token_provider: Option<Arc<dyn TokenProvider>>,
+        user_agent: Option<String>,
+    ) -> Self {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
@@ -100,6 +105,7 @@ impl UnityCatalog {
             endpoint: endpoint_str,
             token_provider,
             client: reqwest::Client::new(),
+            user_agent,
         }
     }
 
@@ -276,6 +282,11 @@ impl UnityCatalog {
             tracing::debug!("Adding bearer token to request");
             builder = builder.bearer_auth(token);
         }
+
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header("User-Agent", user_agent);
+        }
+
         Ok(builder)
     }
 }
