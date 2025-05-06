@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+use http::{
+    HeaderMap, HeaderValue,
+    header::{AUTHORIZATION, USER_AGENT},
+};
 use llms::{
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
@@ -21,7 +25,7 @@ use llms::{
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
@@ -231,21 +235,21 @@ fn databricks(
             param_key: "databricks_endpoint",
         });
     };
-    let Some(token) = extract_secret!(params, "databricks_token") else {
-        return Err(LlmError::MissingParamError {
-            param_key: "databricks_token",
-        });
-    };
     let Some(model_id) = model_id else {
         return Err(LlmError::ModelNotProvided {
             model_source: "databricks".to_string(),
         });
     };
+    let Some(token) = params.get("databricks_token") else {
+        return Err(LlmError::MissingParamError {
+            param_key: "databricks_token",
+        });
+    };
 
-    Ok(Arc::new(llms::databricks::Databricks::from_access_token(
-        endpoint,
-        model_id.as_str(),
-        token,
+    let config = DatabricksConfig::new(endpoint.to_string(), token.clone());
+
+    Ok(Arc::new(llms::openai::new_openai_client_with_config(
+        model_id, config,
     )) as Arc<dyn Chat>)
 }
 
@@ -368,4 +372,62 @@ fn file(
         generation_config.as_deref(),
         chat_template_literal,
     )
+}
+
+#[derive(Clone, Debug)]
+struct DatabricksConfig {
+    api_base: String,
+    token: SecretString,
+}
+
+impl DatabricksConfig {
+    pub fn new(databricks_endpoint: String, token: SecretString) -> Self {
+        Self {
+            api_base: format!("https://{databricks_endpoint}/serving-endpoints"),
+            token,
+        }
+    }
+}
+
+impl async_openai::config::Config for DatabricksConfig {
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+
+        let auth_header = format!("Bearer {}", self.api_key().expose_secret());
+        match HeaderValue::from_str(&auth_header) {
+            Ok(value) => {
+                headers.insert(AUTHORIZATION, value);
+            }
+            Err(_) => {
+                tracing::warn!("Invalid API key given for 'Authorization' header. Will not use");
+            }
+        }
+
+        match HeaderValue::from_str(&data_components::databricks::user_agent()) {
+            Ok(value) => {
+                headers.insert(USER_AGENT, value);
+            }
+            Err(_) => {
+                tracing::warn!("Invalid user agent for 'User-Agent' header. Will not use");
+            }
+        }
+
+        headers
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.api_base, path)
+    }
+
+    fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    fn api_key(&self) -> &SecretString {
+        &self.token
+    }
+
+    fn query(&self) -> Vec<(&str, &str)> {
+        vec![]
+    }
 }
