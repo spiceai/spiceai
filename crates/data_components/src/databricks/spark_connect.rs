@@ -36,8 +36,9 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let session_id = Uuid::new_v4();
+        let user_agent = super::user_agent();
         let connection = format!(
-            "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}"
+            "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id};user_agent={user_agent};"
         );
         Ok(Self {
             spark_connect: Arc::new(SparkConnect::from_connection(connection.as_str()).await?),

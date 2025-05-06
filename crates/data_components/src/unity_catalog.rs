@@ -79,6 +79,7 @@ pub struct UnityCatalog {
     endpoint: String,
     token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,10 +97,18 @@ impl UnityCatalog {
             endpoint_str = format!("https://{endpoint_str}");
         }
 
+        let mut user_agent: Option<String> = None;
+        #[cfg(feature = "databricks")]
+        // Include user_agent, if connects to Databricks instance
+        if endpoint.0.contains("databricks") {
+            user_agent = Some(crate::databricks::user_agent());
+        }
+
         Self {
             endpoint: endpoint_str,
             token_provider,
             client: reqwest::Client::new(),
+            user_agent,
         }
     }
 
@@ -252,6 +261,11 @@ impl UnityCatalog {
             tracing::debug!("Adding bearer token to request");
             builder = builder.bearer_auth(token_provider.get_token());
         }
+
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header("User-Agent", user_agent);
+        }
+
         builder
     }
 }
