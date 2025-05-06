@@ -41,7 +41,7 @@ pub struct DatabricksM2MTokenProvider {
     client_id: String,
 
     tx: watch::Sender<String>,
-    pub rx: watch::Receiver<String>,
+    rx: watch::Receiver<String>,
 
     _handle: Arc<JoinHandle<()>>,
 }
@@ -132,16 +132,12 @@ impl DatabricksM2MTokenProvider {
             _handle: Arc::new(handle),
         })
     }
-
-    pub fn get_token(&self) -> String {
-        self.rx.borrow().clone()
-    }
 }
 
 #[async_trait]
 impl TokenProvider for DatabricksM2MTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        Ok(self.get_token())
+        Ok(self.rx.borrow().clone())
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
