@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Runtime;
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::Read;
@@ -93,7 +92,6 @@ impl Databricks {
     pub async fn new(
         params: Parameters,
         token_provider_registry: Arc<TokenProviderRegistry>,
-        user_agent: String,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
         let endpoint = params
@@ -125,7 +123,6 @@ impl Databricks {
                     Endpoint(endpoint.to_string()),
                     storage_options,
                     token_provider,
-                    user_agent,
                 );
 
                 Ok(Self {
@@ -152,7 +149,6 @@ impl Databricks {
                     token_provider_registry,
                     cluster_id,
                     databricks_use_ssl,
-                    user_agent,
                 )
                 .await
             }
@@ -211,7 +207,6 @@ impl Databricks {
         token_provider_registry: Arc<TokenProviderRegistry>,
         cluster_id: &SecretString,
         databricks_use_ssl: bool,
-        user_agent: String,
     ) -> Result<Self> {
         let databricks_spark = match auth_credentials {
             AuthCredentials::Token(token) => DatabricksSparkConnect::new(
@@ -219,7 +214,6 @@ impl Databricks {
                 cluster_id.expose_secret().to_string(),
                 token.expose_secret().to_string(),
                 databricks_use_ssl,
-                user_agent,
             )
             .await
             .context(UnableToConstructDatabricksSparkSnafu)?,
@@ -238,7 +232,6 @@ impl Databricks {
                     cluster_id.expose_secret().to_string(),
                     databricks_use_ssl,
                     token_provider,
-                    user_agent,
                 )
                 .await
                 .context(UnableToConstructDatabricksSparkSnafu)?
@@ -363,12 +356,8 @@ impl DataConnectorFactory for DatabricksFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
             Box::pin(async move {
-                let databricks = Databricks::new(
-                    params.parameters,
-                    runtime.token_provider_registry(),
-                    Runtime::user_agent(),
-                )
-                .await?;
+                let databricks =
+                    Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
             })
         } else {

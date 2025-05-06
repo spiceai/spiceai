@@ -349,8 +349,6 @@ const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SPICE_USER_AGENT_STRING: &str = "SpiceAI_OSS";
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
@@ -385,12 +383,6 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    #[must_use]
-    pub fn user_agent() -> String {
-        let version = env!("CARGO_PKG_VERSION").to_string();
-        format!("{SPICE_USER_AGENT_STRING}/{version}")
-    }
-
     #[must_use]
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder::new()

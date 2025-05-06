@@ -31,7 +31,6 @@ pub struct DatabricksDelta {
     endpoint: Endpoint,
     token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
-    user_agent: String,
 }
 
 #[derive(Debug, Snafu)]
@@ -51,13 +50,11 @@ impl DatabricksDelta {
         endpoint: Endpoint,
         storage_options: HashMap<String, SecretString>,
         token_provider: Arc<dyn TokenProvider>,
-        user_agent: String,
     ) -> Self {
         Self {
             endpoint,
             token_provider,
             storage_options,
-            user_agent,
         }
     }
 
@@ -95,7 +92,7 @@ impl DatabricksDelta {
         let uc_client = UnityCatalog::new(
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
-            Some(self.user_agent.clone()),
+            Some(super::user_agent()),
         );
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
