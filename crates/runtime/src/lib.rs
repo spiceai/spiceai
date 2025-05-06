@@ -385,6 +385,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    #[must_use]
     pub fn user_agent() -> String {
         let version = env!("CARGO_PKG_VERSION").to_string();
         format!("{SPICE_USER_AGENT_STRING}/{version}")
