@@ -23,7 +23,7 @@ use std::{fmt, sync::Arc};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use token_providers::{Result, TokenProvider};
+use crate::{Result, TokenProvider};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 

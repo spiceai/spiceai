@@ -17,12 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{Error, Result, TokenProvider};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use token_providers::{Error, Result, TokenProvider};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]

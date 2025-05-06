@@ -12941,10 +12941,15 @@ name = "token_providers"
 version = "1.2.1-unstable"
 dependencies = [
  "async-trait",
+ "chrono",
+ "jsonwebtoken",
+ "reqwest 0.12.12",
  "secrecy",
+ "serde",
  "snafu",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]

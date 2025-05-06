@@ -22,6 +22,8 @@ use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
+pub mod databricks;
+pub mod github_app_token;
 pub mod registry;
 
 #[derive(Debug, Snafu)]
