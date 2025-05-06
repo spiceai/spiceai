@@ -19,7 +19,7 @@ use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use odbc_api::{Connection, ConnectionOptions, Environment, sys::AttrConnectionPooling};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{SecretBox, SecretString};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{

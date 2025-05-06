@@ -21,6 +21,7 @@ use async_openai::{Client, error::OpenAIError};
 use futures::{StreamExt, TryStreamExt};
 use reqwest_eventsource::Error as SseError;
 use secrecy::{ExposeSecret, SecretString};
+use snafu::ResultExt;
 use types::{
     PerplexityRequest, PerplexityRequestParameters, PerplexityResponse, PerplexityResponseStream,
     PerplexityStreamResponse,
@@ -63,9 +64,11 @@ impl PerplexitySonar {
             })
             .collect();
 
-        let cfg = HostedModelConfig::default()
-            .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
-            .with_base_url(PERPLEXITY_SONAR_API_BASE);
+        let cfg = HostedModelConfig::from_url(PERPLEXITY_SONAR_API_BASE)
+            .boxed()?
+            .with_auth(GenericAuthMechanism::from_bearer_token(
+                auth_token.expose_secret(),
+            ));
 
         Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),

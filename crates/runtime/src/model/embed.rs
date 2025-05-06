@@ -104,7 +104,7 @@ fn databricks(
         });
     };
 
-    Ok(Arc::new(llms::databricks::Databricks::from_access_token(
+    Ok(Arc::new(llms::databricks::from_access_token(
         endpoint,
         model_id.as_str(),
         token,

@@ -42,9 +42,9 @@ impl Anthropic {
         version: Option<&str>,
     ) -> Result<Self, OpenAIError> {
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
-        let cfg = HostedModelConfig::default()
+        let cfg = HostedModelConfig::from_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
             .with_auth(auth)
-            .with_base_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
             .with_header(
                 "anthropic-version",
                 version.unwrap_or(ANTHROPIC_API_VERSION),
