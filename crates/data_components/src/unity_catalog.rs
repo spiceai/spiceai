@@ -91,15 +91,17 @@ pub struct CatalogId(pub String);
 impl UnityCatalog {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
-        endpoint: Endpoint,
-        token_provider: Option<Arc<dyn TokenProvider>>,
-        user_agent: Option<String>,
-    ) -> Self {
+    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Self {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
         }
+
+        let user_agent = if endpoint.0.contains("databricks.com") {
+            Some(crate::databricks::user_agent())
+        } else {
+            None
+        };
 
         Self {
             endpoint: endpoint_str,

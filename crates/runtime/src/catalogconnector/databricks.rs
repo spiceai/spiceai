@@ -168,11 +168,8 @@ impl CatalogConnector for Databricks {
             }
         };
 
-        let unity_catalog = UnityCatalogClient::new(
-            Endpoint(endpoint.to_string()),
-            Some(token_provider),
-            Some(data_components::databricks::user_agent()),
-        );
+        let unity_catalog =
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider));
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
