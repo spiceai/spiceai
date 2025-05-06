@@ -70,7 +70,7 @@ impl SparkConnect {
 
         let session = Arc::new(RwLock::new(session));
 
-        let (host, port, options) = ChannelBuilder::parse_connection_string(connection)?;
+        let (host, port, options, _) = ChannelBuilder::parse_connection_string(connection)?;
         let options = options.unwrap_or_default();
 
         // it's safe to use default value here for options as session is already established.

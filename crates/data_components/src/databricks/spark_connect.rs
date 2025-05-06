@@ -20,8 +20,8 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::token_provider::TokenProvider;
 use crate::{Read, spark_connect::SparkConnect};
+use token_providers::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnect {
@@ -36,8 +36,9 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let session_id = Uuid::new_v4();
+        let user_agent = super::user_agent();
         let connection = format!(
-            "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}"
+            "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id};user_agent={user_agent};"
         );
         Ok(Self {
             spark_connect: Arc::new(SparkConnect::from_connection(connection.as_str()).await?),
@@ -50,8 +51,13 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let token = token_provider.get_token().await?;
-        let result = Self::new(endpoint, cluster_id, token, databricks_use_ssl).await?;
+        let result = Self::new(
+            endpoint,
+            cluster_id,
+            token_provider.get_token(),
+            databricks_use_ssl,
+        )
+        .await?;
 
         // subscribe to token updates and pass down to spark session
         if let Some(mut rx) = token_provider.subscribe() {

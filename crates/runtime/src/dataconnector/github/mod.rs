@@ -29,7 +29,6 @@ use data_components::{
         provider::GraphQLTableProviderBuilder,
     },
     rate_limit::RateLimiter,
-    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
     common::Column,
@@ -39,7 +38,6 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use github_app_token_provider::GitHubAppTokenProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
@@ -52,6 +50,8 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
+use token_providers::github_app_token::GitHubAppTokenProvider;
+use token_providers::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{
@@ -60,7 +60,6 @@ use super::{
 };
 
 mod commits;
-mod github_app_token_provider;
 mod issues;
 mod pull_requests;
 mod rate_limit;
@@ -353,27 +352,47 @@ impl DataConnectorFactory for GithubFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let token = params.parameters.get("token").ok();
-        let client_id = params.parameters.get("client_id").expose().ok();
-        let private_key = params.parameters.get("private_key").expose().ok();
-        let installation_id = params.parameters.get("installation_id").expose().ok();
-
-        let token_provider: Option<Arc<dyn TokenProvider>> =
-            match (token, client_id, private_key, installation_id) {
-                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.clone()))),
-
-                (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                    Some(Arc::new(GitHubAppTokenProvider::new(
-                        Arc::from(client_id),
-                        Arc::from(private_key),
-                        Arc::from(installation_id),
-                    )))
-                }
-
-                _ => None,
-            };
+        let token = params.parameters.get("token").ok().cloned();
+        let client_id = params
+            .parameters
+            .get("client_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let private_key = params
+            .parameters
+            .get("private_key")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let installation_id = params
+            .parameters
+            .get("installation_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
 
         Box::pin(async move {
+            let token_provider: Option<Arc<dyn TokenProvider>> =
+                match (token, client_id, private_key, installation_id) {
+                    (Some(token), _, _, _) => {
+                        Some(Arc::new(StaticTokenProvider::new(token.clone())))
+                    }
+
+                    (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                        Some(Arc::new(
+                            GitHubAppTokenProvider::try_new(
+                                client_id.into(),
+                                private_key.into(),
+                                installation_id.into(),
+                            )
+                            .await?,
+                        ))
+                    }
+
+                    _ => None,
+                };
+
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,

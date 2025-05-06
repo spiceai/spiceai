@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::Read;
-use crate::token_provider::TokenProvider;
 use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use arrow::datatypes::SchemaRef;
@@ -25,6 +24,7 @@ use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use token_providers::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {

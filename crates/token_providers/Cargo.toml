@@ -1,0 +1,20 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "token_providers"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono = "0.4.38"
+jsonwebtoken = "9.3.0"
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+util = { path = "../util" }

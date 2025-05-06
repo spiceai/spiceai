@@ -15,12 +15,9 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::registry::token_provider::TokenProviderRegistry;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::auth::{AuthCredentials, DatabricksM2MTokenProvider};
 use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
-use data_components::token_provider::{StaticTokenProvider, TokenProvider};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -30,6 +27,9 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use token_providers::databricks::{AuthCredentials, DatabricksM2MTokenProvider};
+use token_providers::registry::TokenProviderRegistry;
+use token_providers::{StaticTokenProvider, TokenProvider};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,

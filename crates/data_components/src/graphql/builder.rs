@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
+use crate::rate_limit::RateLimiter;
 
 use super::{Result, client::GraphQLClient};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
+use token_providers::TokenProvider;
 
 use url::Url;
 

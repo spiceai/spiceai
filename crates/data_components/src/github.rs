@@ -19,9 +19,7 @@ use globset::GlobSet;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
-use crate::{
-    arrow::write::MemTable, graphql, rate_limit::RateLimiter, token_provider::TokenProvider,
-};
+use crate::{arrow::write::MemTable, graphql, rate_limit::RateLimiter};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -34,6 +32,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, path::Path, sync::Arc};
+use token_providers::TokenProvider;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -295,9 +294,7 @@ impl GithubRestClient {
             HeaderValue::from_static("application/vnd.github.v3+json"),
         );
 
-        let token = self.token.get_token().await?;
-
-        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
+        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token.get_token())) {
             headers.insert(AUTHORIZATION, header);
         }
 
@@ -370,9 +367,7 @@ impl GithubRestClient {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
 
-        let token = self.token.get_token().await?;
-
-        if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
+        if let Ok(header) = HeaderValue::from_str(&format!("token {}", self.token.get_token())) {
             headers.insert(AUTHORIZATION, header);
         }
 

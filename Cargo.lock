@@ -3205,6 +3205,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "tiberius",
+ "token_providers",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -10905,6 +10906,7 @@ dependencies = [
  "tera",
  "test-framework",
  "tiberius",
+ "token_providers",
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.1",
@@ -11941,7 +11943,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=e4ebb95b89811db7500d1a39fc960e5f395861a6#e4ebb95b89811db7500d1a39fc960e5f395861a6"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3dc74fef6ca2c5f90d646e2be3889a2f00114a61#3dc74fef6ca2c5f90d646e2be3889a2f00114a61"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -11961,7 +11963,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=e4ebb95b89811db7500d1a39fc960e5f395861a6#e4ebb95b89811db7500d1a39fc960e5f395861a6"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3dc74fef6ca2c5f90d646e2be3889a2f00114a61#3dc74fef6ca2c5f90d646e2be3889a2f00114a61"
 dependencies = [
  "spark-connect-core",
 ]
@@ -12933,6 +12935,21 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "token_providers"
+version = "1.2.1-unstable"
+dependencies = [
+ "chrono",
+ "jsonwebtoken",
+ "reqwest 0.12.12",
+ "secrecy",
+ "serde",
+ "snafu",
+ "tokio",
+ "tracing",
+ "util",
+]
 
 [[package]]
 name = "tokenizers"
