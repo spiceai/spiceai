@@ -54,7 +54,6 @@ use std::{
     },
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tracing::{Instrument, Span};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -396,14 +395,13 @@ impl MistralLlama {
         tool_choice: Option<ToolChoice>,
         sampling: Option<SamplingParams>,
     ) -> MistralRequest {
-        let id = Span::current().id().unwrap().into_u64() as usize;
         MistralRequest::Normal(NormalRequest {
             messages: message,
             sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
             response: tx,
             return_logprobs: false,
             is_streaming,
-            id, // : self.counter.fetch_add(1, Ordering::SeqCst),
+            id: self.counter.fetch_add(1, Ordering::SeqCst),
             constraint: Constraint::None,
             suffix: None,
             web_search_options: None,
@@ -601,22 +599,15 @@ impl Chat for MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let model = req.model.clone();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "mistral_chat_request", stream=false, model = %model.clone());
-
-        let mut recver = self
-            .send_message(req)
-            .instrument(span.clone())
-            .await
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
-        let Some(resp) = recver.recv().instrument(span.clone()).await else {
+        let mut recver = self.send_message(req).await.map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+        let Some(resp) = recver.recv().await else {
             return Err(OpenAIError::ApiError(ApiError {
                 message: "model pipeline unexpectedly closed".to_string(),
                 r#type: None,
@@ -625,8 +616,6 @@ impl Chat for MistralLlama {
             }));
         };
 
-        let post_span = tracing::span!(target: "task_history", tracing::Level::INFO, "mistral_chat_request_post", model = %model.clone());
-        let _ = post_span.enter();
         Self::post_process_req(resp).map(|z| to_openai_response(&z))?
     }
 }
