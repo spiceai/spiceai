@@ -97,11 +97,11 @@ impl UnityCatalog {
             endpoint_str = format!("https://{endpoint_str}");
         }
 
-        let user_agent = if endpoint.0.contains("databricks.com") {
-            Some(crate::databricks::user_agent())
-        } else {
-            None
-        };
+        let mut user_agent: Option<String> = None;
+        #[cfg(feature = "databricks")]
+        if endpoint.0.contains("databricks.com") {
+            user_agent = Some(crate::databricks::user_agent());
+        }
 
         Self {
             endpoint: endpoint_str,
