@@ -242,12 +242,10 @@ fn databricks(
         });
     };
 
-    Ok(Arc::new(llms::openai::new_openai_client(
-        model_id,
-        Some(format!("https://{endpoint}/serving-endpoints").as_str()),
-        Some(token),
-        None,
-        None,
+    Ok(Arc::new(llms::databricks::Databricks::from_access_token(
+        endpoint,
+        model_id.as_str(),
+        token,
     )) as Arc<dyn Chat>)
 }
 
