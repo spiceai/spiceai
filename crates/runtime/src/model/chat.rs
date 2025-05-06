@@ -403,6 +403,7 @@ impl async_openai::config::Config for DatabricksConfig {
             }
         }
 
+        #[cfg(feature = "databricks")]
         match HeaderValue::from_str(&data_components::databricks::user_agent()) {
             Ok(value) => {
                 headers.insert(USER_AGENT, value);
