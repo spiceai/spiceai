@@ -90,7 +90,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.86, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.6.0, Apache-2.0 
+- aws-config 1.6.1, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-sdk-dynamodb 1.67.0, Apache-2.0 
@@ -99,7 +99,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-secretsmanager 1.62.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.63.0, Apache-2.0 
+- aws-sdk-sts 1.65.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.7.9, MIT 
@@ -216,7 +216,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dyn-clone 1.0.18, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/dyn-clone
 
-- either 1.13.0, Apache-2.0 OR MIT 
+- either 1.15.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
 - env_logger 0.11.6, Apache-2.0 OR MIT 
@@ -237,7 +237,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - globset 0.4.16, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
-- governor 0.8.0, MIT 
+- governor 0.10.0, MIT 
   <br/>https://github.com/boinkor-net/governor.git
 
 - graph-rs-sdk 2.0.1, MIT 
@@ -258,7 +258,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hostname 0.3.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
-- hostname 0.4.0, MIT 
+- hostname 0.4.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
 - http 0.2.12, Apache-2.0 OR MIT 
@@ -267,7 +267,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - http 1.3.1, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
-- http-body-util 0.1.2, MIT 
+- http-body-util 0.1.3, MIT 
   <br/>https://github.com/hyperium/http-body
 
 - humantime 2.1.0, Apache-2.0 OR MIT 
@@ -465,7 +465,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rand 0.8.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rand 0.9.0, Apache-2.0 OR MIT 
+- rand 0.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
 - rdkafka 0.37.0, MIT 
@@ -492,7 +492,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
-- rustls 0.23.22, Apache-2.0 OR ISC OR MIT 
+- rustls 0.23.26, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
@@ -564,7 +564,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - sysinfo 0.33.1, MIT 
   <br/>https://github.com/GuillaumeGomez/sysinfo
 
-- tempfile 3.16.0, Apache-2.0 OR MIT 
+- tempfile 3.19.1, Apache-2.0 OR MIT 
   <br/>https://github.com/Stebalien/tempfile
 
 - tera 1.20.0, MIT 
