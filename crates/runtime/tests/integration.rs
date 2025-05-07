@@ -27,6 +27,8 @@ use tracing_subscriber::EnvFilter;
 mod abfs;
 mod acceleration;
 mod catalog;
+#[cfg(feature = "duckdb")]
+mod clickbench;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;

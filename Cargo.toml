@@ -180,11 +180,11 @@ arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "b4744795f6b06e2043863db7b60b642a14da2094" }            # spiceai-46
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "b4744795f6b06e2043863db7b60b642a14da2094" }     # spiceai-46
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "b4744795f6b06e2043863db7b60b642a14da2094" }  # spiceai-46
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "b4744795f6b06e2043863db7b60b642a14da2094" }       # spiceai-46
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "b4744795f6b06e2043863db7b60b642a14da2094" } # spiceai-46
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c809148d209326cdd0eb19d97b2e32d642c66df4" }            # spiceai-46
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c809148d209326cdd0eb19d97b2e32d642c66df4" }     # spiceai-46
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "c809148d209326cdd0eb19d97b2e32d642c66df4" }  # spiceai-46
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "c809148d209326cdd0eb19d97b2e32d642c66df4" }       # spiceai-46
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "c809148d209326cdd0eb19d97b2e32d642c66df4" } # spiceai-46
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "9c246d91df647597ad076bdb34f8c25eb9754d7c" } # phillip/250425-df-46
