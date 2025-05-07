@@ -189,12 +189,12 @@ impl Config for HostedModelConfig {
         self.base_url.as_str()
     }
 
-    fn api_key(&self) -> SecretString {
+    fn api_key(&self) -> Arc<SecretString> {
         match &self.auth {
             Some(GenericAuthMechanism::BearerToken(prov) | GenericAuthMechanism::ApiKey(prov)) => {
-                SecretString::from(prov.get_token())
+                Arc::new(SecretString::from(prov.get_token()))
             }
-            _ => DUMMY_API_KEY.clone(),
+            _ => Arc::new(DUMMY_API_KEY.clone()),
         }
     }
 }
