@@ -18,7 +18,7 @@ opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 secrecy.workspace = true
 snafu.workspace = true
-sha2 = "0.10.8"
+sha2 = "0.10.9"
 tokio.workspace = true
 tracing.workspace = true
 
