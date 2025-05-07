@@ -3030,7 +3030,7 @@ version = "3.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "697b5419f348fd5ae2478e8018cb016c00a5881c7f46c717de98ffd135a5651c"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "windows-sys 0.59.0",
 ]
 
@@ -6866,9 +6866,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.169"
+version = "0.2.172"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5aba8db14291edd000dfcc4d620c7ebfb122c613afb886ca8803fa4e128a20a"
+checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "libduckdb-sys"
@@ -6916,7 +6916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -8101,6 +8101,18 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.8.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
  "bitflags 2.8.0",
  "cfg-if",
@@ -11220,7 +11232,7 @@ dependencies = [
  "libc",
  "log",
  "memchr",
- "nix",
+ "nix 0.29.0",
  "radix_trie",
  "rustyline-derive",
  "unicode-segmentation",
@@ -12611,7 +12623,7 @@ dependencies = [
  "futures",
  "indicatif",
  "insta",
- "nix",
+ "nix 0.30.1",
  "octocrab",
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
