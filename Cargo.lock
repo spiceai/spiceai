@@ -8886,8 +8886,6 @@ dependencies = [
  "rand 0.8.5",
  "serde_json",
  "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -8906,6 +8904,8 @@ dependencies = [
  "rand 0.9.1",
  "serde_json",
  "thiserror 2.0.12",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -8968,7 +8968,7 @@ dependencies = [
  "arrow-buffer",
  "async-trait",
  "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk 0.29.0",
 ]
 
 [[package]]
@@ -10873,7 +10873,7 @@ dependencies = [
  "opentelemetry 0.27.1",
  "opentelemetry-prometheus",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "package",
  "paste",
@@ -12011,7 +12011,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "prometheus",
  "reqwest 0.12.12",
@@ -12520,7 +12520,7 @@ dependencies = [
  "flight_client",
  "hostname 0.4.1",
  "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "secrecy",
  "sha2",
@@ -12614,7 +12614,7 @@ dependencies = [
  "nix",
  "octocrab",
  "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "rand 0.9.1",
  "regex",

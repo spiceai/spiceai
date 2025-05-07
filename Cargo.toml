@@ -115,7 +115,7 @@ opentelemetry-zipkin = { version = "0.27", default-features = false, features = 
     "reqwest",
     "reqwest-rustls",
 ] }
-opentelemetry_sdk = { version = "0.27", default-features = false, features = [
+opentelemetry_sdk = { version = "0.29", default-features = false, features = [
     "metrics",
     "rt-tokio",
     "trace",
