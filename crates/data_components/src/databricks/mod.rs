@@ -14,9 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod auth;
 pub mod delta;
 pub mod spark_connect;
 
 pub use delta::DatabricksDelta;
 pub use spark_connect::DatabricksSparkConnect;
+
+const SPICE_USER_AGENT_STRING: &str = "SpiceAI_OSS";
+
+#[must_use]
+pub fn user_agent() -> String {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    format!("{SPICE_USER_AGENT_STRING}/{version}")
+}

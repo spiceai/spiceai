@@ -202,9 +202,12 @@ mod tests {
             .expect("Failed to load table");
         println!("{table:?}");
 
-        let df_table_provider = IcebergTableProvider::try_new_from_table(table)
-            .await
-            .expect("Failed to create table provider");
+        let df_table_provider = IcebergTableProvider::try_new(
+            Arc::new(catalog),
+            TableIdent::new(NamespaceIdent::new("nyc".to_string()), "taxis".to_string()),
+        )
+        .await
+        .expect("Failed to create table provider");
 
         let ctx = SessionContext::new();
         ctx.register_table("ice_ice_baby", Arc::new(df_table_provider))

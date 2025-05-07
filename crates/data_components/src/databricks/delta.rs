@@ -24,11 +24,12 @@ use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use token_providers::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
     endpoint: Endpoint,
-    token: SecretString,
+    token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
 }
 
@@ -45,15 +46,14 @@ pub enum Error {
 }
 
 impl DatabricksDelta {
-    #[must_use]
     pub fn new(
         endpoint: Endpoint,
-        token: SecretString,
         storage_options: HashMap<String, SecretString>,
+        token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
         Self {
             endpoint,
-            token,
+            token_provider,
             storage_options,
         }
     }
@@ -89,7 +89,10 @@ impl DatabricksDelta {
         &self,
         table_reference: TableReference,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let uc_client = UnityCatalog::new(self.endpoint.clone(), Some(self.token.clone()));
+        let uc_client = UnityCatalog::new(
+            self.endpoint.clone(),
+            Some(Arc::clone(&self.token_provider)),
+        );
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 

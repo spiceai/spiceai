@@ -13,10 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use data_components::token_provider::TokenProvider;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+
+use crate::TokenProvider;
 
 #[derive(Default, Clone)]
 pub struct TokenProviderRegistry {
@@ -24,6 +26,7 @@ pub struct TokenProviderRegistry {
 }
 
 impl TokenProviderRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             token_provider_registry: Arc::new(RwLock::new(HashMap::new())),

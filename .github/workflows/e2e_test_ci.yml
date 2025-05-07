@@ -5,6 +5,7 @@ on:
     branches:
       - trunk
       - release-*
+      - release/* 
     paths-ignore:
       - '**/*.md'
       - 'docs/**'

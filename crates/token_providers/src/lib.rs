@@ -17,9 +17,13 @@ limitations under the License.
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::watch;
+
+pub mod databricks;
+pub mod github_app_token;
+pub mod registry;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -31,9 +35,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[async_trait]
 pub trait TokenProvider: Send + Sync + Debug {
-    async fn get_token(&self) -> Result<String>;
+    fn get_token(&self) -> String;
 
     /// Returns a `watch::Receiver` of new tokens, if the provider supports refresh.
     ///
@@ -44,27 +47,28 @@ pub trait TokenProvider: Send + Sync + Debug {
 }
 
 pub struct StaticTokenProvider {
-    token: Arc<str>,
+    token: Arc<SecretString>,
 }
 
 impl std::fmt::Debug for StaticTokenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StaticTokenProvider")
-            .field("token.len()", &self.token.len())
-            .finish()
+            .field("token", &self.token)
+            .finish_non_exhaustive()
     }
 }
 
 impl StaticTokenProvider {
     #[must_use]
-    pub fn new(token: Arc<str>) -> Self {
-        Self { token }
+    pub fn new(token: SecretString) -> Self {
+        Self {
+            token: Arc::new(token),
+        }
     }
 }
 
-#[async_trait]
 impl TokenProvider for StaticTokenProvider {
-    async fn get_token(&self) -> Result<String> {
-        Ok(self.token.to_string())
+    fn get_token(&self) -> String {
+        self.token.expose_secret().to_string()
     }
 }

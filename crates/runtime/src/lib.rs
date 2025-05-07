@@ -18,12 +18,12 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
-use registry::token_provider::TokenProviderRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use token_providers::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
@@ -93,7 +93,6 @@ pub mod objectstore;
 mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
-mod registry;
 pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
@@ -227,6 +226,13 @@ pub enum Error {
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table has invalid configuration: {source}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    InvalidAccelerationConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },

@@ -49,7 +49,6 @@ jobs:
 
   build:
     name: Build ${{ matrix.target.name }} CLI
-    if: ${{ github.event.inputs.build_cli == 'true' || github.event.inputs.build_cli == null }}
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
@@ -63,33 +62,36 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        if: github.event.inputs.build_cli == 'true'
 
       - name: Set up Go
+        if: github.event.inputs.build_cli == 'true'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GOVER }}
 
       - name: Set up make
-        if: matrix.target.target_os == 'linux'
+        if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Build spice
+        if: github.event.inputs.build_cli == 'true'
         run: make -C bin/spice
 
       - name: Make spice executable & Move spice (Unix)
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
         run: |
           mv target/release/spice spice
           chmod +x spice
 
       - name: Move Spice(Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
         shell: pwsh
         run: |
           Move-Item -Path target/release/spice.exe -Destination spice.exe -Force
 
       - name: Save spice artifact
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -97,7 +99,7 @@ jobs:
             spice
 
       - name: Save spice artifact
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}

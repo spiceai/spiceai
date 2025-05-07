@@ -215,3 +215,5 @@ generate-acknowledgements-formatting:
 		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
 		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
 	fi
+
+-include Makefile.local

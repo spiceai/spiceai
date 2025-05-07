@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -23,7 +23,7 @@ use std::{fmt, sync::Arc};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::token_provider::{Result, TokenProvider};
+use crate::{Result, TokenProvider};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -134,10 +134,9 @@ impl DatabricksM2MTokenProvider {
     }
 }
 
-#[async_trait]
 impl TokenProvider for DatabricksM2MTokenProvider {
-    async fn get_token(&self) -> Result<String> {
-        Ok(self.rx.borrow().clone())
+    fn get_token(&self) -> String {
+        self.rx.borrow().clone()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {

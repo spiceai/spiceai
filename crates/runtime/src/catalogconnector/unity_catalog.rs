@@ -35,6 +35,8 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use token_providers::StaticTokenProvider;
+use token_providers::TokenProvider;
 
 #[derive(Clone)]
 pub struct UnityCatalog {
@@ -126,10 +128,11 @@ impl CatalogConnector for UnityCatalog {
             Err(e) => return Err(e),
         };
 
-        let client = Arc::new(UnityCatalogClient::new(
-            endpoint,
-            self.params.get("token").ok().cloned(),
-        ));
+        let token_provider = self.params.get("token").ok().map(|token| {
+            Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
+        });
+
+        let client = Arc::new(UnityCatalogClient::new(endpoint, token_provider));
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =

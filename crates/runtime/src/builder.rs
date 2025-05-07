@@ -16,9 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use app::App;
-use tokio::sync::{Mutex, RwLock};
-
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -28,12 +25,14 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
-    registry::token_provider::TokenProviderRegistry,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
     tracers,
 };
+use app::App;
+use token_providers::registry::TokenProviderRegistry;
+use tokio::sync::{Mutex, RwLock};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
