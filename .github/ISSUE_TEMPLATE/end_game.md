@@ -200,7 +200,7 @@ assignees: ''
 
 ## Post-Release Housekeeping
 
-- [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned release.
+- [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
