@@ -104,6 +104,11 @@ async fn databricks(
     let client_id = extract_secret!(params, "databricks_client_id");
     let client_secret = extract_secret!(params, "databricks_client_secret");
 
+    #[cfg(feature = "databricks")]
+    let user_agent = Some(data_components::databricks::user_agent());
+    #[cfg(not(feature = "databricks"))]
+    let user_agent: Option<String> = None;
+
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) | (Some(_), Some(_), None) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
@@ -129,7 +134,7 @@ async fn databricks(
             endpoint,
             model_id.as_str(),
             token,
-            Some(data_components::databricks::user_agent().as_str())
+            user_agent.as_deref(),
         ).boxed()
         .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?
         ) as Arc<dyn Embed>),
@@ -150,7 +155,7 @@ async fn databricks(
                     endpoint,
                     model_id.as_str(),
                     Arc::new(token_provider),
-                    Some(data_components::databricks::user_agent().as_str())
+                    user_agent.as_deref(),
                 )
                 .boxed()
                 .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?,
