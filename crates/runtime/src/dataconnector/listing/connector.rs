@@ -43,6 +43,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
+    listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
