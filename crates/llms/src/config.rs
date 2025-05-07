@@ -191,8 +191,9 @@ impl Config for HostedModelConfig {
 
     fn api_key(&self) -> SecretString {
         match &self.auth {
-            Some(GenericAuthMechanism::BearerToken(prov) |
-GenericAuthMechanism::ApiKey(prov)) => SecretString::from(prov.get_token()),
+            Some(GenericAuthMechanism::BearerToken(prov) | GenericAuthMechanism::ApiKey(prov)) => {
+                SecretString::from(prov.get_token())
+            }
             _ => DUMMY_API_KEY.clone(),
         }
     }

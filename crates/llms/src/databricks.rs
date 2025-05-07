@@ -44,7 +44,6 @@ pub struct Databricks {
     client: Client<HostedModelConfig>,
 }
 
-#[must_use]
 pub fn try_from_access_token(
     endpoint: &str,
     model: &str,
@@ -82,8 +81,7 @@ pub fn try_from_token_provider(
     )
     .boxed()
     .map_err(|e| super::chat::Error::FailedToLoadModel { source: e })?
-    .with_auth(GenericAuthMechanism::from_http_username_provider(
-        "token",
+    .with_auth(GenericAuthMechanism::from_bearer_token_provider(
         token_provider,
     ));
 
