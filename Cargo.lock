@@ -490,9 +490,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-odbc"
-version = "16.0.0"
+version = "16.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df5c9eaa58d98c0ba1d2a1a57c1fc2daa8ed25283c54a9b3b7daaf818f473914"
+checksum = "212acf2aaf14506b805f0105a336466f77aee8d1dc4c0a4205fdb31fe33281a2"
 dependencies = [
  "arrow",
  "chrono",
@@ -6916,7 +6916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -14459,7 +14459,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
