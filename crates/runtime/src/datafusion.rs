@@ -1497,6 +1497,11 @@ impl DataFusion {
 
         Ok(plan)
     }
+
+    pub(crate) fn clear_cached_plans(&self) {
+        tracing::trace!("clearing cached logical plans");
+        self.cached_plans.invalidate_all();
+    }
 }
 
 #[must_use]
