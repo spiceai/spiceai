@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
+use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
 use llms::embeddings::{
@@ -34,8 +35,6 @@ use token_providers::databricks::DatabricksM2MTokenProvider;
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
-
-use crate::{get_params_with_secrets, secrets::Secrets};
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
@@ -130,14 +129,12 @@ async fn databricks(
                 source: "If `databricks_client_id` is provided, `databricks_client_secret` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::try_from_access_token(
+        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
             endpoint,
             model_id.as_str(),
             token,
-            user_agent.as_deref(),
-        ).boxed()
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?
-        ) as Arc<dyn Embed>),
+            user_agent,
+        )) as Arc<dyn Embed>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
@@ -151,15 +148,12 @@ async fn databricks(
                 )),
             })?;
             Ok(Arc::new(
-                llms::databricks::try_from_token_provider(
+                llms::databricks::from_token_provider(
                     endpoint,
                     model_id.as_str(),
                     Arc::new(token_provider),
-                    user_agent.as_deref(),
-                )
-                .boxed()
-                .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?,
-            ) as Arc<dyn Embed>)
+                    user_agent,
+                )) as Arc<dyn Embed>)
         }
     }
 }

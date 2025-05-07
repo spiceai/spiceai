@@ -23,7 +23,6 @@ use llms::{
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::SecretString;
 use serde_json::Value;
-use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use token_providers::databricks::DatabricksM2MTokenProvider;
@@ -271,13 +270,12 @@ async fn databricks(
                 source: "If `databricks_client_id` is provided, `databricks_client_secret` must also be provided.".into(),
             })
         }
-        (Some(token), None, None) => Ok(Arc::new(llms::databricks::try_from_access_token(
+        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
             endpoint,
             model_id.as_str(),
             token,
-            user_agent.as_deref(),
-        ).boxed()
-        .map_err(|e| LlmError::FailedToLoadModel { source: e })?) as Arc<dyn Chat>),
+            user_agent,
+        )) as Arc<dyn Chat>),
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
@@ -291,14 +289,12 @@ async fn databricks(
                 )),
             })?;
             Ok(Arc::new(
-                llms::databricks::try_from_token_provider(
+                llms::databricks::from_token_provider(
                     endpoint,
                     model_id.as_str(),
                     Arc::new(token_provider),
-                    user_agent.as_deref(),
+                    user_agent,
                 )
-                .boxed()
-                .map_err(|e| LlmError::FailedToLoadModel { source: e })?,
             ) as Arc<dyn Chat>)
         }
     }
