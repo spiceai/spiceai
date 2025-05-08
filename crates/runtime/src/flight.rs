@@ -19,8 +19,8 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
-use crate::metrics as runtime_metrics;
 use crate::tls::TlsConfig;
+use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -43,7 +43,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, WriteRateLimitLayer};
+use middleware::{RequestContextLayer, TokenProviderLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -335,14 +335,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
-    df: Arc<DataFusion>,
+    rt: Arc<Runtime>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
-        datafusion: Arc::clone(&df),
+        datafusion: rt.datafusion(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
@@ -369,6 +369,7 @@ pub async fn start(
 
     let server = server
         .layer(RequestContextLayer::new(app))
+        .layer(TokenProviderLayer::new(rt.token_provider_registry()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

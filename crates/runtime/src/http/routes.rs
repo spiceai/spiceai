@@ -58,7 +58,6 @@ use axum::{
     routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
-#[cfg(feature = "databricks")]
 use token_providers::registry::TokenProviderRegistry;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -222,7 +221,6 @@ pub(crate) fn routes(
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
-    #[cfg(feature = "databricks")]
     {
         authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
             rt.token_provider_registry(),
@@ -346,7 +344,6 @@ async fn check_shutdown(
     next.run(req).await
 }
 
-#[cfg(feature = "databricks")]
 async fn databticks_u2m_middleware(
     State(token_provider_registry): State<Arc<TokenProviderRegistry>>,
     req: axum::http::Request<Body>,

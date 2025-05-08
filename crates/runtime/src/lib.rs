@@ -521,7 +521,7 @@ impl Runtime {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
-                    Arc::clone(&self_ref.df),
+                    Arc::clone(&self_ref),
                     cloned_tls_config,
                     cloned_endpoint_auth,
                     Arc::clone(&self_ref.rate_limits),
