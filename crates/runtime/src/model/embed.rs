@@ -106,7 +106,7 @@ async fn databricks(
     #[cfg(feature = "databricks")]
     let user_agent = Some(data_components::databricks::user_agent());
     #[cfg(not(feature = "databricks"))]
-    let user_agent: Option<String> = None;
+    let user_agent: Option<&'static str> = None;
 
     match (token_opt, client_id, client_secret) {
         (Some(_), Some(_) | None, Some(_)) | (Some(_), Some(_), None) => {

@@ -68,11 +68,13 @@ impl HostedModelConfig {
     }
 
     /// Add (or override) a default header.
+    #[must_use]
     pub fn with_header(mut self, key: &'static str, value: &'static str) -> Self {
         self = self.with_header_value(key, HeaderValue::from_static(value));
         self
     }
 
+    #[must_use]
     pub fn with_header_value(mut self, key: &'static str, value: HeaderValue) -> Self {
         self.default_headers
             .insert(HeaderName::from_static(key), value);
