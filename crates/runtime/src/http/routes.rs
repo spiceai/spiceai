@@ -58,6 +58,7 @@ use axum::{
     routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
+use token_providers::registry::TokenProviderRegistry;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -220,6 +221,13 @@ pub(crate) fn routes(
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
+    {
+        authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
+            rt.token_provider_registry(),
+            databricks_u2m_middleware,
+        ));
+    }
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled authentication on HTTP routes");
@@ -331,6 +339,30 @@ async fn check_shutdown(
             "Runtime is shutting down",
         )
             .into_response();
+    }
+
+    next.run(req).await
+}
+
+async fn databricks_u2m_middleware(
+    State(token_provider_registry): State<Arc<TokenProviderRegistry>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    for (header_name, header_value) in req.headers() {
+        if header_name != "Spice-Databricks-Auth" {
+            continue;
+        }
+        let Ok(Some((client_id, access_token))) = header_value.to_str().map(|v| v.split_once(':'))
+        else {
+            continue;
+        };
+        if let Some(token_provider) = token_provider_registry
+            .get(format!("databricks_u2m_{client_id}"))
+            .await
+        {
+            token_provider.set_token(access_token.to_string());
+        };
     }
 
     next.run(req).await

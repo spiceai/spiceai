@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
-use token_providers::databricks::DatabricksM2MTokenProvider;
+use token_providers::{
+    databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider},
+    registry::TokenProviderRegistry,
+};
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
@@ -48,6 +51,7 @@ macro_rules! extract_secret {
 pub async fn try_to_embedding(
     component: &spicepod::component::embeddings::Embeddings,
     secrets: Arc<RwLock<Secrets>>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let params = get_params_with_secrets(Arc::clone(&secrets), &component.params).await;
     let model_id = component.get_model_id();
@@ -62,7 +66,9 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
         EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
         EmbeddingPrefix::HuggingFace => huggingface(model_id, &params).await,
-        EmbeddingPrefix::Databricks => databricks(model_id, &params).await,
+        EmbeddingPrefix::Databricks => {
+            databricks(model_id, &params, Arc::clone(&token_provider_registry)).await
+        }
     }
 }
 
@@ -87,6 +93,7 @@ async fn huggingface(
 async fn databricks(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
         return Err(EmbedError::MissingParamError {
@@ -109,7 +116,7 @@ async fn databricks(
     let user_agent: Option<&'static str> = None;
 
     match (token_opt, client_id, client_secret) {
-        (Some(_), Some(_) | None, Some(_)) | (Some(_), Some(_), None) => {
+        (Some(_), Some(_) | None, Some(_)) => {
             Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
@@ -135,13 +142,18 @@ async fn databricks(
             token,
             user_agent,
         )) as Arc<dyn Embed>),
+
         (None, Some(client_id), Some(client_secret)) => {
-            let token_provider = DatabricksM2MTokenProvider::try_new(
-                endpoint.to_string(),
-                client_id.to_string(),
-                client_secret.into()
-            )
-            .await
+            let token_provider = token_provider_registry
+                .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                    DatabricksM2MTokenProvider::try_new(
+                        endpoint.to_string(),
+                        client_id.to_string(),
+                        client_secret.into(),
+                    )
+                    .await
+                })
+                .await
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                 source: Box::from(format!(
                     "Could not retrieve M2M tokens from Databricks. Error: {e}"
@@ -151,9 +163,34 @@ async fn databricks(
                 llms::databricks::from_token_provider(
                     endpoint,
                     model_id.as_str(),
-                    Arc::new(token_provider),
+                    token_provider,
                     user_agent,
-                )) as Arc<dyn Embed>)
+                ),
+            ) as Arc<dyn Embed>)
+        }
+        (Some(token),  Some(client_id), None) => {
+            let token_provider = token_provider_registry
+                .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
+                    DatabricksU2MTokenProvider::new(
+                        endpoint.to_string(),
+                        client_id.to_string(),
+                        token.into(),
+                    )
+                })
+                .await
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: Box::from(format!(
+                    "Could not retrieve U2M tokens from Databricks. Error: {e}"
+                )),
+            })?;
+            Ok(Arc::new(
+                llms::databricks::from_token_provider(
+                    endpoint,
+                    model_id.as_str(),
+                    token_provider,
+                    user_agent,
+                ),
+            ) as Arc<dyn Embed>)
         }
     }
 }
