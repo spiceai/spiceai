@@ -58,7 +58,6 @@ either = "1.15.0"
 indexmap.workspace = true
 tempfile.workspace = true
 token_providers = { path = "../token_providers" }
-url = "2.5.4"
 
 [dev-dependencies]
 anyhow = "1.0.86"

@@ -49,7 +49,8 @@ use crate::{
 };
 
 use super::{
-    Service, flightsql::prepared_statement_query, metrics, middleware::RateLimiterExtension,
+    Service, flightsql::prepared_statement_query, metrics,
+    middleware::rate_limit::RateLimiterExtension,
 };
 
 pub(crate) async fn handle(

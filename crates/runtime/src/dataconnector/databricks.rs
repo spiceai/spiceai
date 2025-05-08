@@ -27,7 +27,9 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use token_providers::databricks::{AuthCredentials, DatabricksM2MTokenProvider};
+use token_providers::databricks::{
+    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+};
 use token_providers::registry::TokenProviderRegistry;
 use token_providers::{StaticTokenProvider, TokenProvider};
 
@@ -117,6 +119,15 @@ impl Databricks {
                         )
                         .await?
                     }
+                    AuthCredentials::U2M(client_id, token) => {
+                        Self::get_u2m_token_provider(
+                            endpoint,
+                            client_id,
+                            token,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
                 };
 
                 let read_provider = DatabricksDelta::new(
@@ -165,6 +176,7 @@ impl Databricks {
 
         match (token, client_id, client_secret) {
             (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
+            (Some(token), Some(client_id), None) => Ok(AuthCredentials::U2M(client_id ,token)),
             (None, Some(client_id), Some(client_secret)) => {
                 Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
             }
@@ -227,7 +239,26 @@ impl Databricks {
                 )
                 .await?;
 
-                DatabricksSparkConnect::new_m2m(
+                DatabricksSparkConnect::from_token_provider(
+                    endpoint.to_string(),
+                    cluster_id.expose_secret().to_string(),
+                    databricks_use_ssl,
+                    token_provider,
+                )
+                .await
+                .context(UnableToConstructDatabricksSparkSnafu)?
+            }
+
+            AuthCredentials::U2M(client_id, token) => {
+                let token_provider = Self::get_u2m_token_provider(
+                    endpoint,
+                    client_id,
+                    token,
+                    &token_provider_registry,
+                )
+                .await?;
+
+                DatabricksSparkConnect::from_token_provider(
                     endpoint.to_string(),
                     cluster_id.expose_secret().to_string(),
                     databricks_use_ssl,
@@ -257,6 +288,24 @@ impl Databricks {
                     client_secret.clone(),
                 )
                 .await
+            })
+            .await
+            .map_err(|_| Error::UnableToGetToken {})
+    }
+
+    pub async fn get_u2m_token_provider(
+        endpoint: &str,
+        client_id: &str,
+        token: &SecretString,
+        token_provider_registry: &Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        token_provider_registry
+            .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
+                DatabricksU2MTokenProvider::new(
+                    endpoint.to_string(),
+                    client_id.to_string(),
+                    token.clone(),
+                )
             })
             .await
             .map_err(|_| Error::UnableToGetToken {})

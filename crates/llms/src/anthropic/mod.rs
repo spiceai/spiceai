@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::{Client, error::OpenAIError};
+use reqwest::header::HeaderValue;
 use types::validate_model_variant;
 
 mod chat;
@@ -41,15 +42,12 @@ impl Anthropic {
         api_base: Option<&str>,
         version: Option<&str>,
     ) -> Result<Self, OpenAIError> {
+        let value = HeaderValue::from_str(version.unwrap_or(ANTHROPIC_API_VERSION))
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
         let cfg = HostedModelConfig::from_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
             .with_auth(auth)
-            .with_header(
-                "anthropic-version",
-                version.unwrap_or(ANTHROPIC_API_VERSION),
-            )
-            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+            .with_header_value("anthropic-version", value);
 
         Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),

@@ -45,7 +45,7 @@ impl DatabricksSparkConnect {
         })
     }
 
-    pub async fn new_m2m(
+    pub async fn from_token_provider(
         endpoint: String,
         cluster_id: String,
         databricks_use_ssl: bool,

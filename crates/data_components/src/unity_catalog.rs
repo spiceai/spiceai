@@ -101,7 +101,7 @@ impl UnityCatalog {
         #[cfg(feature = "databricks")]
         // Include user_agent, if connects to Databricks instance
         if endpoint.0.contains("databricks") {
-            user_agent = Some(crate::databricks::user_agent());
+            user_agent = Some(crate::databricks::user_agent().to_string());
         }
 
         Self {

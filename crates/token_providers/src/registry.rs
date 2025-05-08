@@ -80,4 +80,14 @@ impl TokenProviderRegistry {
 
         Ok(provider_arc)
     }
+
+    /// Get a token provider for the given key and provider type.
+    pub async fn get(&self, key: String) -> Option<Arc<dyn TokenProvider>> {
+        let registry = self.token_provider_registry.read().await;
+        if let Some(provider) = registry.get(&key) {
+            return Some(Arc::clone(provider));
+        }
+
+        None
+    }
 }
