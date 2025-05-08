@@ -453,6 +453,11 @@ impl Runtime {
     async fn update_dataset(&self, ds: Arc<Dataset>) {
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
+
+        // Updating a dataset may cause the cached LogicalPlans to be
+        // obsolete, so we remove them
+        self.df.clear_cached_plans();
+
         match self.load_dataset_connector(Arc::clone(&ds)).await {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
