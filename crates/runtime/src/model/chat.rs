@@ -322,14 +322,12 @@ async fn databricks(
             })?;
 
             Ok(Arc::new(
-                llms::databricks::try_from_token_provider(
+                llms::databricks::from_token_provider(
                     endpoint,
                     model_id.as_str(),
                     token_provider,
-                    user_agent.as_deref(),
-                )
-                .boxed()
-                .map_err(|e| LlmError::FailedToLoadModel { source: e })?,
+                    user_agent,
+                ),
             ) as Arc<dyn Chat>)
         }
     }

@@ -85,10 +85,14 @@ impl Runtime {
     #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<TaskEmbed> {
-        let l = try_to_embedding(in_embed, Arc::clone(&self.secrets))
-            .await
-            .boxed()
-            .context(UnableToInitializeEmbeddingModelSnafu)?;
+        let l = try_to_embedding(
+            in_embed,
+            Arc::clone(&self.secrets),
+            self.token_provider_registry(),
+        )
+        .await
+        .boxed()
+        .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()
             .await
             .boxed()
