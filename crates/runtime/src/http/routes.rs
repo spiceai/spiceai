@@ -352,25 +352,20 @@ async fn databticks_u2m_middleware(
     req: axum::http::Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    use regex::Regex;
-
-    let re = Regex::new(r"^databricks_u2m_(.+)$")
-        .unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
-
     for (header_name, header_value) in req.headers() {
-        if let Some(caps) = re.captures(header_name.as_str()) {
-            let client_id = caps.get(1).map(|m| m.as_str().to_string());
-            let token = header_value.to_str().ok().map(ToString::to_string);
-
-            if let (Some(client_id), Some(token)) = (client_id, token) {
-                if let Some(token_provider) = token_provider_registry
-                    .get(format!("databricks_u2m_{client_id}"))
-                    .await
-                {
-                    token_provider.set_token(token);
-                }
-            }
+        if header_name != "Spice-Databricks-Auth" {
+            continue;
         }
+        let Ok(Some((client_id, access_token))) = header_value.to_str().map(|v| v.split_once(":"))
+        else {
+            continue;
+        };
+        if let Some(token_provider) = token_provider_registry
+            .get(format!("databricks_u2m_{client_id}"))
+            .await
+        {
+            token_provider.set_token(access_token.to_string());
+        };
     }
 
     next.run(req).await
