@@ -16,15 +16,10 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::config::Config;
-use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue,
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use secrecy::SecretString;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use token_providers::{StaticTokenProvider, TokenProvider};
-use url::Url;
-
-static DUMMY_API_KEY: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(String::new()));
 
 /// A generic configuration for any hosted `OpenAI` API client.
 ///
@@ -33,19 +28,19 @@ static DUMMY_API_KEY: LazyLock<SecretString> = LazyLock::new(|| SecretString::fr
 #[derive(Clone, Debug)]
 pub struct HostedModelConfig {
     pub auth: Option<GenericAuthMechanism>,
-    pub base_url: url::Url,
+    pub base_url: String,
     pub default_headers: HeaderMap,
 }
 
 impl HostedModelConfig {
-    pub fn from_url(url: &str) -> Result<Self, url::ParseError> {
+    pub fn from_url(url: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(Self {
+        Self {
             auth: None,
-            base_url: Url::parse(url)?,
+            base_url: url.to_string(),
             default_headers: headers,
-        })
+        }
     }
 
     /// Set the API key for authentication.
@@ -73,15 +68,17 @@ impl HostedModelConfig {
     }
 
     /// Add (or override) a default header.
-    pub fn with_header<V>(mut self, key: &'static str, value: V) -> Result<Self, InvalidHeaderValue>
-    where
-        V: Into<String>,
-    {
-        self.default_headers.insert(
-            HeaderName::from_static(key),
-            HeaderValue::from_str(&value.into())?,
-        );
-        Ok(self)
+    #[must_use]
+    pub fn with_header(mut self, key: &'static str, value: &'static str) -> Self {
+        self = self.with_header_value(key, HeaderValue::from_static(value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_header_value(mut self, key: &'static str, value: HeaderValue) -> Self {
+        self.default_headers
+            .insert(HeaderName::from_static(key), value);
+        self
     }
 }
 
@@ -90,7 +87,6 @@ impl HostedModelConfig {
 pub enum GenericAuthMechanism {
     ApiKey(Arc<dyn TokenProvider>),
     BearerToken(Arc<dyn TokenProvider>),
-    HttpUsername(String, Arc<dyn TokenProvider>),
 }
 
 impl GenericAuthMechanism {
@@ -111,21 +107,6 @@ impl GenericAuthMechanism {
     pub fn from_bearer_token_provider(provider: Arc<dyn TokenProvider>) -> Self {
         Self::BearerToken(provider)
     }
-
-    pub fn from_http_username<S: Into<String>>(username: S, password: S) -> Self {
-        GenericAuthMechanism::from_http_username_provider(
-            username,
-            Arc::new(StaticTokenProvider::new(SecretString::from(
-                password.into(),
-            ))),
-        )
-    }
-    pub fn from_http_username_provider<S: Into<String>>(
-        username: S,
-        provider: Arc<dyn TokenProvider>,
-    ) -> Self {
-        Self::HttpUsername(username.into(), provider)
-    }
 }
 
 impl Config for HostedModelConfig {
@@ -135,7 +116,6 @@ impl Config for HostedModelConfig {
         // Insert authentication header if available.
         if let Some(auth) = &self.auth {
             match auth {
-                GenericAuthMechanism::HttpUsername(_, _) => {}
                 GenericAuthMechanism::ApiKey(prov) => {
                     match HeaderValue::from_str(prov.get_token().as_str()) {
                         Ok(value) => {
@@ -167,18 +147,7 @@ impl Config for HostedModelConfig {
     }
 
     fn url(&self, path: &str) -> String {
-        let base = match &self.auth {
-            Some(GenericAuthMechanism::HttpUsername(username, provider)) => {
-                let mut base = self.base_url.clone();
-                if let Err(()) = base.set_username(username.as_str()) {
-                    tracing::warn!("Failed to set username in URL '{base}'");
-                };
-                let _ = base.set_password(Some(provider.get_token().as_str()));
-                base
-            }
-            _ => self.base_url.clone(),
-        };
-        format!("{base}{path}")
+        format!("{}{path}", self.base_url.as_str())
     }
 
     fn query(&self) -> Vec<(&str, &str)> {
@@ -194,7 +163,7 @@ impl Config for HostedModelConfig {
             Some(GenericAuthMechanism::BearerToken(prov) | GenericAuthMechanism::ApiKey(prov)) => {
                 Arc::new(SecretString::from(prov.get_token()))
             }
-            _ => Arc::new(DUMMY_API_KEY.clone()),
+            _ => Arc::new(SecretString::from(String::new())),
         }
     }
 }
