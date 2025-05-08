@@ -1,3 +1,4 @@
+use arrow::array::{Array, RecordBatch, StringArray};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -15,6 +16,7 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,17 +78,24 @@ impl SpiceModelTool for ListDatasetsTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
-        let elements = get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
-            .await
+        let mut elements =
+            get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref()).await;
+
+        elements.append(
+            &mut get_catalog_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
+                .await?,
+        );
+
+        let result = elements
             .iter()
             .map(serde_json::value::to_value)
             .collect::<Result<Vec<Value>, _>>()
             .boxed()?;
 
-        let captured_output_json = serde_json::to_string(&elements).boxed()?;
+        let captured_output_json = serde_json::to_string(&result).boxed()?;
         tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
 
-        Ok(Value::Array(elements))
+        Ok(Value::Array(result))
     }
 }
 
@@ -122,6 +131,63 @@ pub async fn get_table_elements(
             metadata: d.metadata.clone(),
         })
         .collect_vec()
+}
+
+/// To get tables from catalogs, we must make SQL query on `information_schema.tables` and use to find all tables.
+pub async fn get_catalog_elements(
+    rt: Arc<Runtime>,
+    _opt_include: Option<&[String]>,
+) -> Result<Vec<ListDatasetElement>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(ref app) = *rt.app.read().await else {
+        return Ok(vec![]);
+    };
+
+    let catalogs: Vec<_> = app.catalogs.iter().map(|c| c.name.clone()).collect();
+
+    let batches = rt.datafusion().query_builder(format!(
+        "SELECT table_catalog, table_schema, table_name FROM information_schema.tables WHERE table_schema != 'information_schema' AND table_catalog in ({});",
+        catalogs.iter().map(|c| format!("\'{c}\'")).join(" ")
+    ).as_str()).build().run().await.boxed()?.data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .boxed()?;
+
+    Ok(batches
+        .iter()
+        .flat_map(|rb| {
+            let Some(Some(table_catalog)) = rb
+                .column_by_name("table_catalog")
+                .map(|c| c.as_any().downcast_ref::<StringArray>())
+            else {
+                return vec![];
+            };
+            let Some(Some(table_schema)) = rb
+                .column_by_name("table_schema")
+                .map(|c| c.as_any().downcast_ref::<StringArray>())
+            else {
+                return vec![];
+            };
+            let Some(Some(table_name)) = rb
+                .column_by_name("table_name")
+                .map(|c| c.as_any().downcast_ref::<StringArray>())
+            else {
+                return vec![];
+            };
+            (0..table_catalog.len())
+                .map(|i| ListDatasetElement {
+                    table: TableReference::full(
+                        table_catalog.value(i),
+                        table_schema.value(i),
+                        table_name.value(i),
+                    )
+                    .to_string(),
+                    can_search_documents: false,
+                    description: None,
+                    metadata: HashMap::new(),
+                })
+                .collect()
+        })
+        .collect::<Vec<ListDatasetElement>>())
 }
 
 pub async fn get_view_elements(
