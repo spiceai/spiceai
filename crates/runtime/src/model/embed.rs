@@ -180,7 +180,7 @@ async fn databricks(
                 .await
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                 source: Box::from(format!(
-                    "Could not retrieve M2M tokens from Databricks. Error: {e}"
+                    "Could not retrieve U2M tokens from Databricks. Error: {e}"
                 )),
             })?;
             Ok(Arc::new(

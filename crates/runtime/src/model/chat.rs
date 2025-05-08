@@ -318,7 +318,7 @@ async fn databricks(
                 })
                 .await.boxed().map_err(|e| LlmError::FailedToLoadModel {
                 source: Box::from(format!(
-                    "Could not retrieve M2M tokens from Databricks. Error: {e}"
+                    "Could not retrieve U2M tokens from Databricks. Error: {e}"
                 )),
             })?;
 
