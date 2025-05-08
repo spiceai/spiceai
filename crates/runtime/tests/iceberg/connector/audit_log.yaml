@@ -1,0 +1,11 @@
+version: v1
+kind: Spicepod
+name: iceberg-ai-demo
+
+datasets:
+  - from: iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/security_logs_integration/tables/audit_log
+    name: audit_log
+    params:
+      iceberg_s3_region: ap-northeast-2
+      iceberg_s3_access_key_id: ${ secrets:AWS_ICEBERG_ACCESS_KEY_ID }
+      iceberg_s3_secret_access_key: ${ secrets:AWS_ICEBERG_SECRET_ACCESS_KEY }
