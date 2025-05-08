@@ -44,7 +44,8 @@ pub struct Databricks {
     client: Client<HostedModelConfig>,
 }
 
-#[must_use] pub fn from_access_token(
+#[must_use]
+pub fn from_access_token(
     endpoint: &str,
     model: &str,
     access_token: &str,
