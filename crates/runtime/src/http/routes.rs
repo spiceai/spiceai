@@ -224,7 +224,7 @@ pub(crate) fn routes(
     {
         authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
             rt.token_provider_registry(),
-            databticks_u2m_middleware,
+            databricks_u2m_middleware,
         ));
     }
 
@@ -344,7 +344,7 @@ async fn check_shutdown(
     next.run(req).await
 }
 
-async fn databticks_u2m_middleware(
+async fn databricks_u2m_middleware(
     State(token_provider_registry): State<Arc<TokenProviderRegistry>>,
     req: axum::http::Request<Body>,
     next: Next,
