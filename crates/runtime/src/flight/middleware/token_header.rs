@@ -79,7 +79,7 @@ where
                     continue;
                 }
                 let Ok(Some((client_id, access_token))) =
-                    header_value.to_str().map(|v| v.split_once(":"))
+                    header_value.to_str().map(|v| v.split_once(':'))
                 else {
                     continue;
                 };

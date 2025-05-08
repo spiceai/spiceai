@@ -353,7 +353,7 @@ async fn databricks_u2m_middleware(
         if header_name != "Spice-Databricks-Auth" {
             continue;
         }
-        let Ok(Some((client_id, access_token))) = header_value.to_str().map(|v| v.split_once(":"))
+        let Ok(Some((client_id, access_token))) = header_value.to_str().map(|v| v.split_once(':'))
         else {
             continue;
         };
