@@ -23,6 +23,7 @@ use llms::{
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::SecretString;
 use serde_json::Value;
+use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use token_providers::{
@@ -302,7 +303,7 @@ async fn databricks(
                     endpoint,
                     model_id.as_str(),
                     token_provider,
-                    user_agent.as_deref(),
+                    user_agent,
                 )
             ) as Arc<dyn Chat>)
         }
