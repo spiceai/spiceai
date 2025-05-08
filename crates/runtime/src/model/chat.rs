@@ -26,7 +26,7 @@ use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use token_providers::databricks::DatabricksM2MTokenProvider;
+use token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::{
@@ -251,7 +251,7 @@ async fn databricks(
     let user_agent: Option<String> = None;
 
     match (token_opt, client_id, client_secret) {
-        (Some(_), Some(_) | None, Some(_)) | (Some(_), Some(_), None) => {
+        (Some(_), Some(_) | None, Some(_)) => {
             Err(LlmError::FailedToLoadModel {
                 source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
             })
@@ -285,6 +285,28 @@ async fn databricks(
                 client_secret.into(),
             )
             .await
+            .map_err(|e| LlmError::FailedToLoadModel {
+                source: Box::from(format!(
+                    "Could not retrieve M2M tokens from Databricks. Error: {e}"
+                )),
+            })?;
+            Ok(Arc::new(
+                llms::databricks::try_from_token_provider(
+                    endpoint,
+                    model_id.as_str(),
+                    Arc::new(token_provider),
+                    user_agent.as_deref(),
+                )
+                .boxed()
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?,
+            ) as Arc<dyn Chat>)
+        }
+        (Some(token),  Some(client_id), None) => {
+            let token_provider = DatabricksU2MTokenProvider::new(
+                endpoint.to_string(),
+                client_id.to_string(),
+                token.into()
+            )
             .map_err(|e| LlmError::FailedToLoadModel {
                 source: Box::from(format!(
                     "Could not retrieve M2M tokens from Databricks. Error: {e}"

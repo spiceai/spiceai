@@ -58,6 +58,8 @@ use axum::{
     routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
+#[cfg(feature = "databricks")]
+use token_providers::registry::TokenProviderRegistry;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -220,6 +222,14 @@ pub(crate) fn routes(
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
+    #[cfg(feature = "databricks")]
+    {
+        authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
+            rt.token_provider_registry(),
+            databticks_u2m_middleware,
+        ));
+    }
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled authentication on HTTP routes");
@@ -331,6 +341,36 @@ async fn check_shutdown(
             "Runtime is shutting down",
         )
             .into_response();
+    }
+
+    next.run(req).await
+}
+
+#[cfg(feature = "databricks")]
+async fn databticks_u2m_middleware(
+    State(token_provider_registry): State<Arc<TokenProviderRegistry>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    use regex::Regex;
+
+    let re = Regex::new(r"^databricks_u2m_(.+)$")
+        .unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
+
+    for (header_name, header_value) in req.headers() {
+        if let Some(caps) = re.captures(header_name.as_str()) {
+            let client_id = caps.get(1).map(|m| m.as_str().to_string());
+            let token = header_value.to_str().ok().map(ToString::to_string);
+
+            if let (Some(client_id), Some(token)) = (client_id, token) {
+                if let Some(token_provider) = token_provider_registry
+                    .get(format!("databricks_u2m_{client_id}"))
+                    .await
+                {
+                    token_provider.set_token(token);
+                }
+            }
+        }
     }
 
     next.run(req).await

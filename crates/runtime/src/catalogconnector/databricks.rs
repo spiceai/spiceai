@@ -166,6 +166,20 @@ impl CatalogConnector for Databricks {
                     connector_component: ConnectorComponent::from(catalog),
                 })?
             }
+            AuthCredentials::U2M(client_id, token) => {
+                DatabricksDataConnector::get_u2m_token_provider(
+                    endpoint,
+                    client_id,
+                    token,
+                    &runtime.token_provider_registry,
+                )
+                .await
+                .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                })?
+            }
         };
 
         let unity_catalog =
