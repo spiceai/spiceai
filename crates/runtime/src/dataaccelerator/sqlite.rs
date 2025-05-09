@@ -99,7 +99,7 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(sqlite3_decimal_init));
         }
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new(),
+            sqlite_factory: SqliteTableProviderFactory::new().with_decimal_between(true),
         }
     }
 
