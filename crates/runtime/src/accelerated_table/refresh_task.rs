@@ -128,6 +128,7 @@ impl RefreshTaskBuilder {
         self
     }
 
+    #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
             .semaphore
