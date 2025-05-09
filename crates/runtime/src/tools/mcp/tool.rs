@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use mcp_client::McpClientTrait;
-use mcp_core::{Tool as McpTool, protocol::CallToolResult};
+use rmcp::{model::CallToolResult, tool::Tool};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
