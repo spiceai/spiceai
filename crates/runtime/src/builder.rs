@@ -157,7 +157,6 @@ impl RuntimeBuilder {
             .app
             .as_ref()
             .and_then(|app| app.runtime.dataset_load_parallelism);
-        tracing::info!("dataset_parallelism: {dataset_parallelism:?}");
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
