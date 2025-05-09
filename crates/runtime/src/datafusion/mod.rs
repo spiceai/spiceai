@@ -1373,6 +1373,10 @@ impl DataFusion {
             builder.disable_federation();
         }
 
+        if let Some(semaphore) = &self.acceleration_refresh_semaphore {
+            builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
         let (accelerated_table, _) =
             builder
                 .build()
