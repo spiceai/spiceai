@@ -258,14 +258,19 @@ impl AppBuilder {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        let secrets = spicepod_root.secrets.clone();
-        let runtime = spicepod_root.runtime.clone();
-        let extensions = spicepod_root.extensions.clone();
+        Self::build_from_spicepod(spicepod_root, path)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
+        let path = path.into();
+        let secrets = spicepod.secrets.clone();
+        let runtime = spicepod.runtime.clone();
+        let extensions = spicepod.extensions.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -275,42 +280,42 @@ impl AppBuilder {
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
 
-        for catalog in &spicepod_root.catalogs {
+        for catalog in &spicepod.catalogs {
             catalogs.push(catalog.clone());
         }
 
-        for dataset in &spicepod_root.datasets {
+        for dataset in &spicepod.datasets {
             datasets.push(dataset.clone());
         }
 
-        for view in &spicepod_root.views {
+        for view in &spicepod.views {
             views.push(view.clone());
         }
 
-        for model in &spicepod_root.models {
+        for model in &spicepod.models {
             models.push(model.clone());
         }
 
-        for embedding in &spicepod_root.embeddings {
+        for embedding in &spicepod.embeddings {
             embeddings.push(embedding.clone());
         }
 
-        for eval in &spicepod_root.evals {
+        for eval in &spicepod.evals {
             evals.push(eval.clone());
         }
 
-        for tool in &spicepod_root.tools {
+        for tool in &spicepod.tools {
             tools.push(tool.clone());
         }
 
-        for worker in &spicepod_root.workers {
+        for worker in &spicepod.workers {
             workers.push(worker.clone());
         }
 
-        let root_spicepod_name = spicepod_root.name.clone();
+        let root_spicepod_name = spicepod.name.clone();
         let mut spicepods: Vec<Spicepod> = vec![];
 
-        for dependency in &spicepod_root.dependencies {
+        for dependency in &spicepod.dependencies {
             let dependency_path = path.join("spicepods").join(dependency);
             let dependent_spicepod =
                 Spicepod::load(&dependency_path).context(UnableToLoadSpicepodSnafu {
@@ -347,7 +352,7 @@ impl AppBuilder {
             spicepods.push(dependent_spicepod);
         }
 
-        spicepods.push(spicepod_root);
+        spicepods.push(spicepod);
 
         Ok(App {
             name: root_spicepod_name,
