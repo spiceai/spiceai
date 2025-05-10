@@ -32,16 +32,7 @@ var podsCmd = &cobra.Command{
 spice pods
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			rtcontext = context.NewHttpsContext(rootCertPath)
-		}
-		err := rtcontext.Init(cmd.Flags())
-		if err != nil {
-			slog.Error("failed to initialize runtime context", "error", err)
-			return
-		}
-
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
 		if err != nil {
 			slog.Error("listing spiced pods", "error", err)
@@ -62,6 +53,6 @@ spice pods
 }
 
 func init() {
-	podsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
+	context.InitHttpFlags(podsCmd.Flags())
 	RootCmd.AddCommand(podsCmd)
 }

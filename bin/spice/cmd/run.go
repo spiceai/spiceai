@@ -38,15 +38,13 @@ spice run
 `,
 	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
 
-		err = checkLatestCliReleaseVersion(rtcontext)
-		if err != nil && util.IsDebug() {
+		if checkLatestCliReleaseVersion(rtcontext) != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
 
@@ -85,7 +83,7 @@ spice run
 func init() {
 	RootCmd.AddCommand(runCmd)
 	runCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://127.0.0.1:50051")
-	runCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP endpoint. Defaults to http://127.0.0.1:8090")
+	runCmd.Flags().String(constants.HttpEndpointKeyFlag, "", "Specifies the runtime HTTP endpoint. Defaults to http://127.0.0.1:8090")
 	runCmd.Flags().String("metrics-endpoint", "", "Specifies the runtime Prometheus metrics endpoint. Defaults to http://127.0.0.1:9090")
 	sqlCmd.Flags().String("captured-output", "truncated", "Specifies the captured output setting for task history. [possible values: truncated, none]. Default: truncated")
 }
