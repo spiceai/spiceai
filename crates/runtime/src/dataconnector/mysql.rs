@@ -88,6 +88,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections to allow in the pool.")
         .default("100"),
+    ParameterSpec::component("character_set_results")
+        .description("The character set MySQL server returns query results to the client.")
 ];
 
 impl DataConnectorFactory for MySQLFactory {

@@ -300,7 +300,7 @@ fn create_test_dataset(
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
 ) -> Dataset {
-    let mut ds = make_mysql_dataset("lineitem", "lineitem", MYSQL_PORT, false);
+    let mut ds = make_mysql_dataset("lineitem", "lineitem", MYSQL_PORT, false, None);
 
     let mut acceleration = Acceleration {
         enabled: true,
