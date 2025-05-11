@@ -38,8 +38,7 @@ spice install ai
 # See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)

@@ -53,6 +53,5 @@ spice datasets
 }
 
 func init() {
-	context.InitHttpFlags(datasetsCmd.Flags())
 	RootCmd.AddCommand(datasetsCmd)
 }

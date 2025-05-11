@@ -52,6 +52,5 @@ spice workers
 }
 
 func init() {
-	context.InitHttpFlags(workersCmd.Flags())
 	RootCmd.AddCommand(workersCmd)
 }

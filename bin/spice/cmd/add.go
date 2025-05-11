@@ -50,8 +50,7 @@ func init() {
 
 func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)

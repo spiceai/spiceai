@@ -111,7 +111,6 @@ spice refresh taxi_trips
 }
 
 func init() {
-	context.InitHttpFlags(refreshCmd.Flags())
 	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
 	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")
 	refreshCmd.Flags().String(maxJitterFlag, "", "'refresh_jitter_max', a duration string (e.g. '1m') to specify the maximum jitter allowed for the refresh operation")

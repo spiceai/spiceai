@@ -81,7 +81,6 @@ sql> show tables
 }
 
 func init() {
-	context.InitHttpFlags(sqlCmd.Flags())
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
 	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://localhost:50051")
 	RootCmd.AddCommand(sqlCmd)

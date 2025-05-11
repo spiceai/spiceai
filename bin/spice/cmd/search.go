@@ -197,7 +197,6 @@ func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (
 }
 
 func init() {
-	context.InitHttpFlags(searchCmd.Flags())
 	searchCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 

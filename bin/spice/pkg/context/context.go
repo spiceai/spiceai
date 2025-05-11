@@ -127,10 +127,9 @@ func (c *RuntimeContext) HttpEndpoint() string {
 }
 
 func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
-	fmt.Printf("%s, %s, %s\n", method, fmt.Sprintf("%s%s", c.HttpEndpoint(), path), body)
 	request, err := http.NewRequest(method, fmt.Sprintf("%s%s", c.HttpEndpoint(), path), body)
 	if err != nil {
-		return nil, fmt.Errorf("error creating HTTP request: %w", err)
+		return nil, fmt.Errorf("error sending HTTP request: %w", err)
 	}
 
 	headers := c.GetHeaders()
@@ -142,11 +141,7 @@ func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeade
 		request.Header.Set(additionalHeaders[i], additionalHeaders[i+1])
 	}
 
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("error sending HTTP request: %w", err)
-	}
-	return response, nil
+	return c.httpClient.Do(request)
 }
 
 func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
@@ -530,11 +525,4 @@ func loadDotEnvValues() (map[string]string, error) {
 	}
 
 	return godotenv.Read(env_file)
-}
-
-func InitHttpFlags(fs *pflag.FlagSet) {
-	fs.Bool(constants.CloudKeyFlag, false, "Use cloud instance for chat")
-	fs.String(constants.HttpEndpointKeyFlag, "http://localhost:8090", "HTTP endpoint for chat")
-	fs.String(constants.UserAgentKeyFlag, util.GetSpiceUserAgent("spice"), "The user agent to use for all HTTP requests")
-	fs.String(constants.TlsRootCertificateFile, "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 }

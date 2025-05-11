@@ -206,6 +206,5 @@ func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*htt
 
 func init() {
 	nsqlCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for nsql")
-	context.InitHttpFlags(nsqlCmd.Flags())
 	RootCmd.AddCommand(nsqlCmd)
 }

@@ -45,6 +45,5 @@ spice status
 }
 
 func init() {
-	context.InitHttpFlags(statusCmd.Flags())
 	RootCmd.AddCommand(statusCmd)
 }

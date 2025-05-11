@@ -51,6 +51,5 @@ spice catalogs
 }
 
 func init() {
-	context.InitHttpFlags(catalogsCmd.Flags())
 	RootCmd.AddCommand(catalogsCmd)
 }

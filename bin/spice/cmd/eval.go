@@ -80,6 +80,5 @@ spice eval tetris --model "my_model"`,
 
 func init() {
 	evalCmd.Flags().String("model", "", "Model to evaluate")
-	context.InitHttpFlags(evalCmd.Flags())
 	RootCmd.AddCommand(evalCmd)
 }

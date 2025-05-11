@@ -446,7 +446,6 @@ func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error)
 }
 
 func init() {
-	context.InitHttpFlags(chatCmd.Flags())
 	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
 

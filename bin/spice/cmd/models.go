@@ -61,6 +61,5 @@ spice models
 }
 
 func init() {
-	context.InitHttpFlags(modelsCmd.Flags())
 	RootCmd.AddCommand(modelsCmd)
 }

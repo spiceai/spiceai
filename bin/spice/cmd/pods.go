@@ -53,6 +53,5 @@ spice pods
 }
 
 func init() {
-	context.InitHttpFlags(podsCmd.Flags())
 	RootCmd.AddCommand(podsCmd)
 }
