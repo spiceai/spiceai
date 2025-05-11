@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 use catalog::SpiceToolCatalog;
+use factory::default_catalog_names;
 use std::{borrow::Cow, sync::Arc};
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, rename::with_name};
 
 pub mod builtin;
 pub mod catalog;
@@ -40,7 +41,19 @@ impl Tooling {
     pub async fn tools(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         match self {
             Tooling::Tool(t) => vec![Arc::clone(t)],
-            Tooling::Catalog(c) => c.all().await,
+            Tooling::Catalog(c) => {
+                let catalog_name = c.name();
+                if default_catalog_names().contains(&catalog_name) {
+                    return c.all().await;
+                };
+
+                // If non-default catalog, tool name must be prefixed by catalog.
+                c.all()
+                    .await
+                    .iter()
+                    .map(|t| with_name(&t, format!("{catalog_name}/{}", t.name()).as_str()))
+                    .collect()
+            }
         }
     }
 
