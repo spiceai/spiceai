@@ -245,11 +245,9 @@ impl DataAccelerator for SqliteAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
+        mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cmd = cmd.clone();
-
         if let Some(source) = source {
             if source.is_file_accelerated() {
                 // If the user didn't specify a SQLite file and this is a file-mode SQLite,
@@ -371,7 +369,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(&external_table, None)
+            .create_external_table(external_table, None)
             .await
             .expect("table should be created");
 
