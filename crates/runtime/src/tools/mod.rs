@@ -77,3 +77,98 @@ impl From<Arc<dyn SpiceToolCatalog>> for Tooling {
         Tooling::Catalog(catalog)
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    struct MockTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl SpiceModelTool for MockTool {
+        fn name(&self) -> Cow<'_, str> {
+            self.name.clone().into()
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+        async fn call(&self, _: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+    }
+
+    struct MockCatalog {
+        name: String,
+    }
+
+    #[async_trait]
+    impl SpiceToolCatalog for MockCatalog {
+        fn name(&self) -> &str {
+            self.name.as_str()
+        }
+
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![
+                Arc::new(MockTool {
+                    name: "foo".to_string(),
+                }),
+                Arc::new(MockTool {
+                    name: "bar".to_string(),
+                }),
+                Arc::new(MockTool {
+                    name: "baz".to_string(),
+                }),
+            ]
+        }
+
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            Some(Arc::new(MockTool {
+                name: name.to_string(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_default_catalog() {
+        let t = Tooling::Catalog(Arc::new(MockCatalog {
+            name: "not_in_default_catalogs".to_string(),
+        }));
+        assert_eq!(
+            t.tools()
+                .await
+                .iter()
+                .map(|tt| tt.name().to_string())
+                .collect::<Vec<String>>(),
+            vec![
+                "not_in_default_catalogs/foo",
+                "not_in_default_catalogs/bar",
+                "not_in_default_catalogs/baz",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_catalog() {
+        let t = Tooling::Catalog(Arc::new(MockCatalog {
+            name: default_catalog_names()[0].to_string(),
+        }));
+        assert_eq!(
+            t.tools()
+                .await
+                .iter()
+                .map(|tt| tt.name().to_string())
+                .collect::<Vec<String>>(),
+            vec!["foo", "bar", "baz",]
+        );
+    }
+}
