@@ -20,7 +20,7 @@ use rmcp::{
     RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
-        InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
+        InitializeRequestParam, ListToolsResult, PaginatedRequestParam, ProtocolVersion,
     },
     serve_client,
     service::RunningService,
@@ -33,8 +33,6 @@ use tokio::{process::Command, sync::RwLock};
 use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
 use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
-
-const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
@@ -86,7 +84,7 @@ impl McpToolCatalog {
                     .context(UnderlyingTransportSnafu)?;
 
                 let client_info = ClientInfo {
-                    protocol_version: Default::default(),
+                    protocol_version: ProtocolVersion::default(),
                     capabilities: ClientCapabilities::default(),
                     client_info: Implementation {
                         name: "spiced".to_string(),

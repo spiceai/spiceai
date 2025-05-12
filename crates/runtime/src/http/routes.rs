@@ -130,6 +130,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
@@ -218,7 +219,8 @@ pub(crate) fn routes(
         });
 
         let runtime_arc = Arc::clone(rt);
-        let cancellation_token = sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        let _cancellation_token =
+            sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
