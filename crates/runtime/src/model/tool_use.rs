@@ -133,21 +133,18 @@ impl ToolUsingChat {
     }
 
     /// Check if a tool call is a spiced runtime tool.
-    fn is_spiced_tool(&self, t: &ChatCompletionMessageToolCall) -> bool {
+    fn as_spiced_tool(&self, t: &ChatCompletionMessageToolCall) -> Option<Arc<dyn SpiceModelTool>> {
         self.tools
             .iter()
-            .any(|tool| encode_tool_name(tool.name().as_ref()) == t.function.name)
+            .find(|tool| encode_tool_name(tool.name().as_ref()) == t.function.name)
+            .cloned()
     }
 
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
     async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
-        match self
-            .tools
-            .iter()
-            .find(|t| t.name() == tool_call.function.name)
-        {
+        match self.as_spiced_tool(tool_call) {
             Some(t) => match t.call(&tool_call.function.arguments).await {
                 Ok(v) => {
                     tracing::info!(
@@ -175,7 +172,21 @@ impl ToolUsingChat {
                     ))
                 }
             },
-            None => Value::Null,
+            None => {
+                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+                if cfg!(feature = "dev") {
+                    panic!(
+                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                        tool_call.function.name
+                    );
+                } else {
+                    tracing::warn!(
+                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                        tool_call.function.name
+                    );
+                    Value::Null
+                }
+            }
         }
     }
 
@@ -195,7 +206,7 @@ impl ToolUsingChat {
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
-            .filter(|&t| self.is_spiced_tool(t))
+            .filter(|&t| self.as_spiced_tool(t).is_some())
             .cloned()
             .collect_vec();
 

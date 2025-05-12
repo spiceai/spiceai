@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::Runtime;
 
 use super::{Tooling, options::SpiceToolsOptions};
-use tools::SpiceModelTool;
+use tools::{SpiceModelTool, rename::with_name};
 
 /// Creates the messages that would be sent and received if a language model were to request the `tool`
 /// to be called (via an assistant message), with defined `arg`, and the response from running the
@@ -92,7 +92,10 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
         if let Some((catalog_name, catalog_tool)) = tt.split_once(':') {
             if let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) {
                 if let Some(t) = catalog.get(catalog_tool).await {
-                    tools.push(t);
+                    tools.push(with_name(
+                        &t,
+                        format!("{}/{}", catalog_name, t.name()).as_str(),
+                    ));
                 } else {
                     tracing::warn!("Tool '{catalog_tool}' is not found in '{catalog_name}'.");
                     missing_tools.push(tt);

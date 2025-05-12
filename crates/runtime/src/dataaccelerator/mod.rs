@@ -228,7 +228,7 @@ impl AcceleratorEngineRegistry {
         let external_table = external_table_builder.build()?;
 
         let table_provider = accelerator
-            .create_external_table(&external_table, source)
+            .create_external_table(external_table, source)
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -244,7 +244,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
+        cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 

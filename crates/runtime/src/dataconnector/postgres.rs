@@ -26,6 +26,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError,
     postgrespool::{self, PostgresConnectionPool},
 };
+use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -92,7 +93,14 @@ impl DataConnectorFactory for PostgresFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match PostgresConnectionPool::new(params.parameters.to_secret_map()).await {
+            let mut param_map = params.parameters.to_secret_map();
+
+            param_map.insert(
+                "application_name".to_string(),
+                SecretBox::from(format!("Spice.ai {}", env!("CARGO_PKG_VERSION"))),
+            );
+
+            match PostgresConnectionPool::new(param_map).await {
                 Ok(mut pool) => {
                     if let Some(unsupported_type_action) = params.unsupported_type_action {
                         pool = pool.with_unsupported_type_action(unsupported_type_action);
