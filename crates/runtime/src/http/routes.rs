@@ -44,8 +44,8 @@ use utoipa::{
     openapi::{HttpMethod, path::Operation},
 };
 
-// #[cfg(feature = "dev")]
-use utoipa_swagger_ui::{Config, SwaggerUi};
+#[cfg(feature = "dev")]
+use utoipa_swagger_ui::SwaggerUi;
 
 use super::{metrics, v1};
 

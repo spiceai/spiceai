@@ -17,7 +17,7 @@ limitations under the License.
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 use rmcp::{
-    RoleClient, ServiceError, ServiceExt,
+    ClientHandler, RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
         InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
@@ -41,12 +41,14 @@ pub(crate) struct McpToolCatalog {
 
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
-    heartbeat_task: tokio::task::JoinHandle<()>,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for McpToolCatalog {
     fn drop(&mut self) {
-        self.heartbeat_task.abort();
+        if let Some(heartbeat_task) = self.heartbeat_task {
+            heartbeat_task.abort();
+        }
     }
 }
 
@@ -55,34 +57,12 @@ impl McpToolCatalog {
         let client = Self::create_client(&cfg).await?;
         let client = Arc::new(RwLock::new(client));
 
-        let client_clone = Arc::clone(&client);
-        let cfg_clone = cfg.clone();
-        let name_clone = name.to_string();
-        let heartbeat_task = tokio::spawn(async move {
-            // let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
-            // interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            // loop {
-            //     interval.tick().await;
-
-            //     let heartbeat_result = client_clone.read().await.ping().await;
-
-            //     if let Err(ref e) = heartbeat_result {
-            //         tracing::warn!("MCP client heartbeat failed, attempting reconnection");
-            //         tracing::debug!("MCP client heartbeat failed with error: {e}");
-            //         if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
-            //             let mut client_lock = client_clone.write().await;
-            //             *client_lock = new_client_rwlock.into_inner(); // Directly assign the unwrapped Box<dyn McpClientTrait>
-            //             tracing::info!("Successfully reconnected MCP client for {}", name_clone);
-            //         }
-            //     }
-            // }
-        });
+        // TODO: Implement Ping health checks.
 
         Ok(Self {
             client,
             name: name.to_string(),
-            heartbeat_task,
+            heartbeat_task: None,
         })
     }
 
@@ -113,6 +93,7 @@ impl McpToolCatalog {
                         version: env!("CARGO_PKG_VERSION").to_string(),
                     },
                 };
+
                 Ok(McpClient::Sse(
                     client_info
                         .serve(transport)
