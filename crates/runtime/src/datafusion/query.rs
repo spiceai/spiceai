@@ -223,10 +223,7 @@ impl Query {
                     // but this should never happen if the cache manager is implemented correctly, and its better
                     // to let the query succeed and pollute the logs than to panic.
                     tracing::warn!("No cache key computed for query, skipping caching");
-                    #[allow(clippy::manual_assert)]
-                    if cfg!(test) {
-                        panic!("No cache key computed for query");
-                    }
+                    debug_assert!(false, "No cache key computed for query");
                     res_stream
                 }
             } else {
