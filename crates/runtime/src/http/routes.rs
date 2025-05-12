@@ -89,8 +89,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::search::post,
         v1::chat::post,
         v1::models::get,
-        #[cfg(feature = "mcp")]
-        // v1::mcp::event,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -173,13 +171,10 @@ pub(crate) fn routes(
 
     // Enable Swagger UI & OpenAPI JSON for dev.
     // #[cfg(feature = "dev")]
-    // {
-    //     let ui = SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc());
-    //     let rtr = OpenApiRouter::with_openapi(get_api_doc());
-    //     authenticated_router = authenticated_router
-    //         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
-    //     // .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
-    // }
+    {
+        authenticated_router = authenticated_router
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
+    }
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
@@ -219,6 +214,7 @@ pub(crate) fn routes(
             ct: tokio_util::sync::CancellationToken::new(),
             sse_keep_alive: None,
         });
+
         let runtime_arc = Arc::clone(&rt);
         let cancellation_token = sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
         authenticated_router = mcp_router.merge(authenticated_router);

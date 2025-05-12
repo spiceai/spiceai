@@ -62,14 +62,12 @@ impl ServerHandler for RuntimeServer {
             // If possible, we pass the call through to the MCP server.
             if let Some(mcp_proxy) = tool.as_mcp_proxy().await {
                 tracing::debug!("{tool_name} uses MCP. Will call directly");
-                // Here we wrap the proxy's result inside a CallToolResult.
                 return mcp_proxy
                     .call_tool(arguments)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None));
             }
 
-            // Process as before.
             let args = serde_json::to_string(&arguments)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
