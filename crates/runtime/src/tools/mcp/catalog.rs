@@ -17,7 +17,7 @@ limitations under the License.
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 use rmcp::{
-    ClientHandler, RoleClient, ServiceError, ServiceExt,
+    RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
         InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
@@ -46,7 +46,7 @@ pub(crate) struct McpToolCatalog {
 
 impl Drop for McpToolCatalog {
     fn drop(&mut self) {
-        if let Some(heartbeat_task) = self.heartbeat_task {
+        if let Some(heartbeat_task) = &self.heartbeat_task {
             heartbeat_task.abort();
         }
     }

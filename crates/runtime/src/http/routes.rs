@@ -29,7 +29,6 @@ use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use axum_extra::routing::Resource;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 use rmcp::transport::SseServer;
@@ -170,7 +169,7 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router.merge(iceberg_router);
 
     // Enable Swagger UI & OpenAPI JSON for dev.
-    // #[cfg(feature = "dev")]
+    #[cfg(feature = "dev")]
     {
         authenticated_router = authenticated_router
             .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
