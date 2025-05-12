@@ -133,7 +133,7 @@ impl Query {
             ),
         };
 
-        let raw_cache_key = sql_cache_key.or(plan_cache_key);
+        let raw_cache_key = plan_cache_key.or(sql_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
         tracker = tracker.results_cache_hit(false);
