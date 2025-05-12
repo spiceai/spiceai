@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::model::ModelContextLayer;
+use crate::tools::mcp::server::RuntimeServer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
 use crate::Runtime;
@@ -30,6 +31,8 @@ use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
+use rmcp::transport::SseServer;
+use rmcp::transport::sse_server::SseServerConfig;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -45,8 +48,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use super::{metrics, v1};
 
-#[cfg(feature = "mcp")]
-use super::v1::mcp::McpState;
+// #[cfg(feature = "mcp")]
+// use super::v1::mcp::McpState;
 
 use axum::{
     Extension,
@@ -89,7 +92,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::chat::post,
         v1::models::get,
         #[cfg(feature = "mcp")]
-        v1::mcp::event,
+        // v1::mcp::event,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -208,10 +211,16 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        authenticated_router = authenticated_router
-            .route("/v1/mcp/sse", get(v1::mcp::sse))
-            .route("/v1/mcp/sse", post(v1::mcp::event))
-            .layer(Extension(Arc::new(McpState::default())));
+        let (mut sse_server, mcp_router) = SseServer::new(SseServerConfig {
+            bind: config.http_bind_address,
+            sse_path: "/v1/mcp/sse".to_string(),
+            post_path: "/v1/mcp/sse".to_string(),
+            ct: tokio_util::sync::CancellationToken::new(),
+            sse_keep_alive: None,
+        });
+        let runtime_arc = Arc::clone(&rt);
+        let cancellation_token = sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        authenticated_router = authenticated_router.merge(mcp_router)
     }
 
     authenticated_router = authenticated_router
