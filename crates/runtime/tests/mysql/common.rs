@@ -29,7 +29,7 @@ use crate::{
 
 pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
-    let mut params = HashMap::from([
+    let params = HashMap::from([
         ("mysql_host".to_string(), "localhost".to_string()),
         ("mysql_tcp_port".to_string(), port.to_string()),
         ("mysql_user".to_string(), "root".to_string()),
