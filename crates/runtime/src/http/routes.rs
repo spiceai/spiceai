@@ -206,7 +206,7 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        let (mut sse_server, mcp_router) = SseServer::new(SseServerConfig {
+        let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
             bind: config.http_bind_address,
             sse_path: "/v1/mcp/sse".to_string(),
             post_path: "/v1/mcp/sse".to_string(),
@@ -214,7 +214,7 @@ pub(crate) fn routes(
             sse_keep_alive: None,
         });
 
-        let runtime_arc = Arc::clone(&rt);
+        let runtime_arc = Arc::clone(rt);
         let cancellation_token = sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
         authenticated_router = mcp_router.merge(authenticated_router);
     }

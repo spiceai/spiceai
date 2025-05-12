@@ -96,7 +96,7 @@ impl SpiceModelTool for McpToolWrapper {
                 })?
             };
             let response = client
-                .call_tool(CallToolRequestParam{name: self.internal_name().into(), arguments: Some(object(input))})
+                .call_tool(CallToolRequestParam{name: self.internal_name(), arguments: Some(object(input))})
                 .await
                 .boxed()?;
 
@@ -129,7 +129,7 @@ impl McpProxy for McpToolWrapper {
         let inner = self.client.read().await;
         inner
             .call_tool(CallToolRequestParam {
-                name: self.internal_name().into(),
+                name: self.internal_name(),
                 arguments,
             })
             .await
