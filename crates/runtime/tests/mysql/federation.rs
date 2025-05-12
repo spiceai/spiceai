@@ -92,9 +92,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_federation_push_down")
-                .with_dataset(make_mysql_dataset(
-                    "lineitem", "line", MYSQL_PORT, false, None,
-                ))
+                .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
                 .build();
 
             let mut rt = Runtime::builder()
@@ -197,8 +195,8 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             e.to_string()
         })?;
         let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
-            .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false, None))
-            .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true, None))
+            .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false))
+            .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
             .build();
 
         let mut rt =

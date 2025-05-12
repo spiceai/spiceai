@@ -241,7 +241,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_integration_test")
-                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false, None))
+                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
                 .build();
 
             let mut rt = Runtime::builder()
@@ -333,17 +333,9 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
             let app = AppBuilder::new("mysql_character_set_results_test")
                 .with_dataset(make_mysql_dataset(
                     "test_utf8mb4",
-                    "test_utf8mb3",
-                    MYSQL_PORT,
-                    false,
-                    Some("utf8mb3"),
-                ))
-                .with_dataset(make_mysql_dataset(
-                    "test_utf8mb4",
                     "test_default",
                     MYSQL_PORT,
                     false,
-                    None,
                 ))
                 .build();
 
@@ -366,23 +358,6 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
             runtime_ready_check(&rt).await;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM test_utf8mb3",
-                "character_set_results_utf8mb3",
-                Some(Box::new(|result_batches| {
-                    // snapshot the values of the results
-                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
-                        .expect("should pretty print result batch");
-
-                    insta::with_settings!({
-                        description => format!("MySQL Integration Test Results"),
-                        omit_expression => true,
-                        snapshot_path => "../snapshots"
-                    }, {
-                        insta::assert_snapshot!(format!("character_set_results_utf8mb3"), results);
-                    });
-                })),
-            ),
-            (
                 "SELECT * FROM test_default",
                 "character_set_results_default",
                 Some(Box::new(|result_batches| {
@@ -398,8 +373,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                         insta::assert_snapshot!(format!("character_set_results_default"), results);
                     });
                 })),
-            ),
-            ];
+            )];
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(

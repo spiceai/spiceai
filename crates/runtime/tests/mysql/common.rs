@@ -27,13 +27,7 @@ use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer},
 };
 
-pub fn make_mysql_dataset(
-    path: &str,
-    name: &str,
-    port: u16,
-    accelerated: bool,
-    character_set_results: Option<&str>,
-) -> Dataset {
+pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
     let mut params = HashMap::from([
         ("mysql_host".to_string(), "localhost".to_string()),
@@ -43,12 +37,6 @@ pub fn make_mysql_dataset(
         ("mysql_db".to_string(), "mysqldb".to_string()),
         ("mysql_sslmode".to_string(), "disabled".to_string()),
     ]);
-    if let Some(character_set_results) = character_set_results {
-        params.insert(
-            "mysql_character_set_results".to_string(),
-            character_set_results.to_string(),
-        );
-    }
     dataset.params = Some(DatasetParams::from_string_map(params));
     if accelerated {
         dataset.acceleration = Some(Acceleration::default());
