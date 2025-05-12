@@ -149,7 +149,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             let running_container = Arc::new(running_container);
 
             let mut ds_no_retries =
-                make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT, false, None);
+                make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT, false);
             ds_no_retries.acceleration = Some(Acceleration {
                 enabled: true,
                 refresh_retry_enabled: false,
@@ -158,7 +158,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             });
 
             let mut ds_default_retries =
-                make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT, false, None);
+                make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT, false);
             ds_default_retries.acceleration = Some(Acceleration {
                 enabled: true,
                 refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),
