@@ -14,6 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod github_app_token;
