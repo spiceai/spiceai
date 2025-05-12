@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/cache/mod.rs
-description: File Integration Test Results
+description: Cache Integration Test Results
 ---
 +---------+------+---------+-------+---------------------+------------+----------+-----------+-----------+--------------+
 | integer | text | boolean | float | timestamp           | date       | time     | list      | set       | dict         |

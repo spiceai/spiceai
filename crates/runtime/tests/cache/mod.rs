@@ -76,11 +76,11 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("File Integration Test Results"),
+                        description => format!("Cache Integration Test Results"),
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("file_integration_test_select"), results);
+                        insta::assert_snapshot!(format!("cache_integration_test_select"), results);
                     });
                 })),
             )];
@@ -88,7 +88,7 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
                     &mut rt,
-                    &format!("file_integration_test_{snapshot_suffix}"),
+                    &format!("cache_integration_test_{snapshot_suffix}"),
                     query,
                     false, // snapshot plan changes depending on the runner's filesystem
                     // the file_groups outputs the absolute path to the parquet file
