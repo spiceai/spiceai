@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+mod cache;
 mod catalog;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
