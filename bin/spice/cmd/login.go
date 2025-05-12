@@ -429,6 +429,7 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 			os.Exit(1)
 		}
 
+		// Ensure that either --token is provided OR both --client-id and --client-secret are provided, but not all or neither.
 		if (db_token == "") == (db_client_id == "" || db_client_secret == "") {
 			cmd.Println("You must provide either --token OR both --client-id and --client-secret for Databricks authentication.")
 			os.Exit(1)
