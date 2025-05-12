@@ -185,8 +185,7 @@ datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev 
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a898971e2c2652abf924d9d60e4d9d0a12620cd9" }      # spiceai-45
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" }                      # spiceai-45
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1713e9af2729f686aac46aef63e8c84545083e29" } # spiceai
-
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c8b6ea36266bd2d9a062796c88ae4c178a0177f9" } # spiceai
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2e24b958e44ec7419290249e27a15f1a19703fff" } # spiceai-1.1.3-backported-arrow-54
 
@@ -195,8 +194,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "58308b27bc768f644f32a45dac277bb40984a058" }              # spiceai-0.4.0-df-45
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "58308b27bc768f644f32a45dac277bb40984a058" } # spiceai-0.4.0-df-45
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "58308b27bc768f644f32a45dac277bb40984a058" }   # spiceai-0.4.0-df-45
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51" }              # spiceai-0.4.0-df-45
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51" } # spiceai-0.4.0-df-45
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51" }   # spiceai-0.4.0-df-45
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

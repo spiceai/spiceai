@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod app_utils;
 pub mod flight;
 pub mod gh_utils;
 pub mod git;

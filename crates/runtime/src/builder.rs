@@ -153,13 +153,23 @@ impl RuntimeBuilder {
             .as_ref()
             .and_then(|app| app.runtime.temp_directory.clone());
 
-        let mut df = DataFusion::builder(
+        let dataset_parallelism = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.dataset_load_parallelism);
+
+        let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
         )
         .memory_limit(memory_limit)
-        .temp_directory(temp_directory)
-        .build();
+        .temp_directory(temp_directory);
+
+        if let Some(dataset_parallelism) = dataset_parallelism {
+            df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
+        }
+
+        let mut df = df_builder.build();
 
         if let Some(callback) = self.datafusion_configuration_fn {
             callback(&mut df);

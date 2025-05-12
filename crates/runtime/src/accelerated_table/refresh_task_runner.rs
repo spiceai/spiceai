@@ -22,7 +22,10 @@ use super::{
 use futures::future::BoxFuture;
 use tokio::{
     select,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Semaphore,
+        mpsc::{self, Receiver, Sender},
+    },
     task::JoinHandle,
 };
 
@@ -32,6 +35,78 @@ use tokio::sync::RwLock;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
+
+pub struct RefreshTaskRunnerBuilder {
+    runtime_status: Arc<status::RuntimeStatus>,
+    dataset_name: TableReference,
+    federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
+    refresh: Arc<RwLock<Refresh>>,
+    accelerator: Arc<dyn TableProvider>,
+    disable_federation: bool,
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+impl RefreshTaskRunnerBuilder {
+    #[must_use]
+    pub fn new(
+        runtime_status: Arc<status::RuntimeStatus>,
+        dataset_name: TableReference,
+        federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
+        refresh: Arc<RwLock<Refresh>>,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> Self {
+        Self {
+            runtime_status,
+            dataset_name,
+            federated,
+            federated_source,
+            refresh,
+            accelerator,
+            disable_federation: false,
+            semaphore: None,
+        }
+    }
+
+    /// Sets the `disable_federation` flag
+    #[must_use]
+    pub fn with_disable_federation(mut self, disable: bool) -> Self {
+        self.disable_federation = disable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RefreshTaskRunner {
+        let mut refresh_task_builder = RefreshTask::builder(
+            self.runtime_status,
+            self.dataset_name.clone(),
+            self.federated,
+            self.federated_source,
+            self.accelerator,
+        )
+        .with_disable_federation(self.disable_federation);
+
+        if let Some(semaphore) = self.semaphore {
+            refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
+        }
+
+        let refresh_task = Arc::new(refresh_task_builder.build());
+
+        RefreshTaskRunner {
+            dataset_name: self.dataset_name,
+            refresh: self.refresh,
+            refresh_task,
+            task: None,
+        }
+    }
+}
 
 /// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
@@ -45,32 +120,22 @@ pub struct RefreshTaskRunner {
 
 impl RefreshTaskRunner {
     #[must_use]
-    pub fn new(
+    pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
-        disable_federation: bool,
-    ) -> Self {
-        let refresh_task = Arc::new(
-            RefreshTask::new(
-                runtime_status,
-                dataset_name.clone(),
-                federated,
-                federated_source,
-                accelerator,
-            )
-            .with_disable_federation(disable_federation),
-        );
-
-        Self {
+    ) -> RefreshTaskRunnerBuilder {
+        RefreshTaskRunnerBuilder::new(
+            runtime_status,
             dataset_name,
+            federated,
+            federated_source,
             refresh,
-            refresh_task,
-            task: None,
-        }
+            accelerator,
+        )
     }
 
     pub fn start(

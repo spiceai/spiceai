@@ -3669,7 +3669,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=1713e9af2729f686aac46aef63e8c84545083e29#1713e9af2729f686aac46aef63e8c84545083e29"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c8b6ea36266bd2d9a062796c88ae4c178a0177f9#c8b6ea36266bd2d9a062796c88ae4c178a0177f9"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -5990,7 +5990,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6039,7 +6039,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6065,7 +6065,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6879,7 +6879,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]

@@ -86,12 +86,18 @@ impl DataAccelerator for PostgresAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
+        mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
+
+        cmd.options.insert(
+            "application_name".to_string(),
+            format!("Spice.ai {}", env!("CARGO_PKG_VERSION")),
+        );
+
         let table_provider =
-            TableProviderFactory::create(&self.postgres_factory, &ctx.state(), cmd)
+            TableProviderFactory::create(&self.postgres_factory, &ctx.state(), &cmd)
                 .await
                 .context(UnableToCreateTableSnafu)
                 .boxed()?;
