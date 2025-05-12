@@ -168,12 +168,12 @@ async fn databricks(
         }
         (Some(token),  Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
-                    DatabricksU2MTokenProvider::new(
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                    Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
                         token.into(),
-                    )
+                    ))
                 })
                 .await
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {

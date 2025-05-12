@@ -231,15 +231,14 @@ impl TokenProvider for DatabricksU2MTokenProvider {
 
 impl DatabricksU2MTokenProvider {
     #[allow(clippy::needless_pass_by_value)]
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn new(endpoint: String, client_id: String, token: SecretString) -> Result<Self> {
+    pub fn new(endpoint: String, client_id: String, token: SecretString) -> Self {
         let (tx, rx) = watch::channel(token.clone().expose_secret().to_string());
 
-        Ok(Self {
+        Self {
             endpoint,
             client_id,
             tx,
             rx,
-        })
+        }
     }
 }
