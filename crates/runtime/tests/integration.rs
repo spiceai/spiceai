@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+mod cache;
 mod catalog;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
@@ -82,7 +83,7 @@ mod utils;
 mod view;
 // MySQL is required for the rehydration tests
 mod podswatcher;
-#[cfg(feature = "mysql")]
+#[cfg(all(feature = "mysql", feature = "duckdb"))]
 mod rehydration;
 mod shutdown;
 

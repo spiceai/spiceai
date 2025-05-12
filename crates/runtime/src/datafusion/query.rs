@@ -102,6 +102,11 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    /// Run a query and return the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when running under test if no cache key is computed for the query.
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -218,6 +223,7 @@ impl Query {
                     // but this should never happen if the cache manager is implemented correctly, and its better
                     // to let the query succeed and pollute the logs than to panic.
                     tracing::warn!("No cache key computed for query, skipping caching");
+                    debug_assert!(false, "No cache key computed for query");
                     res_stream
                 }
             } else {
