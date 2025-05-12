@@ -1,6 +1,5 @@
 ---
 source: crates/runtime/tests/cache/mod.rs
-assertion_line: 83
 description: File Integration Test Results
 ---
 +---------+------+---------+-------+---------------------+------------+----------+-----------+-----------+--------------+
