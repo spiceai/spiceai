@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::model::ModelContextLayer;
-use crate::tools::mcp::server::RuntimeServer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
 use crate::Runtime;
@@ -27,11 +26,15 @@ use crate::http::v1::{
 use crate::request::Protocol;
 use crate::{config, request::RequestContext};
 
+#[cfg(feature = "mcp")]
+use crate::tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
+#[cfg(feature = "mcp")]
 use rmcp::transport::SseServer;
+#[cfg(feature = "mcp")]
 use rmcp::transport::sse_server::SseServerConfig;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
