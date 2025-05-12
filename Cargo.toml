@@ -63,7 +63,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "2137319
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.86"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"

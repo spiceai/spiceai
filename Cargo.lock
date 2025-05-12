@@ -1446,7 +1446,6 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core 0.4.5",
- "axum-macros",
  "base64 0.22.1",
  "bytes",
  "futures-util",
@@ -1483,6 +1482,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de45108900e1f9b9242f7f2e254aa3e2c029c921c258fe9e6b4217eeebd54288"
 dependencies = [
  "axum-core 0.5.2",
+ "axum-macros",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -1553,22 +1553,21 @@ dependencies = [
 
 [[package]]
 name = "axum-extra"
-version = "0.9.6"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c794b30c904f0a1c2fb7740f7df7f7972dfaa14ef6f57cb6178dc63e5dca2f04"
+checksum = "45bf463831f5131b7d3c756525b305d40f1185b688565648a92e1392ca35713d"
 dependencies = [
- "axum 0.7.9",
- "axum-core 0.4.5",
+ "axum 0.8.3",
+ "axum-core 0.5.2",
  "bytes",
- "fastrand 2.3.0",
  "futures-util",
  "headers",
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
  "mime",
- "multer",
  "pin-project-lite",
+ "rustversion",
  "serde",
  "tower 0.5.2",
  "tower-layer",
@@ -1577,9 +1576,9 @@ dependencies = [
 
 [[package]]
 name = "axum-macros"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d123550fa8d071b7255cb0cc04dc302baa6c8c4a79f55701552684d8399bce"
+checksum = "604fde5e028fea851ce1d8570bbdc034bec850d157f7569d10f347d06808c05c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10783,7 +10782,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
- "axum 0.7.9",
+ "axum 0.8.3",
  "axum-extra",
  "azure_core 0.22.0",
  "azure_storage",
@@ -10912,7 +10911,7 @@ name = "runtime-auth"
 version = "1.3.0-unstable"
 dependencies = [
  "app",
- "axum 0.7.9",
+ "axum 0.8.3",
  "base64 0.22.1",
  "futures",
  "http 1.3.1",

@@ -29,6 +29,7 @@ use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
+use axum_extra::routing::Resource;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 use rmcp::transport::SseServer;
@@ -43,13 +44,10 @@ use utoipa::{
     openapi::{HttpMethod, path::Operation},
 };
 
-#[cfg(feature = "dev")]
-use utoipa_swagger_ui::SwaggerUi;
+// #[cfg(feature = "dev")]
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use super::{metrics, v1};
-
-// #[cfg(feature = "mcp")]
-// use super::v1::mcp::McpState;
 
 use axum::{
     Extension,
@@ -145,11 +143,11 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
-            "/v1/datasets/:name/acceleration/refresh",
+            "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
         )
         .route(
-            "/v1/datasets/:name/acceleration",
+            "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
@@ -159,31 +157,34 @@ pub(crate) fn routes(
         .route("/v1/config", get(v1::iceberg::get_config))
         .route("/v1/namespaces", get(v1::iceberg::get_namespaces))
         .route(
-            "/v1/namespaces/:namespace",
+            "/v1/namespaces/{namespace}",
             get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
         )
         .route(
-            "/v1/namespaces/:namespace/tables",
+            "/v1/namespaces/{namespace}/tables",
             get(v1::iceberg::list_tables),
         )
         .route(
-            "/v1/namespaces/:namespace/tables/:table",
+            "/v1/namespaces/{namespace}/tables/{table}",
             get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
         );
 
     authenticated_router = authenticated_router.merge(iceberg_router);
 
     // Enable Swagger UI & OpenAPI JSON for dev.
-    #[cfg(feature = "dev")]
-    {
-        authenticated_router = authenticated_router
-            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
-    }
+    // #[cfg(feature = "dev")]
+    // {
+    //     let ui = SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc());
+    //     let rtr = OpenApiRouter::with_openapi(get_api_doc());
+    //     authenticated_router = authenticated_router
+    //         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
+    //     // .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
+    // }
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
-            .route("/v1/models/:name/predict", get(v1::inference::get))
+            .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
@@ -193,11 +194,11 @@ pub(crate) fn routes(
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/*name", post(v1::tools::post))
+            .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
-            .route("/v1/tool/:name", post(v1::tools::post))
+            .route("/v1/tool/{name}", post(v1::tools::post))
             .route(
-                "/v1/evals/:name",
+                "/v1/evals/{name}",
                 post(v1::eval::post).layer(ModelContextLayer),
             )
             .route("/v1/evals", get(v1::eval::list))
@@ -220,7 +221,7 @@ pub(crate) fn routes(
         });
         let runtime_arc = Arc::clone(&rt);
         let cancellation_token = sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
-        authenticated_router = authenticated_router.merge(mcp_router)
+        authenticated_router = mcp_router.merge(authenticated_router);
     }
 
     authenticated_router = authenticated_router

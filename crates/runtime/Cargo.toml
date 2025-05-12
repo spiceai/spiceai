@@ -26,7 +26,7 @@ aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true
-axum-extra = { version = "0.9.6", features = ["typed-header"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
@@ -160,7 +160,7 @@ x509-certificate.workspace = true
 [dev-dependencies]
 anyhow = "1.0.86"
 async-graphql = "7.0.5"
-async-graphql-axum = "=7.0.13"
+async-graphql-axum = "7.0.13"
 azure_core = "0.22.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
