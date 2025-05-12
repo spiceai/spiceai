@@ -35,8 +35,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use token_providers::StaticTokenProvider;
-use token_providers::TokenProvider;
+use token_provider::{StaticTokenProvider, TokenProvider};
 
 #[derive(Clone)]
 pub struct UnityCatalog {

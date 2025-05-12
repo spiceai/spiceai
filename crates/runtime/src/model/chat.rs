@@ -26,12 +26,10 @@ use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use token_providers::{
-    databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider},
-    registry::TokenProviderRegistry,
-};
+use token_provider::registry::TokenProviderRegistry;
 
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
+use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{
     Runtime,
     tools::{options::SpiceToolsOptions, utils::get_tools},

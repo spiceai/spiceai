@@ -21,7 +21,7 @@ use serde::Deserialize;
 use snafu::prelude::*;
 use url::Url;
 
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 pub mod provider;
 
@@ -66,7 +66,7 @@ pub enum Error {
     SchemaDoesntExist { schema: String, catalog_id: String },
 
     #[snafu(display("Failed to get token.\n{source}"))]
-    UnableToGetToken { source: token_providers::Error },
+    UnableToGetToken { source: token_provider::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

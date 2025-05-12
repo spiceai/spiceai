@@ -32,7 +32,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use std::{any::Any, path::Path, sync::Arc};
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;

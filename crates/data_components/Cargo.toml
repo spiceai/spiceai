@@ -69,7 +69,7 @@ spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", re
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
-token_providers = { path = "../token_providers" }
+token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",

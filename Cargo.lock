@@ -3205,7 +3205,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "tiberius",
- "token_providers",
+ "token_provider",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -7124,7 +7124,7 @@ dependencies = [
  "text-embeddings-core",
  "text-splitter",
  "tiktoken-rs",
- "token_providers",
+ "token_provider",
  "tokenizers",
  "tokio",
  "tracing",
@@ -10907,7 +10907,7 @@ dependencies = [
  "tera",
  "test-framework",
  "tiberius",
- "token_providers",
+ "token_provider",
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.1",
@@ -12938,18 +12938,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "token_providers"
+name = "token_provider"
 version = "1.3.0-unstable"
 dependencies = [
- "chrono",
- "jsonwebtoken",
  "reqwest 0.12.12",
  "secrecy",
  "serde",
  "snafu",
  "tokio",
  "tracing",
- "util",
 ]
 
 [[package]]

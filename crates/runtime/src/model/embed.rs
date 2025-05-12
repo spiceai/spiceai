@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
+use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
@@ -31,10 +32,7 @@ use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
-use token_providers::{
-    databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider},
-    registry::TokenProviderRegistry,
-};
+use token_provider::registry::TokenProviderRegistry;
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;

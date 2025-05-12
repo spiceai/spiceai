@@ -31,7 +31,7 @@ use crate::{
     tracers,
 };
 use app::App;
-use token_providers::registry::TokenProviderRegistry;
+use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::{Mutex, RwLock};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);

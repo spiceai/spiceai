@@ -19,7 +19,7 @@ use crate::rate_limit::RateLimiter;
 use super::{Result, client::GraphQLClient};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 use url::Url;
 
