@@ -188,6 +188,9 @@ assignees: ''
 
 - [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
+
+## Post-Release Housekeeping
+
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
@@ -197,9 +200,6 @@ assignees: ''
       - Branch: `trunk`
       - Build the CLI: `false`
       - Release Version: the version tag released.
-
-## Post-Release Housekeeping
-
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
