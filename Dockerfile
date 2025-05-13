@@ -44,11 +44,15 @@ RUN mkdir -p /spice_sandbox/bin && \
     mkdir -p /spice_sandbox/usr/lib && \
     mkdir -p /spice_sandbox/usr/local/bin && \
     mkdir -p /spice_sandbox/etc && \
+    mkdir -p /spice_sandbox/etc/ssl && \
     mkdir -p /spice_sandbox/dev && \
     mkdir -p /spice_sandbox/app
 
 # Copy the binary
 COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
+
+# Copy CA certificates
+RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
 
 # Copy every dependent library reported by ldd
 RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
