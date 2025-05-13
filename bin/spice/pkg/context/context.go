@@ -456,7 +456,7 @@ func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
 		}
 	}
 
-	args = append(args, "--http-endpoint", c.HttpEndpoint())
+	args = append(args, "--http", c.HttpEndpoint())
 
 	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
 		args = append(args, "--metrics", endpoint)
