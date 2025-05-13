@@ -62,7 +62,8 @@ RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
 
 # Give the nobody user ownership of app dir
-RUN chown -R 65534:65534 /spice_sandbox/app
+RUN mkdir -p /spice_sandbox/app && \
+    chown -R 65534:65534 /spice_sandbox/app
 
 FROM scratch
 
