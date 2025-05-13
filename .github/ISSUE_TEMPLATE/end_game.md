@@ -188,7 +188,7 @@ assignees: ''
 
 - [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
-- [ ] Run the following workflows to confirm installation health:
+- [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/e2e_test_release_install_ai.yml)
