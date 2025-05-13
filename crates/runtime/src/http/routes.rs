@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::datafusion_context::DataFusionContextLayer;
 use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
@@ -219,7 +220,8 @@ pub(crate) fn routes(
         .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
-        .layer(Extension(config));
+        .layer(Extension(config))
+        .layer(DataFusionContextLayer::new(Arc::clone(&rt.df)));
 
     {
         authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(

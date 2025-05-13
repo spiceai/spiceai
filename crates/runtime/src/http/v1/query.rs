@@ -26,7 +26,10 @@ use headers_accept::Accept;
 use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
-use crate::datafusion::{DataFusion, param_utils};
+use crate::{
+    datafusion::{DataFusion, datafusion_context::get_datafusion, param_utils},
+    request::{AsyncMarker, RequestContext},
+};
 
 use super::{ResponseMimeType, sql_to_http_response};
 
@@ -187,6 +190,9 @@ pub(crate) async fn post(
         sql: String,
         parameters: serde_json::Value,
     }
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_datafusion(&context).unwrap_or(df);
 
     let content_type = headers
         .get(CONTENT_TYPE)

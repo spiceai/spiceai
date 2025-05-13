@@ -29,8 +29,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     Runtime,
-    datafusion::DataFusion,
+    datafusion::{DataFusion, datafusion_context::get_datafusion},
     model::{EvalScorerRegistry, LLMModelStore, handle_eval_run, sql_query_for},
+    request::{AsyncMarker, RequestContext},
 };
 
 #[cfg(feature = "openapi")]
@@ -124,6 +125,9 @@ pub(crate) async fn post(
         )
             .into_response();
     }
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_datafusion(&context).unwrap_or(df);
 
     match handle_eval_run(
         eval,
