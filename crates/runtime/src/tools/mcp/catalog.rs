@@ -89,7 +89,7 @@ impl McpToolCatalog {
                     client_info: Implementation {
                         name: "spiced".to_string(),
                         version: env!("CARGO_PKG_VERSION").to_string(),
-                    },
+                        name: "Spice.ai".to_string(),
                 };
 
                 Ok(McpClient::Sse(
