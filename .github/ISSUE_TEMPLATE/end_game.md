@@ -201,7 +201,7 @@ assignees: ''
       - Build the CLI: `false`
       - Release Version: the version tag released.
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
-- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
+- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
 - [ ] QA DRI: Run SpiceQA via [Github Action](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml), with the correct `input.spice_version`.
