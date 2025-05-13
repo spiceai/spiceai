@@ -73,6 +73,7 @@ use util::{RetryError, retry};
 pub mod query;
 
 pub mod builder;
+pub mod datafusion_context;
 pub mod dialect;
 pub mod error;
 pub mod extension;
