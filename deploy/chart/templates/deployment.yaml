@@ -30,12 +30,6 @@ spec:
       annotations:
         checksum/spicepod: {{ toYaml .Values.spicepod | sha256sum }}
     spec:
-      securityContext:
-        runAsUser: 65534
-        runAsGroup: 65534
-        allowPrivilegeEscalation: false
-        privileged: false
-        runAsNonRoot: true
       {{- if or .Values.serviceAccount.create .Values.serviceAccount.name }}
       serviceAccountName: {{ include "spiceai.serviceAccountName" . }}
       {{- end }}
@@ -109,6 +103,12 @@ spec:
           {{- if .Values.resources }}
           resources: {{ toYaml .Values.resources | nindent 12 }}
           {{- end }}
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            privileged: false
+            runAsNonRoot: true
       volumes:
         {{- if .Values.volumes }}
         {{- .Values.volumes | toYaml | nindent 8 }}
