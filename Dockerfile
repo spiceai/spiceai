@@ -39,13 +39,19 @@ RUN apt update \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 # Layout a tiny filesystem in /spice_sandbox
-RUN mkdir -p /spice_sandbox/{bin,lib,usr/lib,etc,dev,app}
+RUN mkdir -p /spice_sandbox/bin && \
+    mkdir -p /spice_sandbox/lib && \
+    mkdir -p /spice_sandbox/usr/lib && \
+    mkdir -p /spice_sandbox/usr/local/bin && \
+    mkdir -p /spice_sandbox/etc && \
+    mkdir -p /spice_sandbox/dev && \
+    mkdir -p /spice_sandbox/app
 
 # Copy the binary
-COPY --from=build /root/spiced /spice_sandbox/bin/
+COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
 # Copy every dependent library reported by ldd
-RUN ldd /spice_sandbox/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
@@ -53,8 +59,7 @@ RUN find /lib /usr/lib -name 'librt.so.1' -exec sh -c 'mkdir -p /spice_sandbox/$
 RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
 
 # Minimal passwd & group for the nobody user
-RUN mkdir -p /spice_sandbox/etc && \
-    echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
+RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
     echo 'nogroup:x:65534:' > /spice_sandbox/etc/group
 
 # Create DuckDB directory in sandbox
@@ -62,15 +67,16 @@ RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
 
 # Give the nobody user ownership of app dir
-RUN mkdir -p /spice_sandbox/app && \
-    chown -R 65534:65534 /spice_sandbox/app
+RUN chown -R 65534:65534 /spice_sandbox/app
 
 FROM scratch
 
 COPY --from=sandbox-setup /spice_sandbox/ /
 
+USER 65534:65534
+
 EXPOSE 8090 50051
 
 WORKDIR /app
 
-ENTRYPOINT ["/bin/spiced"]
+ENTRYPOINT ["/usr/local/bin/spiced"]
