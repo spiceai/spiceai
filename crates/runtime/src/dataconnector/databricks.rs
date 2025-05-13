@@ -20,7 +20,9 @@ use crate::token_providers::databricks::{
 };
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
+use data_components::databricks::{
+    DatabricksDelta, DatabricksSparkConnect, DatabricksSqlWarehouse,
+};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -104,6 +106,38 @@ impl Databricks {
         let auth_credentials = Self::build_auth_credentials(&params)?;
 
         match mode {
+            "sql_warehouse" => {
+                let storage_options = params.to_secret_map();
+                let token_provider = match auth_credentials {
+                    AuthCredentials::Token(token) => {
+                        Arc::new(StaticTokenProvider::new(token.clone()))
+                    }
+                    AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                        Self::get_m2m_token_provider(
+                            endpoint,
+                            client_id,
+                            client_secret,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
+                    AuthCredentials::U2M(client_id, token) => {
+                        Self::get_u2m_token_provider(
+                            endpoint,
+                            client_id,
+                            token,
+                            &token_provider_registry,
+                        )
+                        .await?
+                    }
+                };
+
+                let read_provider = DatabricksSqlWarehouse::new();
+
+                Ok(Self {
+                    read_provider: Arc::new(read_provider),
+                })
+            }
             "delta_lake" => {
                 let storage_options = params.to_secret_map();
                 let token_provider = match auth_credentials {
@@ -339,6 +373,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .required()
         .secret()
         .description("The endpoint of the Databricks instance."),
+    ParameterSpec::component("sql_warehouse_id")
+        .required()
+        .secret()
+        .description("The ID of the SQL Warehouse. Only valid when mode is sql_warehouse"),
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
