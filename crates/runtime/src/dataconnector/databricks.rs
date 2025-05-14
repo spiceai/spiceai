@@ -299,7 +299,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .required()
         .secret()
-        .description("The ID of the SQL Warehouse. Only valid when mode is sql_warehouse"),
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
