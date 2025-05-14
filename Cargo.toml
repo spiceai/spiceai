@@ -179,10 +179,10 @@ arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3e6fcbcb0e94c411c5e480c77bc830a273f292df" } # spiceai-54.2.1
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "a898971e2c2652abf924d9d60e4d9d0a12620cd9" }           # spiceai-45
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "a898971e2c2652abf924d9d60e4d9d0a12620cd9" }    # spiceai-45
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "a898971e2c2652abf924d9d60e4d9d0a12620cd9" } # spiceai-45
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "a898971e2c2652abf924d9d60e4d9d0a12620cd9" }      # spiceai-45
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f722141e6f1a1b66b340e780d704cd644d409566" }           # phillip/250512-location-metadata-full-path
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "f722141e6f1a1b66b340e780d704cd644d409566" }    # phillip/250512-location-metadata-full-path
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "f722141e6f1a1b66b340e780d704cd644d409566" } # phillip/250512-location-metadata-full-path
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "f722141e6f1a1b66b340e780d704cd644d409566" }      # phillip/250512-location-metadata-full-path
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" }                      # spiceai-45
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c371d52d942a87287e6c35a9abb916d812f803c0" } # spiceai

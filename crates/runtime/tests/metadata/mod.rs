@@ -58,14 +58,14 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_all",
                     vec![
-                        MetadataColumn::Location,
+                        MetadataColumn::Location(None),
                         MetadataColumn::Size,
                         MetadataColumn::LastModified,
                     ],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location",
-                    vec![MetadataColumn::Location],
+                    vec![MetadataColumn::Location(None)],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_last_modified",
@@ -77,11 +77,11 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location_last_modified",
-                    vec![MetadataColumn::Location, MetadataColumn::LastModified],
+                    vec![MetadataColumn::Location(None), MetadataColumn::LastModified],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location_size",
-                    vec![MetadataColumn::Location, MetadataColumn::Size],
+                    vec![MetadataColumn::Location(None), MetadataColumn::Size],
                 ))
                 .build();
 
