@@ -18,9 +18,11 @@ use crate::Read;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
+use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{datasource::TableProvider, execution::SendableRecordBatchStream};
+use datafusion_table_providers::sql::sql_provider_datafusion;
 use datafusion_table_providers::sql::{
     db_connection_pool::{
         DbConnectionPool, JoinPushDown,
@@ -28,7 +30,7 @@ use datafusion_table_providers::sql::{
     },
     sql_provider_datafusion::SqlTable,
 };
-use futures::{StreamExt as _, stream};
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use reqwest::{Client, ClientBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,10 +47,40 @@ pub struct DatabricksSqlWarehouse {
 pub enum Error {
     #[snafu(display("Not implemented"))]
     NotImplemented,
+
     #[snafu(display("Databricks datatype {ty} not supported"))]
     UnsupportedType { ty: String },
+
     #[snafu(display("Unable to retrieve schema: {reason}"))]
     UnableToRetreiveSchema { reason: String },
+
+    #[snafu(display("HTTP request failed: {source}"))]
+    HttpRequestFailed { source: reqwest::Error },
+
+    #[snafu(display("JSON parsing failed: {source}"))]
+    JsonParsingFailed { source: reqwest::Error },
+
+    #[snafu(display("Missing JSON field: {field}"))]
+    MissingJsonField { field: String },
+
+    #[snafu(display("Invalid JSON array: {field}"))]
+    InvalidJsonArray { field: String },
+
+    #[snafu(display("Failed to deserialize external link: {source}"))]
+    DeserializeExternalLinkFailed { source: serde_json::Error },
+
+    #[snafu(display("Failed to read Arrow stream: {source}"))]
+    ArrowStreamReadFailed { source: arrow::error::ArrowError },
+
+    #[snafu(display("Failed to create table provider: {source}"))]
+    TableProviderCreationFailed {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to initialize SQL table: {source}"))]
+    SqlTableInitializationFailed {
+        source: sql_provider_datafusion::Error,
+    },
 }
 
 impl DatabricksSqlWarehouse {
@@ -84,7 +116,6 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static (dyn Sync)> for SqlWarehous
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        // TODO: allow?
         JoinPushDown::Disallow
     }
 }
@@ -113,10 +144,7 @@ impl SqlWarehouseApi {
         }
     }
 
-    pub async fn get_schema(
-        &self,
-        table: &TableReference,
-    ) -> Result<SchemaRef, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
         let sql = format!("DESCRIBE TABLE {table}");
 
@@ -133,27 +161,41 @@ impl SqlWarehouseApi {
             .bearer_auth(token)
             .json(&payload)
             .send()
-            .await?
+            .await
+            .context(HttpRequestFailedSnafu)?
             .json()
-            .await?;
+            .await
+            .context(JsonParsingFailedSnafu)?;
 
-        Ok(schema_from_json(response)?)
+        schema_from_json(response)
     }
 
     async fn fetch_arrow_streams(
         &self,
         response: Value,
-    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SendableRecordBatchStream, Error> {
         let external_links = response
             .get("result")
             .and_then(|result| result.get("external_links"))
-            .ok_or("Missing result.external_links in JSON response")?
+            .ok_or_else(|| {
+                MissingJsonFieldSnafu {
+                    field: "result.external_links",
+                }
+                .build()
+            })?
             .as_array()
-            .ok_or("external_links is not an array")?;
+            .ok_or_else(|| {
+                InvalidJsonArraySnafu {
+                    field: "external_links",
+                }
+                .build()
+            })?;
 
         let external_links: Vec<ExternalLink> = external_links
             .iter()
-            .map(|link| serde_json::from_value(link.clone()))
+            .map(|link| {
+                serde_json::from_value(link.clone()).context(DeserializeExternalLinkFailedSnafu)
+            })
             .collect::<Result<Vec<ExternalLink>, _>>()?;
 
         let mut streams = vec![];
@@ -163,23 +205,24 @@ impl SqlWarehouseApi {
                 link.chunk_index,
                 link.external_link
             );
-            let response = self.client.get(&link.external_link).send().await?;
+            let response = self
+                .client
+                .get(&link.external_link)
+                .send()
+                .await
+                .context(HttpRequestFailedSnafu)?;
 
-            if !response.status().is_success() {
-                return Err(format!(
-                    "Failed to fetch {}: {}",
-                    link.external_link,
-                    response.status()
-                )
-                .into());
-            }
+            let bytes = match response.error_for_status() {
+                Ok(r) => r.bytes().await.context(HttpRequestFailedSnafu)?,
+                Err(source) => return Err(Error::HttpRequestFailed { source }),
+            };
 
-            let bytes = response.bytes().await?;
             let cursor = Cursor::new(bytes);
 
-            let reader = StreamReader::try_new(cursor, None)?;
+            let reader = StreamReader::try_new(cursor, None).context(ArrowStreamReadFailedSnafu)?;
             let batches: Vec<_> = reader
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()
+                .context(ArrowStreamReadFailedSnafu)?
                 .into_iter()
                 .filter(|batch| batch.num_rows() > 0)
                 .collect();
@@ -197,14 +240,20 @@ impl SqlWarehouseApi {
             )));
         };
 
-        let batch = first_batch?;
+        let batch = first_batch.context(ArrowStreamReadFailedSnafu)?;
 
         let schema = batch.schema();
 
         // add first batch back to stream
         let run_once = stream::once(async move { Ok(batch) });
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(schema, Box::pin(run_once.chain(combined_stream)));
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            schema,
+            Box::pin(
+                run_once
+                    .chain(combined_stream)
+                    .map_err(|e| DataFusionError::Execution(e.to_string())),
+            ),
+        );
 
         Ok(Box::pin(stream_adapter))
     }
@@ -317,7 +366,9 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
         self.api
             .get_schema(table_reference)
             .await
-            .map_err(|source| dbconnection::Error::UnableToGetSchema { source })
+            .map_err(|source| dbconnection::Error::UnableToGetSchema {
+                source: Box::new(source),
+            })
     }
 
     async fn query_arrow(
@@ -343,11 +394,13 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
             .bearer_auth(token)
             .json(&payload)
             .send()
-            .await?
+            .await
+            .context(HttpRequestFailedSnafu)?
             .json::<Value>()
-            .await?;
+            .await
+            .context(JsonParsingFailedSnafu)?;
 
-        self.api.fetch_arrow_streams(response).await
+        Ok(self.api.fetch_arrow_streams(response).await?)
     }
 
     async fn execute(
@@ -355,7 +408,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
         _query: &str,
         _: &[&'a (dyn Sync)],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        return NotImplementedSnafu.fail()?;
+        Ok(NotImplementedSnafu.fail()?)
     }
 }
 
@@ -375,13 +428,17 @@ impl Read for DatabricksSqlWarehouse {
                 table_reference,
                 None,
             )),
-            None => Arc::new(SqlTable::new("databricks", &pool, table_reference, None).await?),
+            None => Arc::new(
+                SqlTable::new("databricks", &pool, table_reference, None)
+                    .await
+                    .context(SqlTableInitializationFailedSnafu)?,
+            ),
         };
 
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+                .context(TableProviderCreationFailedSnafu)?,
         );
 
         Ok(table_provider)
