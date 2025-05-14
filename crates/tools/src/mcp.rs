@@ -26,7 +26,6 @@ use rmcp::{
 ///
 #[async_trait]
 pub trait McpProxy: Send + Sync {
-    /// Unlike [`mcp_client::McpClientTrait`], the implementation should track the appropriate underlying tool name.
     async fn call_tool(
         &self,
         arguments: Option<JsonObject>,

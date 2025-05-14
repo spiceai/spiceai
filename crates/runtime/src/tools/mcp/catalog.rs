@@ -19,34 +19,39 @@ use async_trait::async_trait;
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
     model::{
-        CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
-        InitializeRequestParam, ListToolsResult, PaginatedRequestParam, ProtocolVersion,
+        CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, ClientRequest,
+        Extensions, Implementation, InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
+        PingRequest, PingRequestMethod, ProtocolVersion,
     },
     serve_client,
     service::RunningService,
     transport::{SseTransport, TokioChildProcess},
 };
 use snafu::ResultExt;
-use std::sync::Arc;
-use tokio::{process::Command, sync::RwLock};
+use std::{sync::Arc, time::Duration};
+use tokio::{
+    process::Command,
+    sync::RwLock,
+    time::{MissedTickBehavior, interval},
+};
 
 use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
 use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
+
+const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
 
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
-    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    heartbeat_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for McpToolCatalog {
     fn drop(&mut self) {
-        if let Some(heartbeat_task) = &self.heartbeat_task {
-            heartbeat_task.abort();
-        }
+        self.heartbeat_task.abort();
     }
 }
 
@@ -55,12 +60,34 @@ impl McpToolCatalog {
         let client = Self::create_client(&cfg).await?;
         let client = Arc::new(RwLock::new(client));
 
-        // TODO: Implement Ping health checks.
+        let client_clone = Arc::clone(&client);
+        let cfg_clone = cfg.clone();
+        let name_clone = name.to_string();
+
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let heartbeat_result = client_clone.read().await.ping().await;
+                if let Err(ref e) = heartbeat_result {
+                    tracing::warn!("MCP client heartbeat failed, attempting reconnection");
+                    tracing::debug!("MCP client heartbeat failed with error: {e}");
+                    if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
+                        let mut client_lock = client_clone.write().await;
+                        *client_lock = new_client_rwlock;
+                        tracing::info!("Successfully reconnected MCP client for {}", name_clone);
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             client,
             name: name.to_string(),
-            heartbeat_task: None,
+            heartbeat_task: heartbeat_task,
         })
     }
 
@@ -87,9 +114,8 @@ impl McpToolCatalog {
                     protocol_version: ProtocolVersion::default(),
                     capabilities: ClientCapabilities::default(),
                     client_info: Implementation {
-                        name: "spiced".to_string(),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
                         name: "Spice.ai".to_string(),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
                     },
                 };
 
@@ -174,6 +200,18 @@ impl McpClient {
             McpClient::Stdio(s) => s.call_tool(params).await,
             McpClient::Sse(s) => s.call_tool(params).await,
         }
+    }
+
+    pub async fn ping(&self) -> Result<(), ServiceError> {
+        let req = ClientRequest::PingRequest(PingRequest {
+            method: PingRequestMethod,
+            extensions: Extensions::new(),
+        });
+        match self {
+            McpClient::Stdio(s) => s.send_request(req).await,
+            McpClient::Sse(s) => s.send_request(req).await,
+        }
+        .map(|_| ())
     }
 }
 

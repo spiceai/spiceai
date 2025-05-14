@@ -29,6 +29,7 @@ use crate::{config, request::RequestContext};
 #[cfg(feature = "mcp")]
 use crate::tools::mcp::server::RuntimeServer;
 use app::App;
+use axum::Json;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
@@ -128,6 +129,17 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
         );
     }
     openai
+}
+
+#[utoipa::path(
+    get,
+    path = "/docs/openapi.json",
+    responses(
+        (status = 200, description = "JSON file", body = ())
+    )
+)]
+async fn openapi() -> Json<utoipa::openapi::OpenApi> {
+    Json(get_api_doc())
 }
 
 #[allow(clippy::too_many_lines)]
