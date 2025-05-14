@@ -21,7 +21,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::request::{Protocol, RequestContext};
+use crate::{
+    datafusion::{DataFusion, request_context_extension::DataFusionContextExtension},
+    request::{Protocol, RequestContext},
+};
 use app::App;
 
 use runtime_auth::AuthRequestContext;
@@ -31,12 +34,13 @@ use tower::{Layer, Service};
 #[derive(Clone)]
 pub struct RequestContextLayer {
     app: Option<Arc<App>>,
+    df: Arc<DataFusion>,
 }
 
 impl RequestContextLayer {
     #[must_use]
-    pub fn new(app: Option<Arc<App>>) -> Self {
-        Self { app }
+    pub fn new(app: Option<Arc<App>>, df: Arc<DataFusion>) -> Self {
+        Self { app, df }
     }
 }
 
@@ -47,6 +51,7 @@ impl<S> Layer<S> for RequestContextLayer {
         RequestContextMiddleware {
             inner,
             app: self.app.clone(),
+            df: Arc::clone(&self.df),
         }
     }
 }
@@ -55,6 +60,7 @@ impl<S> Layer<S> for RequestContextLayer {
 pub struct RequestContextMiddleware<S> {
     inner: S,
     app: Option<Arc<App>>,
+    df: Arc<DataFusion>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for RequestContextMiddleware<S>
@@ -83,6 +89,8 @@ where
                 .from_headers(headers)
                 .build(),
         );
+
+        request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&self.df)));
 
         req.extensions_mut()
             .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(

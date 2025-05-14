@@ -21,11 +21,14 @@ use super::{
     error::{IcebergResponseError, InternalServerErrorCode},
     namespace::{Namespace, NamespacePath},
 };
-use crate::DataFusion;
 use crate::datafusion::is_spice_internal_schema;
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    request::{AsyncMarker, RequestContext},
+};
 use arrow::datatypes::Schema as ArrowSchema;
 use axum::{
-    Extension, Json,
+    Json,
     extract::Path,
     http::status,
     response::{IntoResponse, Response},
@@ -53,16 +56,16 @@ const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
         (status = 404, description = "Table does not exist")
     )
 ))]
-pub(crate) async fn head(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path((namespace, table)): Path<(NamespacePath, String)>,
-) -> Response {
+pub(crate) async fn head(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
     let Some(table_reference) = table_reference(&namespace, &table) else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    match datafusion.get_table(&table_reference).await {
+    match df.get_table(&table_reference).await {
         Some(_) => status::StatusCode::OK.into_response(),
         None => status::StatusCode::NOT_FOUND.into_response(),
     }
@@ -146,16 +149,16 @@ struct TableMetadata {
     )
 ))]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn get(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path((namespace, table)): Path<(NamespacePath, String)>,
-) -> Response {
+pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
     let Some(table_reference) = table_reference(&namespace, &table) else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(table) = datafusion.get_table(&table_reference).await else {
+    let Some(table) = df.get_table(&table_reference).await else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
