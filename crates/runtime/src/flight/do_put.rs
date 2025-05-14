@@ -128,7 +128,7 @@ pub(crate) async fn handle(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    if datafusion.is_writable(&path) {
+    if !datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));

@@ -366,7 +366,7 @@ pub async fn start(
         .into_inner();
 
     let server = server
-        .layer(RequestContextLayer::new(app, Arc::clone(&rt.df)))
+        .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(TokenProviderLayer::new(rt.token_provider_registry()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
