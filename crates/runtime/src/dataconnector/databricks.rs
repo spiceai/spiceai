@@ -304,7 +304,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
     ParameterSpec::runtime("mode")
-        .description("The execution mode for querying against Databricks.")
+        .description("The execution mode for running queries: 'spark_connect', 'delta_lake', or 'sql_warehouse'.")
         .default("spark_connect"),
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for object store client."),
