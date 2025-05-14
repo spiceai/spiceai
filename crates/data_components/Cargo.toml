@@ -29,11 +29,7 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { version = "0.9", features = [
-    "default-engine",
-    "cloud",
-    "arrow_54",
-], optional = true }
+delta_kernel = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
