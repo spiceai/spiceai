@@ -107,7 +107,10 @@ impl Databricks {
 
         match mode {
             "sql_warehouse" => {
-                let storage_options = params.to_secret_map();
+                let sql_warehouse_id = params
+                    .get("sql_warehouse_id")
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
                 let token_provider = match auth_credentials {
                     AuthCredentials::Token(token) => {
                         Arc::new(StaticTokenProvider::new(token.clone()))
@@ -132,7 +135,8 @@ impl Databricks {
                     }
                 };
 
-                let read_provider = DatabricksSqlWarehouse::new();
+                let read_provider =
+                    DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider);
 
                 Ok(Self {
                     read_provider: Arc::new(read_provider),
