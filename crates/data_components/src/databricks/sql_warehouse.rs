@@ -317,13 +317,11 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
         _: &[&'a (dyn Sync)],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
-        // databricks does not like escaping default schema
-        let sql = sql.replace("\"default\"", "default");
+        // databricks does not like escaping
+        let sql = sql.replace("\"", "");
         let token = self.api.token_provider.get_token();
         let payload = json!({
             "warehouse_id": self.api.sql_warehouse_id,
-            // "catalog": table.catalog().unwrap_or("spiceai"),
-            // "schema": table.schema().unwrap_or("public"),
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
             "statement": sql,
