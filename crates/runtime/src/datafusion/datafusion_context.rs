@@ -35,7 +35,7 @@ impl DataFusionContextExtension {
     }
 }
 
-pub fn get_datafusion(context: &Arc<RequestContext>) -> Option<Arc<DataFusion>> {
+pub fn get_current_datafusion(context: &Arc<RequestContext>) -> Option<Arc<DataFusion>> {
     context
         .extension::<DataFusionContextExtension>()
         .map(|d| d.datafusion())

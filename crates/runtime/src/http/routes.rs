@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::datafusion::DataFusion;
-use crate::datafusion::datafusion_context::DataFusionContextExtension;
+use crate::datafusion::datafusion_context::{DataFusionContextExtension, get_current_datafusion};
 use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
@@ -25,7 +25,7 @@ use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
-use crate::request::Protocol;
+use crate::request::{AsyncMarker, Protocol};
 use crate::{config, request::RequestContext};
 
 use app::App;
@@ -242,10 +242,23 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        .route_layer(middleware::from_fn(with_datafusion_context))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))
         .layer(cors_layer(cors_config))
+}
+
+async fn with_datafusion_context(mut req: Request<Body>, next: Next) -> impl IntoResponse {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
+    // override DataFusion reference with the one from request context extension
+    // later DF reference will be updated with u2m datasets, if user context provided https://github.com/spiceai/spiceai/issues/5815
+    if let Some(df) = get_current_datafusion(&context) {
+        req.extensions_mut().insert::<Arc<DataFusion>>(df);
+    }
+
+    next.run(req).await
 }
 
 async fn track_metrics(
