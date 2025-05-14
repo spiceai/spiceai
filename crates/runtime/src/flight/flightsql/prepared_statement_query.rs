@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, ops::ControlFlow, sync::Arc};
+use std::{borrow::Cow, ops::ControlFlow};
 
 use arrow::compute::concat_batches;
 use arrow_flight::{
@@ -43,10 +43,12 @@ use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
     flight::{
         Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
+    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 
@@ -58,7 +60,6 @@ pub(crate) struct PreparedStatement {
 
 /// Create a prepared statement from given SQL statement.
 pub(crate) async fn do_action_create_prepared_statement(
-    flight_svc: &Service,
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
@@ -66,10 +67,12 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     let query = convert_jdbc_parameter_placeholders(&statement.query).map_err(error_to_status)?;
 
-    let (dataset_schema, parameter_schema) =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &query)
-            .await
-            .map_err(to_tonic_err)?;
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    let (dataset_schema, parameter_schema) = Service::get_arrow_schema(datafusion, &query)
+        .await
+        .map_err(to_tonic_err)?;
 
     let dataset_schema = Service::serialize_schema(&dataset_schema)?;
     let parameter_schema = if let Some(schema) = &parameter_schema {
@@ -93,7 +96,6 @@ pub(crate) async fn do_action_create_prepared_statement(
 }
 
 pub(crate) async fn get_flight_info(
-    _flight_svc: &Service,
     handle: sql::CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
@@ -117,13 +119,14 @@ pub(crate) async fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    flight_svc: &Service,
     query: sql::CommandPreparedStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("prepared_statement_query")).await;
     set_flightsql_protocol().await;
 
-    let datafusion = Arc::clone(&flight_svc.datafusion);
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
     tracing::trace!("do_get: {query:?}");
 
     let PreparedStatement {
@@ -147,7 +150,6 @@ pub(crate) async fn do_get(
 ///
 /// See [Sequence Diagrams](https://arrow.apache.org/docs/format/FlightSql.html#sequence-diagrams)
 pub(crate) async fn do_put_query(
-    _flight_svc: &Service,
     query: CommandPreparedStatementQuery,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
