@@ -29,7 +29,6 @@ use crate::{config, request::RequestContext};
 #[cfg(feature = "mcp")]
 use crate::tools::mcp::server::RuntimeServer;
 use app::App;
-use axum::Json;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;

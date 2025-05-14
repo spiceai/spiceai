@@ -87,7 +87,7 @@ impl McpToolCatalog {
         Ok(Self {
             client,
             name: name.to_string(),
-            heartbeat_task: heartbeat_task,
+            heartbeat_task,
         })
     }
 
