@@ -252,7 +252,7 @@ pub(crate) fn routes(
 async fn with_datafusion_context(mut req: Request<Body>, next: Next) -> impl IntoResponse {
     let context = RequestContext::current(AsyncMarker::new().await);
 
-    // override DataFusion reference with the one from request context extension
+    // override the DataFusion reference with the one from the request context extension.
     // later DF reference will be updated with u2m datasets, if user context provided https://github.com/spiceai/spiceai/issues/5815
     if let Some(df) = get_current_datafusion(&context) {
         req.extensions_mut().insert::<Arc<DataFusion>>(df);
