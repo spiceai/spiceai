@@ -711,9 +711,9 @@ dependencies = [
 
 [[package]]
 name = "async-graphql"
-version = "7.0.15"
+version = "7.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfff2b17d272a5e3e201feda444e2c24b011fa722951268d1bd8b9b5bc6dc449"
+checksum = "d3ee559e72d983e7e04001ba3bf32e6b71c1d670595780723727fd8a29d36e87"
 dependencies = [
  "async-graphql-derive",
  "async-graphql-parser",
@@ -744,13 +744,12 @@ dependencies = [
 
 [[package]]
 name = "async-graphql-axum"
-version = "7.0.13"
+version = "7.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec8c1bb47161c37286e40e2fa58055e97b2a2b6cf1022a6686967e10636fa5d7"
+checksum = "c95b41ba3c0f4ecccd73bf7e7aa7be3c41ff054968e988317bd9133ed210a4a2"
 dependencies = [
  "async-graphql",
- "async-trait",
- "axum 0.7.9",
+ "axum 0.8.3",
  "bytes",
  "futures-util",
  "serde_json",
@@ -762,9 +761,9 @@ dependencies = [
 
 [[package]]
 name = "async-graphql-derive"
-version = "7.0.15"
+version = "7.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8e5d0c6697def2f79ccbd972fb106b633173a6066e430b480e1ff9376a7561a"
+checksum = "29db05b624fb6352fc11bfe30c54ab1b16a1fe937d7c05a783f4e88ef1292b3b"
 dependencies = [
  "Inflector",
  "async-graphql-parser",
@@ -779,9 +778,9 @@ dependencies = [
 
 [[package]]
 name = "async-graphql-parser"
-version = "7.0.15"
+version = "7.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8531ee6d292c26df31c18c565ff22371e7bdfffe7f5e62b69537db0b8fd554dc"
+checksum = "4904895044116aab098ca82c6cec831ec43ed99efd04db9b70a390419bc88c5b"
 dependencies = [
  "async-graphql-value",
  "pest",
@@ -791,9 +790,9 @@ dependencies = [
 
 [[package]]
 name = "async-graphql-value"
-version = "7.0.15"
+version = "7.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "741110dda927420a28fbc1c310543d3416f789a6ba96859c2c265843a0a96887"
+checksum = "d0cde74de18e3a00c5dd5cfa002ab6f532e1a06c2a79ee6671e2fc353b400b92"
 dependencies = [
  "bytes",
  "indexmap 2.9.0",
@@ -1446,14 +1445,11 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core 0.4.5",
- "base64 0.22.1",
  "bytes",
  "futures-util",
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.6.0",
- "hyper-util",
  "itoa",
  "matchit 0.7.3",
  "memchr",
@@ -1462,17 +1458,10 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
- "sha1",
  "sync_wrapper 1.0.2",
- "tokio",
- "tokio-tungstenite",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -1483,6 +1472,7 @@ checksum = "de45108900e1f9b9242f7f2e254aa3e2c029c921c258fe9e6b4217eeebd54288"
 dependencies = [
  "axum-core 0.5.2",
  "axum-macros",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -1502,8 +1492,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-tungstenite",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -1528,7 +1520,6 @@ dependencies = [
  "sync_wrapper 1.0.2",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -13091,9 +13082,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.24.0"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
@@ -13633,19 +13624,18 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
-version = "0.24.0"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
 dependencies = [
- "byteorder",
  "bytes",
  "data-encoding",
  "http 1.3.1",
  "httparse",
  "log",
- "rand 0.8.5",
+ "rand 0.9.1",
  "sha1",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "utf-8",
 ]
 
