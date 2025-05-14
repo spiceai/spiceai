@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use arrow_flight::{
     FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
@@ -23,12 +21,15 @@ use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
-use crate::flight::metrics;
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    flight::metrics,
+    request::{AsyncMarker, RequestContext},
+};
 
 use super::{Service, to_tonic_err};
 
 pub(crate) async fn handle(
-    flight_svc: &Service,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<SchemaResult>, Status> {
     let _start = metrics::track_flight_request("get_schema", None).await;
@@ -36,13 +37,15 @@ pub(crate) async fn handle(
 
     let fd = request.into_inner();
 
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
     match fd.r#type {
         x if x == DescriptorType::Cmd as i32 => {
             let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
-            let (arrow_schema, _) =
-                Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
-                    .await
-                    .map_err(to_tonic_err)?;
+            let (arrow_schema, _) = Service::get_arrow_schema(datafusion, sql)
+                .await
+                .map_err(to_tonic_err)?;
             let options = IpcWriteOptions::default();
             let IpcMessage(schema) = SchemaAsIpc::new(&arrow_schema, &options)
                 .try_into()
@@ -56,7 +59,7 @@ pub(crate) async fn handle(
             let path = fd.path.join(".");
             let table_reference = TableReference::from(path);
             tracing::debug!("get_schema: table_reference: {:?}", table_reference);
-            let Some(table) = flight_svc.datafusion.get_table(&table_reference).await else {
+            let Some(table) = datafusion.get_table(&table_reference).await else {
                 return Err(Status::not_found("Table not found"));
             };
             let schema = table.schema();
