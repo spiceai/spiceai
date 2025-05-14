@@ -43,10 +43,12 @@ pub struct DatabricksSqlWarehouse {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Not implemented"))]
+    NotImplemented,
     #[snafu(display("Databricks datatype {ty} not supported"))]
     UnsupportedType { ty: String },
-    #[snafu(display("Failed to get schema from Databricks: {issue}"))]
-    GetSchema { issue: String },
+    #[snafu(display("Unable to retrieve schema: {reason}"))]
+    UnableToRetreiveSchema { reason: String },
 }
 
 impl DatabricksSqlWarehouse {
@@ -219,31 +221,38 @@ fn schema_from_json(json_value: Value) -> Result<SchemaRef, Error> {
         .get("result")
         .and_then(|r| r.get("data_array"))
         .and_then(|d| d.as_array())
-        .ok_or_else(|| Error::GetSchema {
-            issue: "result.data_array".to_string(),
+        .ok_or_else(|| Error::UnableToRetreiveSchema {
+            reason: "result.data_array".to_string(),
         })?;
 
     let fields: Result<Vec<Field>, Error> = data_array
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let row_array = row.as_array().ok_or_else(|| Error::GetSchema {
-                issue: format!("data_array[{}] is not an array", i),
-            })?;
+            let row_array = row
+                .as_array()
+                .ok_or_else(|| Error::UnableToRetreiveSchema {
+                    reason: format!("data_array[{}] is not an array", i),
+                })?;
 
             if row_array.len() < 2 {
-                return Err(Error::GetSchema {
-                    issue: format!("data_array[{}] lacks col_name or data_type", i),
+                return Err(Error::UnableToRetreiveSchema {
+                    reason: format!("data_array[{}] lacks col_name or data_type", i),
                 });
             }
 
-            let col_name = row_array[0].as_str().ok_or_else(|| Error::GetSchema {
-                issue: format!("data_array[{}][0] is not a string", i),
-            })?;
+            let col_name = row_array[0]
+                .as_str()
+                .ok_or_else(|| Error::UnableToRetreiveSchema {
+                    reason: format!("data_array[{}][0] is not a string", i),
+                })?;
 
-            let data_type_str = row_array[1].as_str().ok_or_else(|| Error::GetSchema {
-                issue: format!("data_array[{}][1] is not a string", i),
-            })?;
+            let data_type_str =
+                row_array[1]
+                    .as_str()
+                    .ok_or_else(|| Error::UnableToRetreiveSchema {
+                        reason: format!("data_array[{}][1] is not a string", i),
+                    })?;
 
             let data_type = map_databricks_type(data_type_str)?;
             Ok(Field::new(col_name, data_type, true))
@@ -346,7 +355,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
         _query: &str,
         _: &[&'a (dyn Sync)],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        todo!()
+        return NotImplementedSnafu.fail()?;
     }
 }
 
