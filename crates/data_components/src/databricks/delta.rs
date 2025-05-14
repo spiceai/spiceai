@@ -24,7 +24,7 @@ use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {

@@ -37,12 +37,13 @@ _T: Time-Bound_
 - [ ] The Algorithm
 - [ ] PM/Design Review
 - [ ] DX/UX Review
+- [ ] Release Notes / PRFAQ
 - [ ] Threat Model / Security Review
 - [ ] Tests
+- [ ] Telemetry / Metrics / Task History
 - [ ] Performance / Benchmarks
 - [ ] Documentation
 - [ ] Cookbook Recipes/Tutorials
-- [ ] Release Notes prepared
 
 ## The Algorithm
 
@@ -72,13 +73,13 @@ _T: Time-Bound_
 
 <!--
 
-Release notes for this enhancement, to be filled once completed. These release notes will be included as highlights on the next release.
+Release notes to be included as highlights when released on [blog.spiceai.org](https://blog.spiceai.org). Write these *before* implementing the feature as a mini [PRFAQ Work Backwards](https://www.aboutamazon.com/news/workplace/an-insider-look-at-amazons-culture-and-processes) process.
 
 Example:
 
 ## Release Notes
 
-API Key Authentication: Spice now supports optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
+**API Key Authentication**: Optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
 
 Example Spicepod.yml configuration:
 ```yaml
@@ -91,7 +92,7 @@ runtime:
         - my-api-key # Or specify directly
 ```
 
-Would be included on the next release like:
+Included on the next release like:
 
 # Highlights in v1.0-rc.1
 

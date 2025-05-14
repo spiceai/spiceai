@@ -45,7 +45,7 @@ use datafusion::{
 };
 use datafusion_federation::FederationAnalyzerRule;
 use moka::future::CacheBuilder;
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::{embeddings, status};
 
@@ -63,6 +63,7 @@ pub struct DataFusionBuilder {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
+    accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -113,6 +114,7 @@ impl DataFusionBuilder {
             accelerator_engine_registry,
             memory_limit: None,
             temp_directory: None,
+            accelerated_refresh_semaphore: None,
         }
     }
 
@@ -131,6 +133,16 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn temp_directory(mut self, temp_directory: Option<String>) -> Self {
         self.temp_directory = temp_directory;
+        self
+    }
+
+    #[must_use]
+    pub fn max_parallel_accelerated_refreshes(
+        mut self,
+        max_parallel_accelerated_refreshes: usize,
+    ) -> Self {
+        self.accelerated_refresh_semaphore =
+            Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
         self
     }
 
@@ -213,6 +225,7 @@ impl DataFusionBuilder {
             cached_plans,
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
+            acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
         }
     }
 }

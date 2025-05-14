@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::rate_limit::RateLimiter;
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{

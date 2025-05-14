@@ -133,7 +133,7 @@ impl Query {
             ),
         };
 
-        let raw_cache_key = sql_cache_key.or(plan_cache_key);
+        let raw_cache_key = plan_cache_key.or(sql_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
         tracker = tracker.results_cache_hit(false);
@@ -160,18 +160,16 @@ impl Query {
 
         let cache_control = request_context.cache_control();
 
-        // If the user requested no caching, skip the cache lookup
-        let CacheControl::Cache(cache_key) = cache_control else {
-            return Ok((
-                CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass),
-                None,
-            ));
-        };
-
         // Validate that the provided cache key is the correct type for this request
-        match (cache_key, &key) {
-            (CacheKeyType::Default, CacheKey::LogicalPlan(_))
-            | (CacheKeyType::Raw, CacheKey::Query(_, _)) => {}
+        match (cache_control, &key) {
+            (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
+            | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _)) => {}
+            (CacheControl::NoCache, _) => {
+                return Ok((
+                    CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass),
+                    Some(key.as_raw_key()),
+                ));
+            }
             _ => {
                 return Ok((CacheResult::WrongCacheKeyType(tracker), None));
             }

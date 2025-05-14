@@ -65,11 +65,11 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "3dc74fef6ca2c5f90d646e2be3889a2f00114a61", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "8f0473271de9ea611969dbdd88d76816976ce429", features = [
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
-token_providers = { path = "../token_providers" }
+token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",

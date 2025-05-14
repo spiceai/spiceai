@@ -127,7 +127,7 @@ suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
-token_providers = { path = "../token_providers" }
+token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"

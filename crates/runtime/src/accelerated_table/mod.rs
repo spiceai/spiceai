@@ -47,7 +47,7 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -239,6 +239,7 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
+    refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
@@ -271,6 +272,7 @@ impl Builder {
             synchronize_with: None,
             disable_federation: false,
             initial_load_complete: false,
+            refresh_semaphore: None,
         }
     }
 
@@ -304,6 +306,11 @@ impl Builder {
 
     pub fn disable_federation(&mut self) -> &mut Self {
         self.disable_federation = true;
+        self
+    }
+
+    pub fn refresh_semaphore(&mut self, refresh_semaphore: Arc<Semaphore>) -> &mut Self {
+        self.refresh_semaphore = Some(refresh_semaphore);
         self
     }
 
@@ -445,6 +452,9 @@ impl Builder {
         refresher.disable_federation(self.disable_federation);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
+        }
+        if let Some(semaphore) = self.refresh_semaphore {
+            refresher.semaphore(semaphore);
         }
 
         let refresh_handle = refresher

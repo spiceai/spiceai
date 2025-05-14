@@ -3205,7 +3205,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "tiberius",
- "token_providers",
+ "token_provider",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -3678,7 +3678,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=1713e9af2729f686aac46aef63e8c84545083e29#1713e9af2729f686aac46aef63e8c84545083e29"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c371d52d942a87287e6c35a9abb916d812f803c0#c371d52d942a87287e6c35a9abb916d812f803c0"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -6027,7 +6027,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6076,7 +6076,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6102,7 +6102,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=58308b27bc768f644f32a45dac277bb40984a058#58308b27bc768f644f32a45dac277bb40984a058"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51#33ae957a8fbbf3c2791f6b53f9ad7e4b235feb51"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6916,7 +6916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -7124,7 +7124,7 @@ dependencies = [
  "text-embeddings-core",
  "text-splitter",
  "tiktoken-rs",
- "token_providers",
+ "token_provider",
  "tokenizers",
  "tokio",
  "tracing",
@@ -10907,7 +10907,7 @@ dependencies = [
  "tera",
  "test-framework",
  "tiberius",
- "token_providers",
+ "token_provider",
  "tokio",
  "tokio-rusqlite",
  "tokio-rustls 0.26.1",
@@ -11944,7 +11944,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3dc74fef6ca2c5f90d646e2be3889a2f00114a61#3dc74fef6ca2c5f90d646e2be3889a2f00114a61"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=8f0473271de9ea611969dbdd88d76816976ce429#8f0473271de9ea611969dbdd88d76816976ce429"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -11964,7 +11964,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=3dc74fef6ca2c5f90d646e2be3889a2f00114a61#3dc74fef6ca2c5f90d646e2be3889a2f00114a61"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=8f0473271de9ea611969dbdd88d76816976ce429#8f0473271de9ea611969dbdd88d76816976ce429"
 dependencies = [
  "spark-connect-core",
 ]
@@ -12938,18 +12938,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "token_providers"
+name = "token_provider"
 version = "1.3.0-unstable"
 dependencies = [
- "chrono",
- "jsonwebtoken",
  "reqwest 0.12.12",
  "secrecy",
  "serde",
  "snafu",
  "tokio",
  "tracing",
- "util",
 ]
 
 [[package]]

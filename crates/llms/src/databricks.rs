@@ -29,7 +29,7 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use snafu::ResultExt;
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 use tracing::Instrument;
 
 use crate::{
