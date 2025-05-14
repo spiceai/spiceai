@@ -73,13 +73,13 @@ use util::{RetryError, retry};
 pub mod query;
 
 pub mod builder;
-pub mod datafusion_context;
 pub mod dialect;
 pub mod error;
 pub mod extension;
 pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
+pub mod request_context_extension;
 pub mod schema;
 pub mod udf;
 
