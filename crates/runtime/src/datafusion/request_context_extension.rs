@@ -38,11 +38,10 @@ impl DataFusionContextExtension {
 /// # Panics
 ///
 /// Panics if the datafusion extension is not found in the request context.
-/// It is supposed to be set on all routes.
 pub fn get_current_datafusion(context: &Arc<RequestContext>) -> Arc<DataFusion> {
     if let Some(df) = context.extension::<DataFusionContextExtension>() {
         df.datafusion()
     } else {
-        panic!("DataFusionContextExtension not found");
+        unreachable!("DataFusionContextExtension is expected to always be available");
     }
 }
