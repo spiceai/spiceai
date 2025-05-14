@@ -63,12 +63,7 @@ pub(crate) fn infer_partitions_with_types_from_files(
 ) -> Result<Vec<(String, DataType)>> {
     Ok(infer_partitions(table_path_prefix, files)?
         .into_iter()
-        .map(|col_name| {
-            (
-                col_name,
-                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
-            )
-        })
+        .map(|col_name| (col_name, DataType::Utf8))
         .collect::<Vec<_>>())
 }
 
@@ -177,8 +172,8 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, "year");
         assert_eq!(result[1].0, "month");
-        assert!(matches!(result[0].1, DataType::Dictionary(_, _)));
-        assert!(matches!(result[1].1, DataType::Dictionary(_, _)));
+        assert!(matches!(result[0].1, DataType::Utf8));
+        assert!(matches!(result[1].1, DataType::Utf8));
     }
 
     #[test]

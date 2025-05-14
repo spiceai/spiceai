@@ -16,8 +16,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::DataFusion, status::ComponentStatus,
+    LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides,
+    component::dataset::Dataset,
+    datafusion::request_context_extension::get_current_datafusion,
+    request::{AsyncMarker, RequestContext},
+    status::ComponentStatus,
 };
 use app::App;
 use axum::{
@@ -135,7 +139,6 @@ postgres:aidemo_messages,general,false,false
 ))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
@@ -156,6 +159,9 @@ pub(crate) async fn get(
         )
             .into_response();
     };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
@@ -263,7 +269,6 @@ pub struct AccelerationRequest {
 ))]
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     overrides_opt: Option<Json<RefreshOverrides>>,
     // When this is an Option<Json>, Json rejections are silenced
@@ -282,6 +287,9 @@ pub(crate) async fn refresh(
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let Some(dataset) = readable_app
         .datasets
@@ -376,7 +384,6 @@ pub(crate) async fn refresh(
 ))]
 pub(crate) async fn acceleration(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
 ) -> Response {
@@ -392,6 +399,9 @@ pub(crate) async fn acceleration(
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let Some(dataset) = readable_app
         .datasets

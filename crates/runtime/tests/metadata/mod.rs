@@ -58,14 +58,14 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_all",
                     vec![
-                        MetadataColumn::Location,
+                        MetadataColumn::Location(None),
                         MetadataColumn::Size,
                         MetadataColumn::LastModified,
                     ],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location",
-                    vec![MetadataColumn::Location],
+                    vec![MetadataColumn::Location(None)],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_last_modified",
@@ -77,11 +77,11 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location_last_modified",
-                    vec![MetadataColumn::Location, MetadataColumn::LastModified],
+                    vec![MetadataColumn::Location(None), MetadataColumn::LastModified],
                 ))
                 .with_dataset(get_s3_hive_partitioned_dataset(
                     "met_location_size",
-                    vec![MetadataColumn::Location, MetadataColumn::Size],
+                    vec![MetadataColumn::Location(None), MetadataColumn::Size],
                 ))
                 .build();
 
@@ -119,7 +119,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM met_all WHERE location = 'hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
+                .query_builder("SELECT * FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
                 .build()
                 .run()
                 .await
@@ -135,7 +135,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_all WHERE location = 'hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
+                .query_builder("EXPLAIN SELECT * FROM met_all WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
                 .build()
                 .run()
                 .await
@@ -151,7 +151,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location WHERE location = 'hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
+                .query_builder("EXPLAIN SELECT * FROM met_location WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
                 .build()
                 .run()
                 .await
@@ -199,7 +199,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location_last_modified WHERE location = 'hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
+                .query_builder("EXPLAIN SELECT * FROM met_location_last_modified WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
                 .build()
                 .run()
                 .await
@@ -215,7 +215,7 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
 
             let mut query_result = rt
                 .datafusion()
-                .query_builder("EXPLAIN SELECT * FROM met_location_size WHERE location = 'hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
+                .query_builder("EXPLAIN SELECT * FROM met_location_size WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet' ORDER BY id, location")
                 .build()
                 .run()
                 .await

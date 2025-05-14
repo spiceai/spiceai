@@ -15,6 +15,9 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::token_providers::databricks::{
+    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
@@ -27,11 +30,8 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use token_providers::databricks::{
-    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
-};
-use token_providers::registry::TokenProviderRegistry;
-use token_providers::{StaticTokenProvider, TokenProvider};
+use token_provider::registry::TokenProviderRegistry;
+use token_provider::{StaticTokenProvider, TokenProvider};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -300,13 +300,16 @@ impl Databricks {
         token_provider_registry: &Arc<TokenProviderRegistry>,
     ) -> Result<Arc<dyn TokenProvider>> {
         token_provider_registry
-            .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
-                DatabricksU2MTokenProvider::new(
-                    endpoint.to_string(),
-                    client_id.to_string(),
-                    token.clone(),
-                )
-            })
+            .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(
+                format!("databricks_u2m_{client_id}"),
+                || async {
+                    Ok(DatabricksU2MTokenProvider::new(
+                        endpoint.to_string(),
+                        client_id.to_string(),
+                        token.clone(),
+                    ))
+                },
+            )
             .await
             .map_err(|_| Error::UnableToGetToken {})
     }

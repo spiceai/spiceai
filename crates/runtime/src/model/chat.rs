@@ -26,12 +26,10 @@ use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use token_providers::{
-    databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider},
-    registry::TokenProviderRegistry,
-};
+use token_provider::registry::TokenProviderRegistry;
 
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
+use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{
     Runtime,
     tools::{options::SpiceToolsOptions, utils::get_tools},
@@ -309,12 +307,12 @@ async fn databricks(
         }
         (Some(token), Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
-                    DatabricksU2MTokenProvider::new(
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                    Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
                         token.into(),
-                    )
+                    ))
                 })
                 .await.boxed().map_err(|e| LlmError::FailedToLoadModel {
                 source: Box::from(format!(

@@ -22,7 +22,7 @@ use std::{
 };
 
 use http::{Request, Response};
-use token_providers::registry::TokenProviderRegistry;
+use token_provider::registry::TokenProviderRegistry;
 use tower::{Layer, Service};
 
 /// A Layer that injects tokens from the `Spice-Databricks-Auth` header into

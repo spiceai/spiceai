@@ -18,12 +18,12 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{Result, TokenProvider};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
+use token_provider::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;

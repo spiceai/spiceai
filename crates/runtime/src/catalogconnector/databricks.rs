@@ -23,6 +23,7 @@ use crate::component::catalog::Catalog;
 use crate::dataconnector::ConnectorParams;
 use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
 use crate::get_params_with_secrets;
+use crate::token_providers::databricks::AuthCredentials;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
@@ -38,8 +39,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use token_providers::StaticTokenProvider;
-use token_providers::databricks::AuthCredentials;
+use token_provider::StaticTokenProvider;
 
 #[derive(Clone)]
 pub struct Databricks {

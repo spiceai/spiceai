@@ -1,14 +1,15 @@
-# Spice.ai OSS Roadmap
+# Spice.ai Open Source Roadmap
 
-This roadmap outlines the planned and proposed features for Spice.ai OSS. It is updated regularly based on community and customer feedback.
+This roadmap details the planned features and priorities for Spice.ai Open Source, aligning with the mission to empower developers to build decision-making, data-driven AI applications. It is regularly refined based on community feedback, customer needs, and strategic goals.
 
-If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai#-connect-with-us) or [file an issue](https://github.com/spiceai/spiceai/issues/new/choose)!
+To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Discord](https://github.com/spiceai/spiceai#-connect-with-us). Your input drives our direction.
 
 ---
 
-## Known Bugs
+## Known Issues
 
-- See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Please [file a new Issue](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) if you encounter a bug, and let us know on Discord.
+- Track active bugs on [GitHub](https://github.com/spiceai/spiceai/labels/bug).
+- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Discord for faster resolution.
 
 ---
 
@@ -18,76 +19,84 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 **Focus:** Cloud Integration
 
-- DataFusion v46
-- DuckDB v1.2.x
-- Orchestration and workers
-- AWS Glue Catalog Connector (Beta)
-- Ingestion
-  - Spice Cloud write
-- Spice Cloud Catalog Connector (Beta)
+- Upgrade to DataFusion v46.
+- **Ingestion**:
+  - Support write operations to Spice Cloud.
+- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
 
 ### v1.4 (June 2025)
 
 **Focus:** Search
 
-- DataFusion v47
-- Hash Partitioning
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
-- [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
-  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
-- Model Providers: HuggingFace, File (Release Candidate)
-- Data Accelerators: PostgreSQL (Stable)
+- Upgrade to DataFusion v47.
+- Upgrade to DuckDB v1.2.x.
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
+- [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
+  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
+- **Catalog Connectors**
+  - AWS Glue Catalog Connector (Beta).
 
 ### v1.5 (July 2025)
 
-**Focus:** Ingestion
+**Focus:** Advanced Ingestion - Expanded write capabilities for modern data lakehouse architectures.
 
-- Ingestion
-  - Delta Lake write
-  - Iceberg write
-  - PostgreSQL write
+- Hash partitioning for improved query distribution and performance.
+- **Ingestion**:
+  - Delta Lake write support for transactional data lakes.
+  - Apache Iceberg write support for scalable table formats.
+  - PostgreSQL write support for relational database integration.
 
-### v2 (H2 2025)
+### v1.6 (August 2025)
 
-- Policy
-  - Security
-  - Data Access
-- Extensible Middleware
-- AuthN Providers
+- **Model Providers**:
+  - HuggingFace (Release Candidate).
+  - File-based models (Release Candidate).
+
+### v2.0 (H2 2025)
+
+**Focus:** Enterprise Security, Extensibility, and Scalability
+
+- **Policy Engine**:
+  - Role-based security for fine-grained access control.
+  - Data access policies to enforce compliance and governance.
+- **Extensible Middleware**:
+  - Pluggable extensions.
 
 ---
 
 ## Features Under Consideration
 
+These are prioritized based on community demand and strategic alignment. Share your feedback to influence their inclusion.
+
 ### Data Connectors
 
-- S3 Tables
-- ElasticSearch
-- MotherDuck
-- BigQuery
-- Kafka
-- Google Docs
+- **S3 Tables**: Direct querying of S3-Table based datasets.
+- **Elasticsearch**: Integration for search and analytics workloads.
+- **MotherDuck**: Hybrid cloud DuckDB connector.
+- **BigQuery**: Support for Google Cloud's data warehouse.
+- **Kafka**: Real-time streaming data ingestion.
+- **Google Docs**: Experimental connector for collaborative data sources.
 
 ### APIs
 
-- GraphQL API
-- Key/Value API
-  - SlateDB data accelerator
-  - RocksDB data accelerator
-- PostgreSQL API
+- **GraphQL API**: Flexible, query-driven data access.
+- **Key/Value API**:
+  - SlateDB data accelerator for low-latency storage.
+  - RocksDB data accelerator for embedded key-value performance.
+- **PostgreSQL API**: Native compatibility with PostgreSQL clients.
 
 ### AI & Analytics
 
-- Vision (Image/Video)
-- Advanced Embeddings
-- Custom Model Integration
+- **Vision Processing**: Support for image and video.
+- **Advanced Embeddings**: Enhanced support for vector-based AI models.
+- **Custom Model Integration**: Framework for user-defined ML models.
 
-### Other
+### Platform Enhancements
 
-- Improved Observability & Monitoring
-- Enhanced CLI & SDKs
-- More Data Accelerators
+- **Observability**: Comprehensive metrics, logging, and tracing.
+- **CLI & SDKs**: Streamlined developer experience with improved tooling.
+- **Data Accelerators**: Additional engines for specialized workloads.
 
 ---
 
-_This roadmap is subject to change based on feedback and priorities. Thank you for being part of the Spice community!_
+This roadmap is dynamic and evolves with community input and market needs. Thank you for contributing to the Spice.ai ecosystem!

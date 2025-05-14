@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::token_providers::github_app_token::GitHubAppTokenProvider;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -50,8 +51,7 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
-use token_providers::github_app_token::GitHubAppTokenProvider;
-use token_providers::{StaticTokenProvider, TokenProvider};
+use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{

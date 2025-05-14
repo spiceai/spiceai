@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
+use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
@@ -31,10 +32,7 @@ use std::path::{Path, PathBuf};
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
-use token_providers::{
-    databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider},
-    registry::TokenProviderRegistry,
-};
+use token_provider::registry::TokenProviderRegistry;
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
@@ -170,12 +168,12 @@ async fn databricks(
         }
         (Some(token),  Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_u2m_{client_id}"), || async {
-                    DatabricksU2MTokenProvider::new(
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                    Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
                         token.into(),
-                    )
+                    ))
                 })
                 .await
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {

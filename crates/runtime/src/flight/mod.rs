@@ -69,7 +69,6 @@ mod middleware;
 mod util;
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
@@ -105,7 +104,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Box::pin(get_flight_info::handle(self, request)).await
+        Box::pin(get_flight_info::handle(request)).await
     }
 
     async fn poll_flight_info(
@@ -121,7 +120,7 @@ impl FlightService for Service {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let _start = track_flight_request("get_schema", None).await;
-        get_schema::handle(self, request).await
+        get_schema::handle(request).await
     }
 
     async fn do_get(
@@ -129,7 +128,7 @@ impl FlightService for Service {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let _start = track_flight_request("do_get", None).await;
-        Box::pin(do_get::handle(self, request)).await
+        Box::pin(do_get::handle(request)).await
     }
 
     async fn do_put(
@@ -137,7 +136,7 @@ impl FlightService for Service {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let _start = track_flight_request("do_put", None).await;
-        do_put::handle(self, request).await
+        do_put::handle(request).await
     }
 
     async fn do_exchange(
@@ -153,7 +152,7 @@ impl FlightService for Service {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let _start = track_flight_request("do_action", None).await;
-        Box::pin(actions::do_action(self, request)).await
+        Box::pin(actions::do_action(request)).await
     }
 
     async fn list_actions(
@@ -342,7 +341,6 @@ pub async fn start(
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
-        datafusion: rt.datafusion(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
@@ -368,7 +366,7 @@ pub async fn start(
         .into_inner();
 
     let server = server
-        .layer(RequestContextLayer::new(app))
+        .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(TokenProviderLayer::new(rt.token_provider_registry()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,

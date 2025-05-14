@@ -19,7 +19,7 @@ use async_openai::config::Config;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use secrecy::SecretString;
 use std::sync::Arc;
-use token_providers::{StaticTokenProvider, TokenProvider};
+use token_provider::{StaticTokenProvider, TokenProvider};
 
 /// A generic configuration for any hosted `OpenAI` API client.
 ///

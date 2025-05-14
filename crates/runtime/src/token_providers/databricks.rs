@@ -20,10 +20,9 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
+use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-use crate::{Result, TokenProvider};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -232,14 +231,14 @@ impl TokenProvider for DatabricksU2MTokenProvider {
 
 impl DatabricksU2MTokenProvider {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: String, client_id: String, token: SecretString) -> Result<Self> {
+    pub fn new(endpoint: String, client_id: String, token: SecretString) -> Self {
         let (tx, rx) = watch::channel(token.clone().expose_secret().to_string());
 
-        Ok(Self {
+        Self {
             endpoint,
             client_id,
             tx,
             rx,
-        })
+        }
     }
 }
