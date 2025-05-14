@@ -131,17 +131,6 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
-#[utoipa::path(
-    get,
-    path = "/docs/openapi.json",
-    responses(
-        (status = 200, description = "JSON file", body = ())
-    )
-)]
-async fn openapi() -> Json<utoipa::openapi::OpenApi> {
-    Json(get_api_doc())
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
