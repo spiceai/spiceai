@@ -217,8 +217,6 @@ pub(crate) fn routes(
     }
 
     authenticated_router = authenticated_router
-        .layer(Extension(Arc::clone(&rt.app)))
-        .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
@@ -246,6 +244,7 @@ pub(crate) fn routes(
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(Arc::clone(&rt.app)))
+        .layer(Extension(Arc::clone(&rt.df)))
         .layer(cors_layer(cors_config))
 }
 
