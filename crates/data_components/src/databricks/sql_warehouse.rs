@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::Read;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{datasource::TableProvider, execution::SendableRecordBatchStream};
 use datafusion_table_providers::sql::{
@@ -26,9 +28,12 @@ use datafusion_table_providers::sql::{
     },
     sql_provider_datafusion::SqlTable,
 };
+use futures::{StreamExt as _, stream};
 use reqwest::{Client, ClientBuilder};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use snafu::prelude::*;
+use std::io::Cursor;
 use std::{any::Any, sync::Arc};
 use token_provider::TokenProvider;
 
@@ -132,6 +137,81 @@ impl SqlWarehouseApi {
 
         Ok(schema_from_json(response)?)
     }
+
+    async fn fetch_arrow_streams(
+        &self,
+        response: Value,
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+        let external_links = response
+            .get("result")
+            .and_then(|result| result.get("external_links"))
+            .ok_or("Missing result.external_links in JSON response")?
+            .as_array()
+            .ok_or("external_links is not an array")?;
+
+        let external_links: Vec<ExternalLink> = external_links
+            .iter()
+            .map(|link| serde_json::from_value(link.clone()))
+            .collect::<Result<Vec<ExternalLink>, _>>()?;
+
+        let mut streams = vec![];
+        for link in external_links {
+            tracing::trace!(
+                "Fetching chunk {} from {}",
+                link.chunk_index,
+                link.external_link
+            );
+            let response = self.client.get(&link.external_link).send().await?;
+
+            if !response.status().is_success() {
+                return Err(format!(
+                    "Failed to fetch {}: {}",
+                    link.external_link,
+                    response.status()
+                )
+                .into());
+            }
+
+            let bytes = response.bytes().await?;
+            let cursor = Cursor::new(bytes);
+
+            let reader = StreamReader::try_new(cursor, None)?;
+            let batches: Vec<_> = reader
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .collect();
+
+            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+            streams.push(stream);
+        }
+
+        let mut combined_stream = futures::stream::select_all(streams);
+
+        let Some(first_batch) = combined_stream.next().await else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                stream::empty(),
+            )));
+        };
+
+        let batch = first_batch?;
+
+        let schema = batch.schema();
+
+        // add first batch back to stream
+        let run_once = stream::once(async move { Ok(batch) });
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(schema, Box::pin(run_once.chain(combined_stream)));
+
+        Ok(Box::pin(stream_adapter))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalLink {
+    chunk_index: u64,
+    external_link: String,
 }
 
 fn schema_from_json(json_value: Value) -> Result<SchemaRef, Error> {
@@ -237,7 +317,30 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a (dyn Sync)> for SqlWarehous
         _: &[&'a (dyn Sync)],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
-        todo!()
+        // databricks does not like escaping default schema
+        let sql = sql.replace("\"default\"", "default");
+        let token = self.api.token_provider.get_token();
+        let payload = json!({
+            "warehouse_id": self.api.sql_warehouse_id,
+            // "catalog": table.catalog().unwrap_or("spiceai"),
+            // "schema": table.schema().unwrap_or("public"),
+            "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS",
+            "statement": sql,
+        });
+
+        let response = self
+            .api
+            .client
+            .post(&self.api.url)
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        self.api.fetch_arrow_streams(response).await
     }
 
     async fn execute(
