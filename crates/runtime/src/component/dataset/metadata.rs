@@ -275,11 +275,11 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns("", &schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 3);
         assert!(columns.contains(&MetadataColumn::LastModified));
-        assert!(columns.contains(&MetadataColumn::Location(None)));
+        assert!(columns.contains(&MetadataColumn::Location(Some("test".into()))));
         assert!(columns.contains(&MetadataColumn::Size));
     }
 
@@ -335,10 +335,10 @@ mod tests {
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
         ]);
         let columns = dataset
-            .listing_table_metadata_columns("", &schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0], MetadataColumn::Location(None));
+        assert_eq!(columns[0], MetadataColumn::Location(Some("test".into())));
     }
 
     #[tokio::test]
@@ -431,11 +431,11 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns("", &schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 3);
         assert!(columns.contains(&MetadataColumn::LastModified));
-        assert!(columns.contains(&MetadataColumn::Location(None)));
+        assert!(columns.contains(&MetadataColumn::Location(Some("test".into()))));
         assert!(columns.contains(&MetadataColumn::Size));
     }
 
@@ -559,9 +559,9 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns("", &schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0], MetadataColumn::Location(None));
+        assert_eq!(columns[0], MetadataColumn::Location(Some("test".into())));
     }
 }
