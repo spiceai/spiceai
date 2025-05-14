@@ -63,9 +63,9 @@ impl PerplexitySonar {
             })
             .collect();
 
-        let cfg = HostedModelConfig::default()
-            .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
-            .with_base_url(PERPLEXITY_SONAR_API_BASE);
+        let cfg = HostedModelConfig::from_url(PERPLEXITY_SONAR_API_BASE).with_auth(
+            GenericAuthMechanism::from_bearer_token(auth_token.expose_secret()),
+        );
 
         Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),

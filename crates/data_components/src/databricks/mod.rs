@@ -17,13 +17,20 @@ limitations under the License.
 pub mod delta;
 pub mod spark_connect;
 
+use std::sync::LazyLock;
+
 pub use delta::DatabricksDelta;
 pub use spark_connect::DatabricksSparkConnect;
 
-const SPICE_USER_AGENT_STRING: &str = "SpiceAI_OSS";
+const SPICE_USER_AGENT_PREFIX: &str = "SpiceAI_";
+
+static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
+    let product = std::env::var("SPICE_PRODUCT_NAME").unwrap_or("OSS".to_string());
+    let version = env!("CARGO_PKG_VERSION");
+    format!("{SPICE_USER_AGENT_PREFIX}{product}/{version}")
+});
 
 #[must_use]
-pub fn user_agent() -> String {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    format!("{SPICE_USER_AGENT_STRING}/{version}")
+pub fn user_agent() -> &'static str {
+    &USER_AGENT
 }

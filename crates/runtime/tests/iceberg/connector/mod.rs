@@ -33,6 +33,8 @@ use spicepod::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod audit_log;
+
 #[tokio::test]
 async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(

@@ -13,10 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
+
+use std::sync::Arc;
 
 use async_openai::{
     Client,
-    config::OpenAIConfig,
     error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
@@ -27,28 +29,63 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use snafu::ResultExt;
+use token_provider::TokenProvider;
 use tracing::Instrument;
 
 use crate::{
     chat::{Chat, nsql::SqlGeneration},
+    config::{GenericAuthMechanism, HostedModelConfig},
     embeddings::Embed,
 };
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
 pub struct Databricks {
     pub model: String,
-    client: Client<OpenAIConfig>,
+    client: Client<HostedModelConfig>,
 }
 
-impl Databricks {
-    #[must_use]
-    pub fn from_access_token(endpoint: &str, model: &str, access_token: &str) -> Self {
-        Self {
-            model: model.to_string(),
-            client: Client::with_config(OpenAIConfig::default().with_api_base(format!(
-                "https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations"
-            ))),
-        }
+#[must_use]
+pub fn from_access_token(
+    endpoint: &str,
+    model: &str,
+    access_token: &str,
+    user_agent: Option<&'static str>,
+) -> Databricks {
+    let mut cfg = HostedModelConfig::from_url(
+        format!("https://token:{access_token}@{endpoint}/serving-endpoints/{model}/invocations")
+            .as_str(),
+    );
+
+    if let Some(user_agent) = user_agent {
+        cfg = cfg.with_header("user-agent", user_agent);
+    };
+
+    Databricks {
+        model: model.to_string(),
+        client: Client::with_config(cfg),
+    }
+}
+
+pub fn from_token_provider(
+    endpoint: &str,
+    model: &str,
+    token_provider: Arc<dyn TokenProvider>,
+    user_agent: Option<&'static str>,
+) -> Databricks {
+    let mut cfg = HostedModelConfig::from_url(
+        format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
+    )
+    .with_auth(GenericAuthMechanism::from_bearer_token_provider(
+        token_provider,
+    ));
+
+    if let Some(user_agent) = user_agent {
+        cfg = cfg.with_header("user-agent", user_agent);
+    };
+
+    Databricks {
+        model: model.to_string(),
+        client: Client::with_config(cfg),
     }
 }
 

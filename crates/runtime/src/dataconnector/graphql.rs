@@ -23,7 +23,7 @@ use datafusion::datasource::TableProvider;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-use token_providers::{StaticTokenProvider, TokenProvider};
+use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{

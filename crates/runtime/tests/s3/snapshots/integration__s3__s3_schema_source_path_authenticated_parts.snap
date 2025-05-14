@@ -2,10 +2,10 @@
 source: crates/runtime/tests/s3/mod.rs
 expression: schema
 ---
-+-------------+--------------------------+-------------+
-| column_name | data_type                | is_nullable |
-+-------------+--------------------------+-------------+
-| id          | Int64                    | NO          |
-| value       | Float64                  | NO          |
-| part_key    | Dictionary(UInt16, Utf8) | NO          |
-+-------------+--------------------------+-------------+
++-------------+-----------+-------------+
+| column_name | data_type | is_nullable |
++-------------+-----------+-------------+
+| id          | Int64     | NO          |
+| value       | Float64   | NO          |
+| part_key    | Utf8      | NO          |
++-------------+-----------+-------------+

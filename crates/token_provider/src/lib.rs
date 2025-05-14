@@ -21,8 +21,6 @@ use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
-pub mod databricks;
-pub mod github_app_token;
 pub mod registry;
 
 #[derive(Debug, Snafu)]
@@ -44,6 +42,8 @@ pub trait TokenProvider: Send + Sync + Debug {
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
         None
     }
+
+    fn set_token(&self, _token: String) {}
 }
 
 pub struct StaticTokenProvider {

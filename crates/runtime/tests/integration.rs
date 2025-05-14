@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+mod cache;
 mod catalog;
 #[cfg(feature = "duckdb")]
 mod clickbench;
@@ -84,7 +85,7 @@ mod utils;
 mod view;
 // MySQL is required for the rehydration tests
 mod podswatcher;
-#[cfg(feature = "mysql")]
+#[cfg(all(feature = "mysql", feature = "duckdb"))]
 mod rehydration;
 mod shutdown;
 

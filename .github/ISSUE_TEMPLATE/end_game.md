@@ -188,7 +188,10 @@ assignees: ''
 
 - [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
-- [ ] Run the following workflows to confirm installation health:
+
+## Post-Release Housekeeping
+
+- [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/e2e_test_release_install_ai.yml)
@@ -197,16 +200,13 @@ assignees: ''
       - Branch: `trunk`
       - Build the CLI: `false`
       - Release Version: the version tag released.
-
-## Post-Release Housekeeping
-
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
-- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
+- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
-- [ ] QA DRI: Run SpiceQA via SCP over the following recipes using the template prompt from the [SpiceQA workflow](https://github.com/spiceai/cookbook/blob/trunk/.github/workflows/spice-qa.yml#L45):
-  - [ ] File Data Connector
-  - [ ] Dremio Data Connector
+- [ ] QA DRI: Run SpiceQA via [Github Action](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml), with the correct `input.spice_version`.
+  - [ ] Redeploy the SpiceQA app in the Spice.ai Cloud Platform (SCP). Ensure the deployment is successful.
+  - [ ] Run the [SpiceQA Workflow](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml) in GitHub Actions. Verify the artifact for each cookbook recipe are present and confirm that all tests pass as expected.
 - [ ] QA DRI: Add metrics to [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv).
   - Use number of recipes total from [spiceai.org/docs/cookbook](https://spiceai.org/docs/cookbook).
 

@@ -112,8 +112,8 @@ impl Spicepod {
         Self::load_from(&reader::StdFileSystem, path)
     }
 
-    fn load_from_rdr<T>(
-        fs: &impl reader::ReadableYaml<T>,
+    fn load_from_rdr(
+        fs: &impl reader::ReadableYaml,
         spicepod_rdr: Box<dyn std::io::Read>,
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
@@ -205,10 +205,7 @@ impl Spicepod {
         Self::load_from_rdr(&fs, spicepod_rdr, path)
     }
 
-    pub fn load_from<T>(
-        fs: &impl reader::ReadableYaml<T>,
-        path: impl Into<PathBuf>,
-    ) -> Result<Spicepod> {
+    pub fn load_from(fs: &impl reader::ReadableYaml, path: impl Into<PathBuf>) -> Result<Spicepod> {
         let path = path.into();
         let path_str = path.to_string_lossy().to_string();
 
@@ -223,8 +220,8 @@ impl Spicepod {
         Self::load_definition_from(&reader::StdFileSystem, path)
     }
 
-    pub fn load_definition_from<T>(
-        fs: &impl reader::ReadableYaml<T>,
+    pub fn load_definition_from(
+        fs: &impl reader::ReadableYaml,
         path: impl Into<PathBuf>,
     ) -> Result<SpicepodDefinition> {
         let path = path.into();

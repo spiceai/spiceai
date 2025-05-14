@@ -21,7 +21,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{Read, spark_connect::SparkConnect};
-use token_providers::TokenProvider;
+use token_provider::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnect {
@@ -45,7 +45,7 @@ impl DatabricksSparkConnect {
         })
     }
 
-    pub async fn new_m2m(
+    pub async fn from_token_provider(
         endpoint: String,
         cluster_id: String,
         databricks_use_ssl: bool,

@@ -22,7 +22,7 @@ use mysql_async::prelude::Queryable;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+use crate::utils::{runtime_ready_check, test_request_context};
 
 pub mod common;
 
@@ -173,6 +173,47 @@ CREATE TABLE test (
     Ok(())
 }
 
+#[instrument]
+async fn init_mysql_utf8mb4_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+
+    tracing::debug!("DROP TABLE IF EXISTS test_utf8mb4");
+    let _: Vec<Row> = conn
+        .exec("DROP TABLE IF EXISTS test_utf8mb4", Params::Empty)
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "
+CREATE TABLE test_utf8mb4 (
+  id SERIAL PRIMARY KEY,
+  col_text_utf8mb4 TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  col_varchar_utf8mb4 VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  col_normal_text TEXT
+);",
+            Params::Empty,
+        )
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO test_utf8mb4 (
+  col_text_utf8mb4,
+  col_varchar_utf8mb4,
+  col_normal_text
+) VALUES (
+  '🚀 This text contains UTF8MB4 characters that are not in UTF8MB3 😊',
+  '🦄 Another UTF8MB4 string with emojis 🎉',
+  'Regular text with no special characters'
+);",
+            Params::Empty,
+        )
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn mysql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
@@ -247,6 +288,99 @@ async fn mysql_integration_test() -> Result<(), String> {
                     &format!("mysql_integration_test_{snapshot_suffix}"),
                     query,
                     true,
+                    validate_result,
+                )
+                .await?;
+            }
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn mysql_character_set_results_test() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_utf8mb4_db(MYSQL_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL database: {e}");
+                e.to_string()
+            })?;
+
+            let app = AppBuilder::new("mysql_character_set_results_test")
+                .with_dataset(make_mysql_dataset(
+                    "test_utf8mb4",
+                    "test_default",
+                    MYSQL_PORT,
+                    false,
+                ))
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let queries: QueryTests = vec![(
+                "SELECT * FROM test_default",
+                "character_set_results_default",
+                Some(Box::new(|result_batches| {
+                    // snapshot the values of the results
+                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("should pretty print result batch");
+
+                    insta::with_settings!({
+                        description => format!("MySQL Integration Test Results"),
+                        omit_expression => true,
+                        snapshot_path => "../snapshots"
+                    }, {
+                        insta::assert_snapshot!(format!("character_set_results_default"), results);
+                    });
+                })),
+            )];
+
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("mysql_integration_test_{snapshot_suffix}"),
+                    query,
+                    false,
                     validate_result,
                 )
                 .await?;

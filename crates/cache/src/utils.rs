@@ -42,7 +42,8 @@ pub fn to_cached_record_batch_stream(
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
-        let cache_max_size: usize = cache_provider.max_size().try_into().unwrap_or(usize::MAX);
+        // moka-rs operates by `u32` for records size, so max single record size is `u32::MAX` / 4 GB
+        let cache_max_size = usize::try_from(cache_provider.max_size().min(u64::from(u32::MAX))).unwrap_or_default();
 
         while let Some(batch_result) = stream.next().await {
             if records_size < cache_max_size {

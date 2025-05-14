@@ -20,10 +20,9 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
+use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-use crate::{Result, TokenProvider};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -189,4 +188,57 @@ async fn get_m2m_access_token(
 pub enum AuthCredentials<'a> {
     Token(&'a SecretString),
     ServicePrincipal(&'a str, &'a SecretString),
+    U2M(&'a str, &'a SecretString),
+}
+
+//
+// U2M
+//
+
+#[derive(Clone)]
+pub struct DatabricksU2MTokenProvider {
+    endpoint: String,
+    client_id: String,
+
+    tx: watch::Sender<String>,
+    rx: watch::Receiver<String>,
+}
+
+impl fmt::Debug for DatabricksU2MTokenProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabricksU2MTokenProvider")
+            .field("endpoint", &self.endpoint)
+            .field("client_id", &self.client_id)
+            .field("tx", &"<watch::Sender>")
+            .field("rx", &"<watch::Receiver>")
+            .finish()
+    }
+}
+
+impl TokenProvider for DatabricksU2MTokenProvider {
+    fn get_token(&self) -> String {
+        self.rx.borrow().clone()
+    }
+
+    fn subscribe(&self) -> Option<watch::Receiver<String>> {
+        Some(self.tx.subscribe())
+    }
+
+    fn set_token(&self, token: String) {
+        let _ = self.tx.send(token);
+    }
+}
+
+impl DatabricksU2MTokenProvider {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(endpoint: String, client_id: String, token: SecretString) -> Self {
+        let (tx, rx) = watch::channel(token.clone().expose_secret().to_string());
+
+        Self {
+            endpoint,
+            client_id,
+            tx,
+            rx,
+        }
+    }
 }

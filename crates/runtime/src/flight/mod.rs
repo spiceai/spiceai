@@ -19,8 +19,8 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
-use crate::metrics as runtime_metrics;
 use crate::tls::TlsConfig;
+use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -43,7 +43,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, WriteRateLimitLayer};
+use middleware::{RequestContextLayer, TokenProviderLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -69,7 +69,6 @@ mod middleware;
 mod util;
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
@@ -105,7 +104,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Box::pin(get_flight_info::handle(self, request)).await
+        Box::pin(get_flight_info::handle(request)).await
     }
 
     async fn poll_flight_info(
@@ -121,7 +120,7 @@ impl FlightService for Service {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let _start = track_flight_request("get_schema", None).await;
-        get_schema::handle(self, request).await
+        get_schema::handle(request).await
     }
 
     async fn do_get(
@@ -129,7 +128,7 @@ impl FlightService for Service {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let _start = track_flight_request("do_get", None).await;
-        Box::pin(do_get::handle(self, request)).await
+        Box::pin(do_get::handle(request)).await
     }
 
     async fn do_put(
@@ -137,7 +136,7 @@ impl FlightService for Service {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let _start = track_flight_request("do_put", None).await;
-        do_put::handle(self, request).await
+        do_put::handle(request).await
     }
 
     async fn do_exchange(
@@ -153,7 +152,7 @@ impl FlightService for Service {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let _start = track_flight_request("do_action", None).await;
-        Box::pin(actions::do_action(self, request)).await
+        Box::pin(actions::do_action(request)).await
     }
 
     async fn list_actions(
@@ -335,14 +334,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
-    df: Arc<DataFusion>,
+    rt: Arc<Runtime>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
-        datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
@@ -368,7 +366,8 @@ pub async fn start(
         .into_inner();
 
     let server = server
-        .layer(RequestContextLayer::new(app))
+        .layer(RequestContextLayer::new(app, rt.datafusion()))
+        .layer(TokenProviderLayer::new(rt.token_provider_registry()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

@@ -64,8 +64,8 @@ use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
-use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::oneshot;
+use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::time::{Instant, sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -79,6 +79,7 @@ pub mod extension;
 pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
+pub mod request_context_extension;
 pub mod schema;
 pub mod udf;
 
@@ -272,6 +273,8 @@ pub struct DataFusion {
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    // Controls the parallelism of accelerated table refreshes
+    acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -884,6 +887,10 @@ impl DataFusion {
             accelerated_table_builder.disable_federation();
         }
 
+        if let Some(semaphore) = &self.acceleration_refresh_semaphore {
+            accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
         if refresh_mode == RefreshMode::Changes {
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
@@ -1367,6 +1374,10 @@ impl DataFusion {
             builder.disable_federation();
         }
 
+        if let Some(semaphore) = &self.acceleration_refresh_semaphore {
+            builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
         let (accelerated_table, _) =
             builder
                 .build()
@@ -1496,6 +1507,11 @@ impl DataFusion {
         self.cached_plans.insert(key, plan.clone()).await;
 
         Ok(plan)
+    }
+
+    pub(crate) fn clear_cached_plans(&self) {
+        tracing::trace!("clearing cached logical plans");
+        self.cached_plans.invalidate_all();
     }
 }
 

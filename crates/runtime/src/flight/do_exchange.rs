@@ -28,7 +28,9 @@ use futures::{StreamExt, stream};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::request::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
 
@@ -70,7 +72,10 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    let Some(table_provider) = flight_svc.datafusion.get_table(&data_path).await else {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    let Some(table_provider) = datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -170,7 +175,6 @@ pub(crate) async fn handle(
     })
     .flat_map(|x| x);
 
-    let datafusion = Arc::clone(&flight_svc.datafusion);
     let table_provider = Arc::clone(&table_provider);
     tokio::spawn(async move {
         let Ok(df) = datafusion.ctx.read_table(table_provider) else {

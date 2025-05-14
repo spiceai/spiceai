@@ -97,7 +97,9 @@ pub async fn get_dataset_elements(
 ) -> Vec<ListDatasetElement> {
     let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
     let views = get_view_elements(Arc::clone(&rt), opt_include).await;
+    let catalogs = get_catalog_elements(Arc::clone(&rt), opt_include).await;
     tables.extend(views.into_iter());
+    tables.extend(catalogs.into_iter());
 
     tables
 }
@@ -122,6 +124,46 @@ pub async fn get_table_elements(
             metadata: d.metadata.clone(),
         })
         .collect_vec()
+}
+
+pub async fn get_catalog_elements(
+    rt: Arc<Runtime>,
+    _opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
+    let Some(ref app) = *rt.app.read().await else {
+        return vec![];
+    };
+
+    app.catalogs
+        .iter()
+        .flat_map(|c| {
+            let Some(ctlg) = rt.datafusion().ctx.catalog(c.name.as_str()) else {
+                return vec![];
+            };
+            ctlg.schema_names()
+                .iter()
+                .flat_map(|s| {
+                    let Some(schm) = ctlg.schema(s.as_str()) else {
+                        return vec![];
+                    };
+                    schm.table_names()
+                        .iter()
+                        .map(|t| ListDatasetElement {
+                            table: TableReference::Full {
+                                table: t.as_str().into(),
+                                schema: s.as_str().into(),
+                                catalog: c.name.as_str().into(),
+                            }
+                            .to_string(),
+                            can_search_documents: false,
+                            description: None,
+                            metadata: HashMap::new(),
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 pub async fn get_view_elements(

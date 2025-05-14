@@ -95,7 +95,8 @@ async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                // We may need to wait for the cluster to startup and become ready, so wait for up to 10 minutes
+                () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

@@ -23,7 +23,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use token_providers::registry::TokenProviderRegistry;
+use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
@@ -100,6 +100,7 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
+mod token_providers;
 pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
@@ -521,7 +522,7 @@ impl Runtime {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
-                    Arc::clone(&self_ref.df),
+                    Arc::clone(&self_ref),
                     cloned_tls_config,
                     cloned_endpoint_auth,
                     Arc::clone(&self_ref.rate_limits),

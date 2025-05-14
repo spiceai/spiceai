@@ -59,7 +59,7 @@ use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, Semaphore, oneshot};
 
 use datafusion::execution::context::SessionContext;
 use datafusion::{
@@ -82,7 +82,7 @@ struct RefreshStat {
     pub memory_size: usize,
 }
 
-pub struct RefreshTask {
+pub struct RefreshTaskBuilder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
@@ -90,9 +90,11 @@ pub struct RefreshTask {
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
     disable_federation: bool,
+    // Used to control how many parallel refreshes the runtime performs.
+    semaphore: Option<Arc<Semaphore>>,
 }
 
-impl RefreshTask {
+impl RefreshTaskBuilder {
     #[must_use]
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -109,13 +111,69 @@ impl RefreshTask {
             accelerator: Arc::clone(&accelerator),
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
             disable_federation: false,
+            semaphore: None,
         }
     }
+
     /// Sets the `disable_federation` flag
     #[must_use]
-    pub fn with_disable_federation(mut self, disable: bool) -> RefreshTask {
+    pub fn with_disable_federation(mut self, disable: bool) -> RefreshTaskBuilder {
         self.disable_federation = disable;
         self
+    }
+
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> RefreshTaskBuilder {
+        self.semaphore = Some(semaphore);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RefreshTask {
+        let semaphore = self
+            .semaphore
+            .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+        RefreshTask {
+            runtime_status: self.runtime_status,
+            dataset_name: self.dataset_name,
+            federated: self.federated,
+            federated_source: self.federated_source,
+            accelerator: self.accelerator,
+            sink: self.sink,
+            disable_federation: self.disable_federation,
+            semaphore,
+        }
+    }
+}
+
+pub struct RefreshTask {
+    runtime_status: Arc<status::RuntimeStatus>,
+    dataset_name: TableReference,
+    federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
+    accelerator: Arc<dyn TableProvider>,
+    sink: Arc<RwLock<AccelerationSink>>,
+    disable_federation: bool,
+    // Used to control how many parallel refreshes the runtime performs.
+    semaphore: Arc<Semaphore>,
+}
+
+impl RefreshTask {
+    #[must_use]
+    pub fn builder(
+        runtime_status: Arc<status::RuntimeStatus>,
+        dataset_name: TableReference,
+        federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> RefreshTaskBuilder {
+        RefreshTaskBuilder::new(
+            runtime_status,
+            dataset_name,
+            federated,
+            federated_source,
+            accelerator,
+        )
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.
@@ -127,6 +185,9 @@ impl RefreshTask {
     }
 
     pub async fn run(&self, refresh: Refresh) -> super::Result<()> {
+        // Limit parallel refreshes via a semaphore
+        let _permit = self.semaphore.acquire().await;
+
         let max_retries = if refresh.refresh_retry_enabled {
             refresh.refresh_retry_max_attempts
         } else {

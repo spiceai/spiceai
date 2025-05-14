@@ -113,13 +113,14 @@ async fn create_refresh_task(
         .ok_or("table is not an AcceleratedTable")?;
 
     Ok((
-        RefreshTask::new(
+        RefreshTask::builder(
             rt.status(),
             table_name.into(),
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
-        ),
+        )
+        .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
 }
