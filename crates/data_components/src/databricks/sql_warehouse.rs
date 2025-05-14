@@ -77,6 +77,9 @@ pub enum Error {
     SqlTableInitializationFailed {
         source: datafusion_table_providers::sql::sql_provider_datafusion::Error,
     },
+
+    #[snafu(display("A fully-qualified path for is required: {reason}"))]
+    FullyQualifiedPath { reason: String },
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -154,19 +157,19 @@ impl SqlWarehouseApi {
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
         let sql = format!("DESCRIBE TABLE {table}");
-        let payload = self.create_schema_payload(table, &sql);
+        let payload = self.create_schema_payload(table, &sql)?;
 
         let response = self.execute_request(&token, &payload).await?;
         schema_from_json(&response)
     }
 
-    fn create_schema_payload(&self, table: &TableReference, sql: &str) -> Value {
-        json!({
+    fn create_schema_payload(&self, table: &TableReference, sql: &str) -> Result<Value, Error> {
+        Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
-            "catalog": table.catalog().unwrap_or("spiceai"),
-            "schema": table.schema().unwrap_or("public"),
+            "catalog": table.catalog().ok_or_else(|| Error::FullyQualifiedPath{ reason: "missing catalog".into() })?,
+            "schema": table.schema().ok_or_else(|| Error::FullyQualifiedPath{ reason: "missing schema".into() })?,
             "statement": sql,
-        })
+        }))
     }
 
     async fn execute_request(&self, token: &str, payload: &Value) -> Result<Value, Error> {
