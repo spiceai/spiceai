@@ -338,8 +338,10 @@ impl DataAccelerator for DuckDBAccelerator {
                     .collect::<HashSet<_>>(); // collect unique paths using HashSet
 
                 if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.iter().join(";"));
+                    cmd.options.insert(
+                        "attach_databases".to_string(),
+                        attach_databases.iter().join(";"),
+                    );
                 }
             }
         }
