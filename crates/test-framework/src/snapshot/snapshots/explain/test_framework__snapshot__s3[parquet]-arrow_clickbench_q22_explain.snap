@@ -6,7 +6,7 @@ description: "Query: clickbench_q22"
 | plan_type     | plan                                                                                                                    |
 +---------------+-------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                      |
-|               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS count(*) AS c                                        |
+|               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS c                                                    |
 |               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), count(Int64(1))]]                                   |
 |               |       BytesProcessedNode                                                                                                |
 |               |         Filter: hits.URL LIKE LargeUtf8("%google%") AND hits.SearchPhrase != LargeUtf8("")                              |

@@ -6,7 +6,7 @@ description: "Query: clickbench_q13"
 | plan_type     | plan                                                                                                     |
 +---------------+----------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                       |
-|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS count(*) AS c                                        |
+|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS c                                                    |
 |               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                   |
 |               |       BytesProcessedNode                                                                                 |
 |               |         Filter: hits.SearchPhrase != LargeUtf8("")                                                       |
