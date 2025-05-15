@@ -242,6 +242,10 @@ struct MyStruct(u64);
 fn consumes_value(v: MyStruct) -> {
     v.0;
 }
+
+let a = MyStruct(0);
+consumes_value(a);
+consumes_value(a);
 ```
 
 **Why?**
