@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use crate::{DataFusion, datafusion::is_spice_internal_schema};
+use crate::{
+    DataFusion,
+    datafusion::{is_spice_internal_schema, request_context_extension::get_current_datafusion},
+    request::{AsyncMarker, RequestContext},
+};
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Path, Query},
     http::status,
     response::{IntoResponse, Response},
@@ -136,11 +138,11 @@ struct NamespacesResponse {
         )))
     )
 ))]
-pub(crate) async fn get_namespaces(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Query(params): Query<ParentNamespaceQueryParams>,
-) -> Response {
-    match get_child_namespaces_impl(&datafusion, &params.parent) {
+pub(crate) async fn get_namespaces(Query(params): Query<ParentNamespaceQueryParams>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
+    match get_child_namespaces_impl(&df, &params.parent) {
         Ok(namespaces) => (
             status::StatusCode::OK,
             Json(NamespacesResponse { namespaces }),
@@ -163,12 +165,12 @@ pub(crate) async fn get_namespaces(
         (status = 404, description = "Namespace does not exist")
     )
 ))]
-pub(crate) async fn head_namespace(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path(namespace): Path<NamespacePath>,
-) -> Response {
+pub(crate) async fn head_namespace(Path(namespace): Path<NamespacePath>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
-    match get_child_namespaces_impl(&datafusion, &namespace) {
+    match get_child_namespaces_impl(&df, &namespace) {
         Ok(_) => status::StatusCode::OK.into_response(),
         Err(e) => e.into_response(),
     }
@@ -187,12 +189,12 @@ pub(crate) async fn head_namespace(
         (status = 404, description = "Namespace does not exist")
     )
 ))]
-pub(crate) async fn get_namespace(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path(namespace): Path<NamespacePath>,
-) -> Response {
+pub(crate) async fn get_namespace(Path(namespace): Path<NamespacePath>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
-    match get_child_namespaces_impl(&datafusion, &namespace) {
+    match get_child_namespaces_impl(&df, &namespace) {
         Ok(_) => (
             status::StatusCode::OK,
             Json(NamespacesResponse {
@@ -292,17 +294,17 @@ struct ListTablesResponse {
         (status = 404, description = "Namespace does not exist")
     )
 ))]
-pub(crate) async fn list_tables(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path(namespace): Path<NamespacePath>,
-) -> Response {
+pub(crate) async fn list_tables(Path(namespace): Path<NamespacePath>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
 
     match namespace.parts.len() {
         // If only catalog is specified, return empty list
         1 => {
             let catalog_name = &namespace.parts[0];
-            if datafusion.ctx.catalog(catalog_name).is_none() {
+            if df.ctx.catalog(catalog_name).is_none() {
                 return IcebergResponseError::no_such_namespace(format!(
                     "Catalog '{catalog_name}' does not exist"
                 ))
@@ -330,7 +332,7 @@ pub(crate) async fn list_tables(
             }
 
             // Get the catalog
-            let Some(catalog) = datafusion.ctx.catalog(catalog_name) else {
+            let Some(catalog) = df.ctx.catalog(catalog_name) else {
                 return IcebergResponseError::no_such_namespace(format!(
                     "Catalog '{catalog_name}' does not exist"
                 ))

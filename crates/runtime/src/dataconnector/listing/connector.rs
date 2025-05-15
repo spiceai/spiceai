@@ -479,7 +479,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
-        options = add_metadata_columns_if_required(options, &expanded_schema, dataset);
+        options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset);
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
@@ -581,10 +581,12 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
 fn add_metadata_columns_if_required(
     mut options: ListingOptions,
+    table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
 ) -> ListingOptions {
-    if let Some(columns) = dataset.listing_table_metadata_columns(schema) {
+    let url_prefix = get_url_prefix(table_url);
+    if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
         tracing::debug!(
             "Enabling metadata columns for '{}': {:?}",
             dataset.name,
@@ -594,6 +596,11 @@ fn add_metadata_columns_if_required(
     }
 
     options
+}
+
+// Returns the prefix of the table URL, e.g. for "s3://mybucket/myfolder" it returns "s3://mybucket/"
+fn get_url_prefix(table_url: &Url) -> String {
+    format!("{}/", &table_url[..url::Position::BeforePath])
 }
 
 // 1024³
@@ -1249,5 +1256,41 @@ mod tests {
         // Should return Ok even though no matching files were found,
         // because we hit the scan limit
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_get_url_prefix_basic() {
+        let url = Url::parse("s3://mybucket/").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_path() {
+        let url = Url::parse("s3://mybucket/folder/file.txt").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_query() {
+        let url = Url::parse("s3://mybucket/file.txt?version=1").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_fragment() {
+        let url = Url::parse("s3://mybucket/file.txt#section1").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_port() {
+        let url = Url::parse("http://localhost:8080/path").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_without_host() {
+        let url = Url::parse("file:///absolute/path").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "file:///");
     }
 }

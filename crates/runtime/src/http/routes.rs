@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::DataFusion;
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
@@ -215,8 +217,6 @@ pub(crate) fn routes(
     }
 
     authenticated_router = authenticated_router
-        .layer(Extension(Arc::clone(&rt.app)))
-        .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
@@ -242,12 +242,16 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
-        .route_layer(middleware::from_fn(track_metrics))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&rt.df),
+            track_metrics,
+        ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
 }
 
 async fn track_metrics(
+    State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
     req: Request<Body>,
@@ -260,6 +264,8 @@ async fn track_metrics(
             .from_headers(&headers)
             .build(),
     );
+
+    request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
 
     let request_dimensions = request_context.to_dimensions();
 

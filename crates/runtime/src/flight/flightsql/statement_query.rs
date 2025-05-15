@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
@@ -25,18 +23,19 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
     flight::{
         Service,
         metrics::track_flight_request,
         to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
+    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 
 /// Get a `FlightInfo` for executing a SQL query.
 pub(crate) async fn get_flight_info(
-    flight_svc: &Service,
     query: sql::CommandStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
@@ -46,7 +45,10 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let (arrow_schema, _) = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    let (arrow_schema, _) = Service::get_arrow_schema(datafusion, sql)
         .await
         .map_err(to_tonic_err)?;
 
@@ -66,13 +68,14 @@ pub(crate) async fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    flight_svc: &Service,
     cmd: sql::CommandStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = track_flight_request("do_get", Some("statement_query")).await;
     set_flightsql_protocol().await;
 
-    let datafusion = Arc::clone(&flight_svc.datafusion);
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
     tracing::trace!("do_get_statement: {cmd:?}");
     let (output, from_cache) =
         Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query, None)).await?;

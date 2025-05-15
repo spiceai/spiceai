@@ -13,10 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::Arc;
 
 use axum::{
-    Extension,
     body::Bytes,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -26,7 +24,10 @@ use headers_accept::Accept;
 use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
-use crate::datafusion::{DataFusion, param_utils};
+use crate::{
+    datafusion::{param_utils, request_context_extension::get_current_datafusion},
+    request::{AsyncMarker, RequestContext},
+};
 
 use super::{ResponseMimeType, sql_to_http_response};
 
@@ -177,7 +178,6 @@ use super::{ResponseMimeType, sql_to_http_response};
     )
 ))]
 pub(crate) async fn post(
-    Extension(df): Extension<Arc<DataFusion>>,
     headers: axum::http::HeaderMap,
     accept: Option<TypedHeader<Accept>>,
     body: Bytes,
@@ -187,6 +187,9 @@ pub(crate) async fn post(
         sql: String,
         parameters: serde_json::Value,
     }
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let content_type = headers
         .get(CONTENT_TYPE)

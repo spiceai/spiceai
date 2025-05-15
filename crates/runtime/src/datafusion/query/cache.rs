@@ -44,11 +44,11 @@ pub(super) enum PlanOrCached {
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: QueryResultsCacheStatus,
-    pub(super) raw_cache_key: Option<RawCacheKey>,
+    pub(super) raw_cache_key: RawCacheKey,
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: Option<RawCacheKey>) -> Self {
+    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: RawCacheKey) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -77,24 +77,30 @@ impl Query {
         tracker: QueryTracker,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
-        let (tracker, cache_status, sql_cache_key) = match Self::try_get_cached_result(
+        let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
+        let (tracker, cache_status, sql_raw_cache_key) = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::Query(sql, parameters.as_ref()),
+            &sql_cache_key,
         )
         .await?
         {
             (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
-            (CacheResult::MissOrSkipped(tracker, status), sql_cache_key) => {
-                (tracker, Some(status), sql_cache_key)
+            (CacheResult::MissOrSkipped(tracker, status), sql_raw_cache_key) => {
+                (tracker, Some(status), sql_raw_cache_key)
             }
-            (CacheResult::WrongCacheKeyType(tracker), sql_cache_key) => {
-                (tracker, None, sql_cache_key)
+            (CacheResult::WrongCacheKeyType(tracker), sql_raw_cache_key) => {
+                (tracker, None, sql_raw_cache_key)
             }
         };
 
-        let plan = match df.get_or_create_logical_plan(session, sql).await {
+        let sql_raw_cache_key = sql_raw_cache_key.unwrap_or_else(|| sql_cache_key.as_raw_key());
+
+        let plan = match df
+            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
+            .await
+        {
             Ok(plan) => plan,
             Err(e) => {
                 let e = find_datafusion_root(e);
@@ -118,7 +124,7 @@ impl Query {
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::LogicalPlan(&plan),
+            &CacheKey::LogicalPlan(&plan),
         )
         .await?
         {
@@ -133,7 +139,7 @@ impl Query {
             ),
         };
 
-        let raw_cache_key = plan_cache_key.or(sql_cache_key);
+        let raw_cache_key = plan_cache_key.unwrap_or(sql_raw_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
         tracker = tracker.results_cache_hit(false);
@@ -149,7 +155,7 @@ impl Query {
         df: &DataFusion,
         request_context: Arc<RequestContext>,
         mut tracker: QueryTracker,
-        key: CacheKey<'_>,
+        key: &CacheKey<'_>,
     ) -> super::Result<(CacheResult, Option<RawCacheKey>)> {
         let Some(cache_provider) = df.cache_provider() else {
             return Ok((
@@ -177,7 +183,7 @@ impl Query {
 
         let raw_key = key.as_raw_key();
 
-        let cached_result = match cache_provider.get_raw_key(raw_key).await {
+        let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
             Ok(None) => {
                 return Ok((
@@ -270,12 +276,8 @@ mod tests {
         let cache_status = QueryResultsCacheStatus::CacheHit;
         let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
-        let manager = RequestCacheManager::new(cache_status, Some(raw_cache_key));
+        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
-
-        let disabled_manager =
-            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, None);
-        assert!(!disabled_manager.should_cache_results());
     }
 
     #[tokio::test]

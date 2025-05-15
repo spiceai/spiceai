@@ -2,17 +2,17 @@
 source: crates/runtime/tests/metadata/mod.rs
 expression: met_all_location_filtered
 ---
-+----+---------+------+-------+-----+----------------------+--------------------------------------------------------------+------+
-| id | value   | year | month | day | last_modified        | location                                                     | size |
-+----+---------+------+-------+-----+----------------------+--------------------------------------------------------------+------+
-| 10 | value_0 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 11 | value_1 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 12 | value_2 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 13 | value_3 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 14 | value_4 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 15 | value_5 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 16 | value_6 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 17 | value_7 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 18 | value_8 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-| 19 | value_9 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
-+----+---------+------+-------+-----+----------------------+--------------------------------------------------------------+------+
++----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+------+
+| id | value   | year | month | day | last_modified        | location                                                                                  | size |
++----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+------+
+| 10 | value_0 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 11 | value_1 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 12 | value_2 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 13 | value_3 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 14 | value_4 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 15 | value_5 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 16 | value_6 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 17 | value_7 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 18 | value_8 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
+| 19 | value_9 | 2023 | 2     | 2   | 2024-10-10T05:37:00Z | s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet | 2319 |
++----+---------+------+-------+-----+----------------------+-------------------------------------------------------------------------------------------+------+

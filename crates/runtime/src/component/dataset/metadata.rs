@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use arrow::datatypes::Schema;
 use datafusion::datasource::listing::MetadataColumn;
 
@@ -22,7 +24,11 @@ use super::Dataset;
 impl Dataset {
     /// Returns which `ListingTable` metadata columns are enabled for this dataset.
     #[must_use]
-    pub fn listing_table_metadata_columns(&self, schema: &Schema) -> Option<Vec<MetadataColumn>> {
+    pub fn listing_table_metadata_columns(
+        &self,
+        url_prefix: impl Into<Arc<str>>,
+        schema: &Schema,
+    ) -> Option<Vec<MetadataColumn>> {
         let needs_last_modified = self.needs_last_modified(schema);
         // Handle the common case where no metadata columns are enabled
         if !needs_last_modified && self.metadata.is_empty() {
@@ -37,8 +43,8 @@ impl Dataset {
             columns.push(MetadataColumn::LastModified);
         }
 
-        if self.metadata_column_enabled(MetadataColumn::Location.name(), schema) {
-            columns.push(MetadataColumn::Location);
+        if self.metadata_column_enabled(MetadataColumn::Location(None).name(), schema) {
+            columns.push(MetadataColumn::Location(Some(url_prefix.into())));
         }
 
         if self.metadata_column_enabled(MetadataColumn::Size.name(), schema) {
@@ -101,7 +107,7 @@ mod tests {
     #[test]
     fn test_metadata_column_names() {
         assert_eq!(MetadataColumn::LastModified.name(), "last_modified");
-        assert_eq!(MetadataColumn::Location.name(), "location");
+        assert_eq!(MetadataColumn::Location(None).name(), "location");
         assert_eq!(MetadataColumn::Size.name(), "size");
     }
 
@@ -168,7 +174,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -180,7 +186,7 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         assert!(dataset.metadata_column_enabled(MetadataColumn::LastModified.name(), &schema));
-        assert!(dataset.metadata_column_enabled(MetadataColumn::Location.name(), &schema));
+        assert!(dataset.metadata_column_enabled(MetadataColumn::Location(None).name(), &schema));
         assert!(dataset.metadata_column_enabled(MetadataColumn::Size.name(), &schema));
     }
 
@@ -196,7 +202,7 @@ mod tests {
                     "disabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "disabled".to_string(),
                 ),
                 (
@@ -208,7 +214,7 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         assert!(!dataset.metadata_column_enabled(MetadataColumn::LastModified.name(), &schema));
-        assert!(!dataset.metadata_column_enabled(MetadataColumn::Location.name(), &schema));
+        assert!(!dataset.metadata_column_enabled(MetadataColumn::Location(None).name(), &schema));
         assert!(!dataset.metadata_column_enabled(MetadataColumn::Size.name(), &schema));
     }
 
@@ -221,7 +227,11 @@ mod tests {
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
-        assert!(dataset.listing_table_metadata_columns(&schema).is_none());
+        assert!(
+            dataset
+                .listing_table_metadata_columns("", &schema)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -235,7 +245,7 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::LastModified);
@@ -253,7 +263,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -265,11 +275,11 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 3);
         assert!(columns.contains(&MetadataColumn::LastModified));
-        assert!(columns.contains(&MetadataColumn::Location));
+        assert!(columns.contains(&MetadataColumn::Location(Some("test".into()))));
         assert!(columns.contains(&MetadataColumn::Size));
     }
 
@@ -285,7 +295,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
             ]))
@@ -293,10 +303,10 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![
             Field::new("test", DataType::Utf8, false),
-            Field::new(MetadataColumn::Location.name(), DataType::Utf8, false),
+            Field::new(MetadataColumn::Location(None).name(), DataType::Utf8, false),
         ]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::LastModified);
@@ -314,7 +324,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
             ]))
@@ -325,10 +335,10 @@ mod tests {
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
         ]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0], MetadataColumn::Location);
+        assert_eq!(columns[0], MetadataColumn::Location(Some("test".into())));
     }
 
     #[tokio::test]
@@ -343,7 +353,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -356,10 +366,14 @@ mod tests {
         let schema = Schema::new(vec![
             Field::new("test", DataType::Utf8, false),
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
-            Field::new(MetadataColumn::Location.name(), DataType::Utf8, false),
+            Field::new(MetadataColumn::Location(None).name(), DataType::Utf8, false),
             Field::new(MetadataColumn::Size.name(), DataType::Utf8, false),
         ]);
-        assert!(dataset.listing_table_metadata_columns(&schema).is_none());
+        assert!(
+            dataset
+                .listing_table_metadata_columns("", &schema)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -374,7 +388,7 @@ mod tests {
                     "enabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -387,10 +401,10 @@ mod tests {
         let schema = Schema::new(vec![
             Field::new("test", DataType::Utf8, false),
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
-            Field::new(MetadataColumn::Location.name(), DataType::Utf8, false),
+            Field::new(MetadataColumn::Location(None).name(), DataType::Utf8, false),
         ]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::Size);
@@ -405,7 +419,7 @@ mod tests {
             .with_time_column("last_modified".to_string())
             .with_metadata(HashMap::from([
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -417,11 +431,11 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 3);
         assert!(columns.contains(&MetadataColumn::LastModified));
-        assert!(columns.contains(&MetadataColumn::Location));
+        assert!(columns.contains(&MetadataColumn::Location(Some("test".into()))));
         assert!(columns.contains(&MetadataColumn::Size));
     }
 
@@ -437,7 +451,7 @@ mod tests {
                     "disabled".to_string(),
                 ),
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "disabled".to_string(),
                 ),
                 (
@@ -448,7 +462,11 @@ mod tests {
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
-        assert!(dataset.listing_table_metadata_columns(&schema).is_none());
+        assert!(
+            dataset
+                .listing_table_metadata_columns("", &schema)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -466,7 +484,7 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::LastModified);
@@ -485,7 +503,11 @@ mod tests {
             Field::new("test", DataType::Utf8, false),
             Field::new(MetadataColumn::LastModified.name(), DataType::Utf8, false),
         ]);
-        assert!(dataset.listing_table_metadata_columns(&schema).is_none());
+        assert!(
+            dataset
+                .listing_table_metadata_columns("", &schema)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -511,7 +533,7 @@ mod tests {
             Field::new(MetadataColumn::Size.name(), DataType::Utf8, false),
         ]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0], MetadataColumn::LastModified);
@@ -525,7 +547,7 @@ mod tests {
             .with_runtime(test_runtime().await)
             .with_metadata(HashMap::from([
                 (
-                    MetadataColumn::Location.name().to_string(),
+                    MetadataColumn::Location(None).name().to_string(),
                     "enabled".to_string(),
                 ),
                 (
@@ -537,9 +559,9 @@ mod tests {
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
         let columns = dataset
-            .listing_table_metadata_columns(&schema)
+            .listing_table_metadata_columns("test", &schema)
             .expect("to get columns");
         assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0], MetadataColumn::Location);
+        assert_eq!(columns[0], MetadataColumn::Location(Some("test".into())));
     }
 }
