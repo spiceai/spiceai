@@ -78,7 +78,7 @@ pub enum Error {
         source: datafusion_table_providers::sql::sql_provider_datafusion::Error,
     },
 
-    #[snafu(display("A fully-qualified path for is required: {reason}"))]
+    #[snafu(display("A fully-qualified path is required: {reason}"))]
     FullyQualifiedPath { reason: String },
 }
 
@@ -189,7 +189,7 @@ impl SqlWarehouseApi {
         &self,
         response: Value,
     ) -> Result<SendableRecordBatchStream, Error> {
-        let external_links = Self::extract_external_links(&response)?;
+        let external_links = Self::extract_external_links(response)?;
         let mut streams = Vec::new();
 
         for link in external_links {
@@ -229,29 +229,26 @@ impl SqlWarehouseApi {
         )))
     }
 
-    fn extract_external_links(response: &Value) -> Result<Vec<ExternalLink>, Error> {
+    fn extract_external_links(mut response: Value) -> Result<Vec<ExternalLink>, Error> {
         let links = response
-            .get("result")
-            .and_then(|result| result.get("external_links"))
+            .get_mut("result")
+            .and_then(|result| result.get_mut("external_links").map(Value::take))
             .ok_or_else(|| {
                 MissingJsonFieldSnafu {
                     field: "result.external_links",
                 }
                 .build()
-            })?
-            .as_array()
-            .ok_or_else(|| {
-                InvalidJsonArraySnafu {
-                    field: "external_links",
-                }
-                .build()
             })?;
 
+        let Value::Array(links) = links else {
+            return Err(Error::InvalidJsonArray {
+                field: "external_links".into(),
+            });
+        };
+
         links
-            .iter()
-            .map(|link| {
-                serde_json::from_value(link.clone()).context(DeserializeExternalLinkFailedSnafu)
-            })
+            .into_iter()
+            .map(|link| serde_json::from_value(link).context(DeserializeExternalLinkFailedSnafu))
             .collect()
     }
 
