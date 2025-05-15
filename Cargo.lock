@@ -10528,7 +10528,7 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "rand 0.9.1",
- "reqwest 0.12.12",
+ "reqwest 0.12.15",
  "rmcp-macros",
  "schemars",
  "serde",
@@ -10540,7 +10540,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
