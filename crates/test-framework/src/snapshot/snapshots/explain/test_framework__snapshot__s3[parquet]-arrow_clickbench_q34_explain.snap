@@ -6,7 +6,7 @@ description: "Query: clickbench_q34"
 | plan_type     | plan                                                                                    |
 +---------------+-----------------------------------------------------------------------------------------+
 | logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                      |
-|               |   Projection: hits.URL, count(Int64(1)) AS count(*) AS c                                |
+|               |   Projection: hits.URL, count(Int64(1)) AS c                                            |
 |               |     Aggregate: groupBy=[[hits.URL]], aggr=[[count(Int64(1))]]                           |
 |               |       BytesProcessedNode                                                                |
 |               |         TableScan: hits projection=[URL]                                                |
