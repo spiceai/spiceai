@@ -286,6 +286,38 @@ struct ExternalLink {
 }
 
 fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
+    if type_name.to_uppercase().starts_with("DECIMAL") {
+        let (precision, scale) = if type_name.contains('(') {
+            let params: &str = type_name
+                .split('(')
+                .nth(1)
+                .ok_or_else(|| Error::UnsupportedType {
+                    ty: type_name.to_string(),
+                })?
+                .trim_end_matches(')')
+                .trim();
+
+            let parts: Vec<&str> = params.split(',').map(str::trim).collect();
+            if parts.len() == 2 {
+                let precision: u8 = parts[0].parse().map_err(|_| Error::UnsupportedType {
+                    ty: type_name.to_string(),
+                })?;
+                let scale: i8 = parts[1].parse().map_err(|_| Error::UnsupportedType {
+                    ty: type_name.to_string(),
+                })?;
+                (precision, scale)
+            } else {
+                return Err(Error::UnsupportedType {
+                    ty: type_name.to_string(),
+                });
+            }
+        } else {
+            (10, 0)
+        };
+
+        return Ok(DataType::Decimal128(precision, scale));
+    }
+
     Ok(match type_name.to_uppercase().as_str() {
         "BOOLEAN" => DataType::Boolean,
         "TINYINT" => DataType::Int8,
@@ -444,5 +476,93 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .create_federated_table_provider()
                 .context(TableProviderCreationFailedSnafu)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timestamp_type(tz: Option<String>) -> DataType {
+        DataType::Timestamp(TimeUnit::Microsecond, tz.map(Into::into))
+    }
+
+    #[test]
+    fn test_map_databricks_type() {
+        let test_cases = &[
+            ("BOOLEAN", Ok(DataType::Boolean), "BOOLEAN mapping failed"),
+            ("TINYINT", Ok(DataType::Int8), "TINYINT mapping failed"),
+            ("SMALLINT", Ok(DataType::Int16), "SMALLINT mapping failed"),
+            ("INT", Ok(DataType::Int32), "INT mapping failed"),
+            ("BIGINT", Ok(DataType::Int64), "BIGINT mapping failed"),
+            ("FLOAT", Ok(DataType::Float32), "FLOAT mapping failed"),
+            ("DOUBLE", Ok(DataType::Float64), "DOUBLE mapping failed"),
+            ("STRING", Ok(DataType::Utf8), "STRING mapping failed"),
+            ("CHAR", Ok(DataType::Utf8), "CHAR mapping failed"),
+            ("VARCHAR", Ok(DataType::Utf8), "VARCHAR mapping failed"),
+            ("BINARY", Ok(DataType::Binary), "BINARY mapping failed"),
+            ("DATE", Ok(DataType::Date32), "DATE mapping failed"),
+            (
+                "TIMESTAMP",
+                Ok(timestamp_type(Some("UTC".into()))),
+                "TIMESTAMP mapping failed",
+            ),
+            (
+                "TIMESTAMP_NTZ",
+                Ok(timestamp_type(None)),
+                "TIMESTAMP_NTZ mapping failed",
+            ),
+            ("VOID", Ok(DataType::Null), "VOID mapping failed"),
+            (
+                "DECIMAL(8,4)",
+                Ok(DataType::Decimal128(8, 4)),
+                "DECIMAL(8,4) mapping failed",
+            ),
+            (
+                "DECIMAL",
+                Ok(DataType::Decimal128(10, 0)),
+                "Plain DECIMAL mapping failed",
+            ),
+            (
+                "DECIMAL(10,2)",
+                Ok(DataType::Decimal128(10, 2)),
+                "DECIMAL(10,2) mapping failed",
+            ),
+            (
+                "decimal(5,0)",
+                Ok(DataType::Decimal128(5, 0)),
+                "Case-insensitive DECIMAL(5,0) mapping failed",
+            ),
+            (
+                "UNKNOWN",
+                Err(Error::UnsupportedType {
+                    ty: "UNKNOWN".to_string(),
+                }),
+                "UNKNOWN type should fail",
+            ),
+            (
+                "DECIMAL(abc)",
+                Err(Error::UnsupportedType {
+                    ty: "DECIMAL(abc)".to_string(),
+                }),
+                "Malformed DECIMAL should fail",
+            ),
+            (
+                "DECIMAL(8,)",
+                Err(Error::UnsupportedType {
+                    ty: "DECIMAL(8,)".to_string(),
+                }),
+                "Incomplete DECIMAL parameters should fail",
+            ),
+        ];
+
+        for (input, expected, error_msg) in test_cases {
+            let result = map_databricks_type(input);
+            match (result, expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, *want, "{error_msg}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("{error_msg}"),
+            }
+        }
     }
 }
