@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     Runtime,
-    datafusion::DataFusion,
+    datafusion::request_context_extension::get_current_datafusion,
     http::v1::{ResponseMetadata, ResponseMimeType, run_sql, to_http_response},
     model::LLMModelStore,
     request::{AsyncMarker, RequestContext},
@@ -243,7 +243,6 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
 ))]
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
-    Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     accept: Option<TypedHeader<Accept>>,
@@ -251,6 +250,8 @@ pub(crate) async fn post(
 ) -> Response {
     // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     crate::model::add_tools_used(&context, 1);
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
