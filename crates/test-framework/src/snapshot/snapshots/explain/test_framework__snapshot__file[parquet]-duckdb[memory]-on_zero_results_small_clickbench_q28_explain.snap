@@ -6,7 +6,7 @@ description: "Query: clickbench_q28"
 | plan_type     | plan                                                                                                                                    |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: l DESC NULLS FIRST, fetch=25                                                                                                      |
-|               |   Projection: hits.CounterID, avg(character_length(hits.URL)) AS l, count(Int64(1)) AS count(*) AS c                                    |
+|               |   Projection: hits.CounterID, avg(character_length(hits.URL)) AS l, count(Int64(1)) AS c                                                |
 |               |     Filter: count(Int64(1)) > Int64(100000)                                                                                             |
 |               |       Aggregate: groupBy=[[hits.CounterID]], aggr=[[avg(CAST(character_length(CAST(hits.URL AS Utf8)) AS Float64)), count(Int64(1))]]   |
 |               |         BytesProcessedNode                                                                                                              |
