@@ -9,7 +9,7 @@ description: "Query: tpcds_q90"
 |               |   Projection: CAST(at.amc AS Decimal128(15, 4)) / CAST(pt.pmc AS Decimal128(15, 4)) AS am_pm_ratio                                                                           |
 |               |     Cross Join:                                                                                                                                                              |
 |               |       SubqueryAlias: at                                                                                                                                                      |
-|               |         Projection: count(Int64(1)) AS count(*) AS amc                                                                                                                       |
+|               |         Projection: count(Int64(1)) AS amc                                                                                                                                   |
 |               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                  |
 |               |             Projection:                                                                                                                                                      |
 |               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                 |
@@ -32,7 +32,7 @@ description: "Query: tpcds_q90"
 |               |                     Filter: web_page.wp_char_count >= Int32(2500) AND web_page.wp_char_count <= Int32(5200)                                                                  |
 |               |                       TableScan: web_page projection=[wp_web_page_sk, wp_char_count]                                                                                         |
 |               |       SubqueryAlias: pt                                                                                                                                                      |
-|               |         Projection: count(Int64(1)) AS count(*) AS pmc                                                                                                                       |
+|               |         Projection: count(Int64(1)) AS pmc                                                                                                                                   |
 |               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                  |
 |               |             Projection:                                                                                                                                                      |
 |               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                 |
