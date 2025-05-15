@@ -44,11 +44,11 @@ pub(super) enum PlanOrCached {
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: QueryResultsCacheStatus,
-    pub(super) raw_cache_key: Option<RawCacheKey>,
+    pub(super) raw_cache_key: RawCacheKey,
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: Option<RawCacheKey>) -> Self {
+    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: RawCacheKey) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -147,7 +147,7 @@ impl Query {
         Ok(PlanOrCached::Plan(
             plan,
             tracker,
-            RequestCacheManager::new(cache_status, Some(raw_cache_key)),
+            RequestCacheManager::new(cache_status, raw_cache_key),
         ))
     }
 
@@ -276,12 +276,8 @@ mod tests {
         let cache_status = QueryResultsCacheStatus::CacheHit;
         let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
 
-        let manager = RequestCacheManager::new(cache_status, Some(raw_cache_key));
+        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
-
-        let disabled_manager =
-            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, None);
-        assert!(!disabled_manager.should_cache_results());
     }
 
     #[tokio::test]
