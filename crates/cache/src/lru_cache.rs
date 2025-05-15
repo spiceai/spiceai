@@ -68,10 +68,10 @@ impl LruCache {
 impl QueryResultCache for LruCache {
     async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>> {
         let raw_key = key.as_raw_key();
-        self.get_raw_key(raw_key).await
+        self.get_raw_key(&raw_key).await
     }
 
-    async fn get_raw_key(&self, raw_key: RawCacheKey) -> Result<Option<CachedQueryResult>> {
+    async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
         match self.cache.get(&raw_key.0).await {
             Some(value) => Ok(Some(value)),
             None => Ok(None),
@@ -83,7 +83,7 @@ impl QueryResultCache for LruCache {
         Ok(())
     }
 
-    async fn put_raw_key(&self, raw_key: RawCacheKey, result: CachedQueryResult) -> Result<()> {
+    async fn put_raw_key(&self, raw_key: &RawCacheKey, result: CachedQueryResult) -> Result<()> {
         self.cache.insert(raw_key.0, result).await;
         Ok(())
     }
@@ -181,7 +181,7 @@ mod tests {
 
         // Put a value with a raw key
         cache
-            .put_raw_key(raw_key, result.clone())
+            .put_raw_key(&raw_key, result.clone())
             .await
             .expect("Failed to put with raw key");
 

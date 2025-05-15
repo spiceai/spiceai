@@ -63,7 +63,7 @@ pub fn to_cached_record_batch_stream(
                 input_tables,
             };
 
-            if let Err(e) = cache_provider.put_raw_key(raw_cache_key, cached_result).await {
+            if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
                 tracing::error!("Failed to cache query results: {e}");
             }
         }

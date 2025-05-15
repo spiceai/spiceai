@@ -43,7 +43,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::{CacheKey, QueryResultsCacheProvider, RawCacheKey};
+use cache::{QueryResultsCacheProvider, RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -261,15 +261,13 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
-type SqlHash = RawCacheKey;
-
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
-    cached_plans: Cache<SqlHash, LogicalPlan>,
+    cached_plans: Cache<u64, LogicalPlan>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
@@ -1492,11 +1490,10 @@ impl DataFusion {
     async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
+        key: &RawCacheKey,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let key = CacheKey::Query(sql, None).as_raw_key();
-
-        if let Some(plan) = self.cached_plans.get(&key).await {
+        if let Some(plan) = self.cached_plans.get(&key.as_u64()).await {
             tracing::trace!("using cached plan for {sql}");
             return Ok(plan);
         }
@@ -1504,7 +1501,7 @@ impl DataFusion {
         let plan = session.create_logical_plan(sql).await?;
 
         tracing::trace!("caching plan for {sql}");
-        self.cached_plans.insert(key, plan.clone()).await;
+        self.cached_plans.insert(key.as_u64(), plan.clone()).await;
 
         Ok(plan)
     }
@@ -1583,6 +1580,8 @@ async fn wait_until_dependent_tables_are_ready(
 
 #[cfg(test)]
 mod tests {
+    use cache::CacheKey;
+
     use crate::builder::RuntimeBuilder;
 
     use super::*;
@@ -1590,6 +1589,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {
         static SQL: &str = "SELECT 1";
+        let raw_cache_key = CacheKey::Query(SQL, None).as_raw_key();
 
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
@@ -1602,7 +1602,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, SQL)
+        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
             .await
             .expect("logical plan");
 
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(df.cached_plans.entry_count(), 1);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, SQL)
+        df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
             .await
             .expect("logical plan");
 
