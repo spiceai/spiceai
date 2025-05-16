@@ -213,13 +213,15 @@ impl fmt::Debug for DatabricksU2MTokenProvider {
 }
 
 impl TokenProvider for DatabricksU2MTokenProvider {
-    #![allow(deprecated)]
     /// Retrieves the corresponding access token from the current request context by matching the `client_id`.
     /// If no token is found, it returns an empty string, and the dependent component is expected to handle this as an error.
     ///
-    /// `get_token` is synchronous but should be called in an async context, so it is safe to use `RequestContext::current_sync`
+    /// # Safety
+    /// This function uses `RequestContext::current_sync()`, which is marked unsafe because it accesses thread-local or global state
+    /// that may not be valid outside of a request context. In this usage, we are always calling `get_token` from within a valid
+    /// async request context, so it is safe to call this function here.
     fn get_token(&self) -> String {
-        let context = RequestContext::current_sync();
+        let context = unsafe { RequestContext::current_sync() };
         if let Some(extension) = context.extension::<DatabricksAuthExtension>() {
             if let Some(token) = extension.get_token(&self.client_id) {
                 tracing::debug!(

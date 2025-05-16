@@ -99,19 +99,16 @@ impl RequestContext {
             .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
     }
 
-    /// **DEPRECATED: Use `RequestContext::current`.**
+    /// **UNSAFE: Use `RequestContext::current` instead.**
     ///
     /// Returns the current request context, or an internal context if this is called outside of a request.
     ///
-    /// # Warning
-    /// This method is deprecated and should not be used. It allows access to the request context from synchronous code,
-    /// which can easily lead to subtle bugs.
+    /// # Safety
+    /// This method is unsafe and should not be used in most cases. It allows access to the request context from synchronous code,
+    /// which can easily lead to subtle bugs and undefined behavior if the context is not actually present.
     /// Always prefer using [`RequestContext::current`] with an [`AsyncMarker`] in async code to ensure correct context handling.
-    #[deprecated(
-        note = "Use `RequestContext::current(AsyncMarker::new().await)` instead. Calling this from sync code can lead to subtle context bugs."
-    )]
     #[must_use]
-    pub fn current_sync() -> Arc<Self> {
+    pub unsafe fn current_sync() -> Arc<Self> {
         REQUEST_CONTEXT
             .try_with(Arc::clone)
             .ok()
