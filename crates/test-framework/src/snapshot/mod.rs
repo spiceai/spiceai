@@ -58,6 +58,7 @@ pub async fn record_explain_plan(
         filters => vec![
             (path_filter_pattern.as_str(), "/data"),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
+            (r"Execution error: Placeholder '\$[0-9]+' was not provided a value for execution\.", "Execution error: Placeholder 'X' was not provided a value for execution."),
         ],
     }, {
         let result = panic::catch_unwind(|| {
