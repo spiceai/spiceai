@@ -213,6 +213,7 @@ impl fmt::Debug for DatabricksU2MTokenProvider {
 }
 
 impl TokenProvider for DatabricksU2MTokenProvider {
+    #![allow(deprecated)]
     /// Retrieves the corresponding access token from the current request context by matching the `client_id`.
     /// If no token is found, it returns an empty string, and the dependent component is expected to handle this as an error.
     ///
