@@ -64,6 +64,7 @@ pub struct DataFusionBuilder {
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    task_history_enabled: bool,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -115,7 +116,14 @@ impl DataFusionBuilder {
             memory_limit: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
+            task_history_enabled: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_task_history(mut self, task_history: bool) -> Self {
+        self.task_history_enabled = task_history;
+        self
     }
 
     #[must_use]
@@ -226,6 +234,7 @@ impl DataFusionBuilder {
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            task_history_enabled: self.task_history_enabled,
         }
     }
 }

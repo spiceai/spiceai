@@ -90,13 +90,13 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: Arc<str>,
     parameters: Option<ParamValues>,
-    tracker: QueryTracker,
+    tracker: Option<QueryTracker>,
 }
 
 macro_rules! handle_error {
     ($self:expr, $request_context:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self.finish_with_error($request_context, snafu_error.to_string(), $error_code);
+        $self.map(|t| t.finish_with_error($request_context, snafu_error.to_string(), $error_code));
         return Err(snafu_error);
     }};
 }
@@ -171,13 +171,20 @@ impl Query {
                 }
             }
             if is_accelerated {
-                tracker.is_accelerated = Some(true);
+                tracker = tracker.map(|mut t| {
+                    t.is_accelerated = Some(true);
+                    t
+                });
             }
 
-            tracker = tracker.datasets(Arc::new(input_tables));
+            let datasets = Arc::new(input_tables);
+            tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
 
             // Start the timer for the query execution
-            tracker.query_execution_duration_timer = Instant::now();
+            tracker = tracker.map(|mut t| {
+                t.query_execution_duration_timer = Instant::now();
+                t
+            });
 
             let df = DataFrame::new(session, plan);
 
@@ -215,7 +222,7 @@ impl Query {
                     &ctx.df,
                     res_stream,
                     cache_manager.raw_cache_key,
-                    Arc::clone(&tracker.datasets),
+                    datasets,
                 )
             } else {
                 res_stream
@@ -249,8 +256,9 @@ impl Query {
         error_message: String,
         error_code: ErrorCode,
     ) {
-        self.tracker
-            .finish_with_error(request_context, error_message, error_code);
+        if let Some(t) = self.tracker {
+            t.finish_with_error(request_context, error_message, error_code);
+        }
     }
 
     /// Return the schema for the data and (possibly) the parameters of a [`Query`].
@@ -327,9 +335,13 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
 fn attach_query_tracker_to_stream(
     span: Span,
     request_context: Arc<RequestContext>,
-    tracker: QueryTracker,
+    tracker: Option<QueryTracker>,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
+    let Some(tracker) = tracker else {
+        return stream;
+    };
+
     let schema = stream.schema();
     let schema_copy = Arc::clone(&schema);
 
