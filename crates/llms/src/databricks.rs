@@ -100,7 +100,6 @@ impl Chat for Databricks {
     }
 
     fn needs_health_check(&self) -> bool {
-        tracing::info!("needs_health_check, {:?}", self.needs_health_check);
         self.needs_health_check
     }
 
