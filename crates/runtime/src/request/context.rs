@@ -93,6 +93,14 @@ impl RequestContext {
     /// ```
     #[must_use]
     pub fn current(_marker: AsyncMarker) -> Arc<Self> {
+        RequestContext::current_sync()
+    }
+
+    /// Returns the current request context, or an internal context if this is called outside of a request.
+    ///
+    /// Method can be called from synchronous code, but inside a request context.
+    #[must_use]
+    pub fn current_sync() -> Arc<Self> {
         REQUEST_CONTEXT
             .try_with(Arc::clone)
             .ok()
