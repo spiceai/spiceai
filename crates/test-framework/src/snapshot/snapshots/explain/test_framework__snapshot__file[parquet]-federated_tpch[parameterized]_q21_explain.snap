@@ -34,5 +34,5 @@ description: "Query: tpch[parameterized]_q21"
 |                     |             SubqueryAlias: l3                                                                                                                     |
 |                     |               BytesProcessedNode                                                                                                                  |
 |                     |                 TableScan: lineitem projection=[l_orderkey, l_suppkey], full_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]             |
-| physical_plan_error | Execution error: Placeholder '$2' was not provided a value for execution.                                                                         |
+| physical_plan_error | Execution error: Placeholder 'X' was not provided a value for execution.                                                                         |
 +---------------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

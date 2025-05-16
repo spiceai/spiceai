@@ -32,5 +32,5 @@ description: "Query: tpch[parameterized]_q11"
 |                     |                       TableScan: supplier projection=[s_suppkey, s_nationkey]                                                                                                                |
 |                     |                 BytesProcessedNode                                                                                                                                                           |
 |                     |                   TableScan: nation projection=[n_nationkey], full_filters=[nation.n_name = $2]                                                                                              |
-| physical_plan_error | Execution error: Placeholder '$2' was not provided a value for execution.                                                                                                                    |
+| physical_plan_error | Execution error: Placeholder 'X' was not provided a value for execution.                                                                                                                    |
 +---------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
