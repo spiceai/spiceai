@@ -187,7 +187,6 @@ impl SpiceTestQueryWorker {
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
 
-                        println!("Worker {} - Query '{}' - Pre-run", self.id, query.name);
                         let (connection_succeed, _) = self
                             .run_single_query(
                                 query,
