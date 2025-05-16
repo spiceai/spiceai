@@ -20,8 +20,11 @@ use arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    datasource::TableProvider,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
+    sql::{TableReference, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -452,7 +455,6 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
-        let sql = sql.replace('\"', "");
         let token = self.api.token_provider.get_token();
         let payload = json!({
             "warehouse_id": self.api.sql_warehouse_id,
@@ -481,6 +483,12 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 }
 
+fn databricks_dialect() -> dialect::CustomDialect {
+    dialect::CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build()
+}
+
 #[async_trait]
 impl crate::Read for DatabricksSqlWarehouse {
     async fn table_provider(
@@ -488,18 +496,18 @@ impl crate::Read for DatabricksSqlWarehouse {
         table_reference: TableReference,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let dialect = Arc::new(databricks_dialect());
+
         let table_provider = match schema {
-            Some(schema) => Arc::new(SqlTable::new_with_schema(
-                "databricks",
-                &self.pool,
-                schema,
-                table_reference,
-                None,
-            )),
+            Some(schema) => Arc::new(
+                SqlTable::new_with_schema("databricks", &self.pool, schema, table_reference, None)
+                    .with_dialect(dialect),
+            ),
             None => Arc::new(
                 SqlTable::new("databricks", &self.pool, table_reference, None)
                     .await
-                    .context(SqlTableInitializationFailedSnafu)?,
+                    .context(SqlTableInitializationFailedSnafu)?
+                    .with_dialect(dialect),
             ),
         };
 
