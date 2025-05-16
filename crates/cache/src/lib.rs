@@ -27,14 +27,19 @@ use std::time::UNIX_EPOCH;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::common::ParamValues;
+use datafusion::error::DataFusionError;
+use datafusion::execution::RecordBatchStream;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
+use futures::Stream;
+use futures::task::{Context, Poll};
 use lru_cache::LruCache;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
@@ -148,9 +153,59 @@ impl QueryResult {
 
 #[derive(Clone)]
 pub struct CachedQueryResult {
-    pub records: Arc<Vec<RecordBatch>>,
+    pub records: Vec<RecordBatch>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
+}
+
+pub struct CachedStream {
+    /// Vector of record batches
+    /// There is little point using a Vec<Option<RecordBatch>> here, as iterating the vec to collect them as options
+    /// lets us use `.take()` to remove and replace the options - but it is just as slow as cloning the whole vec in practice.
+    data: Vec<RecordBatch>,
+    /// Schema representing the data
+    schema: SchemaRef,
+    index: usize,
+}
+
+impl CachedStream {
+    #[must_use]
+    pub fn try_new(data: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+        Self {
+            data,
+            schema,
+            index: 0,
+        }
+    }
+}
+
+impl Stream for CachedStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(if self.index < self.data.len() {
+            self.index += 1;
+            // `.remove()` reorders the vec, but in practice this is faster than using `.take()` on the vec or otherwise cloning the vec.
+            // `VecDeque.pop_front()` is about the same speed, but changing the type probably isn't worth it.
+            Some(Ok(self.data.remove(0)))
+        } else {
+            None
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.data.len(), Some(self.data.len()))
+    }
+}
+
+impl RecordBatchStream for CachedStream {
+    /// Get the schema
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 #[async_trait]

@@ -16,12 +16,13 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use cache::{CacheKey, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream};
+use cache::{
+    CacheKey, CachedStream, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream,
+};
 use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
-    physical_plan::memory::MemoryStream,
     sql::TableReference,
 };
 use snafu::ResultExt;
@@ -199,11 +200,7 @@ impl Query {
             .results_cache_hit(true);
 
         let record_batch_stream =
-            match MemoryStream::try_new(cached_result.records.to_vec(), cached_result.schema, None)
-            {
-                Ok(stream) => stream,
-                Err(e) => return Err(super::Error::UnableToCreateMemoryStream { source: e }),
-            };
+            CachedStream::try_new(cached_result.records, cached_result.schema);
 
         Ok((
             CacheResult::Hit(QueryResult::new(
