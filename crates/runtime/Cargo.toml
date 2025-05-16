@@ -26,7 +26,7 @@ aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true
-axum-extra = { version = "0.9.6", features = ["typed-header"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
@@ -79,9 +79,6 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos = "0.15.0"
-mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-core", optional = true }
-mcp-server = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-server", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -111,6 +108,15 @@ prost = { version = "0.13.1", default-features = false, features = [
 rand = "0.9.1"
 regex.workspace = true
 reqwest.workspace = true
+rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "63ffdaea73ccce4c12f5eb88d1d4e146fa8a8387", optional = true, features = [
+    "client",
+    "server",
+    "transport-sse-server",
+    "transport-io",
+    "transport-sse",
+    "transport-child-process",
+    "transport-streamable-http-server",
+] }
 runtime-auth = { path = "../runtime-auth" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
@@ -146,7 +152,9 @@ tract-core = "0.21.10"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = ">=8.1.1", features = [
+    "axum",
+], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
@@ -154,8 +162,8 @@ x509-certificate.workspace = true
 
 [dev-dependencies]
 anyhow = "1.0.86"
-async-graphql = "7.0.5"
-async-graphql-axum = "=7.0.13"
+async-graphql = "7.0.16"
+async-graphql-axum = "7.0.16"
 azure_core = "0.22.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
@@ -201,7 +209,7 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
-mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server", "tools/mcp"]
+mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]

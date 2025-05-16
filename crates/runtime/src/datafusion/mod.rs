@@ -273,6 +273,7 @@ pub struct DataFusion {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
+    pub(crate) task_history_enabled: bool,
 }
 
 impl std::fmt::Debug for DataFusion {

@@ -16,14 +16,17 @@ limitations under the License.
 
 use crate::Runtime;
 use futures::StreamExt;
-use mcp_core::{
-    Content, ToolError,
-    handler::{PromptError, ResourceError},
-    protocol::{ServerCapabilities, ToolsCapability},
+
+use rmcp::{
+    Error as McpError, RoleServer, ServerHandler,
+    model::{
+        CallToolRequestMethod, CallToolRequestParam, CallToolResult, Content, ListToolsResult,
+        PaginatedRequestParam,
+    },
+    service::RequestContext,
 };
-use mcp_server;
-use serde_json::json;
-use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
+use serde_json::{Map, Value, json};
+use std::{borrow::Cow, future::Future, ops::Deref, sync::Arc};
 
 #[derive(Clone)]
 pub struct RuntimeServer(Arc<Runtime>);
@@ -41,60 +44,19 @@ impl From<&Arc<Runtime>> for RuntimeServer {
     }
 }
 
-impl mcp_server::Router for RuntimeServer {
-    fn name(&self) -> String {
-        "Spiced".to_string()
-    }
-
-    fn instructions(&self) -> String {
-        "Instructions for Spiced".to_string()
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities {
-            prompts: None,
-            resources: None,
-            tools: Some(ToolsCapability {
-                list_changed: Some(false),
-            }),
-        }
-    }
-
-    fn list_tools(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::tool::Tool>, ToolError>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let result = self
-                .list_all_tools()
-                .map(|t| mcp_core::tool::Tool {
-                    name: t.name().to_string(),
-                    description: t.description().map(|d| d.to_string()).unwrap_or_default(),
-                    // For null inputs, we default to an empty object.
-                    input_schema: t.parameters().unwrap_or(json!({
-                        "$schema": "http://json-schema.org/draft-07/schema#",
-                        "title": "empty",
-                        "type": "object",
-                        "required": [],
-                        "properties": {}
-                        }
-                    )),
-                })
-                .collect::<Vec<_>>()
-                .await;
-            Ok(result)
-        })
-    }
-
+impl ServerHandler for RuntimeServer {
     fn call_tool(
         &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send + '_>> {
-        let tool_name = tool_name.to_string();
+        request: CallToolRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let CallToolRequestParam {
+            name: tool_name,
+            arguments,
+        } = request;
         Box::pin(async move {
-            let Some(tool) = self.get_tool(tool_name.as_str()).await else {
-                return Err(ToolError::NotFound(format!("Tool {tool_name} not found")));
+            let Some(tool) = self.get_tool(tool_name.to_string().as_str()).await else {
+                return Err(McpError::method_not_found::<CallToolRequestMethod>());
             };
 
             // If possible, we pass the call through to the MCP server.
@@ -103,81 +65,66 @@ impl mcp_server::Router for RuntimeServer {
                 return mcp_proxy
                     .call_tool(arguments)
                     .await
-                    .map(|r| r.content)
-                    .map_err(|e| ToolError::ExecutionError(e.to_string()));
+                    .map_err(|e| McpError::internal_error(e.to_string(), None));
             }
 
             let args = serde_json::to_string(&arguments)
-                .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
             let result = tool
                 .call(args.as_str())
                 .await
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
             let text = serde_json::to_string(&result)
-                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-            Ok(vec![Content::Text(mcp_core::TextContent {
-                text,
-                annotations: None,
-            })])
+            Ok(CallToolResult {
+                content: vec![Content::text(text)],
+                is_error: Some(false),
+            })
         })
     }
 
-    fn list_resources(
+    fn list_tools(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::Resource>, ToolError>> + Send + '_>> {
-        Box::pin(async move { Ok(vec![]) })
-    }
-
-    fn read_resource(
-        &self,
-        uri: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send + '_>> {
-        let uri = uri.to_string();
-        Box::pin(async move { Err(ResourceError::NotFound(uri)) })
-    }
-
-    fn list_prompts(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::prompt::Prompt>, ToolError>> + Send + '_>>
-    {
-        Box::pin(async move { Ok(vec![]) })
-    }
-
-    fn get_prompt(
-        &self,
-        prompt_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, PromptError>> + Send + '_>> {
-        let prompt_name = prompt_name.to_string();
-        Box::pin(async move { Err(PromptError::NotFound(prompt_name)) })
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        Box::pin(async move {
+            let tools = self
+                .list_all_tools()
+                .map(|t| rmcp::model::Tool {
+                    name: t.name().into_owned().into(),
+                    description: t
+                        .description()
+                        .as_deref()
+                        .map(|s| Cow::Owned(s.to_string())),
+                    // For null inputs, we default to an empty object.
+                    input_schema: to_map(t.parameters().unwrap_or(json!({
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "title": "empty",
+                        "type": "object",
+                        "required": [],
+                        "properties": {}
+                        }
+                    )))
+                    .into(),
+                    annotations: None,
+                })
+                .collect::<Vec<_>>()
+                .await;
+            Ok(ListToolsResult {
+                tools,
+                next_cursor: None,
+            })
+        })
     }
 }
 
-pub(crate) mod codec {
-    use tokio_util::codec::Decoder;
-
-    #[derive(Default)]
-    pub struct JsonRpcFrameCodec;
-    impl Decoder for JsonRpcFrameCodec {
-        type Item = tokio_util::bytes::Bytes;
-        type Error = tokio::io::Error;
-        fn decode(
-            &mut self,
-            src: &mut tokio_util::bytes::BytesMut,
-        ) -> Result<Option<Self::Item>, Self::Error> {
-            if let Some(end) = src
-                .iter()
-                .enumerate()
-                .find_map(|(idx, &b)| (b == b'\n').then_some(idx))
-            {
-                let line = src.split_to(end);
-                let _char_next_line = src.split_to(1);
-                Ok(Some(line.freeze()))
-            } else {
-                Ok(None)
-            }
-        }
-    }
+fn to_map(v: Value) -> Map<String, Value> {
+    let Value::Object(m) = v else {
+        return Map::default();
+    };
+    m
 }

@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use mcp_core::protocol::CallToolResult;
-use serde_json::Value;
+use rmcp::{
+    ServiceError,
+    model::{CallToolResult, JsonObject},
+};
 
 /// [`McpProxy`] is the minimal interface from [`mcp_client::McpClientTrait`] for tools that are fundamentally proxies around MCP tools.
 ///
@@ -24,6 +26,8 @@ use serde_json::Value;
 ///
 #[async_trait]
 pub trait McpProxy: Send + Sync {
-    /// Unlike [`mcp_client::McpClientTrait`], the implementation should track the appropriate underlying tool name.
-    async fn call_tool(&self, arguments: Value) -> Result<CallToolResult, mcp_client::Error>;
+    async fn call_tool(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, ServiceError>;
 }

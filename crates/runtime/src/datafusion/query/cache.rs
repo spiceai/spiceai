@@ -38,7 +38,7 @@ use super::{
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
-    Plan(LogicalPlan, QueryTracker, RequestCacheManager),
+    Plan(LogicalPlan, Option<QueryTracker>, RequestCacheManager),
     Cached(QueryResult),
 }
 
@@ -62,8 +62,8 @@ impl RequestCacheManager {
 
 enum CacheResult {
     Hit(QueryResult),
-    MissOrSkipped(QueryTracker, QueryResultsCacheStatus),
-    WrongCacheKeyType(QueryTracker),
+    MissOrSkipped(Option<QueryTracker>, QueryResultsCacheStatus),
+    WrongCacheKeyType(Option<QueryTracker>),
 }
 
 impl Query {
@@ -74,7 +74,7 @@ impl Query {
         request_context: Arc<RequestContext>,
         sql: &str,
         parameters: Option<ParamValues>,
-        tracker: QueryTracker,
+        tracker: Option<QueryTracker>,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
         let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
@@ -106,7 +106,9 @@ impl Query {
                 let e = find_datafusion_root(e);
                 let error_code = ErrorCode::from(&e);
                 let snafu_error = super::Error::UnableToExecuteQuery { source: e };
-                tracker.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                if let Some(t) = tracker {
+                    t.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                }
                 return Err(snafu_error);
             }
         };
@@ -142,7 +144,7 @@ impl Query {
         let raw_cache_key = plan_cache_key.unwrap_or(sql_raw_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
-        tracker = tracker.results_cache_hit(false);
+        tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
             plan,
@@ -154,7 +156,7 @@ impl Query {
     async fn try_get_cached_result(
         df: &DataFusion,
         request_context: Arc<RequestContext>,
-        mut tracker: QueryTracker,
+        mut tracker: Option<QueryTracker>,
         key: &CacheKey<'_>,
     ) -> super::Result<(CacheResult, Option<RawCacheKey>)> {
         let Some(cache_provider) = df.cache_provider() else {
@@ -194,9 +196,10 @@ impl Query {
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };
 
-        tracker = tracker
-            .datasets(cached_result.input_tables)
-            .results_cache_hit(true);
+        tracker = tracker.map(|t| {
+            t.datasets(cached_result.input_tables)
+                .results_cache_hit(true)
+        });
 
         let record_batch_stream =
             match MemoryStream::try_new(cached_result.records.to_vec(), cached_result.schema, None)

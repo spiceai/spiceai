@@ -56,11 +56,8 @@ impl<'a> QueryBuilder<'a> {
     #[must_use]
     pub fn build(self) -> Query {
         let sql: Arc<str> = self.sql.into();
-        Query {
-            df: Arc::clone(&self.df),
-            sql: Arc::clone(&sql),
-            parameters: self.parameters,
-            tracker: QueryTracker {
+        let tracker = if self.df.task_history_enabled {
+            Some(QueryTracker {
                 schema: None,
                 query_duration_secs: None,
                 query_execution_duration_secs: None,
@@ -72,7 +69,16 @@ impl<'a> QueryBuilder<'a> {
                 query_duration_timer: Instant::now(),
                 query_execution_duration_timer: Instant::now(),
                 datasets: Arc::new(HashSet::default()),
-            },
+            })
+        } else {
+            None
+        };
+
+        Query {
+            df: Arc::clone(&self.df),
+            sql: Arc::clone(&sql),
+            parameters: self.parameters,
+            tracker,
         }
     }
 }
