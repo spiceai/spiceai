@@ -17,7 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::hash::DefaultHasher;
+use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -28,7 +28,6 @@ use std::time::UNIX_EPOCH;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
@@ -41,13 +40,18 @@ use fundu::ParseError;
 use futures::Stream;
 use futures::task::{Context, Poll};
 use lru_cache::LruCache;
+use simple_cache::TableInvalidator;
 use snafu::{ResultExt, Snafu};
+use spicepod::component::runtime::HashingAlgorithm;
 use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
 mod metrics;
+mod simple_cache;
 mod utils;
 
+pub use simple_cache::{CacheProvider, SimpleCache};
+use std::sync::RwLock;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -64,9 +68,48 @@ pub enum Error {
         source: moka::PredicateError,
         table_name: Arc<str>,
     },
+
+    #[snafu(display(
+        "Cache invalidation failed with error: {source}.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug)]
+pub enum CacheType {
+    Results,
+    Plans,
+}
+
+#[derive(Default)]
+pub struct Caching {
+    pub results: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+    pub plans: RwLock<Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>>,
+}
+
+impl Caching {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_results_cache(mut self, results: Arc<QueryResultsCacheProvider>) -> Self {
+        self.results = RwLock::new(Some(results));
+        self
+    }
+
+    #[must_use]
+    pub fn with_plans_cache(
+        mut self,
+        plans: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+    ) -> Self {
+        self.plans = RwLock::new(Some(plans));
+        self
+    }
+}
 
 pub struct QueryResult {
     pub data: SendableRecordBatchStream,
@@ -101,8 +144,7 @@ pub enum CacheKey<'a> {
 
 impl CacheKey<'_> {
     #[must_use]
-    pub fn as_raw_key(&self) -> RawCacheKey {
-        let mut hasher = DefaultHasher::new();
+    pub fn as_raw_key<T: Hasher + Send + Sync>(&self, mut hasher: T) -> RawCacheKey {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
             Self::Query(sql, param_values) => {
@@ -206,17 +248,13 @@ impl RecordBatchStream for CachedStream {
     }
 }
 
-#[async_trait]
-pub trait QueryResultCache {
-    async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>>;
-    async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>>;
-    async fn put<'a>(&self, key: CacheKey<'a>, result: CachedQueryResult) -> Result<()>;
-    async fn put_raw_key(&self, raw_key: &RawCacheKey, result: CachedQueryResult) -> Result<()>;
-    async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()>;
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
+trait QueryResultCache: CacheProvider<CachedQueryResult> + TableInvalidator {}
+impl<T: BuildHasher + Clone + Send + Sync + 'static> QueryResultCache
+    for LruCache<CachedQueryResult, T>
+{
 }
 
+// TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
     cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
@@ -258,7 +296,20 @@ impl QueryResultsCacheProvider {
         };
 
         let cache_provider = QueryResultsCacheProvider {
-            cache: Arc::new(LruCache::new(cache_max_size, ttl)),
+            cache: match config.hashing_algorithm {
+                HashingAlgorithm::Ahash => Arc::new(LruCache::new(
+                    cache_max_size,
+                    ttl,
+                    ahash::RandomState::default(),
+                    config.hashing_algorithm,
+                )),
+                HashingAlgorithm::Siphash => Arc::new(LruCache::new(
+                    cache_max_size,
+                    ttl,
+                    std::hash::RandomState::default(),
+                    config.hashing_algorithm,
+                )),
+            },
             cache_max_size,
             ttl,
             metrics_reported_last_time: AtomicU64::new(0),
@@ -274,7 +325,7 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
-        let raw_key = key.as_raw_key();
+        let raw_key = key.as_raw_key(self.cache.hasher());
         self.get_raw_key(&raw_key).await
     }
 
@@ -283,13 +334,12 @@ impl QueryResultsCacheProvider {
     /// Will return `Err` if method fails to access the cache
     pub async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
         metrics::REQUESTS.add(1, &[]);
-        match self.cache.get_raw_key(raw_key).await {
-            Ok(Some(cached_result)) => {
+        match self.cache.get_raw_key(&raw_key.as_u64()).await {
+            Some(cached_result) => {
                 metrics::HITS.add(1, &[]);
                 Ok(Some(cached_result))
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
@@ -297,9 +347,8 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn put(&self, key: CacheKey<'_>, result: CachedQueryResult) -> Result<()> {
-        let res = self.cache.put(key, result).await;
-        self.report_size_metrics();
-        res
+        let raw_key = key.as_raw_key(self.cache.hasher());
+        self.put_raw_key(&raw_key, result).await
     }
 
     /// # Errors
@@ -310,9 +359,9 @@ impl QueryResultsCacheProvider {
         raw_key: &RawCacheKey,
         result: CachedQueryResult,
     ) -> Result<()> {
-        let res = self.cache.put_raw_key(raw_key, result).await;
+        let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
         self.report_size_metrics();
-        res
+        Ok(res)
     }
 
     fn report_size_metrics(&self) {
@@ -329,13 +378,18 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        self.cache.invalidate_for_table(table_name).await
+    pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
+        self.cache.invalidate_for_table(table_name)
     }
 
     #[must_use]
     pub fn max_size(&self) -> u64 {
         self.cache_max_size
+    }
+
+    #[must_use]
+    pub fn hasher(&self) -> Box<dyn Hasher + Send + Sync> {
+        self.cache.hasher()
     }
 
     #[must_use]

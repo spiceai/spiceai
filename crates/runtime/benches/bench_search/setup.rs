@@ -32,7 +32,7 @@ use spicepod::{
     component::{
         dataset::{Dataset, Mode, replication::Replication},
         embeddings::{EmbeddingChunkConfig, Embeddings},
-        runtime::{CacheKeyType, ResultsCache},
+        runtime::{CacheKeyType, HashingAlgorithm, ResultsCache},
     },
 };
 
@@ -246,6 +246,7 @@ async fn build_bench_app(
             item_ttl: None,
             eviction_policy: None,
             cache_key_type: CacheKeyType::default(),
+            hashing_algorithm: HashingAlgorithm::default(),
         })
         .with_embedding(create_embeddings_model(embeddings_model));
 
