@@ -434,6 +434,10 @@ impl Chat for ToolUsingChat {
         self.inner_chat.as_sql()
     }
 
+    fn needs_health_check(&self) -> bool {
+        self.inner_chat.needs_health_check()
+    }
+
     /// Override health endpoint to 1. avoid passing tools in request, 2. pre-calling `list_datasets` in [`ToolUsingChat::prepare_req`].
     async fn health(&self) -> ChatResult<()> {
         self.inner_chat.health().await
