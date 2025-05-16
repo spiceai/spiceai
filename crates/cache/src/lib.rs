@@ -162,7 +162,7 @@ pub struct CachedStream {
     /// Vector of record batches
     /// There is little point using a Vec<Option<RecordBatch>> here, as iterating the vec to collect them as options
     /// lets us use `.take()` to remove and replace the options - but it is just as slow as cloning the whole vec in practice.
-    data: Vec<RecordBatch>,
+    data: Vec<Option<RecordBatch>>,
     /// Schema representing the data
     schema: SchemaRef,
     index: usize,
@@ -172,7 +172,7 @@ impl CachedStream {
     #[must_use]
     pub fn try_new(data: Vec<RecordBatch>, schema: SchemaRef) -> Self {
         Self {
-            data,
+            data: data.into_iter().map(Some).collect(),
             schema,
             index: 0,
         }
@@ -187,10 +187,11 @@ impl Stream for CachedStream {
         _: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         Poll::Ready(if self.index < self.data.len() {
+            let index = self.index;
+            let batch = self.data[index].take(); // replaces with None, avoiding a Vec reshuffle like .remove()
             self.index += 1;
-            // `.remove()` reorders the vec, but in practice this is faster than using `.take()` on the vec or otherwise cloning the vec.
-            // `VecDeque.pop_front()` is about the same speed, but changing the type probably isn't worth it.
-            Some(Ok(self.data.remove(0)))
+
+            batch.map(Ok)
         } else {
             None
         })

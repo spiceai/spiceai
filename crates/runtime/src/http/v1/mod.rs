@@ -180,6 +180,8 @@ pub async fn sql_to_http_response(
         }
     };
 
+    return (StatusCode::OK, String::new()).into_response();
+
     to_http_response(
         data,
         results_cache_status,
