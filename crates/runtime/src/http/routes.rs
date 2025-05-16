@@ -61,7 +61,6 @@ use axum::{
     routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
-use token_provider::registry::TokenProviderRegistry;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 

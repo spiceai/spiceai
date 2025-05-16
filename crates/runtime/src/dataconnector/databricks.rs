@@ -119,14 +119,9 @@ impl Databricks {
                         )
                         .await?
                     }
-                    AuthCredentials::U2M(client_id, token) => {
-                        Self::get_u2m_token_provider(
-                            endpoint,
-                            client_id,
-                            token,
-                            &token_provider_registry,
-                        )
-                        .await?
+                    AuthCredentials::U2M(client_id) => {
+                        Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
+                            .await?
                     }
                 };
 
@@ -176,7 +171,7 @@ impl Databricks {
 
         match (token, client_id, client_secret) {
             (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
-            (Some(token), Some(client_id), None) => Ok(AuthCredentials::U2M(client_id ,token)),
+            (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
             (None, Some(client_id), Some(client_secret)) => {
                 Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
             }
@@ -186,19 +181,13 @@ impl Databricks {
                 }
                 .fail()
             }
-            (None, Some(_), None) => {
-                MissingParameterSnafu {
-                    parameter: "`databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
             (None, None, Some(_)) => {
                 MissingParameterSnafu {
                     parameter: "databricks_client_id".to_string(),
                 }
                 .fail()
             }
-            (Some(_), Some(_), Some(_)) => {
+            (Some(_), Some(_), Some(_) | None) => {
                 InvalidConfigurationSnafu {
                     message: "Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
                 }
@@ -249,14 +238,10 @@ impl Databricks {
                 .context(UnableToConstructDatabricksSparkSnafu)?
             }
 
-            AuthCredentials::U2M(client_id, token) => {
-                let token_provider = Self::get_u2m_token_provider(
-                    endpoint,
-                    client_id,
-                    token,
-                    &token_provider_registry,
-                )
-                .await?;
+            AuthCredentials::U2M(client_id) => {
+                let token_provider =
+                    Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
+                        .await?;
 
                 DatabricksSparkConnect::from_token_provider(
                     endpoint.to_string(),
@@ -296,7 +281,6 @@ impl Databricks {
     pub async fn get_u2m_token_provider(
         endpoint: &str,
         client_id: &str,
-        token: &SecretString,
         token_provider_registry: &Arc<TokenProviderRegistry>,
     ) -> Result<Arc<dyn TokenProvider>> {
         token_provider_registry
@@ -306,7 +290,6 @@ impl Databricks {
                     Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
-                        token.clone(),
                     ))
                 },
             )
