@@ -111,21 +111,6 @@ impl Databricks {
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
         let auth_credentials = Self::build_auth_credentials(&params)?;
-        let token_provider = match auth_credentials {
-            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
-            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
-                Self::get_m2m_token_provider(
-                    endpoint,
-                    client_id,
-                    client_secret,
-                    &token_provider_registry,
-                )
-                .await?
-            }
-            AuthCredentials::U2M(client_id) => {
-                Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
-            }
-        };
 
         match mode {
             "sql_warehouse" => {
@@ -133,6 +118,10 @@ impl Databricks {
                     .get("sql_warehouse_id")
                     .expose()
                     .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+
+                let token_provider =
+                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
+                        .await?;
 
                 let read_provider =
                     DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider)
@@ -144,6 +133,9 @@ impl Databricks {
             }
             "delta_lake" => {
                 let storage_options = params.to_secret_map();
+                let token_provider =
+                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
+                        .await?;
 
                 let read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
@@ -182,6 +174,28 @@ impl Databricks {
                 value: mode.to_string(),
             }),
         }
+    }
+
+    pub async fn get_token_provider(
+        endpoint: &str,
+        auth_credentials: AuthCredentials<'_>,
+        token_provider_registry: Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        Ok(match auth_credentials {
+            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
+            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                Self::get_m2m_token_provider(
+                    endpoint,
+                    client_id,
+                    client_secret,
+                    &token_provider_registry,
+                )
+                .await?
+            }
+            AuthCredentials::U2M(client_id) => {
+                Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+            }
+        })
     }
 
     pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials> {
