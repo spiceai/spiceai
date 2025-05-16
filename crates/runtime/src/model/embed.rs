@@ -158,6 +158,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
+                    true,
                 ),
             ) as Arc<dyn Embed>)
         }
@@ -181,6 +182,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
+                    false,
                 ),
             ) as Arc<dyn Embed>)
         }

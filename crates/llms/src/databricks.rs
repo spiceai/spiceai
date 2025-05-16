@@ -42,6 +42,7 @@ use crate::{
 pub struct Databricks {
     pub model: String,
     client: Client<HostedModelConfig>,
+    needs_health_check: bool,
 }
 
 #[must_use]
@@ -63,6 +64,7 @@ pub fn from_access_token(
     Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
+        needs_health_check: true,
     }
 }
 
@@ -71,6 +73,7 @@ pub fn from_token_provider(
     model: &str,
     token_provider: Arc<dyn TokenProvider>,
     user_agent: Option<&'static str>,
+    needs_health_check: bool,
 ) -> Databricks {
     let mut cfg = HostedModelConfig::from_url(
         format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
@@ -86,6 +89,7 @@ pub fn from_token_provider(
     Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
+        needs_health_check,
     }
 }
 
@@ -93,6 +97,11 @@ pub fn from_token_provider(
 impl Chat for Databricks {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
+    }
+
+    fn needs_health_check(&self) -> bool {
+        tracing::info!("needs_health_check, {:?}", self.needs_health_check);
+        self.needs_health_check
     }
 
     /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
@@ -147,6 +156,10 @@ impl Chat for Databricks {
 
 #[async_trait]
 impl Embed for Databricks {
+    fn needs_health_check(&self) -> bool {
+        self.needs_health_check
+    }
+
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
