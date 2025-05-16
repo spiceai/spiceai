@@ -128,7 +128,7 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
 
 struct SqlWarehouseApi {
     client: Client,
-    url: String,
+    host: String,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
 }
@@ -144,11 +144,9 @@ impl SqlWarehouseApi {
             .build()
             .context(ClientBuildFailedSnafu)?;
 
-        let url = format!("https://{host}/api/2.0/sql/statements/");
-
         Ok(Self {
             client,
-            url,
+            host: host.to_string(),
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
         })
@@ -173,8 +171,9 @@ impl SqlWarehouseApi {
     }
 
     async fn execute_request(&self, token: &str, payload: &Value) -> Result<Value, Error> {
+        let url = format!("https://{}/api/2.0/sql/statements/", self.host);
         self.client
-            .post(&self.url)
+            .post(&url)
             .bearer_auth(token)
             .json(payload)
             .send()
@@ -185,22 +184,44 @@ impl SqlWarehouseApi {
             .context(JsonParsingFailedSnafu)
     }
 
-    async fn fetch_arrow_streams(
+    // Fetch the arrow data at the external links, repeating for each chunk
+    async fn fetch_external_links(
         &self,
-        response: Value,
+        result_object: Value,
     ) -> Result<SendableRecordBatchStream, Error> {
-        let external_links = Self::extract_external_links(response)?;
         let mut streams = Vec::new();
-
-        for link in external_links {
+        let token = self.token_provider.get_token();
+        let mut external_link = Self::extract_external_links(result_object)?;
+        loop {
             tracing::trace!(
                 "Fetching chunk {} from {}",
-                link.chunk_index,
-                link.external_link
+                external_link.chunk_index,
+                external_link.external_link
             );
-            let bytes = self.fetch_chunk_data(&link.external_link).await?;
+            let bytes = self.fetch_chunk_data(&external_link.external_link).await?;
             let batches = Self::read_arrow_batches(bytes)?;
             streams.push(futures::stream::iter(batches.into_iter().map(Ok)));
+
+            match external_link.next_chunk_internal_link {
+                Some(path) => {
+                    let url = format!("https://{}{path}", self.host);
+                    dbg!(&url);
+                    let result_object = self
+                        .client
+                        .get(url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await
+                        .context(HttpRequestFailedSnafu)?
+                        .error_for_status()
+                        .context(HttpRequestFailedSnafu)?
+                        .json()
+                        .await
+                        .context(JsonParsingFailedSnafu)?;
+                    external_link = Self::extract_external_links(result_object)?;
+                }
+                None => break,
+            }
         }
 
         let mut combined_stream = stream::select_all(streams);
@@ -229,27 +250,30 @@ impl SqlWarehouseApi {
         )))
     }
 
-    fn extract_external_links(mut response: Value) -> Result<Vec<ExternalLink>, Error> {
+    /// Deserializes the first [`ExternalLink`] in the `external_links` array
+    fn extract_external_links(mut response: Value) -> Result<ExternalLink, Error> {
         let links = response
-            .get_mut("result")
-            .and_then(|result| result.get_mut("external_links").map(Value::take))
+            .get_mut("external_links")
+            .map(Value::take)
             .ok_or_else(|| {
                 MissingJsonFieldSnafu {
-                    field: "result.external_links",
+                    field: "external_links",
                 }
                 .build()
             })?;
 
-        let Value::Array(links) = links else {
+        let Value::Array(mut links) = links else {
             return Err(Error::InvalidJsonArray {
                 field: "external_links".into(),
             });
         };
 
-        links
-            .into_iter()
-            .map(|link| serde_json::from_value(link).context(DeserializeExternalLinkFailedSnafu))
-            .collect()
+        // Only ever returns 1 external link in the array
+        let link = links.pop().ok_or_else(|| Error::InvalidJsonArray {
+            field: "external_links".into(),
+        })?;
+
+        serde_json::from_value(link).context(DeserializeExternalLinkFailedSnafu)
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
@@ -282,7 +306,9 @@ impl SqlWarehouseApi {
 #[derive(Debug, Deserialize, Serialize)]
 struct ExternalLink {
     chunk_index: u64,
+    #[allow(clippy::struct_field_names)]
     external_link: String,
+    next_chunk_internal_link: Option<String>,
 }
 
 fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
@@ -436,8 +462,15 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "statement": sql,
         });
 
-        let response = self.api.execute_request(&token, &payload).await?;
-        Ok(self.api.fetch_arrow_streams(response).await?)
+        let mut response = self.api.execute_request(&token, &payload).await?;
+
+        // Get the result object
+        let result_object = response
+            .get_mut("result")
+            .map(Value::take)
+            .ok_or_else(|| MissingJsonFieldSnafu { field: "result" }.build())?;
+
+        Ok(self.api.fetch_external_links(result_object).await?)
     }
 
     async fn execute(
