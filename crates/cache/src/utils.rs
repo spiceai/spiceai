@@ -58,7 +58,7 @@ pub fn to_cached_record_batch_stream(
 
         if records_size < cache_max_size {
             let cached_result = CachedQueryResult {
-                records,
+                records: Arc::new(records),
                 schema: schema_copy,
                 input_tables,
             };

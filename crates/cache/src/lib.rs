@@ -153,14 +153,14 @@ impl QueryResult {
 
 #[derive(Clone)]
 pub struct CachedQueryResult {
-    pub records: Vec<RecordBatch>,
+    pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
 }
 
 pub struct CachedStream {
     /// Vector of record batches
-    data: Vec<Option<RecordBatch>>,
+    data: Arc<Vec<RecordBatch>>,
     /// Schema representing the data
     schema: SchemaRef,
     index: usize,
@@ -168,9 +168,9 @@ pub struct CachedStream {
 
 impl CachedStream {
     #[must_use]
-    pub fn try_new(data: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+    pub fn try_new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
         Self {
-            data: data.into_iter().map(Some).collect(),
+            data,
             schema,
             index: 0,
         }
@@ -186,10 +186,9 @@ impl Stream for CachedStream {
     ) -> Poll<Option<Self::Item>> {
         Poll::Ready(if self.index < self.data.len() {
             let index = self.index;
-            let batch = self.data[index].take(); // replaces with None, avoiding a Vec reshuffle like .remove()
+            let batch = self.data.get(index).cloned().map(Ok);
             self.index += 1;
-
-            batch.map(Ok)
+            batch
         } else {
             None
         })
