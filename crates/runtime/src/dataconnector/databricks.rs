@@ -361,7 +361,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The endpoint of the Databricks instance."),
     ParameterSpec::component("sql_warehouse_id")
-        .required()
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
     ParameterSpec::component("token")
