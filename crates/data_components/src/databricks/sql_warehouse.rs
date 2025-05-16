@@ -205,7 +205,6 @@ impl SqlWarehouseApi {
             match external_link.next_chunk_internal_link {
                 Some(path) => {
                     let url = format!("https://{}{path}", self.host);
-                    dbg!(&url);
                     let result_object = self
                         .client
                         .get(url)
