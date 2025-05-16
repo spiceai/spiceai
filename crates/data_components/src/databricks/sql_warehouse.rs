@@ -314,7 +314,27 @@ struct ExternalLink {
 }
 
 fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
-    if type_name.to_uppercase().starts_with("DECIMAL") {
+    let type_name_upper = type_name.to_uppercase();
+
+    if type_name_upper.starts_with("ARRAY") {
+        let inner_type = type_name
+            .split('<')
+            .nth(1)
+            .ok_or_else(|| Error::UnsupportedType {
+                ty: type_name.to_string(),
+            })?
+            .trim_end_matches('>')
+            .trim();
+
+        let inner_data_type = map_databricks_type(inner_type)?;
+        return Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            inner_data_type,
+            true,
+        ))));
+    }
+
+    if type_name_upper.starts_with("DECIMAL") {
         let (precision, scale) = if type_name.contains('(') {
             let params: &str = type_name
                 .split('(')
@@ -346,7 +366,7 @@ fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
         return Ok(DataType::Decimal128(precision, scale));
     }
 
-    Ok(match type_name.to_uppercase().as_str() {
+    Ok(match type_name_upper.as_str() {
         "BOOLEAN" => DataType::Boolean,
         "TINYINT" => DataType::Int8,
         "SMALLINT" => DataType::Int16,
@@ -373,42 +393,43 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
             reason: "result.data_array".to_string(),
         })?;
 
-    let fields = data_array
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let row_array = row
-                .as_array()
-                .ok_or_else(|| Error::UnableToRetrieveSchema {
-                    reason: format!("data_array[{i}] is not an array"),
-                })?;
+    let mut fields = Vec::new();
 
-            if row_array.len() < 2 {
-                return Err(Error::UnableToRetrieveSchema {
-                    reason: format!("data_array[{i}] lacks col_name or data_type"),
-                });
-            }
+    for (i, row) in data_array.iter().enumerate() {
+        let row_array = row
+            .as_array()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: format!("data_array[{i}] is not an array"),
+            })?;
 
-            let col_name = row_array[0]
-                .as_str()
-                .ok_or_else(|| Error::UnableToRetrieveSchema {
-                    reason: format!("data_array[{i}][0] is not a string"),
-                })?;
+        if row_array.len() < 2 {
+            return Err(Error::UnableToRetrieveSchema {
+                reason: format!("data_array[{i}] lacks col_name or data_type"),
+            });
+        }
 
-            let data_type_str =
-                row_array[1]
-                    .as_str()
-                    .ok_or_else(|| Error::UnableToRetrieveSchema {
-                        reason: format!("data_array[{i}][1] is not a string"),
-                    })?;
+        let col_name = row_array[0]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: format!("data_array[{i}][0] is not a string"),
+            })?;
 
-            Ok(Field::new(
-                col_name,
-                map_databricks_type(data_type_str)?,
-                true,
-            ))
-        })
-        .collect::<Result<Vec<Field>, Error>>()?;
+        // If we see #, DB is now providing the clustering metadata info and
+        // we have all the columns we need
+        if col_name.starts_with('#') {
+            break;
+        }
+
+        let data_type_str = row_array[1]
+            .as_str()
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: format!("data_array[{i}][1] is not a string"),
+            })?;
+
+        let field = Field::new(col_name, map_databricks_type(data_type_str)?, true);
+
+        fields.push(field);
+    }
 
     Ok(Arc::new(Schema::new(fields)))
 }
@@ -572,6 +593,11 @@ mod tests {
                 "decimal(5,0)",
                 Ok(DataType::Decimal128(5, 0)),
                 "Case-insensitive DECIMAL(5,0) mapping failed",
+            ),
+            (
+                "ARRAY<STRING>",
+                Ok(DataType::new_list(DataType::Utf8, true)),
+                "ARRAY<STRING> mapping failed",
             ),
             (
                 "UNKNOWN",
