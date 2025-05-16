@@ -17,5 +17,5 @@ description: "Query: tpch[parameterized]_q13"
 |                     |                   TableScan: customer projection=[c_custkey]                                                        |
 |                     |                 BytesProcessedNode                                                                                  |
 |                     |                   TableScan: orders projection=[o_orderkey, o_custkey], full_filters=[orders.o_comment NOT LIKE $1] |
-| physical_plan_error | Execution error: Placeholder 'X' was not provided a value for execution.                                           |
+| physical_plan_error | Execution error: Placeholder '$1' was not provided a value for execution.                                           |
 +---------------------+---------------------------------------------------------------------------------------------------------------------+
