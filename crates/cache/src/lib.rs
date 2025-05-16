@@ -160,8 +160,6 @@ pub struct CachedQueryResult {
 
 pub struct CachedStream {
     /// Vector of record batches
-    /// There is little point using a Vec<Option<RecordBatch>> here, as iterating the vec to collect them as options
-    /// lets us use `.take()` to remove and replace the options - but it is just as slow as cloning the whole vec in practice.
     data: Vec<Option<RecordBatch>>,
     /// Schema representing the data
     schema: SchemaRef,
