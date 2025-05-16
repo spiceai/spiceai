@@ -215,6 +215,43 @@ pub enum Error {
 }
 ```
 
+### Avoid using `Clone` or `Copy` on Newtypes
+
+*Good:*
+
+Accessing the newtype value via a borrow:
+
+```rust
+struct MyStruct(u64);
+
+impl MyStruct {
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+```
+
+*Bad:*
+
+Accessing the newtype value directly through a `Copy`:
+
+```rust
+#[derive(Clone, Copy)]
+struct MyStruct(u64);
+
+fn consumes_value(v: MyStruct) -> {
+    v.0;
+}
+
+let a = MyStruct(0);
+consumes_value(a);
+consumes_value(a);
+```
+
+**Why?**
+
+Rust can make some compiler optimisations that result in more stack operations with implicit copies than register operations would use for borrows that result in a copy. Related reading: [When Zero Cost Abstractions Aren't Zero Cost](https://blog.polybdenum.com/2021/08/09/when-zero-cost-abstractions-aren-t-zero-cost.html).
+
 ### Notes
 
 **Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.

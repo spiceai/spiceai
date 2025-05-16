@@ -21,6 +21,8 @@ use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::scalar::ScalarValue;
 use std::any::Any;
@@ -38,7 +40,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
-use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
@@ -194,11 +195,9 @@ impl TableProvider for MemTable {
             let inner_vec = arc_inner_vec.read().await;
             partitions.push(inner_vec.clone());
         }
-        Ok(Arc::new(MemoryExec::try_new(
-            &partitions,
-            self.schema(),
-            projection.cloned(),
-        )?))
+        Ok(Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&partitions, self.schema(), projection.cloned())?,
+        ))))
     }
 
     /// Returns an ExecutionPlan that inserts the execution results of a given [`ExecutionPlan`] into this [`MemTable`].
@@ -221,13 +220,13 @@ impl TableProvider for MemTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
-        if !self
+        if let Err(e) = self
             .schema()
             .logically_equivalent_names_and_types(&input.schema())
         {
-            return Err(DataFusionError::Execution(
-                "Inserting query must have the same schema with the table.".to_string(),
-            ));
+            return Err(DataFusionError::Execution(format!(
+                "Inserting query must have the same schema with the table. {e}"
+            )));
         }
 
         let primary_key = self.get_and_ensure_only_primary_keys()?;

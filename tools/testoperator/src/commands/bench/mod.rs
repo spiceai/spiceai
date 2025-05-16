@@ -133,7 +133,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     Ok(row_counts)
 }
 
+/// List of query results that should not be snapshotted because they don't return deterministic results
+const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
+    "tpcds_q77", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
+];
+
 /// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
 fn snapshot_predicate(query_name: &str) -> bool {
-    query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
+    (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
+        && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
 }

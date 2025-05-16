@@ -264,7 +264,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use data_components::arrow::write::MemTable;
     use datafusion::execution::context::SessionContext;
-    use datafusion::physical_plan::memory::MemoryExec;
     use std::sync::Arc;
 
     fn schema() -> SchemaRef {
@@ -276,6 +275,7 @@ mod tests {
 
     mod empty_fallback {
         use datafusion::catalog::TableProvider;
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 
         use super::*;
 
@@ -291,10 +291,10 @@ mod tests {
         }
 
         fn empty_memory_exec() -> Arc<dyn ExecutionPlan> {
-            Arc::new(
-                MemoryExec::try_new(&[vec![]], schema(), None)
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![]], schema(), None)
                     .expect("memory exec should not panic"),
-            )
+            )))
         }
 
         fn memory_table_provider() -> Arc<dyn TableProvider> {
@@ -338,6 +338,7 @@ mod tests {
             logical_expr::{Expr, Operator, binary_expr, col},
             scalar::ScalarValue,
         };
+        use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 
         use super::*;
 
@@ -366,10 +367,10 @@ mod tests {
         }
 
         fn memory_exec() -> Arc<dyn ExecutionPlan> {
-            Arc::new(
-                MemoryExec::try_new(&[vec![batch_input()]], schema(), None)
+            Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![batch_input()]], schema(), None)
                     .expect("memory exec should not panic"),
-            )
+            )))
         }
 
         fn memory_table_provider() -> Arc<dyn TableProvider> {

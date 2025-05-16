@@ -6,8 +6,8 @@ description: "Query: tpch[parameterized]_q21"
 | plan_type           | plan                                                                                                                                              |
 +---------------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan        | Sort: numwait DESC NULLS FIRST, supplier.s_name ASC NULLS LAST, fetch=100                                                                         |
-|                     |   Projection: supplier.s_name, count(*) AS numwait                                                                                                |
-|                     |     Aggregate: groupBy=[[supplier.s_name]], aggr=[[count(Int64(1)) AS count(*)]]                                                                  |
+|                     |   Projection: supplier.s_name, count(Int64(1)) AS numwait                                                                                         |
+|                     |     Aggregate: groupBy=[[supplier.s_name]], aggr=[[count(Int64(1))]]                                                                              |
 |                     |       Projection: supplier.s_name                                                                                                                 |
 |                     |         LeftAnti Join: l1.l_orderkey = __correlated_sq_2.l_orderkey Filter: __correlated_sq_2.l_suppkey != l1.l_suppkey                           |
 |                     |           LeftSemi Join: l1.l_orderkey = __correlated_sq_1.l_orderkey Filter: __correlated_sq_1.l_suppkey != l1.l_suppkey                         |
@@ -34,5 +34,5 @@ description: "Query: tpch[parameterized]_q21"
 |                     |             SubqueryAlias: l3                                                                                                                     |
 |                     |               BytesProcessedNode                                                                                                                  |
 |                     |                 TableScan: lineitem projection=[l_orderkey, l_suppkey], full_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]             |
-| physical_plan_error | Execution error: Placeholder '$1' was not provided a value for execution.                                                                         |
+| physical_plan_error | Execution error: Placeholder 'X' was not provided a value for execution.                                                                         |
 +---------------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

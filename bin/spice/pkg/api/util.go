@@ -65,7 +65,11 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		for key, value := range headers {
 			request.Header.Set(key, value)
 		}
-		request.Header.Set("Content-Type", "application/json")
+
+		if body != nil {
+			// Otherwise server will fail parsing empty HTTP body.
+			request.Header.Set("Content-Type", "application/json")
+		}
 		resp, err = rtcontext.Client().Do(request)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)

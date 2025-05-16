@@ -42,8 +42,6 @@ pub trait TokenProvider: Send + Sync + Debug {
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
         None
     }
-
-    fn set_token(&self, _token: String) {}
 }
 
 pub struct StaticTokenProvider {

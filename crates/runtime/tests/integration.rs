@@ -28,6 +28,8 @@ mod abfs;
 mod acceleration;
 mod cache;
 mod catalog;
+#[cfg(feature = "duckdb")]
+mod clickbench;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;

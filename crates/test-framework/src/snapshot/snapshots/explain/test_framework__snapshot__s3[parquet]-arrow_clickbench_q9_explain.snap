@@ -25,6 +25,6 @@ description: "Query: clickbench_q9"
 |               |                       BytesProcessedExec                                                                      |
 |               |                         SchemaCastScanExec                                                                    |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1               |
-|               |                             MemoryExec: partitions=1, partition_sizes=[12218]                                 |
+|               |                             DataSourceExec: partitions=1, partition_sizes=[12218]                             |
 |               |                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------+

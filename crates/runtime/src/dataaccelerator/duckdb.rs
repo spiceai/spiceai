@@ -36,8 +36,9 @@ use datafusion_table_providers::{
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
+use itertools::Itertools;
 use snafu::prelude::*;
-use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
+use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
 use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
@@ -334,11 +335,13 @@ impl DataAccelerator for DuckDBAccelerator {
                             None
                         }
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<HashSet<_>>(); // collect unique paths using HashSet
 
                 if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    cmd.options.insert(
+                        "attach_databases".to_string(),
+                        attach_databases.iter().join(";"),
+                    );
                 }
             }
         }

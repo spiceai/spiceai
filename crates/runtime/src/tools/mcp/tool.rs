@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use mcp_client::McpClientTrait;
-use mcp_core::{Tool as McpTool, protocol::CallToolResult};
+use rmcp::{
+    ServiceError,
+    model::{CallToolRequestParam, CallToolResult, JsonObject, Tool, object},
+};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -27,22 +29,18 @@ use tracing_futures::Instrument;
 
 use crate::tools::SpiceModelTool;
 
-use super::Result;
+use super::{Result, catalog::McpClient};
 
 pub struct McpToolWrapper {
-    client: Arc<RwLock<Box<dyn McpClientTrait>>>,
-    spec: McpTool,
+    client: Arc<RwLock<McpClient>>,
+    spec: Tool,
 
     /// Spicepod defined name, not from underlying MCP.
     server_name: String,
 }
 
 impl McpToolWrapper {
-    pub fn new(
-        client: Arc<RwLock<Box<dyn McpClientTrait>>>,
-        spec: McpTool,
-        server_name: String,
-    ) -> Self {
+    pub fn new(client: Arc<RwLock<McpClient>>, spec: Tool, server_name: String) -> Self {
         Self {
             client,
             spec,
@@ -51,23 +49,29 @@ impl McpToolWrapper {
     }
 
     #[must_use]
-    pub fn internal_name(&self) -> &str {
-        self.spec.name.as_str()
+    pub fn internal_name(&self) -> Cow<'static, str> {
+        self.spec.name.clone()
     }
 }
 
 #[async_trait]
 impl SpiceModelTool for McpToolWrapper {
     fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.internal_name())
+        self.internal_name()
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        Some(Cow::Borrowed(&self.spec.description))
+        self.spec.description.clone()
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(self.spec.input_schema.clone())
+        Some(Value::Object(
+            self.spec
+                .input_schema
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ))
     }
 
     async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
@@ -92,7 +96,7 @@ impl SpiceModelTool for McpToolWrapper {
                 })?
             };
             let response = client
-                .call_tool(self.internal_name(), input)
+                .call_tool(CallToolRequestParam{name: self.internal_name(), arguments: Some(object(input))})
                 .await
                 .boxed()?;
 
@@ -118,8 +122,16 @@ impl SpiceModelTool for McpToolWrapper {
 
 #[async_trait]
 impl McpProxy for McpToolWrapper {
-    async fn call_tool(&self, arguments: Value) -> Result<CallToolResult, mcp_client::Error> {
+    async fn call_tool(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, ServiceError> {
         let inner = self.client.read().await;
-        inner.call_tool(self.internal_name(), arguments).await
+        inner
+            .call_tool(CallToolRequestParam {
+                name: self.internal_name(),
+                arguments,
+            })
+            .await
     }
 }
