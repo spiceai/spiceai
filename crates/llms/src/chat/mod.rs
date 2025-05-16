@@ -546,6 +546,11 @@ pub trait Chat: Sync + Send {
         .await
     }
 
+    /// Indicates whether chat implementation requires a health check.
+    fn needs_health_check(&self) -> bool {
+        true
+    }
+
     /// A basic health check to ensure the model can process future [`Self::run`] requests.
     /// Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
