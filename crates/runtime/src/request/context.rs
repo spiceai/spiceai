@@ -28,7 +28,10 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+use super::{
+    CacheControl, CacheKeyType, DatabricksAuth, DatabricksAuthExtension, Protocol, UserAgent,
+    baggage,
+};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
@@ -198,6 +201,7 @@ pub struct RequestContextBuilder {
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
+    extensions: Extensions,
 }
 
 impl RequestContextBuilder {
@@ -209,6 +213,7 @@ impl RequestContextBuilder {
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
+            extensions: Extensions::default(),
         }
     }
 
@@ -232,6 +237,13 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
+
+        if let Some(databricks_auth) = DatabricksAuth::from_headers(headers) {
+            let extension = DatabricksAuthExtension::from_headers(databricks_auth);
+            self.extensions
+                .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
+        }
+
         self
     }
 
@@ -308,7 +320,7 @@ impl RequestContextBuilder {
             cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
-            extensions: RwLock::new(HashMap::new()),
+            extensions: RwLock::new(self.extensions),
         }
     }
 }

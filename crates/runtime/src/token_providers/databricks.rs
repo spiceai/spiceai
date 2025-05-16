@@ -24,7 +24,7 @@ use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::request::{DatabricksContextExtension, RequestContext};
+use crate::request::{DatabricksAuthExtension, RequestContext};
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -219,7 +219,7 @@ impl TokenProvider for DatabricksU2MTokenProvider {
     /// `get_token` is synchronous but should be called in an async context, so it is safe to use `RequestContext::current_sync`
     fn get_token(&self) -> String {
         let context = RequestContext::current_sync();
-        if let Some(extension) = context.extension::<DatabricksContextExtension>() {
+        if let Some(extension) = context.extension::<DatabricksAuthExtension>() {
             if let Some(token) = extension.get_token(&self.client_id) {
                 tracing::debug!(
                     "using access_token for {} from the request context",

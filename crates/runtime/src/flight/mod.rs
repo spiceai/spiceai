@@ -43,7 +43,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, TokenProviderLayer, WriteRateLimitLayer};
+use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -367,7 +367,6 @@ pub async fn start(
 
     let server = server
         .layer(RequestContextLayer::new(app, rt.datafusion()))
-        .layer(TokenProviderLayer::new(rt.token_provider_registry()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

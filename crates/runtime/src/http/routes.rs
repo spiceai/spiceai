@@ -25,12 +25,11 @@ use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
-use crate::request::{AsyncMarker, DatabricksAuth, DatabricksContextExtension, Protocol};
+use crate::request::Protocol;
 use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
-use axum_extra::TypedHeader;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
@@ -234,7 +233,6 @@ pub(crate) fn routes(
 
     unauthenticated_router
         .merge(authenticated_router)
-        .route_layer(middleware::from_fn(databricks_u2m_middleware))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
@@ -339,20 +337,6 @@ async fn check_shutdown(
             "Runtime is shutting down",
         )
             .into_response();
-    }
-
-    next.run(req).await
-}
-
-async fn databricks_u2m_middleware(
-    databricks_auth: Option<TypedHeader<DatabricksAuth>>,
-    req: axum::http::Request<Body>,
-    next: Next,
-) -> impl IntoResponse {
-    if let Some(headers) = databricks_auth {
-        let extension = DatabricksContextExtension::from_headers(headers.0);
-        let context = RequestContext::current(AsyncMarker::new().await);
-        context.insert_extension(extension);
     }
 
     next.run(req).await
