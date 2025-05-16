@@ -512,11 +512,13 @@ mod tests {
         let result = Databricks::build_auth_credentials(&parameters);
 
         assert!(
-            result.is_err(),
-            "Databricks::build_auth_credentials should return an error"
+            result.is_ok(),
+            "Databricks::build_auth_credentials should return an Ok result"
         );
-        if let Err(error) = result {
-            assert!(error.to_string().contains("`databricks_client_secret`"));
+        if let Ok(AuthCredentials::U2M(id)) = result {
+            assert_eq!(id, client_id);
+        } else {
+            panic!("Expected U2M variant");
         }
     }
 
