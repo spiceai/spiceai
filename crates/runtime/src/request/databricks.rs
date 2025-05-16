@@ -19,10 +19,21 @@ use secrecy::SecretString;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug)]
-pub struct DatabricksAuth(pub HashMap<String, SecretString>);
+#[derive(Clone, Debug)]
+pub struct DatabricksAuthExtension {
+    tokens: Arc<HashMap<String, SecretString>>,
+}
 
-impl DatabricksAuth {
+impl Default for DatabricksAuthExtension {
+    fn default() -> Self {
+        Self {
+            tokens: Arc::new(HashMap::new()),
+        }
+    }
+}
+
+impl DatabricksAuthExtension {
+    #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
         let databricks_headers = headers.get_all("Spice-Databricks-Auth");
         let values = databricks_headers.iter();
@@ -46,29 +57,9 @@ impl DatabricksAuth {
         if auth_map.is_empty() {
             None
         } else {
-            Some(DatabricksAuth(auth_map))
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DatabricksAuthExtension {
-    tokens: Arc<HashMap<String, SecretString>>,
-}
-
-impl Default for DatabricksAuthExtension {
-    fn default() -> Self {
-        Self {
-            tokens: Arc::new(HashMap::new()),
-        }
-    }
-}
-
-impl DatabricksAuthExtension {
-    #[must_use]
-    pub fn from_headers(headers: DatabricksAuth) -> Self {
-        Self {
-            tokens: Arc::new(headers.0),
+            Some(Self {
+                tokens: Arc::new(auth_map),
+            })
         }
     }
 
