@@ -1,0 +1,15 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    query_set: tpch
+    runner_type: spiceai-runners
+    validate_results: true
+  throughput:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    query_set: tpch
+    runner_type: spiceai-large-runners
+  load:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    query_set: tpch
+    runner_type: spiceai-large-runners
+    duration: 28800
