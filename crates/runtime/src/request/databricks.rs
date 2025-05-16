@@ -73,19 +73,23 @@ pub struct DatabricksContextExtension {
     tokens: Arc<HashMap<String, SecretString>>,
 }
 
-impl DatabricksContextExtension {
-    pub fn new() -> Self {
+impl Default for DatabricksContextExtension {
+    fn default() -> Self {
         Self {
             tokens: Arc::new(HashMap::new()),
         }
     }
+}
 
+impl DatabricksContextExtension {
+    #[must_use]
     pub fn from_headers(headers: DatabricksAuth) -> Self {
         Self {
             tokens: Arc::new(headers.0),
         }
     }
 
+    #[must_use]
     pub fn get_token(&self, client_id: &str) -> Option<SecretString> {
         self.tokens.get(client_id).cloned()
     }

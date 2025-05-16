@@ -213,7 +213,7 @@ impl fmt::Debug for DatabricksU2MTokenProvider {
 }
 
 impl TokenProvider for DatabricksU2MTokenProvider {
-    /// Retrieves the corresponding access token from the current request context by matching the client_id.
+    /// Retrieves the corresponding access token from the current request context by matching the `client_id`.
     /// If no token is found, it returns an empty string, and the dependent component is expected to handle this as an error.
     ///
     /// `get_token` is synchronous but should be called in an async context, so it is safe to use `RequestContext::current_sync`
@@ -226,9 +226,8 @@ impl TokenProvider for DatabricksU2MTokenProvider {
                     &self.client_id,
                 );
                 return token.expose_secret().to_string();
-            } else {
-                tracing::debug!("no token found for client_id {}", &self.client_id);
             }
+            tracing::debug!("no token found for client_id {}", &self.client_id);
         } else {
             tracing::debug!("not in the scope of request context");
         }
