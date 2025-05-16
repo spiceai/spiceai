@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_auth_credentials_missing_client_id() {
+    fn test_build_auth_credentials_u2m() {
         let client_secret = "test_client_secret";
         let params_vec = vec![(
             "client_secret".to_string(),
