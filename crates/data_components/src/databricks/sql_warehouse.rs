@@ -335,18 +335,15 @@ fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
     }
 
     if type_name_upper.starts_with("DECIMAL") {
-        let (precision, scale) = if type_name.contains('(') {
-            let params: &str = type_name
-                .split('(')
-                .nth(1)
-                .ok_or_else(|| Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                })?
-                .trim_end_matches(')')
-                .trim();
-
-            let parts: Vec<&str> = params.split(',').map(str::trim).collect();
-            if parts.len() == 2 {
+        let (precision, scale) = match type_name.split_once('(') {
+            Some((_, params)) => {
+                let params = params.trim_end_matches(')').trim();
+                let parts: Vec<_> = params.split(',').map(str::trim).collect();
+                if parts.len() != 2 {
+                    return Err(Error::UnsupportedType {
+                        ty: type_name.to_string(),
+                    });
+                }
                 let precision: u8 = parts[0].parse().map_err(|_| Error::UnsupportedType {
                     ty: type_name.to_string(),
                 })?;
@@ -354,15 +351,9 @@ fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
                     ty: type_name.to_string(),
                 })?;
                 (precision, scale)
-            } else {
-                return Err(Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                });
             }
-        } else {
-            (10, 0)
+            None => (10, 0),
         };
-
         return Ok(DataType::Decimal128(precision, scale));
     }
 
