@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
+    array::RecordBatch,
     datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     ipc::reader::StreamReader,
 };
@@ -33,12 +34,12 @@ use datafusion_table_providers::sql::{
     },
     sql_provider_datafusion::SqlTable,
 };
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, pin::Pin, sync::Arc};
 use token_provider::TokenProvider;
 
 #[derive(Debug, Snafu)]
@@ -189,54 +190,86 @@ impl SqlWarehouseApi {
 
     // Fetch the arrow data at the external links, repeating for each chunk
     async fn fetch_external_links(
-        &self,
+        self: Arc<Self>,
         result_object: Value,
     ) -> Result<SendableRecordBatchStream, Error> {
-        let mut streams = Vec::new();
         let token = self.token_provider.get_token();
-        let mut external_link = Self::extract_external_links(result_object)?;
-        loop {
-            tracing::trace!(
-                "Fetching chunk {} from {}",
-                external_link.chunk_index,
-                external_link.external_link
-            );
-            let bytes = self.fetch_chunk_data(&external_link.external_link).await?;
-            let batches = Self::read_arrow_batches(bytes)?;
-            streams.push(futures::stream::iter(batches.into_iter().map(Ok)));
+        let initial_external_link = Self::extract_external_links(result_object)?;
 
-            match external_link.next_chunk_internal_link {
-                Some(path) => {
-                    let url = format!("https://{}{path}", self.host);
-                    let result_object = self
-                        .client
-                        .get(url)
-                        .bearer_auth(&token)
-                        .send()
-                        .await
-                        .context(HttpRequestFailedSnafu)?
-                        .error_for_status()
-                        .context(HttpRequestFailedSnafu)?
-                        .json()
-                        .await
-                        .context(JsonParsingFailedSnafu)?;
-                    external_link = Self::extract_external_links(result_object)?;
-                }
-                None => break,
+        let token = token.to_string();
+        let stream = stream::unfold(Some(initial_external_link), move |current_link| {
+            let api = Arc::clone(&self);
+            let token = token.clone();
+            async move {
+                let link = current_link?;
+
+                tracing::trace!(
+                    "Fetching chunk {} from {}",
+                    link.chunk_index,
+                    link.external_link
+                );
+
+                let bytes = match api.fetch_chunk_data(&link.external_link).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Some((Err(e), None)),
+                };
+
+                let batches = match Self::read_arrow_batches(bytes) {
+                    Ok(batches) => batches,
+                    Err(e) => return Some((Err(e), None)),
+                };
+
+                let next_link = match link.next_chunk_internal_link {
+                    Some(path) => {
+                        let url = format!("https://{}{path}", api.host);
+                        match api
+                            .client
+                            .get(&url)
+                            .bearer_auth(&token)
+                            .send()
+                            .await
+                            .context(HttpRequestFailedSnafu)
+                            .and_then(|resp| {
+                                resp.error_for_status().context(HttpRequestFailedSnafu)
+                            }) {
+                            Ok(response) => match response
+                                .json()
+                                .await
+                                .context(JsonParsingFailedSnafu)
+                                .and_then(Self::extract_external_links)
+                            {
+                                Ok(next) => Some(next),
+                                Err(e) => return Some((Err(e), None)),
+                            },
+                            Err(e) => return Some((Err(e), None)),
+                        }
+                    }
+                    None => None,
+                };
+
+                Some((Ok(batches), next_link))
             }
-        }
+        });
 
-        let mut combined_stream = stream::select_all(streams);
+        // Flatten the stream of Vec<RecordBatch> into individual RecordBatch items
+        let batch_stream = stream.flat_map(|result| match result {
+            Ok(batches) => Box::pin(futures::stream::iter(batches.into_iter().map(Ok)))
+                as Pin<Box<dyn Stream<Item = Result<RecordBatch, Error>> + Send>>,
+            Err(e) => Box::pin(futures::stream::iter(vec![Err(e)]))
+                as Pin<Box<dyn Stream<Item = Result<RecordBatch, Error>> + Send>>,
+        });
 
-        let first_batch = match combined_stream.next().await {
+        // Handle the first batch to extract schema
+        let mut batch_stream = batch_stream.boxed();
+        let first_batch: RecordBatch = match batch_stream.next().await {
             Some(Ok(batch)) => batch,
+            Some(Err(e)) => return Err(e),
             None => {
                 return Ok(Box::pin(RecordBatchStreamAdapter::new(
                     Arc::new(Schema::empty()),
-                    stream::empty(),
+                    Box::pin(stream::empty()),
                 )));
             }
-            Some(Err(e)) => return Err(Error::ArrowStreamReadFailed { source: e }),
         };
 
         let schema = first_batch.schema();
@@ -244,11 +277,8 @@ impl SqlWarehouseApi {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            Box::pin(
-                run_once
-                    .chain(combined_stream)
-                    .map_err(|e| DataFusionError::Execution(e.to_string())),
-            ),
+            Box::pin(run_once.chain(batch_stream))
+                .map_err(|e| DataFusionError::Execution(e.to_string())),
         )))
     }
 
@@ -483,7 +513,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .map(Value::take)
             .ok_or_else(|| MissingJsonFieldSnafu { field: "result" }.build())?;
 
-        Ok(self.api.fetch_external_links(result_object).await?)
+        Ok(SqlWarehouseApi::fetch_external_links(Arc::clone(&self.api), result_object).await?)
     }
 
     async fn execute(
