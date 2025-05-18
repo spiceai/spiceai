@@ -22,13 +22,10 @@ use arrow::{
     datatypes::{Field, Schema},
 };
 use datafusion::{
-    common::{
-        Column, DFSchema,
-        tree_node::{TreeNode, TreeNodeRecursion},
-    },
-    datasource::listing::PartitionedFile,
+    common::DFSchema,
+    datasource::listing::{PartitionedFile, helpers::expr_applicable_for_cols},
     execution::context::ExecutionProps,
-    logical_expr::{Expr, Volatility},
+    logical_expr::Expr,
     physical_expr::create_physical_expr,
     scalar::ScalarValue,
 };
@@ -130,79 +127,4 @@ pub(crate) fn can_be_evaluted_for_partition_pruning(
     expr: &Expr,
 ) -> bool {
     !partition_column_names.is_empty() && expr_applicable_for_cols(partition_column_names, expr)
-}
-
-/// Check whether the given expression can be resolved using only the columns `col_names`.
-/// This means that if this function returns true:
-/// - the table provider can filter the table partition values with this expression
-/// - the expression can be marked as `TableProviderFilterPushDown::Exact` once this filtering
-///   was performed
-///
-/// Taken from: <https://github.com/apache/datafusion/blob/28856e15bd490044d24619e19057160e647aa256/datafusion/catalog-listing/src/helpers.rs#L53>
-/// We can remove this code once we upgrade to `DataFusion` 45.0.0 and depend on it from the `datafusion-catalog-listing` crate.
-#[allow(clippy::unwrap_used)] // This code is taken from DataFusion directly.
-fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
-    let mut is_applicable = true;
-    expr.apply(|expr| match expr {
-        Expr::Column(Column { name, .. }) => {
-            is_applicable &= col_names.contains(&name.as_str());
-            if is_applicable {
-                Ok(TreeNodeRecursion::Jump)
-            } else {
-                Ok(TreeNodeRecursion::Stop)
-            }
-        }
-        Expr::Literal(_)
-        | Expr::Alias(_)
-        | Expr::OuterReferenceColumn(_, _)
-        | Expr::ScalarVariable(_, _)
-        | Expr::Not(_)
-        | Expr::IsNotNull(_)
-        | Expr::IsNull(_)
-        | Expr::IsTrue(_)
-        | Expr::IsFalse(_)
-        | Expr::IsUnknown(_)
-        | Expr::IsNotTrue(_)
-        | Expr::IsNotFalse(_)
-        | Expr::IsNotUnknown(_)
-        | Expr::Negative(_)
-        | Expr::Cast(_)
-        | Expr::TryCast(_)
-        | Expr::BinaryExpr(_)
-        | Expr::Between(_)
-        | Expr::Like(_)
-        | Expr::SimilarTo(_)
-        | Expr::InList(_)
-        | Expr::Exists(_)
-        | Expr::InSubquery(_)
-        | Expr::ScalarSubquery(_)
-        | Expr::GroupingSet(_)
-        | Expr::Case(_) => Ok(TreeNodeRecursion::Continue),
-
-        Expr::ScalarFunction(scalar_function) => {
-            match scalar_function.func.signature().volatility {
-                Volatility::Immutable => Ok(TreeNodeRecursion::Continue),
-                // TODO: Stable functions could be `applicable`, but that would require access to the context
-                Volatility::Stable | Volatility::Volatile => {
-                    is_applicable = false;
-                    Ok(TreeNodeRecursion::Stop)
-                }
-            }
-        }
-
-        // TODO other expressions are not handled yet:
-        // - AGGREGATE and WINDOW should not end up in filter conditions, except maybe in some edge cases
-        // - Can `Wildcard` be considered as a `Literal`?
-        // - ScalarVariable could be `applicable`, but that would require access to the context
-        Expr::AggregateFunction { .. }
-        | Expr::WindowFunction { .. }
-        | Expr::Wildcard { .. }
-        | Expr::Unnest { .. }
-        | Expr::Placeholder(_) => {
-            is_applicable = false;
-            Ok(TreeNodeRecursion::Stop)
-        }
-    })
-    .unwrap();
-    is_applicable
 }

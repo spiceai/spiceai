@@ -90,7 +90,7 @@ pub(crate) fn cosine_distance_to_sql(
 #[cfg(test)]
 mod tests {
     use datafusion::{
-        common::Column,
+        common::{Column, Spans},
         functions_array::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
         prelude::lit,
@@ -140,6 +140,7 @@ mod tests {
             Expr::Column(Column {
                 relation: Some(TableReference::from("table_name")),
                 name: "column_name".to_string(),
+                spans: Spans::new(),
             }),
             Expr::ScalarFunction(ScalarFunction::new_udf(
                 make_array_udf(),

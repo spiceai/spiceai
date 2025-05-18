@@ -2,27 +2,27 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q13"
 ---
-+---------------+---------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                              |
-+---------------+---------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                |
-|               |   Projection: hits.SearchPhrase, count(*) AS c                                                    |
-|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1)) AS count(*)]]                |
-|               |       BytesProcessedNode                                                                          |
-|               |         Filter: hits.SearchPhrase != LargeUtf8("")                                                |
-|               |           TableScan: hits projection=[SearchPhrase]                                               |
-| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                     |
-|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                         |
-|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(*)@1 as c]                        |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(*)] |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                               |
-|               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16           |
-|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(*)]    |
-|               |               BytesProcessedExec                                                                  |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                       |
-|               |                   FilterExec: SearchPhrase@0 !=                                                   |
-|               |                     SchemaCastScanExec                                                            |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
-|               |                         MemoryExec: partitions=1, partition_sizes=[12218]                         |
-|               |                                                                                                   |
-+---------------+---------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                     |
++---------------+----------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                       |
+|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS c                                                    |
+|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                   |
+|               |       BytesProcessedNode                                                                                 |
+|               |         Filter: hits.SearchPhrase != LargeUtf8("")                                                       |
+|               |           TableScan: hits projection=[SearchPhrase]                                                      |
+| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                            |
+|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                                |
+|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                        |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                      |
+|               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                  |
+|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]    |
+|               |               BytesProcessedExec                                                                         |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                              |
+|               |                   FilterExec: SearchPhrase@0 !=                                                          |
+|               |                     SchemaCastScanExec                                                                   |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1              |
+|               |                         DataSourceExec: partitions=1, partition_sizes=[12218]                            |
+|               |                                                                                                          |
++---------------+----------------------------------------------------------------------------------------------------------+

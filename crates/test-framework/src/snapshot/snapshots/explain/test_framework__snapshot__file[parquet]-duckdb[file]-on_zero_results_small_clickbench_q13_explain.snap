@@ -6,18 +6,18 @@ description: "Query: clickbench_q13"
 | plan_type     | plan                                                                                                                        |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                          |
-|               |   Projection: hits.SearchPhrase, count(*) AS c                                                                              |
-|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1)) AS count(*)]]                                          |
+|               |   Projection: hits.SearchPhrase, count(Int64(1)) AS c                                                                       |
+|               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                                      |
 |               |       BytesProcessedNode                                                                                                    |
 |               |         Filter: CAST(hits.SearchPhrase AS Utf8) != Utf8("")                                                                 |
 |               |           TableScan: hits projection=[SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8) != Utf8("")]          |
 | physical_plan | SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[false]                                                    |
 |               |   CoalescePartitionsExec                                                                                                    |
-|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(*)@1 as c]                                                  |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(*)]                           |
+|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                                           |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                    |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                     |
-|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(*)]                              |
+|               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                       |
 |               |               BytesProcessedExec                                                                                            |
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                 |
 |               |                   FilterExec: CAST(SearchPhrase@0 AS Utf8) !=                                                               |

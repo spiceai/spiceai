@@ -14,46 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::ConnectorComponent;
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorError;
-use crate::dataconnector::DataConnectorResult;
-use crate::dataconnector::listing::infer::infer_partitions_with_types_from_files;
-use crate::dataconnector::listing::infer::infer_partitions_with_types_prefix;
-use crate::parameters::ExposedParamLookup;
-use crate::parameters::Parameters;
-use arrow_schema::Schema;
-use arrow_tools::schema::expand_views_schema;
-use async_trait::async_trait;
-use data_components::object::metadata::ObjectStoreMetadataTable;
-use data_components::object::text::ObjectStoreTextTable;
-use datafusion::config::ConfigField;
-use datafusion::config::TableParquetOptions;
-use datafusion::datasource::TableProvider;
-use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
-use datafusion::datasource::file_format::json::JsonFormat;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
-use datafusion::error::DataFusionError;
-use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionContext;
-use futures::TryStreamExt;
-use object_store::ObjectMeta;
-use object_store::ObjectStore;
-use object_store::path::Path;
-use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use arrow_schema::Schema;
+use arrow_tools::schema::expand_views_schema;
+use async_trait::async_trait;
+use datafusion::config::{ConfigField, TableParquetOptions};
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::file_format::{
+    FileFormat, csv::CsvFormat, file_compression_type::FileCompressionType, json::JsonFormat,
+    parquet::ParquetFormat,
+};
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::error::DataFusionError;
+use datafusion::execution::{config::SessionConfig, context::SessionContext};
+use futures::TryStreamExt;
+use object_store::{ObjectMeta, ObjectStore, path::Path};
+use snafu::prelude::*;
 use url::Url;
+
+use crate::accelerated_table::AcceleratedTable;
+use crate::component::dataset::Dataset;
+use crate::dataconnector::{
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
+    listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
+};
+use crate::parameters::{ExposedParamLookup, Parameters};
+use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use crate::object_store_registry::default_runtime_env;
 

@@ -73,9 +73,11 @@ pub enum Error {
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication."
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication.\n{source}"
     ))]
-    UnableToGetToken {},
+    UnableToGetToken {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -275,7 +277,9 @@ impl Databricks {
                 .await
             })
             .await
-            .map_err(|_| Error::UnableToGetToken {})
+            .map_err(|e| Error::UnableToGetToken {
+                source: Box::new(e),
+            })
     }
 
     pub async fn get_u2m_token_provider(
@@ -294,7 +298,9 @@ impl Databricks {
                 },
             )
             .await
-            .map_err(|_| Error::UnableToGetToken {})
+            .map_err(|err| Error::UnableToGetToken {
+                source: Box::new(err),
+            })
     }
 
     pub(crate) fn read_provider(&self) -> Arc<dyn Read> {

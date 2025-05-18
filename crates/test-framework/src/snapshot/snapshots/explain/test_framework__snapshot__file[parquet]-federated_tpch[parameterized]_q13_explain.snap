@@ -2,20 +2,20 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch[parameterized]_q13"
 ---
-+---------------------+----------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type           | plan                                                                                                                                   |
-+---------------------+----------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan        | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                     |
-|                     |   Projection: c_orders.c_count, count(*) AS custdist                                                                                   |
-|                     |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1)) AS count(*)]]                                                      |
-|                     |       SubqueryAlias: c_orders                                                                                                          |
-|                     |         Projection: count(orders.o_orderkey) AS c_count                                                                                |
-|                     |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                                                 |
-|                     |             Projection: customer.c_custkey, orders.o_orderkey                                                                          |
-|                     |               Left Join: customer.c_custkey = orders.o_custkey                                                                         |
-|                     |                 BytesProcessedNode                                                                                                     |
-|                     |                   TableScan: customer projection=[c_custkey]                                                                           |
-|                     |                 BytesProcessedNode                                                                                                     |
-|                     |                   TableScan: orders projection=[o_orderkey, o_custkey], full_filters=[orders.o_comment NOT LIKE CAST($1 AS LargeUtf8)] |
-| physical_plan_error | Execution error: Placeholder '$1' was not provided a value for execution.                                                              |
-+---------------------+----------------------------------------------------------------------------------------------------------------------------------------+
++---------------------+---------------------------------------------------------------------------------------------------------------------+
+| plan_type           | plan                                                                                                                |
++---------------------+---------------------------------------------------------------------------------------------------------------------+
+| logical_plan        | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                  |
+|                     |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                         |
+|                     |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                               |
+|                     |       SubqueryAlias: c_orders                                                                                       |
+|                     |         Projection: count(orders.o_orderkey) AS c_count                                                             |
+|                     |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                              |
+|                     |             Projection: customer.c_custkey, orders.o_orderkey                                                       |
+|                     |               Left Join: customer.c_custkey = orders.o_custkey                                                      |
+|                     |                 BytesProcessedNode                                                                                  |
+|                     |                   TableScan: customer projection=[c_custkey]                                                        |
+|                     |                 BytesProcessedNode                                                                                  |
+|                     |                   TableScan: orders projection=[o_orderkey, o_custkey], full_filters=[orders.o_comment NOT LIKE $1] |
+| physical_plan_error | Execution error: Placeholder 'X' was not provided a value for execution.                                           |
++---------------------+---------------------------------------------------------------------------------------------------------------------+

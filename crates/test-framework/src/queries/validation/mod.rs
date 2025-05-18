@@ -26,8 +26,9 @@ use arrow::{
     array::{
         Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
         Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -141,7 +142,11 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
             | (DataType::Int32, DataType::Int64)
             | (
                 DataType::Int64,
-                DataType::Int32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8
+                DataType::Int32
+                    | DataType::Float64
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
             )
             | (DataType::Utf8, DataType::LargeUtf8)
             | (DataType::LargeUtf8, DataType::Utf8)
@@ -241,6 +246,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
         DataType::Float64 => downcast_and_stringify!(array, index, Float64Array),
         DataType::Utf8 => downcast_and_stringify!(array, index, StringArray),
         DataType::LargeUtf8 => downcast_and_stringify!(array, index, LargeStringArray),
+        DataType::Utf8View => downcast_and_stringify!(array, index, StringViewArray),
         DataType::Boolean => downcast_and_stringify!(array, index, BooleanArray),
 
         DataType::Date32 => {

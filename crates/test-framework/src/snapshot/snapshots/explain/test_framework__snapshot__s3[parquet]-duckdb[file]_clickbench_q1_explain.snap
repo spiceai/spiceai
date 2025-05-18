@@ -2,16 +2,16 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q1"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                           |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                                             |
-|               |   Federated                                                                                                                                                                    |
-|               |  Projection: count(*)                                                                                                                                                          |
-|               |   Aggregate: groupBy=[[]], aggr=[[count(*)]]                                                                                                                                   |
-|               |     TableScan: hits projection=[]                                                                                                                                              |
-| physical_plan | BytesProcessedExec                                                                                                                                                             |
-|               |   SchemaCastScanExec                                                                                                                                                           |
-|               |     VirtualExecutionPlan name=duckdb compute_context=//data/accelerated_duckdb.db sql=SELECT count(*) FROM hits rewritten_sql=SELECT count(*) FROM "hits" |
-|               |                                                                                                                                                                                |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                       |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                                                         |
+|               |   Federated                                                                                                                                                                                                |
+|               |  Projection: count(Int64(1)) AS count(*)                                                                                                                                                                   |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                                                        |
+|               |     TableScan: hits projection=[]                                                                                                                                                                          |
+| physical_plan | BytesProcessedExec                                                                                                                                                                                         |
+|               |   SchemaCastScanExec                                                                                                                                                                                       |
+|               |     VirtualExecutionPlan name=duckdb compute_context=//data/accelerated_duckdb.db sql=SELECT count(1) AS "count(*)" FROM hits rewritten_sql=SELECT count(1) AS "count(*)" FROM "hits" |
+|               |                                                                                                                                                                                                            |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

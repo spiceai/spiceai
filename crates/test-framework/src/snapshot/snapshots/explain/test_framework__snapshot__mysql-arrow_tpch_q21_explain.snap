@@ -6,8 +6,8 @@ description: "Query: tpch_q21"
 | plan_type     | plan                                                                                                                                                                                          |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: numwait DESC NULLS FIRST, supplier.s_name ASC NULLS LAST, fetch=100                                                                                                                     |
-|               |   Projection: supplier.s_name, count(*) AS numwait                                                                                                                                            |
-|               |     Aggregate: groupBy=[[supplier.s_name]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                              |
+|               |   Projection: supplier.s_name, count(Int64(1)) AS numwait                                                                                                                                     |
+|               |     Aggregate: groupBy=[[supplier.s_name]], aggr=[[count(Int64(1))]]                                                                                                                          |
 |               |       Projection: supplier.s_name                                                                                                                                                             |
 |               |         LeftAnti Join: l1.l_orderkey = __correlated_sq_2.l_orderkey Filter: __correlated_sq_2.l_suppkey != l1.l_suppkey                                                                       |
 |               |           LeftSemi Join: l1.l_orderkey = __correlated_sq_1.l_orderkey Filter: __correlated_sq_1.l_suppkey != l1.l_suppkey                                                                     |
@@ -44,11 +44,11 @@ description: "Query: tpch_q21"
 |               |                     TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate]                                                                                       |
 | physical_plan | SortPreservingMergeExec: [numwait@1 DESC, s_name@0 ASC NULLS LAST], fetch=100                                                                                                                 |
 |               |   SortExec: TopK(fetch=100), expr=[numwait@1 DESC, s_name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                     |
-|               |     ProjectionExec: expr=[s_name@0 as s_name, count(*)@1 as numwait]                                                                                                                          |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[s_name@0 as s_name], aggr=[count(*)]                                                                                                         |
+|               |     ProjectionExec: expr=[s_name@0 as s_name, count(Int64(1))@1 as numwait]                                                                                                                   |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[s_name@0 as s_name], aggr=[count(Int64(1))]                                                                                                  |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                           |
 |               |           RepartitionExec: partitioning=Hash([s_name@0], 24), input_partitions=24                                                                                                             |
-|               |             AggregateExec: mode=Partial, gby=[s_name@0 as s_name], aggr=[count(*)]                                                                                                            |
+|               |             AggregateExec: mode=Partial, gby=[s_name@0 as s_name], aggr=[count(Int64(1))]                                                                                                     |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
 |               |                 HashJoinExec: mode=Partitioned, join_type=LeftAnti, on=[(l_orderkey@1, l_orderkey@0)], filter=l_suppkey@1 != l_suppkey@0, projection=[s_name@0]                               |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
@@ -70,7 +70,7 @@ description: "Query: tpch_q21"
 |               |                                                   BytesProcessedExec                                                                                                                          |
 |               |                                                     SchemaCastScanExec                                                                                                                        |
 |               |                                                       RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                   |
-|               |                                                         MemoryExec: partitions=1, partition_sizes=[3]                                                                                         |
+|               |                                                         DataSourceExec: partitions=1, partition_sizes=[3]                                                                                     |
 |               |                                               CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
 |               |                                                 RepartitionExec: partitioning=Hash([l_suppkey@1], 24), input_partitions=24                                                                    |
 |               |                                                   ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]                                                                 |
@@ -79,7 +79,7 @@ description: "Query: tpch_q21"
 |               |                                                         FilterExec: l_receiptdate@3 > l_commitdate@2                                                                                          |
 |               |                                                           SchemaCastScanExec                                                                                                                  |
 |               |                                                             RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                             |
-|               |                                                               MemoryExec: partitions=1, partition_sizes=[1501]                                                                                |
+|               |                                                               DataSourceExec: partitions=1, partition_sizes=[1501]                                                                            |
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                         RepartitionExec: partitioning=Hash([o_orderkey@0], 24), input_partitions=24                                                                           |
 |               |                                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey]                                                                                                   |
@@ -88,7 +88,7 @@ description: "Query: tpch_q21"
 |               |                                                 FilterExec: o_orderstatus@1 = F                                                                                                               |
 |               |                                                   SchemaCastScanExec                                                                                                                          |
 |               |                                                     RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                     |
-|               |                                                       MemoryExec: partitions=1, partition_sizes=[375]                                                                                         |
+|               |                                                       DataSourceExec: partitions=1, partition_sizes=[375]                                                                                     |
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
 |               |                                 RepartitionExec: partitioning=Hash([n_nationkey@0], 24), input_partitions=24                                                                                  |
 |               |                                   ProjectionExec: expr=[n_nationkey@0 as n_nationkey]                                                                                                         |
@@ -97,13 +97,13 @@ description: "Query: tpch_q21"
 |               |                                         FilterExec: n_name@1 = SAUDI ARABIA                                                                                                                   |
 |               |                                           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                               |
 |               |                                             SchemaCastScanExec                                                                                                                                |
-|               |                                               MemoryExec: partitions=1, partition_sizes=[1]                                                                                                   |
+|               |                                               DataSourceExec: partitions=1, partition_sizes=[1]                                                                                               |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
 |               |                         RepartitionExec: partitioning=Hash([l_orderkey@0], 24), input_partitions=24                                                                                           |
 |               |                           BytesProcessedExec                                                                                                                                                  |
 |               |                             SchemaCastScanExec                                                                                                                                                |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                                           |
-|               |                                 MemoryExec: partitions=1, partition_sizes=[1501]                                                                                                              |
+|               |                                 DataSourceExec: partitions=1, partition_sizes=[1501]                                                                                                          |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 24), input_partitions=24                                                                                               |
 |               |                       ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]                                                                                             |
@@ -112,6 +112,6 @@ description: "Query: tpch_q21"
 |               |                             FilterExec: l_receiptdate@3 > l_commitdate@2                                                                                                                      |
 |               |                               SchemaCastScanExec                                                                                                                                              |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                                         |
-|               |                                   MemoryExec: partitions=1, partition_sizes=[1501]                                                                                                            |
+|               |                                   DataSourceExec: partitions=1, partition_sizes=[1501]                                                                                                        |
 |               |                                                                                                                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

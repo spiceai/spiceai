@@ -53,6 +53,7 @@ impl TokenProviderRegistry {
     ) -> Result<Arc<dyn TokenProvider>, E>
     where
         P: TokenProvider + 'static,
+        E: std::error::Error + Send + Sync,
         Fut: std::future::Future<Output = Result<P, E>> + Send,
         F: FnOnce() -> Fut + Send,
     {

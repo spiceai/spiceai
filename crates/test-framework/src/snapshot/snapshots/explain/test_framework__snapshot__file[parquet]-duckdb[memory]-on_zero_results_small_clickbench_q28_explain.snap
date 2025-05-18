@@ -2,33 +2,33 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q28"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                              |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: l DESC NULLS FIRST, fetch=25                                                                                                                |
-|               |   Projection: hits.CounterID, avg(character_length(hits.URL)) AS l, count(*) AS c                                                                 |
-|               |     Filter: count(*) > Int64(100000)                                                                                                              |
-|               |       Aggregate: groupBy=[[hits.CounterID]], aggr=[[avg(CAST(character_length(CAST(hits.URL AS Utf8)) AS Float64)), count(Int64(1)) AS count(*)]] |
-|               |         BytesProcessedNode                                                                                                                        |
-|               |           Filter: CAST(hits.URL AS Utf8) != Utf8("")                                                                                              |
-|               |             TableScan: hits projection=[CounterID, URL], partial_filters=[CAST(hits.URL AS Utf8) != Utf8("")]                                     |
-| physical_plan | SortExec: TopK(fetch=25), expr=[l@1 DESC], preserve_partitioning=[false]                                                                          |
-|               |   CoalescePartitionsExec                                                                                                                          |
-|               |     ProjectionExec: expr=[CounterID@0 as CounterID, avg(character_length(hits.URL))@1 as l, count(*)@2 as c]                                      |
-|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
-|               |         FilterExec: count(*)@2 > 100000                                                                                                           |
-|               |           AggregateExec: mode=FinalPartitioned, gby=[CounterID@0 as CounterID], aggr=[avg(character_length(hits.URL)), count(*)]                  |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                           |
-|               |               RepartitionExec: partitioning=Hash([CounterID@0], 16), input_partitions=16                                                          |
-|               |                 AggregateExec: mode=Partial, gby=[CounterID@0 as CounterID], aggr=[avg(character_length(hits.URL)), count(*)]                     |
-|               |                   BytesProcessedExec                                                                                                              |
-|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                       FilterExec: CAST(URL@1 AS Utf8) !=                                                                                          |
-|               |                         SchemaCastScanExec                                                                                                        |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                   |
-|               |                             FallbackOnZeroResultsScanExec                                                                                         |
-|               |                               CoalescePartitionsExec                                                                                              |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                             |
-|               |                                   DuckSqlExec sql= SELECT "CounterID", "URL" FROM hits WHERE (CAST("URL" AS VARCHAR) <> '')                       |
-|               |                                                                                                                                                   |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                    |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: l DESC NULLS FIRST, fetch=25                                                                                                      |
+|               |   Projection: hits.CounterID, avg(character_length(hits.URL)) AS l, count(Int64(1)) AS c                                                |
+|               |     Filter: count(Int64(1)) > Int64(100000)                                                                                             |
+|               |       Aggregate: groupBy=[[hits.CounterID]], aggr=[[avg(CAST(character_length(CAST(hits.URL AS Utf8)) AS Float64)), count(Int64(1))]]   |
+|               |         BytesProcessedNode                                                                                                              |
+|               |           Filter: CAST(hits.URL AS Utf8) != Utf8("")                                                                                    |
+|               |             TableScan: hits projection=[CounterID, URL], partial_filters=[CAST(hits.URL AS Utf8) != Utf8("")]                           |
+| physical_plan | SortExec: TopK(fetch=25), expr=[l@1 DESC], preserve_partitioning=[false]                                                                |
+|               |   CoalescePartitionsExec                                                                                                                |
+|               |     ProjectionExec: expr=[CounterID@0 as CounterID, avg(character_length(hits.URL))@1 as l, count(Int64(1))@2 as c]                     |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                       |
+|               |         FilterExec: count(Int64(1))@2 > 100000                                                                                          |
+|               |           AggregateExec: mode=FinalPartitioned, gby=[CounterID@0 as CounterID], aggr=[avg(character_length(hits.URL)), count(Int64(1))] |
+|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                 |
+|               |               RepartitionExec: partitioning=Hash([CounterID@0], 16), input_partitions=16                                                |
+|               |                 AggregateExec: mode=Partial, gby=[CounterID@0 as CounterID], aggr=[avg(character_length(hits.URL)), count(Int64(1))]    |
+|               |                   BytesProcessedExec                                                                                                    |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                         |
+|               |                       FilterExec: CAST(URL@1 AS Utf8) !=                                                                                |
+|               |                         SchemaCastScanExec                                                                                              |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                         |
+|               |                             FallbackOnZeroResultsScanExec                                                                               |
+|               |                               CoalescePartitionsExec                                                                                    |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
+|               |                                   DuckSqlExec sql= SELECT "CounterID", "URL" FROM hits WHERE (CAST("URL" AS VARCHAR) <> '')             |
+|               |                                                                                                                                         |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+

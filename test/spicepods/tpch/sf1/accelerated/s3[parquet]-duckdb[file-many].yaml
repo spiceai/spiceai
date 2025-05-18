@@ -24,7 +24,7 @@ datasets:
   - from: s3://benchmarks/tpch_sf1/nation/
     name: nation
     params: *s3_params
-    acceleration: &acceleration1
+    acceleration: *acceleration1
   - from: s3://benchmarks/tpch_sf1/orders/
     name: orders
     params: *s3_params
