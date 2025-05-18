@@ -6,8 +6,8 @@ description: "Query: tpch_q13"
 | plan_type     | plan                                                                                                                                                                  |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                                                    |
-|               |   Projection: c_orders.c_count, count(*) AS custdist                                                                                                                  |
-|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                     |
+|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                                           |
+|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                                                 |
 |               |       SubqueryAlias: c_orders                                                                                                                                         |
 |               |         Projection: count(orders.o_orderkey) AS c_count                                                                                                               |
 |               |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                                                                                |
@@ -21,11 +21,11 @@ description: "Query: tpch_q13"
 |               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment], partial_filters=[orders.o_comment NOT LIKE LargeUtf8("%special%requests%")]    |
 | physical_plan | SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[false]                                                                                       |
 |               |   CoalescePartitionsExec                                                                                                                                              |
-|               |     ProjectionExec: expr=[c_count@0 as c_count, count(*)@1 as custdist]                                                                                               |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(*)]                                                                               |
+|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                        |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                        |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                   |
 |               |           RepartitionExec: partitioning=Hash([c_count@0], 24), input_partitions=24                                                                                    |
-|               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(*)]                                                                                  |
+|               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                           |
 |               |               ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]                                                                                            |
 |               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]                                                |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                         |

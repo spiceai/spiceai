@@ -16,28 +16,33 @@ limitations under the License.
 
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
-use mcp_client::{
-    ClientCapabilities, ClientInfo, Error as McpError, McpClient, McpClientTrait, McpService,
-    SseTransport, StdioTransport, Transport, transport::Error as TransportError,
+use rmcp::{
+    RoleClient, ServiceError, ServiceExt,
+    model::{
+        CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, ClientRequest,
+        Extensions, Implementation, InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
+        PingRequest, PingRequestMethod, ProtocolVersion,
+    },
+    serve_client,
+    service::RunningService,
+    transport::{SseTransport, TokioChildProcess},
 };
-use mcp_core::Tool as McpTool;
 use snafu::ResultExt;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
+    process::Command,
     sync::RwLock,
     time::{MissedTickBehavior, interval},
 };
 
 use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
-use super::{
-    MCPConfig, Result, UnderlyingInitilizationSnafu, UnderlyingTransportSnafu, tool::McpToolWrapper,
-};
+use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
 pub(crate) struct McpToolCatalog {
-    client: Arc<RwLock<Box<dyn McpClientTrait>>>,
+    client: Arc<RwLock<McpClient>>,
 
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
@@ -52,24 +57,9 @@ impl Drop for McpToolCatalog {
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str) -> Result<Self> {
-        let client = Self::create_client(&cfg)
-            .await
-            .context(UnderlyingTransportSnafu)?;
+        let client = Self::create_client(&cfg).await?;
+        let client = Arc::new(RwLock::new(client));
 
-        client
-            .write()
-            .await
-            .initialize(
-                ClientInfo {
-                    name: "spiced".to_string(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                },
-                ClientCapabilities::default(),
-            )
-            .await
-            .context(UnderlyingInitilizationSnafu)?;
-
-        let client = Arc::new(client);
         let client_clone = Arc::clone(&client);
         let cfg_clone = cfg.clone();
         let name_clone = name.to_string();
@@ -82,31 +72,13 @@ impl McpToolCatalog {
                 interval.tick().await;
 
                 let heartbeat_result = client_clone.read().await.ping().await;
-
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
                     tracing::debug!("MCP client heartbeat failed with error: {e}");
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
-                        if new_client_rwlock
-                            .write()
-                            .await
-                            .initialize(
-                                ClientInfo {
-                                    name: "spiced".to_string(),
-                                    version: env!("CARGO_PKG_VERSION").to_string(),
-                                },
-                                ClientCapabilities::default(),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            let mut client_lock = client_clone.write().await;
-                            *client_lock = new_client_rwlock.into_inner(); // Directly assign the unwrapped Box<dyn McpClientTrait>
-                            tracing::info!(
-                                "Successfully reconnected MCP client for {}",
-                                name_clone
-                            );
-                        }
+                        let mut client_lock = client_clone.write().await;
+                        *client_lock = new_client_rwlock;
+                        tracing::info!("Successfully reconnected MCP client for {}", name_clone);
                     }
                 }
             }
@@ -119,42 +91,57 @@ impl McpToolCatalog {
         })
     }
 
-    async fn create_client(
-        cfg: &MCPConfig,
-    ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
+    async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
         match cfg {
-            MCPConfig::Stdio { command, args, env } => {
-                Self::stdio_client(command.as_str(), args, env).await
+            MCPConfig::Stdio { command, args, env } => Ok(McpClient::Stdio(
+                serve_client(
+                    (),
+                    TokioChildProcess::new(Command::new(command.as_str()).args(args).envs(env))
+                        .boxed()
+                        .context(UnderlyingTransportSnafu)?,
+                )
+                .await
+                .boxed()
+                .context(UnderlyingTransportSnafu)?,
+            )),
+            MCPConfig::Https { url } => {
+                let transport = SseTransport::start(url.clone())
+                    .await
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?;
+
+                let client_info = ClientInfo {
+                    protocol_version: ProtocolVersion::default(),
+                    capabilities: ClientCapabilities::default(),
+                    client_info: Implementation {
+                        name: "Spice.ai".to_string(),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                };
+
+                Ok(McpClient::Sse(
+                    client_info
+                        .serve(transport)
+                        .await
+                        .boxed()
+                        .context(UnderlyingTransportSnafu)?,
+                ))
             }
-            MCPConfig::Https { url } => Self::https_client(url.clone()).await,
         }
     }
 
-    async fn stdio_client(
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
-    ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
-        let transport = StdioTransport::new(command, args.to_vec(), env.clone());
-        let transport_handle = transport.start().await?;
-        let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
-        Ok(RwLock::new(Box::new(McpClient::new(service))))
-    }
-
-    async fn https_client(
-        url: url::Url,
-    ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
-        let transport = SseTransport::new(url, HashMap::new());
-        let transport_handle = transport.start().await?;
-        let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
-        Ok(RwLock::new(Box::new(McpClient::new(service))))
-    }
-
-    async fn list_tools(&self) -> std::result::Result<Vec<McpTool>, McpError> {
+    async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
         let mut cursor: Option<String> = None;
-        let mut tools: Vec<McpTool> = vec![];
+        let mut tools: Vec<rmcp::model::Tool> = vec![];
         loop {
-            let response = self.client.read().await.list_tools(cursor.clone()).await?;
+            let response = self
+                .client
+                .read()
+                .await
+                .list_tools(Some(PaginatedRequestParam {
+                    cursor: cursor.clone(),
+                }))
+                .await?;
             tools.extend(response.tools);
             cursor = response.next_cursor;
             if cursor.is_none() {
@@ -164,11 +151,21 @@ impl McpToolCatalog {
         Ok(tools)
     }
 
-    async fn get_tool(&self, name: &str) -> std::result::Result<Option<McpTool>, McpError> {
+    async fn get_tool(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
         let mut cursor: Option<String> = None;
         loop {
-            let response = self.client.read().await.list_tools(cursor.clone()).await?;
-            if let Some(t) = response.tools.iter().find(|t| t.name.as_str() == name) {
+            let response = self
+                .client
+                .read()
+                .await
+                .list_tools(Some(PaginatedRequestParam {
+                    cursor: cursor.clone(),
+                }))
+                .await?;
+            if let Some(t) = response.tools.iter().find(|t| t.name == name) {
                 return Ok(Some(t.clone()));
             }
             cursor = response.next_cursor;
@@ -177,6 +174,44 @@ impl McpToolCatalog {
             }
         }
         Ok(None)
+    }
+}
+
+pub enum McpClient {
+    Stdio(RunningService<RoleClient, ()>),
+    Sse(RunningService<RoleClient, InitializeRequestParam>),
+}
+
+impl McpClient {
+    pub async fn list_tools(
+        &self,
+        params: Option<PaginatedRequestParam>,
+    ) -> Result<ListToolsResult, ServiceError> {
+        match self {
+            McpClient::Stdio(s) => s.list_tools(params).await,
+            McpClient::Sse(s) => s.list_tools(params).await,
+        }
+    }
+    pub async fn call_tool(
+        &self,
+        params: CallToolRequestParam,
+    ) -> Result<CallToolResult, ServiceError> {
+        match self {
+            McpClient::Stdio(s) => s.call_tool(params).await,
+            McpClient::Sse(s) => s.call_tool(params).await,
+        }
+    }
+
+    pub async fn ping(&self) -> Result<(), ServiceError> {
+        let req = ClientRequest::PingRequest(PingRequest {
+            method: PingRequestMethod,
+            extensions: Extensions::new(),
+        });
+        match self {
+            McpClient::Stdio(s) => s.send_request(req).await,
+            McpClient::Sse(s) => s.send_request(req).await,
+        }
+        .map(|_| ())
     }
 }
 
@@ -207,9 +242,14 @@ impl SpiceToolCatalog for McpToolCatalog {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: None,
-                    name: t.name,
-                    description: Some(t.description),
-                    parameters: Some(t.input_schema),
+                    name: t.name.to_string(),
+                    description: t.description.as_deref().map(ToString::to_string),
+                    parameters: Some(serde_json::Value::Object(
+                        t.input_schema
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    )),
                 },
             })
             .collect()

@@ -46,7 +46,12 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		if body != nil {
 			reader = strings.NewReader(*body)
 		}
-		resp, err = rtcontext.Do("POST", path, reader, "Content-Type", "application/json")
+
+		if body != nil {
+			resp, err = rtcontext.Do("POST", path, reader, "Content-Type", "application/json")
+		} else {
+			resp, err = rtcontext.Do("POST", path, reader)
+		}
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}

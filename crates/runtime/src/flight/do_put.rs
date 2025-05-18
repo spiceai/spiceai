@@ -42,9 +42,9 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
-    datafusion::DataFusion,
+    datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    request::RequestContext,
+    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 
@@ -54,7 +54,6 @@ use super::{
 };
 
 pub(crate) async fn handle(
-    flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     let rate_limit_check_fn = request
@@ -78,8 +77,7 @@ pub(crate) async fn handle(
         if let Command::CommandPreparedStatementQuery(query) =
             Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
         {
-            return prepared_statement_query::do_put_query(flight_svc, query, streaming_flight)
-                .await;
+            return prepared_statement_query::do_put_query(query, streaming_flight).await;
         }
     }
 
@@ -127,7 +125,10 @@ pub(crate) async fn handle(
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
 
-    if !flight_svc.datafusion.is_writable(&path) {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    if !datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
@@ -137,9 +138,7 @@ pub(crate) async fn handle(
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
-    let df = Arc::clone(&flight_svc.datafusion);
-
-    let target_schema = df
+    let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
@@ -152,7 +151,7 @@ pub(crate) async fn handle(
 
     let first_message = first_message.clone();
     let response_stream =
-        create_response_stream(path, schema, df, streaming_flight, &first_message);
+        create_response_stream(path, schema, datafusion, streaming_flight, &first_message);
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 

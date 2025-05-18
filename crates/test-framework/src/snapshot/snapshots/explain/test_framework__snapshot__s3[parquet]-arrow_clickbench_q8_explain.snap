@@ -2,25 +2,27 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q8"
 ---
-+---------------+-----------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                          |
-+---------------+-----------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: count(*) DESC NULLS FIRST                                                               |
-|               |   Aggregate: groupBy=[[hits.AdvEngineID]], aggr=[[count(Int64(1)) AS count(*)]]               |
-|               |     BytesProcessedNode                                                                        |
-|               |       Filter: hits.AdvEngineID != Int16(0)                                                    |
-|               |         TableScan: hits projection=[AdvEngineID]                                              |
-| physical_plan | SortPreservingMergeExec: [count(*)@1 DESC]                                                    |
-|               |   SortExec: expr=[count(*)@1 DESC], preserve_partitioning=[true]                              |
-|               |     AggregateExec: mode=FinalPartitioned, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(*)] |
-|               |       CoalesceBatchesExec: target_batch_size=8192                                             |
-|               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 16), input_partitions=16          |
-|               |           AggregateExec: mode=Partial, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(*)]    |
-|               |             BytesProcessedExec                                                                |
-|               |               CoalesceBatchesExec: target_batch_size=8192                                     |
-|               |                 FilterExec: AdvEngineID@0 != 0                                                |
-|               |                   SchemaCastScanExec                                                          |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1     |
-|               |                       MemoryExec: partitions=1, partition_sizes=[12218]                       |
-|               |                                                                                               |
-+---------------+-----------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                   |
++---------------+--------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: count(*) DESC NULLS FIRST                                                                        |
+|               |   Projection: hits.AdvEngineID, count(Int64(1)) AS count(*)                                            |
+|               |     Aggregate: groupBy=[[hits.AdvEngineID]], aggr=[[count(Int64(1))]]                                  |
+|               |       BytesProcessedNode                                                                               |
+|               |         Filter: hits.AdvEngineID != Int16(0)                                                           |
+|               |           TableScan: hits projection=[AdvEngineID]                                                     |
+| physical_plan | SortPreservingMergeExec: [count(*)@1 DESC]                                                             |
+|               |   SortExec: expr=[count(*)@1 DESC], preserve_partitioning=[true]                                       |
+|               |     ProjectionExec: expr=[AdvEngineID@0 as AdvEngineID, count(Int64(1))@1 as count(*)]                 |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                    |
+|               |           RepartitionExec: partitioning=Hash([AdvEngineID@0], 16), input_partitions=16                 |
+|               |             AggregateExec: mode=Partial, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))]    |
+|               |               BytesProcessedExec                                                                       |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                            |
+|               |                   FilterExec: AdvEngineID@0 != 0                                                       |
+|               |                     SchemaCastScanExec                                                                 |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1            |
+|               |                         DataSourceExec: partitions=1, partition_sizes=[12218]                          |
+|               |                                                                                                        |
++---------------+--------------------------------------------------------------------------------------------------------+

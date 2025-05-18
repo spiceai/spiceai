@@ -73,9 +73,11 @@ pub enum Error {
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication."
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication.\n{source}"
     ))]
-    UnableToGetToken {},
+    UnableToGetToken {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -119,14 +121,9 @@ impl Databricks {
                         )
                         .await?
                     }
-                    AuthCredentials::U2M(client_id, token) => {
-                        Self::get_u2m_token_provider(
-                            endpoint,
-                            client_id,
-                            token,
-                            &token_provider_registry,
-                        )
-                        .await?
+                    AuthCredentials::U2M(client_id) => {
+                        Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
+                            .await?
                     }
                 };
 
@@ -176,7 +173,7 @@ impl Databricks {
 
         match (token, client_id, client_secret) {
             (Some(token), None, None) => Ok(AuthCredentials::Token(token)),
-            (Some(token), Some(client_id), None) => Ok(AuthCredentials::U2M(client_id ,token)),
+            (None, Some(client_id), None) => Ok(AuthCredentials::U2M(client_id)),
             (None, Some(client_id), Some(client_secret)) => {
                 Ok(AuthCredentials::ServicePrincipal(client_id, client_secret))
             }
@@ -186,19 +183,13 @@ impl Databricks {
                 }
                 .fail()
             }
-            (None, Some(_), None) => {
-                MissingParameterSnafu {
-                    parameter: "`databricks_client_secret`".to_string(),
-                }
-                .fail()
-            }
             (None, None, Some(_)) => {
                 MissingParameterSnafu {
                     parameter: "databricks_client_id".to_string(),
                 }
                 .fail()
             }
-            (Some(_), Some(_), Some(_)) => {
+            (Some(_), Some(_), Some(_) | None) => {
                 InvalidConfigurationSnafu {
                     message: "Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`".to_string(),
                 }
@@ -249,14 +240,10 @@ impl Databricks {
                 .context(UnableToConstructDatabricksSparkSnafu)?
             }
 
-            AuthCredentials::U2M(client_id, token) => {
-                let token_provider = Self::get_u2m_token_provider(
-                    endpoint,
-                    client_id,
-                    token,
-                    &token_provider_registry,
-                )
-                .await?;
+            AuthCredentials::U2M(client_id) => {
+                let token_provider =
+                    Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
+                        .await?;
 
                 DatabricksSparkConnect::from_token_provider(
                     endpoint.to_string(),
@@ -290,13 +277,14 @@ impl Databricks {
                 .await
             })
             .await
-            .map_err(|_| Error::UnableToGetToken {})
+            .map_err(|e| Error::UnableToGetToken {
+                source: Box::new(e),
+            })
     }
 
     pub async fn get_u2m_token_provider(
         endpoint: &str,
         client_id: &str,
-        token: &SecretString,
         token_provider_registry: &Arc<TokenProviderRegistry>,
     ) -> Result<Arc<dyn TokenProvider>> {
         token_provider_registry
@@ -306,12 +294,13 @@ impl Databricks {
                     Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),
-                        token.clone(),
                     ))
                 },
             )
             .await
-            .map_err(|_| Error::UnableToGetToken {})
+            .map_err(|err| Error::UnableToGetToken {
+                source: Box::new(err),
+            })
     }
 
     pub(crate) fn read_provider(&self) -> Arc<dyn Read> {
@@ -529,16 +518,18 @@ mod tests {
         let result = Databricks::build_auth_credentials(&parameters);
 
         assert!(
-            result.is_err(),
-            "Databricks::build_auth_credentials should return an error"
+            result.is_ok(),
+            "Databricks::build_auth_credentials should return an Ok result"
         );
-        if let Err(error) = result {
-            assert!(error.to_string().contains("`databricks_client_secret`"));
+        if let Ok(AuthCredentials::U2M(id)) = result {
+            assert_eq!(id, client_id);
+        } else {
+            panic!("Expected U2M variant");
         }
     }
 
     #[test]
-    fn test_build_auth_credentials_missing_client_id() {
+    fn test_build_auth_credentials_u2m() {
         let client_secret = "test_client_secret";
         let params_vec = vec![(
             "client_secret".to_string(),

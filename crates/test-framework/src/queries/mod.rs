@@ -168,7 +168,6 @@ impl Query {
 
     #[must_use]
     pub fn get_parameters_batch(&self) -> Option<anyhow::Result<RecordBatch>> {
-        println!("parameters: {}", self.parameters.is_some());
         self.parameters.as_ref().map(|params| {
             let columns: Vec<_> = params
                 .iter()

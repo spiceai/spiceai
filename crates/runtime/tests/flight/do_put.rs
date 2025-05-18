@@ -46,7 +46,7 @@ async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+            let (channel, df) = start_spice_test_app(Some(auth), None, None).await?;
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
@@ -83,7 +83,7 @@ async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
     let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+    let (channel, df) = start_spice_test_app(Some(auth), None, None).await?;
 
     let mut client = create_flight_client(channel, Some("valid"))?;
 
@@ -141,7 +141,7 @@ async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope_retry(3, || async {
-            let (channel, _df) = start_spice_test_app(None, None).await?;
+            let (channel, _df) = start_spice_test_app(None, None, None).await?;
 
             let mut client = create_flight_client(channel, None)?;
 
@@ -167,7 +167,7 @@ async fn test_flight_do_put_ro_key() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let (channel, _df) = start_spice_test_app(Some(auth), None).await?;
+            let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
@@ -200,6 +200,7 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
             let (channel, df) = start_spice_test_app(
                 Some(auth),
                 Some(RateLimits::new().with_flight_write_limit(write_quota)),
+                None,
             )
             .await?;
 
@@ -253,7 +254,7 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+            let (channel, df) = start_spice_test_app(Some(auth), None, None).await?;
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
@@ -294,7 +295,7 @@ async fn test_do_put_read_timeout() -> Result<(), Box<dyn std::error::Error>> {
     let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+    let (channel, df) = start_spice_test_app(Some(auth), None, None).await?;
 
     let mut client = create_flight_client(channel, Some("valid"))?;
 

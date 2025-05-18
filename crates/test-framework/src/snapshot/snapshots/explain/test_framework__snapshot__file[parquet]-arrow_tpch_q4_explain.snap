@@ -6,8 +6,8 @@ description: "Query: tpch_q4"
 | plan_type     | plan                                                                                                                                  |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: orders.o_orderpriority ASC NULLS LAST                                                                                           |
-|               |   Projection: orders.o_orderpriority, count(*) AS order_count                                                                         |
-|               |     Aggregate: groupBy=[[orders.o_orderpriority]], aggr=[[count(Int64(1)) AS count(*)]]                                               |
+|               |   Projection: orders.o_orderpriority, count(Int64(1)) AS order_count                                                                  |
+|               |     Aggregate: groupBy=[[orders.o_orderpriority]], aggr=[[count(Int64(1))]]                                                           |
 |               |       Projection: orders.o_orderpriority                                                                                              |
 |               |         LeftSemi Join: orders.o_orderkey = __correlated_sq_1.l_orderkey                                                               |
 |               |           Projection: orders.o_orderkey, orders.o_orderpriority                                                                       |
@@ -21,11 +21,11 @@ description: "Query: tpch_q4"
 |               |                   TableScan: lineitem projection=[l_orderkey, l_commitdate, l_receiptdate]                                            |
 | physical_plan | SortPreservingMergeExec: [o_orderpriority@0 ASC NULLS LAST]                                                                           |
 |               |   SortExec: expr=[o_orderpriority@0 ASC NULLS LAST], preserve_partitioning=[true]                                                     |
-|               |     ProjectionExec: expr=[o_orderpriority@0 as o_orderpriority, count(*)@1 as order_count]                                            |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(*)]                               |
+|               |     ProjectionExec: expr=[o_orderpriority@0 as o_orderpriority, count(Int64(1))@1 as order_count]                                     |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(Int64(1))]                        |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |           RepartitionExec: partitioning=Hash([o_orderpriority@0], 24), input_partitions=24                                            |
-|               |             AggregateExec: mode=Partial, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(*)]                                  |
+|               |             AggregateExec: mode=Partial, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(Int64(1))]                           |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                             |
 |               |                 HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_orderpriority@1] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
@@ -36,7 +36,7 @@ description: "Query: tpch_q4"
 |               |                             FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01                                    |
 |               |                               SchemaCastScanExec                                                                                      |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                 |
-|               |                                   MemoryExec: partitions=1, partition_sizes=[184]                                                     |
+|               |                                   DataSourceExec: partitions=1, partition_sizes=[184]                                                 |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 24), input_partitions=24                                       |
 |               |                       ProjectionExec: expr=[l_orderkey@0 as l_orderkey]                                                               |
@@ -45,6 +45,6 @@ description: "Query: tpch_q4"
 |               |                             FilterExec: l_receiptdate@2 > l_commitdate@1                                                              |
 |               |                               SchemaCastScanExec                                                                                      |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                 |
-|               |                                   MemoryExec: partitions=1, partition_sizes=[733]                                                     |
+|               |                                   DataSourceExec: partitions=1, partition_sizes=[733]                                                 |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+

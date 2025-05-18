@@ -58,7 +58,6 @@ pub(crate) async fn get_flight_info(
 ///   `key_sequence`: int32 not null
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) async fn do_get(
-    _flight_svc: &Service,
     query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("get_primary_keys")).await;

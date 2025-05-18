@@ -1,0 +1,43 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-duckdb[file-many]
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration1
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-1.db
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration: *acceleration1
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration1
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration: &acceleration2
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-2.db
+  - from: file:data/part.parquet
+    name: part
+    acceleration: *acceleration2
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration: *acceleration2
+  - from: file:data/region.parquet
+    name: region
+    acceleration: &acceleration3
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-3.db
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration: *acceleration3

@@ -33,6 +33,7 @@ use arrow_flight::{
     Ticket, flight_service_server::FlightServiceServer,
 };
 use arrow_ipc::writer::IpcWriteOptions;
+use async_stream::try_stream;
 use bytes::Bytes;
 use cache::QueryResultsCacheStatus;
 use datafusion::common::ParamValues;
@@ -43,7 +44,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, TokenProviderLayer, WriteRateLimitLayer};
+use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -69,7 +70,6 @@ mod middleware;
 mod util;
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
@@ -105,7 +105,7 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Box::pin(get_flight_info::handle(self, request)).await
+        Box::pin(get_flight_info::handle(request)).await
     }
 
     async fn poll_flight_info(
@@ -121,7 +121,7 @@ impl FlightService for Service {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let _start = track_flight_request("get_schema", None).await;
-        get_schema::handle(self, request).await
+        get_schema::handle(request).await
     }
 
     async fn do_get(
@@ -129,7 +129,7 @@ impl FlightService for Service {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let _start = track_flight_request("do_get", None).await;
-        Box::pin(do_get::handle(self, request)).await
+        Box::pin(do_get::handle(request)).await
     }
 
     async fn do_put(
@@ -137,7 +137,7 @@ impl FlightService for Service {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let _start = track_flight_request("do_put", None).await;
-        do_put::handle(self, request).await
+        do_put::handle(request).await
     }
 
     async fn do_exchange(
@@ -153,7 +153,7 @@ impl FlightService for Service {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let _start = track_flight_request("do_action", None).await;
-        Box::pin(actions::do_action(self, request)).await
+        Box::pin(actions::do_action(request)).await
     }
 
     async fn list_actions(
@@ -206,47 +206,50 @@ impl Service {
 
         let query_result = query.run().await.map_err(handle_query_error)?;
 
-        let schema = query_result.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
-        let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
-        let schema_flight_data = FlightData::from(schema_as_ipc);
 
-        let batches_stream = query_result
-            .data
-            .then(move |batch_result| {
-                let options_clone = options.clone();
-                async move {
-                    let encoder = IpcDataGenerator::default();
-                    let mut tracker = DictionaryTracker::new(false);
+        let mut dict_tracker = DictionaryTracker::new(false);
+        let encoder = IpcDataGenerator::default();
+        let data = IpcMessage(
+            encoder
+                .schema_to_bytes_with_dictionary_tracker(
+                    query_result.data.schema().as_ref(),
+                    &mut dict_tracker,
+                    &options,
+                )
+                .ipc_message
+                .into(),
+        );
+        let schema_flight_data = FlightData {
+            data_header: data.0,
+            ..Default::default()
+        };
 
-                    match batch_result {
-                        Ok(batch) => {
-                            let (flight_dictionaries, flight_batch) = encoder
-                                .encoded_batch(&batch, &mut tracker, &options_clone)
-                                .map_err(|e| Status::internal(e.to_string()))?;
+        let data_stream = query_result.data;
+        let flights_stream = try_stream! {
+            yield schema_flight_data;
 
-                            let mut flights: Vec<FlightData> =
-                                flight_dictionaries.into_iter().map(Into::into).collect();
-                            flights.push(flight_batch.into());
-                            Ok(flights)
+            futures::pin_mut!(data_stream); // needed to use `.next()` on stream
+
+            while let Some(batch_result) = data_stream.next().await {
+                match batch_result {
+                    Ok(batch) => {
+                        let (dicts, batch_data) = encoder
+                            .encoded_batch(&batch, &mut dict_tracker, &options)
+                            .map_err(|e| Status::internal(e.to_string()))?;
+
+                        for dict in dicts {
+                            yield dict.into();
                         }
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            Err(handle_datafusion_error(e))
-                        }
+                        yield batch_data.into();
+                    }
+                    Err(e) => {
+                        let e = find_datafusion_root(e);
+                        Err(handle_datafusion_error(e))?;
                     }
                 }
-            })
-            .map(|result| {
-                // Convert Result<Vec<FlightData>, Status> into Stream of Result<FlightData, Status>
-                match result {
-                    Ok(flights) => stream::iter(flights.into_iter().map(Ok)).left_stream(),
-                    Err(e) => stream::once(async { Err(e) }).right_stream(),
-                }
-            })
-            .flatten();
-
-        let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
+            }
+        };
 
         Ok((flights_stream.boxed(), query_result.results_cache_status))
     }
@@ -342,7 +345,6 @@ pub async fn start(
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
-        datafusion: rt.datafusion(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
@@ -368,8 +370,7 @@ pub async fn start(
         .into_inner();
 
     let server = server
-        .layer(RequestContextLayer::new(app))
-        .layer(TokenProviderLayer::new(rt.token_provider_registry()))
+        .layer(RequestContextLayer::new(app, rt.datafusion()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

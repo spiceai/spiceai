@@ -36,9 +36,8 @@ use datafusion::{
     optimizer::{
         AnalyzerRule,
         analyzer::{
-            count_wildcard_rule::CountWildcardRule, expand_wildcard_rule::ExpandWildcardRule,
-            inline_table_scan::InlineTableScan, resolve_grouping_function::ResolveGroupingFunction,
-            type_coercion::TypeCoercion,
+            expand_wildcard_rule::ExpandWildcardRule, inline_table_scan::InlineTableScan,
+            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
         },
     },
     prelude::{SessionConfig, SessionContext},
@@ -64,6 +63,7 @@ pub struct DataFusionBuilder {
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    task_history_enabled: bool,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -115,7 +115,14 @@ impl DataFusionBuilder {
             memory_limit: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
+            task_history_enabled: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_task_history(mut self, task_history: bool) -> Self {
+        self.task_history_enabled = task_history;
+        self
     }
 
     #[must_use]
@@ -226,6 +233,7 @@ impl DataFusionBuilder {
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            task_history_enabled: self.task_history_enabled,
         }
     }
 }
@@ -243,7 +251,6 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
-        Arc::new(CountWildcardRule::new()),
     ]
 }
 
@@ -312,7 +319,7 @@ mod tests {
         let default_rules = Analyzer::new().rules;
         assert_eq!(
             default_rules.len(),
-            5,
+            4,
             "Default analyzer rules have changed"
         );
         let expected_rule_names = vec![
@@ -320,7 +327,6 @@ mod tests {
             "expand_wildcard_rule",
             "resolve_grouping_function",
             "type_coercion",
-            "count_wildcard_rule",
         ];
         for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
             assert_eq!(

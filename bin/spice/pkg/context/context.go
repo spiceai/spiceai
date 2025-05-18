@@ -144,6 +144,20 @@ func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeade
 	return c.httpClient.Do(request)
 }
 
+func (c *RuntimeContext) HttpSocketAddress() string {
+	if endpoint, err := c.flags.GetString("http-endpoint"); err == nil && endpoint != "" {
+		return endpoint
+	}
+
+	if c.IsCloud() {
+		slog.Warn("Attempting to get socket address for HTTP endpoint when `--cloud` enabled")
+	}
+
+	// Note socket address, not HTTP address
+	return "127.0.0.1:8090"
+
+}
+
 func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -489,7 +503,7 @@ func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
 		}
 	}
 
-	args = append(args, "--http-endpoint", c.HttpEndpoint())
+	args = append(args, "--http", c.HttpSocketAddress())
 
 	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
 		args = append(args, "--metrics", endpoint)

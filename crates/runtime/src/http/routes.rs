@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::DataFusion;
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
@@ -26,10 +28,16 @@ use crate::http::v1::{
 use crate::request::Protocol;
 use crate::{config, request::RequestContext};
 
+#[cfg(feature = "mcp")]
+use crate::tools::mcp::server::RuntimeServer;
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
+#[cfg(feature = "mcp")]
+use rmcp::transport::SseServer;
+#[cfg(feature = "mcp")]
+use rmcp::transport::sse_server::SseServerConfig;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -45,9 +53,6 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use super::{metrics, v1};
 
-#[cfg(feature = "mcp")]
-use super::v1::mcp::McpState;
-
 use axum::{
     Extension,
     body::Body,
@@ -58,7 +63,6 @@ use axum::{
     routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
-use token_provider::registry::TokenProviderRegistry;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
@@ -88,8 +92,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::search::post,
         v1::chat::post,
         v1::models::get,
-        #[cfg(feature = "mcp")]
-        v1::mcp::event,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -129,6 +131,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
@@ -142,11 +145,11 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
-            "/v1/datasets/:name/acceleration/refresh",
+            "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
         )
         .route(
-            "/v1/datasets/:name/acceleration",
+            "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
@@ -156,15 +159,15 @@ pub(crate) fn routes(
         .route("/v1/config", get(v1::iceberg::get_config))
         .route("/v1/namespaces", get(v1::iceberg::get_namespaces))
         .route(
-            "/v1/namespaces/:namespace",
+            "/v1/namespaces/{namespace}",
             get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
         )
         .route(
-            "/v1/namespaces/:namespace/tables",
+            "/v1/namespaces/{namespace}/tables",
             get(v1::iceberg::list_tables),
         )
         .route(
-            "/v1/namespaces/:namespace/tables/:table",
+            "/v1/namespaces/{namespace}/tables/{table}",
             get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
         );
 
@@ -180,7 +183,7 @@ pub(crate) fn routes(
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
-            .route("/v1/models/:name/predict", get(v1::inference::get))
+            .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
             .route(
@@ -190,11 +193,11 @@ pub(crate) fn routes(
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/*name", post(v1::tools::post))
+            .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
-            .route("/v1/tool/:name", post(v1::tools::post))
+            .route("/v1/tool/{name}", post(v1::tools::post))
             .route(
-                "/v1/evals/:name",
+                "/v1/evals/{name}",
                 post(v1::eval::post).layer(ModelContextLayer),
             )
             .route("/v1/evals", get(v1::eval::list))
@@ -208,25 +211,24 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        authenticated_router = authenticated_router
-            .route("/v1/mcp/sse", get(v1::mcp::sse))
-            .route("/v1/mcp/sse", post(v1::mcp::event))
-            .layer(Extension(Arc::new(McpState::default())));
+        let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
+            bind: config.http_bind_address,
+            sse_path: "/v1/mcp/sse".to_string(),
+            post_path: "/v1/mcp/sse".to_string(),
+            ct: tokio_util::sync::CancellationToken::new(),
+            sse_keep_alive: None,
+        });
+
+        let runtime_arc = Arc::clone(rt);
+        let _cancellation_token =
+            sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        authenticated_router = mcp_router.merge(authenticated_router);
     }
 
     authenticated_router = authenticated_router
-        .layer(Extension(Arc::clone(&rt.app)))
-        .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
-
-    {
-        authenticated_router = authenticated_router.route_layer(middleware::from_fn_with_state(
-            rt.token_provider_registry(),
-            databricks_u2m_middleware,
-        ));
-    }
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
@@ -242,12 +244,16 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
-        .route_layer(middleware::from_fn(track_metrics))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&rt.df),
+            track_metrics,
+        ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
 }
 
 async fn track_metrics(
+    State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
     req: Request<Body>,
@@ -260,6 +266,8 @@ async fn track_metrics(
             .from_headers(&headers)
             .build(),
     );
+
+    request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
 
     let request_dimensions = request_context.to_dimensions();
 
@@ -339,30 +347,6 @@ async fn check_shutdown(
             "Runtime is shutting down",
         )
             .into_response();
-    }
-
-    next.run(req).await
-}
-
-async fn databricks_u2m_middleware(
-    State(token_provider_registry): State<Arc<TokenProviderRegistry>>,
-    req: axum::http::Request<Body>,
-    next: Next,
-) -> impl IntoResponse {
-    for (header_name, header_value) in req.headers() {
-        if header_name != "Spice-Databricks-Auth" {
-            continue;
-        }
-        let Ok(Some((client_id, access_token))) = header_value.to_str().map(|v| v.split_once(':'))
-        else {
-            continue;
-        };
-        if let Some(token_provider) = token_provider_registry
-            .get(format!("databricks_u2m_{client_id}"))
-            .await
-        {
-            token_provider.set_token(access_token.to_string());
-        };
     }
 
     next.run(req).await

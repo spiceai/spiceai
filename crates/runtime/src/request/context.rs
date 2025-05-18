@@ -28,7 +28,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
+use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
@@ -93,6 +93,22 @@ impl RequestContext {
     /// ```
     #[must_use]
     pub fn current(_marker: AsyncMarker) -> Arc<Self> {
+        REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .ok()
+            .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
+    }
+
+    /// **UNSAFE: Use `RequestContext::current` instead.**
+    ///
+    /// Returns the current request context, or an internal context if this is called outside of a request.
+    ///
+    /// # Safety
+    /// This method is unsafe and should not be used in most cases. It allows access to the request context from synchronous code,
+    /// which can easily lead to subtle bugs and undefined behavior if the context is not actually present.
+    /// Always prefer using [`RequestContext::current`] with an [`AsyncMarker`] in async code to ensure correct context handling.
+    #[must_use]
+    pub unsafe fn current_sync() -> Arc<Self> {
         REQUEST_CONTEXT
             .try_with(Arc::clone)
             .ok()
@@ -190,6 +206,7 @@ pub struct RequestContextBuilder {
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
+    extensions: Extensions,
 }
 
 impl RequestContextBuilder {
@@ -201,6 +218,7 @@ impl RequestContextBuilder {
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
+            extensions: Extensions::default(),
         }
     }
 
@@ -224,6 +242,12 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
+
+        if let Some(extension) = DatabricksAuthExtension::from_headers(headers) {
+            self.extensions
+                .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
+        }
+
         self
     }
 
@@ -300,7 +324,7 @@ impl RequestContextBuilder {
             cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
-            extensions: RwLock::new(HashMap::new()),
+            extensions: RwLock::new(self.extensions),
         }
     }
 }

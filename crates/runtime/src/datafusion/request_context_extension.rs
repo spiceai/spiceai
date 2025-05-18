@@ -1,0 +1,47 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use super::DataFusion;
+use crate::request::RequestContext;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct DataFusionContextExtension {
+    df: Arc<DataFusion>,
+}
+
+impl DataFusionContextExtension {
+    #[must_use]
+    pub fn new(df: Arc<DataFusion>) -> Self {
+        Self { df }
+    }
+
+    #[must_use]
+    pub fn datafusion(&self) -> Arc<DataFusion> {
+        Arc::clone(&self.df)
+    }
+}
+
+/// # Panics
+///
+/// Panics if the datafusion extension is not found in the request context.
+pub fn get_current_datafusion(context: &Arc<RequestContext>) -> Arc<DataFusion> {
+    if let Some(df) = context.extension::<DataFusionContextExtension>() {
+        df.datafusion()
+    } else {
+        unreachable!("DataFusionContextExtension is expected to always be available");
+    }
+}

@@ -14,46 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::ConnectorComponent;
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorError;
-use crate::dataconnector::DataConnectorResult;
-use crate::dataconnector::listing::infer::infer_partitions_with_types_from_files;
-use crate::dataconnector::listing::infer::infer_partitions_with_types_prefix;
-use crate::parameters::ExposedParamLookup;
-use crate::parameters::Parameters;
-use arrow_schema::Schema;
-use arrow_tools::schema::expand_views_schema;
-use async_trait::async_trait;
-use data_components::object::metadata::ObjectStoreMetadataTable;
-use data_components::object::text::ObjectStoreTextTable;
-use datafusion::config::ConfigField;
-use datafusion::config::TableParquetOptions;
-use datafusion::datasource::TableProvider;
-use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
-use datafusion::datasource::file_format::json::JsonFormat;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
-use datafusion::error::DataFusionError;
-use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionContext;
-use futures::TryStreamExt;
-use object_store::ObjectMeta;
-use object_store::ObjectStore;
-use object_store::path::Path;
-use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use arrow_schema::Schema;
+use arrow_tools::schema::expand_views_schema;
+use async_trait::async_trait;
+use datafusion::config::{ConfigField, TableParquetOptions};
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::file_format::{
+    FileFormat, csv::CsvFormat, file_compression_type::FileCompressionType, json::JsonFormat,
+    parquet::ParquetFormat,
+};
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::error::DataFusionError;
+use datafusion::execution::{config::SessionConfig, context::SessionContext};
+use futures::TryStreamExt;
+use object_store::{ObjectMeta, ObjectStore, path::Path};
+use snafu::prelude::*;
 use url::Url;
+
+use crate::accelerated_table::AcceleratedTable;
+use crate::component::dataset::Dataset;
+use crate::dataconnector::{
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
+    listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
+};
+use crate::parameters::{ExposedParamLookup, Parameters};
+use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use crate::object_store_registry::default_runtime_env;
 
@@ -479,7 +472,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
-        options = add_metadata_columns_if_required(options, &expanded_schema, dataset);
+        options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset);
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
@@ -581,10 +574,12 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
 fn add_metadata_columns_if_required(
     mut options: ListingOptions,
+    table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
 ) -> ListingOptions {
-    if let Some(columns) = dataset.listing_table_metadata_columns(schema) {
+    let url_prefix = get_url_prefix(table_url);
+    if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
         tracing::debug!(
             "Enabling metadata columns for '{}': {:?}",
             dataset.name,
@@ -594,6 +589,11 @@ fn add_metadata_columns_if_required(
     }
 
     options
+}
+
+// Returns the prefix of the table URL, e.g. for "s3://mybucket/myfolder" it returns "s3://mybucket/"
+fn get_url_prefix(table_url: &Url) -> String {
+    format!("{}/", &table_url[..url::Position::BeforePath])
 }
 
 // 1024³
@@ -1249,5 +1249,41 @@ mod tests {
         // Should return Ok even though no matching files were found,
         // because we hit the scan limit
         assert!(result.is_ok(), "Expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_get_url_prefix_basic() {
+        let url = Url::parse("s3://mybucket/").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_path() {
+        let url = Url::parse("s3://mybucket/folder/file.txt").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_query() {
+        let url = Url::parse("s3://mybucket/file.txt?version=1").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_fragment() {
+        let url = Url::parse("s3://mybucket/file.txt#section1").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "s3://mybucket/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_with_port() {
+        let url = Url::parse("http://localhost:8080/path").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn test_get_url_prefix_without_host() {
+        let url = Url::parse("file:///absolute/path").expect("to parse url");
+        assert_eq!(get_url_prefix(&url), "file:///");
     }
 }
