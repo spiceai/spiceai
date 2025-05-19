@@ -23,6 +23,7 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
 - `--validate`: A boolean flag to specify whether results should be validated against their expected results. Only supported for `tpch` or `tpch[parameterized]` query sets, and only supported for scale factor 1.
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
+- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
 
 Running a benchmark test will always generate snapshots for the query explain plan and results for `tpch` and `tpcds` queries. Only explain plans will be generated for `clickbench` queries.
 
