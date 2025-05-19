@@ -41,17 +41,17 @@ runs:
       if: inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]'
       run: |
         cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpch_sf1/* ./
+        mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
     
     - name: Download File Connector TPCDS Data
       shell: bash
       if: inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpcds_sf1/* ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
         mkdir ./sf0_01
         cd ./sf0_01
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/* ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/* ./
     
     - name: Download File Connector ClickBench Data
       shell: bash
