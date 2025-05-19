@@ -16,9 +16,12 @@ limitations under the License.
 
 use crate::{
     App, Runtime,
-    component::dataset::{
-        Dataset,
-        acceleration::{Engine, Mode},
+    component::{
+        dataset::{
+            Dataset,
+            acceleration::{Engine, Mode},
+        },
+        view::View,
     },
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
@@ -316,19 +319,29 @@ impl DataAccelerator for DuckDBAccelerator {
                 let datasets: Vec<Arc<Dataset>> = Arc::clone(&source.runtime())
                     .get_initialized_datasets(&source.app(), crate::LogErrors(false))
                     .await;
+
+                let views: Vec<Arc<View>> = Arc::clone(&source.runtime())
+                    .get_initialized_views(&source.app(), crate::LogErrors(false))
+                    .await;
+
                 let self_path = self.file_path(source)?;
                 let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset
-                            .acceleration
-                            .as_ref()
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn AccelerationSource>)
+                    .chain(
+                        views
+                            .into_iter()
+                            .map(|view| view as Arc<dyn AccelerationSource>),
+                    )
+                    .filter_map(|other_source| {
+                        if other_source
+                            .acceleration()
                             .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
                         {
-                            if other_dataset.name() == source.name() {
+                            if other_source.name() == source.name() {
                                 None
                             } else {
-                                let other_path = self.file_path(other_dataset.as_ref());
+                                let other_path = self.file_path(other_source.as_ref());
                                 other_path.ok().filter(|p| p != &self_path)
                             }
                         } else {

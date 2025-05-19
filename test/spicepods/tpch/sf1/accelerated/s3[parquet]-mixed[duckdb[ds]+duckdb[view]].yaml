@@ -1,0 +1,76 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-mixed[duckdb[ds]+duckdb[view]]
+datasets:
+  - from: s3://benchmarks/tpch_sf1/customer/
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration1
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-1.db
+  - from: s3://benchmarks/tpch_sf1/lineitem/
+    name: lineitem
+    params: *s3_params
+    acceleration: *acceleration1
+  - from: s3://benchmarks/tpch_sf1/nation/
+    name: nation
+    params: *s3_params
+    acceleration: *acceleration1
+  - from: s3://benchmarks/tpch_sf1/orders/
+    name: orders
+    params: *s3_params
+    acceleration: &acceleration2
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-2.db
+  - from: s3://benchmarks/tpch_sf1/part/
+    name: part
+    params: *s3_params
+    acceleration: *acceleration2
+  - from: s3://benchmarks/tpch_sf1/partsupp/
+    name: partsupp_ds
+    params: *s3_params
+    acceleration: &acceleration3
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-3.db
+  - from: s3://benchmarks/tpch_sf1/region/
+    name: region_ds
+    params: *s3_params
+    acceleration: *acceleration3
+  - from: s3://benchmarks/tpch_sf1/supplier/
+    name: supplier_ds
+    params: *s3_params
+    acceleration: *acceleration3
+
+views:
+  - name: partsupp
+    sql: |
+      SELECT * FROM partsupp_ds
+    acceleration: &acceleration4
+      enabled: true
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_file: duckdb-view.db
+  - name: region
+    sql: |
+      SELECT * FROM region_ds
+    acceleration: *acceleration4
+  - name: supplier
+    sql: |
+      SELECT * FROM supplier_ds
+    acceleration: *acceleration4
