@@ -361,6 +361,7 @@ jobs:
     runs-on: spiceai-dev-runners
     if: inputs.platform_option == 'Linux x64'
     steps:
+      - uses: actions/checkout@v4
       - name: Setup MinIO
         uses: ./.github/actions/setup-minio
         with:
