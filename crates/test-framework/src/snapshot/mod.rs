@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::panic;
+use std::{panic, sync::Arc};
 
 use flight_client::FlightClient;
 
-use crate::flight::query_to_batches;
+use crate::{flight::query_to_batches, queries::Query};
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
@@ -27,17 +27,17 @@ fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
 pub async fn record_explain_plan(
     client: &FlightClient,
     name: &str,
-    query_name: &str,
-    query: &str,
-) -> Result<(), String> {
+    query: &Query,
+) -> anyhow::Result<()> {
     // Check the plan
-    let plan_results = query_to_batches(client, &format!("EXPLAIN {query}"))
+    let sql = Arc::clone(&query.sql);
+    let query_name = Arc::clone(&query.name);
+    let parameters = query.get_parameters_batch().transpose()?;
+    let plan_results = query_to_batches(client, &format!("EXPLAIN {sql}"), parameters)
         .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("query `{query_name}` to plan: {e}"))?;
 
-    let Ok(explain_plan) = arrow::util::pretty::pretty_format_batches(&plan_results) else {
-        return Err("Failed to format plan".to_string());
-    };
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&plan_results)?;
 
     let mut assertion_err: Option<String> = None;
 
@@ -70,7 +70,7 @@ pub async fn record_explain_plan(
     });
 
     if let Some(assertion_err) = assertion_err {
-        return Err(assertion_err);
+        return Err(anyhow::anyhow!(assertion_err));
     }
 
     Ok(())
