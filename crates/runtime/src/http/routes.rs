@@ -280,7 +280,10 @@ async fn track_metrics(
     let method = req.method().clone();
 
     let response = Arc::clone(&request_context)
-        .scope(async move { next.run(req).await })
+        .scope(async move {
+            request_context.run_extensions().await;
+            next.run(req).await
+        })
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;

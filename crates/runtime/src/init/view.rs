@@ -17,16 +17,18 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    LogErrors, Result, Runtime, UnableToAttachViewSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
+    Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
     metrics,
     secrets::Secrets,
     status,
     topological_ordering::construct_effected_in_topological_order,
-    view,
+    view, warn_spaced,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+use futures::stream::StreamExt;
 use itertools::Itertools;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
@@ -89,6 +91,73 @@ impl Runtime {
                 }
             })
             .collect()
+    }
+
+    /// Initialize views configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `DuckDB`).
+    pub(crate) async fn initialize_views_accelerators(&self, views: &[Arc<View>]) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        for view in views {
+            if let Some(acceleration) = &view.acceleration {
+                let accelerator = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let view_name = &view.name;
+                        self.status
+                            .update_view(view_name, status::ComponentStatus::Error);
+                        metrics::views::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
+                        continue;
+                    }
+                };
+
+                if let Err(err) = accelerator.init(view.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
+                        name: acceleration.engine.to_string(),
+                    },
+                ) {
+                    let view_name = &view.name;
+                    self.status
+                        .update_view(view_name, status::ComponentStatus::Error);
+                    metrics::views::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
+                }
+            };
+        }
+    }
+
+    pub(crate) async fn get_initialized_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Arc<View>> {
+        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
+        futures::stream::iter(valid_views)
+            .filter_map(|view| async move {
+                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
+                    (true, true) | (false, _) => Some(Arc::clone(&view)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View {view_name} is accelerated but the accelerator failed to initialize.",
+                                view_name = &view.name.to_string(),
+                            );
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
     }
 
     fn load_view(&self, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {

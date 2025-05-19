@@ -14,19 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::App;
+use datafusion::sql::TableReference;
 use http::HeaderMap;
 use secrecy::SecretString;
+use spicepod::{component::dataset::Dataset, param::ParamValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+use crate::{
+    datafusion::request_context_extension::DataFusionContextExtension,
+    request::{AsyncMarker, RequestContext},
+};
+
+#[derive(Clone)]
 pub struct DatabricksAuthExtension {
+    app: Option<Arc<App>>,
     tokens: Arc<HashMap<String, SecretString>>,
 }
 
 impl Default for DatabricksAuthExtension {
     fn default() -> Self {
         Self {
+            app: None,
             tokens: Arc::new(HashMap::new()),
         }
     }
@@ -34,7 +44,7 @@ impl Default for DatabricksAuthExtension {
 
 impl DatabricksAuthExtension {
     #[must_use]
-    pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+    pub fn from_headers(app: &Option<Arc<App>>, headers: &HeaderMap) -> Option<Self> {
         let databricks_headers = headers.get_all("Spice-Databricks-Auth");
         let values = databricks_headers.iter();
 
@@ -58,6 +68,7 @@ impl DatabricksAuthExtension {
             None
         } else {
             Some(Self {
+                app: app.as_ref().map(Arc::clone),
                 tokens: Arc::new(auth_map),
             })
         }
@@ -66,5 +77,46 @@ impl DatabricksAuthExtension {
     #[must_use]
     pub fn get_token(&self, client_id: &str) -> Option<SecretString> {
         self.tokens.get(client_id).cloned()
+    }
+
+    pub async fn load_u2m_components(&self) {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        if let (Some(app), Some(df)) = (
+            self.app.clone(),
+            context.extension::<DataFusionContextExtension>(),
+        ) {
+            let df = df.datafusion();
+            let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
+            let databricks_u2m_datasets: Vec<Dataset> = app
+                .datasets
+                .iter()
+                .filter_map(|dataset| {
+                    let params = dataset.params.as_ref()?;
+                    let Some(ParamValue::String(client_id)) =
+                        params.data.get("databricks_client_id")
+                    else {
+                        return None;
+                    };
+
+                    if !client_ids.contains(client_id) {
+                        return None;
+                    }
+
+                    if df.table_exists(TableReference::from(&dataset.name)) {
+                        return None;
+                    }
+
+                    Some(dataset.clone())
+                })
+                .collect();
+
+            for ds in databricks_u2m_datasets {
+                let tr = TableReference::from(ds.name.clone());
+
+                if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
+                    tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
+                }
+            }
+        }
     }
 }
