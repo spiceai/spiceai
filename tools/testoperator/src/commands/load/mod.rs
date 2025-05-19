@@ -118,12 +118,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let mut test_passed = true;
     let mut yellow_measurements = 0;
     for query in queries {
-        let Some(baseline_percentile) = baseline_percentiles.get(&query.name.to_string()) else {
+        let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
             // Query Failed, no percentile statistics recorded
             continue;
         };
 
-        let Some(duration) = test_durations.get(&query.name.to_string()) else {
+        let Some(duration) = test_durations.get(&query.name) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
                 query.name

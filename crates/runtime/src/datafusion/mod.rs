@@ -586,7 +586,7 @@ impl DataFusion {
             .read_provider(&pending_registration.dataset)
             .await
             .context(UnableToResolveTableProviderSnafu)?;
-        let federated_table = FederatedTable::new(read_provider);
+        let federated_table = FederatedTable::new_unchecked(read_provider);
 
         tracing::info!(
             "Loading data for dataset {}",
@@ -809,7 +809,7 @@ impl DataFusion {
                         .build()
                     })?
                     .context(UnableToResolveTableProviderSnafu)?;
-                Arc::new(FederatedTable::new(read_write_provider))
+                Arc::new(FederatedTable::new_unchecked(read_write_provider))
             }
         };
 
@@ -1384,7 +1384,8 @@ impl DataFusion {
         wait_until_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
 
         let schema = view_table.schema();
-        let federated_table = FederatedTable::new(Arc::new(view_table) as Arc<dyn TableProvider>);
+        let federated_table =
+            FederatedTable::new_unchecked(Arc::new(view_table) as Arc<dyn TableProvider>);
 
         let accelerated_table_provider = self
             .accelerator_engine_registry()

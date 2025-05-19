@@ -167,7 +167,7 @@ impl MetricCollector<SearchScoreMetric, NoExtendedMetrics> for SpiceTest<Complet
             .iter()
             .map(|(id, result)| {
                 QueryMetric::new_from_durations(
-                    id,
+                    id.as_str().into(),
                     &vec![result.duration],
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,

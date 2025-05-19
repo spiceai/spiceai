@@ -52,20 +52,25 @@ pub(crate) struct SpiceTestQueryWorker {
 }
 
 pub struct SpiceTestQueryWorkerResult {
-    pub query_durations: BTreeMap<String, Vec<Duration>>,
-    pub query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
-    pub query_statuses: BTreeMap<String, QueryStatus>,
+    pub query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
+    pub query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
+    pub query_statuses: BTreeMap<Arc<str>, QueryStatus>,
     pub connection_failed: bool,
-    pub row_counts: BTreeMap<String, Vec<usize>>,
+    pub row_counts: BTreeMap<Arc<str>, Vec<usize>>,
+}
+
+struct QueryRunResult {
+    connection_failed: bool,
+    query_failure: Option<String>,
 }
 
 impl SpiceTestQueryWorkerResult {
     pub fn new(
-        query_durations: BTreeMap<String, Vec<Duration>>,
-        query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
-        query_statuses: BTreeMap<String, QueryStatus>,
+        query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
+        query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
+        query_statuses: BTreeMap<Arc<str>, QueryStatus>,
         connection_failed: bool,
-        row_counts: BTreeMap<String, Vec<usize>>,
+        row_counts: BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Self {
         Self {
             query_durations,
@@ -124,14 +129,14 @@ impl SpiceTestQueryWorker {
     #[allow(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
-            let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+            let mut query_durations: BTreeMap<Arc<str>, Vec<Duration>> = BTreeMap::new();
 
             // Keeps track of the start and end time of each query iteration
-            let mut query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)> =
+            let mut query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)> =
                 BTreeMap::new();
 
-            let mut query_statuses: BTreeMap<String, QueryStatus> = BTreeMap::new();
-            let mut row_counts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+            let mut query_statuses: BTreeMap<Arc<str>, QueryStatus> = BTreeMap::new();
+            let mut row_counts: BTreeMap<Arc<str>, Vec<usize>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
@@ -187,7 +192,9 @@ impl SpiceTestQueryWorker {
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
 
-                        let (connection_succeed, _) = self
+                        let QueryRunResult {
+                            connection_failed, ..
+                        } = self
                             .run_single_query(
                                 query,
                                 &mut BTreeMap::new(),
@@ -196,7 +203,7 @@ impl SpiceTestQueryWorker {
                                 false,
                             )
                             .await?;
-                        if !connection_succeed {
+                        if connection_failed {
                             return Ok(SpiceTestQueryWorkerResult::new(
                                 query_durations,
                                 query_iteration_durations,
@@ -217,7 +224,9 @@ impl SpiceTestQueryWorker {
                                     self.id, query.name, e
                                 );
 
-                                query_status = QueryStatus::Failed;
+                                query_status = QueryStatus::Failed(Some(
+                                    "Explain plan snapshot assertion failed".into(),
+                                ));
                             }
                         }
 
@@ -236,7 +245,10 @@ impl SpiceTestQueryWorker {
                                 );
                             }
 
-                            let (connection_succeed, query_succeed) = self
+                            let QueryRunResult {
+                                connection_failed,
+                                query_failure,
+                            } = self
                                 .run_single_query(
                                     query,
                                     &mut query_durations,
@@ -246,7 +258,7 @@ impl SpiceTestQueryWorker {
                                 )
                                 .await?;
 
-                            if !connection_succeed {
+                            if connection_failed {
                                 return Ok(SpiceTestQueryWorkerResult::new(
                                     query_durations,
                                     query_iteration_durations,
@@ -256,16 +268,16 @@ impl SpiceTestQueryWorker {
                                 ));
                             }
 
-                            if !query_succeed {
-                                query_status = QueryStatus::Failed;
+                            if let Some(query_failure) = query_failure {
+                                query_status = QueryStatus::Failed(Some(query_failure.into()));
                             }
 
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
                         query_iteration_durations
-                            .insert(query.name.to_string(), (query_start, end));
-                        query_statuses.insert(query.name.to_string(), query_status);
+                            .insert(Arc::clone(&query.name), (query_start, end));
+                        query_statuses.insert(Arc::clone(&query.name), query_status);
                     }
                 }
             }
@@ -283,30 +295,33 @@ impl SpiceTestQueryWorker {
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
-        query_durations: &mut BTreeMap<String, Vec<Duration>>,
-        query_statuses: &mut BTreeMap<String, QueryStatus>,
-        row_counts: &mut BTreeMap<String, Vec<usize>>,
+        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
+        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Result<bool> {
         for query in &self.query_set {
-            let (connection_succeed, query_succeed) = self
+            let QueryRunResult {
+                connection_failed,
+                query_failure,
+            } = self
                 .run_single_query(query, query_durations, row_counts, false, false)
                 .await?;
-            if !connection_succeed {
+            if connection_failed {
                 return Ok(false);
             }
 
-            let worker_status = if query_succeed {
-                QueryStatus::Passed
+            let worker_status = if let Some(query_failure) = query_failure {
+                QueryStatus::Failed(Some(query_failure.into()))
             } else {
-                QueryStatus::Failed
+                QueryStatus::Passed
             };
 
             query_statuses
-                .entry(query.name.to_string())
+                .entry(Arc::clone(&query.name))
                 .and_modify(|existing_status| {
                     // If the worker reports failure, update the status to Failed
-                    if worker_status == QueryStatus::Failed {
-                        *existing_status = QueryStatus::Failed;
+                    if matches!(worker_status, QueryStatus::Failed(_)) {
+                        *existing_status = worker_status.clone();
                     }
                 })
                 .or_insert(worker_status);
@@ -318,11 +333,11 @@ impl SpiceTestQueryWorker {
     async fn run_single_query(
         &self,
         query: &Query,
-        query_durations: &mut BTreeMap<String, Vec<Duration>>,
-        row_counts: &mut BTreeMap<String, Vec<usize>>,
+        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<QueryRunResult> {
         match self
             .execute_query(
                 query,
@@ -333,7 +348,10 @@ impl SpiceTestQueryWorker {
             )
             .await
         {
-            Ok(()) => Ok((true, true)),
+            Ok(()) => Ok(QueryRunResult {
+                connection_failed: false,
+                query_failure: None,
+            }),
             Err(e) => {
                 let flight_error = e.downcast_ref::<flight_client::Error>();
                 if let Some(
@@ -345,14 +363,20 @@ impl SpiceTestQueryWorker {
                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                         self.id, query.name, e
                     );
-                    Ok((false, false))
+                    Ok(QueryRunResult {
+                        connection_failed: true,
+                        query_failure: None,
+                    })
                 } else {
                     eprintln!(
                         "FAIL - Worker {} - Query '{}' failed: {}",
                         self.id, query.name, e
                     );
-                    query_durations.entry(query.name.to_string()).or_default();
-                    Ok((true, false))
+                    query_durations.entry(Arc::clone(&query.name)).or_default();
+                    Ok(QueryRunResult {
+                        connection_failed: false,
+                        query_failure: Some(format!("{e}")),
+                    })
                 }
             }
         }
@@ -361,8 +385,8 @@ impl SpiceTestQueryWorker {
     async fn execute_query(
         &self,
         query: &Query,
-        query_durations: &mut BTreeMap<String, Vec<Duration>>,
-        row_counts: &mut BTreeMap<String, Vec<usize>>,
+        query_durations: &mut BTreeMap<Arc<str>, Vec<Duration>>,
+        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
@@ -384,7 +408,7 @@ impl SpiceTestQueryWorker {
                         "FAIL - Worker {} - Query '{}' failed: {}",
                         self.id, query.name, e
                     );
-                    query_durations.entry(query.name.to_string()).or_default();
+                    query_durations.entry(Arc::clone(&query.name)).or_default();
                     return Err(e.into());
                 }
                 Ok(Some(batch)) => {
@@ -425,7 +449,9 @@ impl SpiceTestQueryWorker {
                     "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
                     self.id, query.name
                 );
-                return Err(anyhow::anyhow!("Query validation failed"));
+                return Err(anyhow::anyhow!(
+                    "Query validation failed: {validation_reason:?}"
+                ));
             }
         }
 
@@ -453,12 +479,12 @@ impl SpiceTestQueryWorker {
 
         let duration = query_start.elapsed();
         query_durations
-            .entry(query.name.to_string())
+            .entry(Arc::clone(&query.name))
             .or_default()
             .push(duration);
 
         row_counts
-            .entry(query.name.to_string())
+            .entry(Arc::clone(&query.name))
             .or_default()
             .push(row_count);
 
