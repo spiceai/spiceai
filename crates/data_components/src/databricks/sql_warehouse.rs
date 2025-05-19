@@ -183,6 +183,8 @@ impl SqlWarehouseApi {
             .send()
             .await
             .context(HttpRequestFailedSnafu)?
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
             .json()
             .await
             .context(JsonParsingFailedSnafu)
