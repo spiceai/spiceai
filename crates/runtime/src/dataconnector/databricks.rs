@@ -20,9 +20,7 @@ use crate::token_providers::databricks::{
 };
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::{
-    DatabricksDelta, DatabricksSparkConnect, DatabricksSparkConnectU2M,
-};
+use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -269,12 +267,16 @@ impl Databricks {
                         .await?;
 
                 (
-                    Arc::new(DatabricksSparkConnectU2M::from_token_provider(
-                        endpoint,
-                        cluster_id.expose_secret(),
-                        databricks_use_ssl,
-                        token_provider,
-                    )),
+                    Arc::new(
+                        DatabricksSparkConnect::from_token_provider(
+                            endpoint.to_string(),
+                            cluster_id.expose_secret().to_string(),
+                            databricks_use_ssl,
+                            token_provider,
+                        )
+                        .await
+                        .context(UnableToConstructDatabricksSparkSnafu)?,
+                    ),
                     true,
                 )
             }
