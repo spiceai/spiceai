@@ -64,12 +64,19 @@ pub struct NotStarted {
     query_count: usize,
     parallel_count: usize,
     validate: bool,
+    disable_caching: bool,
 }
 
 impl NotStarted {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_disable_caching(mut self, disable_caching: bool) -> Self {
+        self.disable_caching = disable_caching;
+        self
     }
 
     #[must_use]
@@ -162,7 +169,7 @@ impl SpiceTest<NotStarted> {
 
         let flight_client = self
             .get_spiced()?
-            .flight_client(self.api_key.clone())
+            .flight_client(self.api_key.clone(), self.state.disable_caching)
             .await?;
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {

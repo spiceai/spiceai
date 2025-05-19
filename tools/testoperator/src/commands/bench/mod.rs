@@ -57,7 +57,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_query_set(queries.clone())
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
-            .with_validate(args.validate),
+            .with_validate(args.validate)
+            .with_disable_caching(args.disable_caching),
     )
     .with_spiced_instance(spiced_instance)
     .with_explain_plan_snapshot()
