@@ -36,13 +36,11 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        if l.needs_health_check() {
-            l.health()
-                .await
-                .boxed()
-                .map_err(try_map_boxed_error_to_box)
-                .context(UnableToInitializeLlmSnafu)?;
-        }
+        l.health()
+            .await
+            .boxed()
+            .map_err(try_map_boxed_error_to_box)
+            .context(UnableToInitializeLlmSnafu)?;
 
         Ok(l)
     }

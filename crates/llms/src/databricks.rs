@@ -99,13 +99,13 @@ impl Chat for Databricks {
         None
     }
 
-    fn needs_health_check(&self) -> bool {
-        self.needs_health_check
-    }
-
     /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
     #[allow(deprecated)]
     async fn health(&self) -> super::chat::Result<()> {
+        if !self.needs_health_check {
+            return Ok(());
+        }
+
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
         if let Err(e) = self
@@ -155,8 +155,17 @@ impl Chat for Databricks {
 
 #[async_trait]
 impl Embed for Databricks {
-    fn needs_health_check(&self) -> bool {
-        self.needs_health_check
+    async fn health(&self) -> super::embeddings::Result<()> {
+        if !self.needs_health_check {
+            return Ok(());
+        }
+
+        self.embed(EmbeddingInput::String("health".to_string()))
+            .await
+            .boxed()
+            .map_err(|source| super::embeddings::Error::HealthCheckError { source })?;
+
+        Ok(())
     }
 
     async fn embed_request(

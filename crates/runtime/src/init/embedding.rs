@@ -94,12 +94,10 @@ impl Runtime {
         .boxed()
         .context(UnableToInitializeEmbeddingModelSnafu)?;
 
-        if l.needs_health_check() {
-            l.health()
-                .await
-                .boxed()
-                .context(UnableToInitializeEmbeddingModelSnafu)?;
-        }
+        l.health()
+            .await
+            .boxed()
+            .context(UnableToInitializeEmbeddingModelSnafu)?;
 
         TaskEmbed::new(in_embed.name.as_str(), l)
             .await

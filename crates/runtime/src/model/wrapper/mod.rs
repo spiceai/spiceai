@@ -288,10 +288,6 @@ impl Chat for ChatWrapper {
         }
     }
 
-    fn needs_health_check(&self) -> bool {
-        self.chat.needs_health_check()
-    }
-
     async fn health(&self) -> ChatResult<()> {
         self.chat.health().await
     }

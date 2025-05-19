@@ -122,11 +122,6 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
-    /// Indicates whether embeddings implementation requires a health check.
-    fn needs_health_check(&self) -> bool {
-        true
-    }
-
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].
     async fn health(&self) -> Result<()> {
