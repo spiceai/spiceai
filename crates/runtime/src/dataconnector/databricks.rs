@@ -20,7 +20,9 @@ use crate::token_providers::databricks::{
 };
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::{DatabricksDelta, DatabricksSparkConnect};
+use data_components::databricks::{
+    DatabricksDelta, DatabricksSparkConnect, DatabricksSqlWarehouse, sql_warehouse,
+};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -58,6 +60,11 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to connect to Databricks SQL Warehouse.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    ))]
+    UnableToConstructDatabricksSqlWarehouse { source: sql_warehouse::Error },
+
+    #[snafu(display(
         "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidMode { value: String },
@@ -84,6 +91,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
+    deferred_load: bool,
 }
 
 impl std::fmt::Debug for Databricks {
@@ -106,26 +114,54 @@ impl Databricks {
         let auth_credentials = Self::build_auth_credentials(&params)?;
 
         match mode {
+            "sql_warehouse" => {
+                let sql_warehouse_id = params
+                    .get("sql_warehouse_id")
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+
+                let token_provider =
+                    Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
+                        .await?;
+
+                let read_provider =
+                    DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider)
+                        .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+
+                Ok(Self {
+                    read_provider: Arc::new(read_provider),
+                    deferred_load: false,
+                })
+            }
             "delta_lake" => {
                 let storage_options = params.to_secret_map();
-                let token_provider = match auth_credentials {
-                    AuthCredentials::Token(token) => {
-                        Arc::new(StaticTokenProvider::new(token.clone()))
-                    }
-                    AuthCredentials::ServicePrincipal(client_id, client_secret) => {
-                        Self::get_m2m_token_provider(
-                            endpoint,
-                            client_id,
-                            client_secret,
-                            &token_provider_registry,
-                        )
-                        .await?
-                    }
-                    AuthCredentials::U2M(client_id) => {
-                        Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
-                            .await?
-                    }
-                };
+                let (token_provider, deferred_load): (Arc<dyn TokenProvider>, bool) =
+                    match auth_credentials {
+                        AuthCredentials::Token(token) => (
+                            Arc::new(StaticTokenProvider::new(token.clone()))
+                                as Arc<dyn TokenProvider>,
+                            false,
+                        ),
+                        AuthCredentials::ServicePrincipal(client_id, client_secret) => (
+                            Self::get_m2m_token_provider(
+                                endpoint,
+                                client_id,
+                                client_secret,
+                                &token_provider_registry,
+                            )
+                            .await?,
+                            false,
+                        ),
+                        AuthCredentials::U2M(client_id) => (
+                            Self::get_u2m_token_provider(
+                                endpoint,
+                                client_id,
+                                &token_provider_registry,
+                            )
+                            .await?,
+                            true,
+                        ),
+                    };
 
                 let read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
@@ -135,6 +171,7 @@ impl Databricks {
 
                 Ok(Self {
                     read_provider: Arc::new(read_provider),
+                    deferred_load,
                 })
             }
             "spark_connect" => {
@@ -164,6 +201,28 @@ impl Databricks {
                 value: mode.to_string(),
             }),
         }
+    }
+
+    pub async fn get_token_provider(
+        endpoint: &str,
+        auth_credentials: AuthCredentials<'_>,
+        token_provider_registry: Arc<TokenProviderRegistry>,
+    ) -> Result<Arc<dyn TokenProvider>> {
+        Ok(match auth_credentials {
+            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
+            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                Self::get_m2m_token_provider(
+                    endpoint,
+                    client_id,
+                    client_secret,
+                    &token_provider_registry,
+                )
+                .await?
+            }
+            AuthCredentials::U2M(client_id) => {
+                Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry).await?
+            }
+        })
     }
 
     pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials> {
@@ -211,15 +270,20 @@ impl Databricks {
         cluster_id: &SecretString,
         databricks_use_ssl: bool,
     ) -> Result<Self> {
-        let databricks_spark = match auth_credentials {
-            AuthCredentials::Token(token) => DatabricksSparkConnect::new(
-                endpoint.to_string(),
-                cluster_id.expose_secret().to_string(),
-                token.expose_secret().to_string(),
-                databricks_use_ssl,
-            )
-            .await
-            .context(UnableToConstructDatabricksSparkSnafu)?,
+        let (read_provider, deferred_load): (Arc<dyn Read>, bool) = match auth_credentials {
+            AuthCredentials::Token(token) => (
+                Arc::new(
+                    DatabricksSparkConnect::new(
+                        endpoint.to_string(),
+                        cluster_id.expose_secret().to_string(),
+                        token.expose_secret().to_string(),
+                        databricks_use_ssl,
+                    )
+                    .await
+                    .context(UnableToConstructDatabricksSparkSnafu)?,
+                ),
+                false,
+            ),
 
             AuthCredentials::ServicePrincipal(client_id, client_secret) => {
                 let token_provider = Self::get_m2m_token_provider(
@@ -230,14 +294,19 @@ impl Databricks {
                 )
                 .await?;
 
-                DatabricksSparkConnect::from_token_provider(
-                    endpoint.to_string(),
-                    cluster_id.expose_secret().to_string(),
-                    databricks_use_ssl,
-                    token_provider,
+                (
+                    Arc::new(
+                        DatabricksSparkConnect::from_token_provider(
+                            endpoint.to_string(),
+                            cluster_id.expose_secret().to_string(),
+                            databricks_use_ssl,
+                            token_provider,
+                        )
+                        .await
+                        .context(UnableToConstructDatabricksSparkSnafu)?,
+                    ),
+                    false,
                 )
-                .await
-                .context(UnableToConstructDatabricksSparkSnafu)?
             }
 
             AuthCredentials::U2M(client_id) => {
@@ -245,19 +314,25 @@ impl Databricks {
                     Self::get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
                         .await?;
 
-                DatabricksSparkConnect::from_token_provider(
-                    endpoint.to_string(),
-                    cluster_id.expose_secret().to_string(),
-                    databricks_use_ssl,
-                    token_provider,
+                (
+                    Arc::new(
+                        DatabricksSparkConnect::from_token_provider(
+                            endpoint.to_string(),
+                            cluster_id.expose_secret().to_string(),
+                            databricks_use_ssl,
+                            token_provider,
+                        )
+                        .await
+                        .context(UnableToConstructDatabricksSparkSnafu)?,
+                    ),
+                    true,
                 )
-                .await
-                .context(UnableToConstructDatabricksSparkSnafu)?
             }
         };
 
         Ok(Self {
-            read_provider: Arc::new(databricks_spark),
+            read_provider,
+            deferred_load,
         })
     }
 
@@ -328,11 +403,14 @@ const PARAMETERS: &[ParameterSpec] = &[
         .required()
         .secret()
         .description("The endpoint of the Databricks instance."),
+    ParameterSpec::component("sql_warehouse_id")
+        .secret()
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
     ParameterSpec::runtime("mode")
-        .description("The execution mode for querying against Databricks.")
+        .description("The execution mode for running queries: 'spark_connect', 'delta_lake', or 'sql_warehouse'.")
         .default("spark_connect"),
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for object store client."),
@@ -439,6 +517,10 @@ impl DataConnector for Databricks {
                 dataconnector: "databricks",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    fn deferred_load(&self) -> bool {
+        self.deferred_load
     }
 }
 

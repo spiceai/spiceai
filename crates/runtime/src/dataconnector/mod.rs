@@ -92,6 +92,7 @@ pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+pub mod deferred;
 pub mod iceberg;
 #[cfg(feature = "imap")]
 pub mod imap;
@@ -289,6 +290,14 @@ pub enum DataConnectorError {
     ))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
+    },
+
+    #[snafu(display(
+        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled.\nVerify if the remote table schema update is expected and rebuild the acceleration if necessary."
+    ))]
+    SchemaMismatch {
+        dataset_name: String,
+        differences: String,
     },
 }
 
@@ -489,6 +498,11 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// If the data connector does not support metrics, return `None`.
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         None
+    }
+
+    /// Returns whether the data connector load should be deferred.
+    fn deferred_load(&self) -> bool {
+        false
     }
 }
 

@@ -311,7 +311,7 @@ mod tests {
             let exec = FallbackOnZeroResultsScanExec::new(
                 TableReference::bare("test"),
                 empty_memory_exec(),
-                Arc::new(FederatedTable::new(memory_table_provider())),
+                Arc::new(FederatedTable::new_unchecked(memory_table_provider())),
                 TableScanParams {
                     state: ctx.state(),
                     projection: None,
@@ -385,7 +385,8 @@ mod tests {
             let ctx = SessionContext::new();
 
             let input_plan = memory_exec();
-            let fallback_provider = Arc::new(FederatedTable::new(memory_table_provider()));
+            let fallback_provider =
+                Arc::new(FederatedTable::new_unchecked(memory_table_provider()));
             let fallback_scan_params = TableScanParams {
                 state: ctx.state(),
                 projection: None,

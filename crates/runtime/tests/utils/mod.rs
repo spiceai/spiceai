@@ -15,11 +15,14 @@ limitations under the License.
 */
 
 use std::{
+    fmt::Display,
     future::Future,
     sync::{Arc, LazyLock},
     time::Duration,
 };
 
+use arrow::array::RecordBatch;
+use futures::StreamExt;
 use runtime::{
     Runtime,
     request::{Protocol, RequestContext, UserAgent},
@@ -82,4 +85,27 @@ pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), St
 
 pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn run_query(
+    rt: &Arc<Runtime>,
+    query: &str,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let mut result = rt.datafusion().query_builder(query).build().run().await?;
+
+    let mut results: Vec<RecordBatch> = vec![];
+    while let Some(batch) = result.data.next().await {
+        results.push(batch?);
+    }
+
+    Ok(results)
+}
+
+#[allow(dead_code)]
+pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
+    let pretty = arrow::util::pretty::pretty_format_batches(batches)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+
+    Ok(pretty)
 }
