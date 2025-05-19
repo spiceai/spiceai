@@ -4,7 +4,8 @@ name: s3[parquet]-duckdb[file]-cache_ttl_sql_ahash_no_tracking
 runtime:
   results_cache:
     enabled: true
-    item_ttl: 60s
+    item_ttl: 15s
+    cache_max_size: 4gb
     cache_key_type: sql
     hashing_algorithm: ahash
   task_history:
