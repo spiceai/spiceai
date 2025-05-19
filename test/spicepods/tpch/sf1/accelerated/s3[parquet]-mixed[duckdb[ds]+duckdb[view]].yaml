@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file-many]
+name: s3[parquet]-mixed[duckdb[ds]+duckdb[view]]
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer/
     name: customer
