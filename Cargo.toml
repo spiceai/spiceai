@@ -48,6 +48,7 @@ rust-version = "1.85"
 version = "1.3.0-unstable"
 
 [workspace.dependencies]
+ahash = "0.8.12"
 arrow = { version = "54.3", features = ["prettyprint"] }
 arrow-array = "54.3"
 arrow-buffer = "54.3"

@@ -110,3 +110,140 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
         self.cache.run_pending_tasks().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::CacheKey;
+
+    use super::*;
+    use crate::CachedQueryResult;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use rstest::rstest;
+    use std::collections::HashSet;
+    use std::hash::RandomState;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn create_test_record_batch() -> RecordBatch {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let array = Int32Array::from(vec![1, 2, 3]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .expect("Failed to create record batch")
+    }
+
+    fn create_test_cached_result() -> CachedQueryResult {
+        let record_batch = create_test_record_batch();
+        let mut input_tables = HashSet::new();
+        input_tables.insert(TableReference::Bare {
+            table: Arc::from("test_table"),
+        });
+
+        CachedQueryResult {
+            records: Arc::new(vec![record_batch.clone()]),
+            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
+            input_tables: Arc::new(input_tables),
+        }
+    }
+
+    #[rstest]
+    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
+    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[tokio::test]
+    async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
+        #[case] hasher: T,
+        #[case] hashing_algorithm: HashingAlgorithm,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+        let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+
+        let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+
+        // Get the value from the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        assert!(retrieved.is_some());
+        assert_eq!(
+            retrieved.expect("Failed to get from cache").records.len(),
+            result.records.len()
+        );
+    }
+
+    #[rstest]
+    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
+    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[tokio::test]
+    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(
+        #[case] hasher: T,
+        #[case] hashing_algorithm: HashingAlgorithm,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+        let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
+
+        // Try to get a non-existent key
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[rstest]
+    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
+    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[tokio::test]
+    async fn test_cache_invalidate_all<T: BuildHasher + Clone + Send + Sync + 'static>(
+        #[case] hasher: T,
+        #[case] hashing_algorithm: HashingAlgorithm,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        let get_key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let key = get_key();
+        cache.put_raw_key(&key.as_u64(), result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        assert!(retrieved.is_some());
+
+        // Invalidate the cache for the table
+        cache.invalidate_all();
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[rstest]
+    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
+    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[tokio::test]
+    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(
+        #[case] hasher: T,
+        #[case] hashing_algorithm: HashingAlgorithm,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_millis(100), hasher, hashing_algorithm);
+        let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache.put_raw_key(&key().as_u64(), result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_some());
+
+        // Wait for the TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+}

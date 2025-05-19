@@ -9,7 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ahash = "0.8.12"
+ahash.workspace = true
 app = { path = "../app" }
 arrow.workspace = true
 arrow-csv.workspace = true

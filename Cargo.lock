@@ -2220,6 +2220,7 @@ dependencies = [
  "futures",
  "moka",
  "opentelemetry 0.27.1",
+ "rstest",
  "snafu",
  "spicepod",
  "tokio",
