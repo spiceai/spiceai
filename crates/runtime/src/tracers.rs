@@ -42,9 +42,10 @@ macro_rules! warn_once {
             tracing::error!("Lock poisoned while logging: {poisoned}");
             poisoned.into_inner()
         });
-        if !logged_values.contains(&$value) {
-            logged_values.insert($value.clone());
-            tracing::warn!($msg, $value);
+        let msg = format!($msg, $value);
+        if !logged_values.contains(&msg) {
+            logged_values.insert(msg.clone());
+            tracing::warn!("{}", msg);
         }
     }};
 }

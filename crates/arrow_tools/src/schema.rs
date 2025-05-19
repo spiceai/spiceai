@@ -160,6 +160,71 @@ pub fn schema_meta_get_computed_columns(
     }
 }
 
+/// Returns a string describing the difference between two schemas.
+#[must_use]
+pub fn schema_difference(expected: &Schema, actual: &Schema) -> String {
+    let mut differences = Vec::new();
+
+    // Check for missing columns in actual schema
+    for field in expected.fields() {
+        if !actual.fields().iter().any(|f| f.name() == field.name()) {
+            differences.push(format!("The column `{}` is missing", field.name()));
+        }
+    }
+
+    // Check for extra columns in actual schema
+    for field in actual.fields() {
+        if !expected.fields().iter().any(|f| f.name() == field.name()) {
+            differences.push(format!("The column `{}` is unexpected", field.name()));
+        }
+    }
+
+    // Check for type mismatches in common columns
+    for expected_field in expected.fields() {
+        if let Some(actual_field) = actual
+            .fields()
+            .iter()
+            .find(|f| f.name() == expected_field.name())
+        {
+            if !DFSchema::datatype_is_semantically_equal(
+                expected_field.data_type(),
+                actual_field.data_type(),
+            ) {
+                differences.push(format!(
+                    "The type of `{}` changed from `{}` to `{}`",
+                    expected_field.name(),
+                    expected_field.data_type(),
+                    actual_field.data_type()
+                ));
+            }
+
+            // Check for nullability changes
+            if expected_field.is_nullable() != actual_field.is_nullable() {
+                differences.push(format!(
+                    "The column `{}` changed from {} to {}",
+                    expected_field.name(),
+                    if expected_field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    },
+                    if actual_field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    }
+                ));
+            }
+        }
+    }
+
+    if differences.is_empty() {
+        "The schemas are identical".to_string()
+    } else {
+        differences.join(". ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +282,52 @@ mod tests {
         assert_eq!(computed_columns.len(), 2);
         assert_eq!(computed_columns[0].name(), "name_embedding");
         assert_eq!(computed_columns[1].name(), "name_offset");
+    }
+
+    #[test]
+    fn test_schema_difference() {
+        let expected = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+
+        let actual = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("age", DataType::Utf8, true),
+            Field::new("extra", DataType::Float64, false),
+        ]);
+
+        let diff = schema_difference(&expected, &actual);
+        assert!(diff.contains("The column `name` is missing"));
+        assert!(diff.contains("The column `extra` is unexpected"));
+        assert!(diff.contains("The type of `age` changed from `Int32` to `Utf8`"));
+    }
+
+    #[test]
+    fn test_schema_difference_nullability() {
+        let expected = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let actual = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+
+        let diff = schema_difference(&expected, &actual);
+        assert!(diff.contains("The column `name` changed from nullable to non-nullable"));
+    }
+
+    #[test]
+    fn test_schema_difference_identical() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let diff = schema_difference(&schema, &schema);
+        assert_eq!(diff, "The schemas are identical");
     }
 }

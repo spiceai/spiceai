@@ -30,6 +30,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
 use tokio::sync::{Mutex, oneshot};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -37,7 +38,9 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use crate::{
     component::dataset::Dataset,
     dataaccelerator::spice_sys::dataset_checkpoint::{DatasetCheckpoint, DatasetCheckpointer},
-    dataconnector::DataConnector,
+    dataconnector::{DataConnector, DataConnectorError},
+    tracers::OnceTracer,
+    warn_once,
 };
 
 #[derive(Debug)]
@@ -75,6 +78,7 @@ impl FederatedTable {
         Self::Immediate(table_provider)
     }
 
+    /// Creates a federated table, and first checks if the schema matches the existing acceleration checkpoint.
     pub async fn new(
         dataset: Arc<Dataset>,
         table_provider: Arc<dyn TableProvider>,
@@ -92,10 +96,6 @@ impl FederatedTable {
         let federated_schema = table_provider.schema();
 
         if federated_schema != accelerated_schema {
-            tracing::warn!(
-                "Schema mismatch between federated table and acceleration for {}. The existing accelerated data is available, but updates are disabled.",
-                dataset.name
-            );
             return Self::Deferred(Self::new_deferred_with_schema(
                 Arc::clone(&dataset),
                 data_connector,
@@ -114,9 +114,7 @@ impl FederatedTable {
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {
-        let Some(checkpoint) = Self::get_checkpoint(Arc::clone(&dataset)).await else {
-            return None;
-        };
+        let checkpoint = Self::get_checkpoint(Arc::clone(&dataset)).await?;
         let accelerated_schema = checkpoint.get_schema().await.ok()??;
 
         Some(Self::Deferred(Self::new_deferred_with_schema(
@@ -175,16 +173,32 @@ impl FederatedTable {
         schema: SchemaRef,
     ) -> DeferredTableProvider {
         let dataset_name = dataset.name.clone();
-        let accelerated_schema = schema.clone();
+        let accelerated_schema = Arc::clone(&schema);
 
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
+            let tracer = OnceTracer::new();
             let data_connector = Arc::clone(&data_connector);
             let table_provider_result = retry(retry_strategy, || async {
                 match data_connector.read_provider(&dataset).await {
-                    Ok(table_provider) => Ok(table_provider),
+                    Ok(table_provider) => {
+                        let federated_schema = table_provider.schema();
+
+                        if federated_schema != accelerated_schema {
+                            let differences =
+                                schema_difference(&accelerated_schema, &federated_schema);
+                            let error = DataConnectorError::SchemaMismatch {
+                                dataset_name: dataset_name.to_string(),
+                                differences,
+                            };
+                            warn_once!(tracer, "{}", error);
+                            return Err(RetryError::transient(error));
+                        }
+
+                        Ok(table_provider)
+                    }
                     Err(e) => Err(RetryError::transient(e)),
                 }
             })
@@ -192,15 +206,6 @@ impl FederatedTable {
 
             match table_provider_result {
                 Ok(table_provider) => {
-                    let federated_schema = table_provider.schema();
-
-                    if federated_schema != accelerated_schema {
-                        tracing::warn!(
-                            "Schema mismatch between federated table and acceleration for {dataset_name}. The existing accelerated data is available, but updates are disabled.",
-                        );
-                        return;
-                    }
-
                     if tx.send(table_provider).is_err() {
                         tracing::error!(
                             "Failed to send deferred table provider for dataset '{}': Channel closed.",
