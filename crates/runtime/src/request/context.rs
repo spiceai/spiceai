@@ -249,8 +249,8 @@ impl RequestContextBuilder {
         self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
 
-        let app = self.app.as_ref().map(|app| Arc::clone(app));
-        if let Some(extension) = DatabricksAuthExtension::from_headers(app, headers) {
+        let app = self.app.as_ref().map(Arc::clone);
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, headers) {
             self.extensions
                 .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
         }

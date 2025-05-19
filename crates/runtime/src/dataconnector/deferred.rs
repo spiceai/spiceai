@@ -46,6 +46,7 @@ impl DeferredConnector {
         }
     }
 
+    #[must_use]
     pub fn source(&self) -> Arc<dyn DataConnector> {
         Arc::clone(&self.inner)
     }

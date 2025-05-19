@@ -270,8 +270,8 @@ impl Databricks {
 
                 (
                     Arc::new(DatabricksSparkConnectU2M::from_token_provider(
-                        endpoint.to_string(),
-                        cluster_id.expose_secret().to_string(),
+                        endpoint,
+                        cluster_id.expose_secret(),
                         databricks_use_ssl,
                         token_provider,
                     )),

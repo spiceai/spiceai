@@ -44,7 +44,7 @@ impl Default for DatabricksAuthExtension {
 
 impl DatabricksAuthExtension {
     #[must_use]
-    pub fn from_headers(app: Option<Arc<App>>, headers: &HeaderMap) -> Option<Self> {
+    pub fn from_headers(app: &Option<Arc<App>>, headers: &HeaderMap) -> Option<Self> {
         let databricks_headers = headers.get_all("Spice-Databricks-Auth");
         let values = databricks_headers.iter();
 
@@ -68,7 +68,7 @@ impl DatabricksAuthExtension {
             None
         } else {
             Some(Self {
-                app: app.as_ref().map(|app| Arc::clone(app)),
+                app: app.as_ref().map(Arc::clone),
                 tokens: Arc::new(auth_map),
             })
         }
@@ -92,14 +92,13 @@ impl DatabricksAuthExtension {
                 .iter()
                 .filter_map(|dataset| {
                     let params = dataset.params.as_ref()?;
-                    let client_id = match params.data.get("databricks_client_id") {
-                        Some(ParamValue::String(id)) => id,
-                        _ => {
-                            return None;
-                        }
+                    let Some(ParamValue::String(client_id)) =
+                        params.data.get("databricks_client_id")
+                    else {
+                        return None;
                     };
 
-                    if !client_ids.contains(&client_id) {
+                    if !client_ids.contains(client_id) {
                         return None;
                     }
 

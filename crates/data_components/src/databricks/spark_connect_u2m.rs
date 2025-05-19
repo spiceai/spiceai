@@ -29,7 +29,7 @@ type SparkSession = SparkConnect;
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnectU2M {
-    /// Base connection string (without token or session_id).
+    /// Base connection string without access token
     base_connection: String,
 
     session_pool: Arc<RwLock<HashMap<String, Arc<RwLock<SparkSession>>>>>,
@@ -39,8 +39,8 @@ pub struct DatabricksSparkConnectU2M {
 
 impl DatabricksSparkConnectU2M {
     pub fn from_token_provider(
-        endpoint: String,
-        cluster_id: String,
+        endpoint: &str,
+        cluster_id: &str,
         databricks_use_ssl: bool,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
@@ -63,7 +63,7 @@ impl DatabricksSparkConnectU2M {
         {
             let pool = self.session_pool.read().await;
             if let Some(session) = pool.get(&access_token) {
-                return Ok(session.clone());
+                return Ok(Arc::clone(session));
             }
         }
 
@@ -77,7 +77,7 @@ impl DatabricksSparkConnectU2M {
 
         let spark_connect = SparkConnect::from_connection(connection.as_str()).await?;
         let session = Arc::new(RwLock::new(spark_connect));
-        pool.insert(access_token, session.clone());
+        pool.insert(access_token, Arc::clone(&session));
         Ok(session)
     }
 }
