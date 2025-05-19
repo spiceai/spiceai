@@ -246,14 +246,11 @@ impl SpiceTest<Running> {
                     .entry(query)
                     .and_modify(|existing_status| {
                         // If the worker reports failure, update the status to Failed
-                        if matches!(existing_status, QueryStatus::FailedWithReason(_)) {
+                        if matches!(existing_status, QueryStatus::Failed(_)) {
                             return; // don't update any existing status message
                         }
 
-                        if matches!(
-                            worker_status,
-                            QueryStatus::Failed | QueryStatus::FailedWithReason(_)
-                        ) {
+                        if matches!(worker_status, QueryStatus::Failed(_)) {
                             *existing_status = worker_status.clone();
                         }
                     })
@@ -414,7 +411,7 @@ impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed>
                     .state
                     .query_statuses
                     .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
+                    .unwrap_or(&QueryStatus::Failed(None))
                     .to_owned();
 
                 let metric = QueryMetric::new_from_durations(
@@ -468,7 +465,7 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
                     .state
                     .query_statuses
                     .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
+                    .unwrap_or(&QueryStatus::Failed(None))
                     .to_owned();
 
                 QueryMetric::new_from_durations(

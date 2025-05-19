@@ -49,15 +49,14 @@ pub fn to_i32(value: usize) -> i32 {
 pub enum QueryStatus {
     #[default]
     Passed,
-    Failed,
-    FailedWithReason(Arc<str>),
+    Failed(Option<Arc<str>>),
 }
 
 impl Display for QueryStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryStatus::Passed => write!(f, "passed"),
-            QueryStatus::Failed | QueryStatus::FailedWithReason(_) => write!(f, "failed"),
+            QueryStatus::Failed(_) => write!(f, "failed"),
         }
     }
 }
@@ -109,10 +108,10 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
 
     #[must_use]
     pub fn failed_with_status(mut self, query_status: QueryStatus) -> Self {
-        if matches!(query_status, QueryStatus::FailedWithReason(_)) {
+        if matches!(query_status, QueryStatus::Failed(_)) {
             self.query_status = query_status;
         } else {
-            self.query_status = QueryStatus::Failed;
+            self.query_status = QueryStatus::Failed(None);
         }
 
         self
@@ -662,7 +661,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             {
                 QueryStatus::Passed
             } else {
-                QueryStatus::Failed
+                QueryStatus::Failed(None)
             },
         ];
 

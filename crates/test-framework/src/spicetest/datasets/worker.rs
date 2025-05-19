@@ -224,9 +224,9 @@ impl SpiceTestQueryWorker {
                                     self.id, query.name, e
                                 );
 
-                                query_status = QueryStatus::FailedWithReason(
+                                query_status = QueryStatus::Failed(Some(
                                     "Explain plan snapshot assertion failed".into(),
-                                );
+                                ));
                             }
                         }
 
@@ -269,7 +269,7 @@ impl SpiceTestQueryWorker {
                             }
 
                             if let Some(query_failure) = query_failure {
-                                query_status = QueryStatus::FailedWithReason(query_failure.into());
+                                query_status = QueryStatus::Failed(Some(query_failure.into()));
                             }
 
                             current_query_count += 1;
@@ -311,7 +311,7 @@ impl SpiceTestQueryWorker {
             }
 
             let worker_status = if let Some(query_failure) = query_failure {
-                QueryStatus::FailedWithReason(query_failure.into())
+                QueryStatus::Failed(Some(query_failure.into()))
             } else {
                 QueryStatus::Passed
             };
@@ -320,10 +320,7 @@ impl SpiceTestQueryWorker {
                 .entry(Arc::clone(&query.name))
                 .and_modify(|existing_status| {
                     // If the worker reports failure, update the status to Failed
-                    if matches!(
-                        worker_status,
-                        QueryStatus::FailedWithReason(_) | QueryStatus::Failed
-                    ) {
+                    if matches!(worker_status, QueryStatus::Failed(_)) {
                         *existing_status = worker_status.clone();
                     }
                 })

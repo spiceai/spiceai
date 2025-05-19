@@ -100,12 +100,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
         let status: u64 = u64::from(match &query.query_status {
             QueryStatus::Passed => true,
-            QueryStatus::Failed => {
-                failures.push(format!("{query_name}: failed with an undetermined error"));
-                false
-            }
-            QueryStatus::FailedWithReason(reason) => {
-                failures.push(format!("{query_name}: {reason}"));
+            QueryStatus::Failed(reason) => {
+                if let Some(reason) = reason {
+                    failures.push(format!("{query_name}: {reason}"));
+                } else {
+                    failures.push(format!("{query_name}: failed with an undetermined error"));
+                }
                 false
             }
         });
