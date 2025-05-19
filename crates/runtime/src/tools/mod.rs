@@ -51,7 +51,7 @@ impl Tooling {
                 c.all()
                     .await
                     .iter()
-                    .map(|t| with_name(&t, format!("{catalog_name}/{}", t.name()).as_str()))
+                    .map(|t| with_name(t, format!("{catalog_name}/{}", t.name()).as_str()))
                     .collect()
             }
         }
