@@ -18,13 +18,12 @@ use std::{
     collections::HashSet,
     num::NonZeroUsize,
     sync::{Arc, RwLock},
-    time::Duration,
 };
 
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry, object_store_registry::SpiceObjectStoreRegistry,
 };
-use cache::QueryResultsCacheProvider;
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -33,6 +32,7 @@ use datafusion::{
         memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
+    logical_expr::LogicalPlan,
     optimizer::{
         AnalyzerRule,
         analyzer::{
@@ -43,7 +43,6 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::FederationAnalyzerRule;
-use moka::future::CacheBuilder;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::{embeddings, status};
@@ -58,7 +57,8 @@ use super::{
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    results_cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    plans_cache_provider: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
@@ -110,7 +110,8 @@ impl DataFusionBuilder {
         Self {
             config: df_config,
             status,
-            cache_provider: None,
+            results_cache_provider: None,
+            plans_cache_provider: None,
             accelerator_engine_registry,
             memory_limit: None,
             temp_directory: None,
@@ -126,8 +127,20 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn with_cache_provider(mut self, cache_provider: Arc<QueryResultsCacheProvider>) -> Self {
-        self.cache_provider = Some(cache_provider);
+    pub fn with_results_cache_provider(
+        mut self,
+        cache_provider: Arc<QueryResultsCacheProvider>,
+    ) -> Self {
+        self.results_cache_provider = Some(cache_provider);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plans_cache_provider(
+        mut self,
+        cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+    ) -> Self {
+        self.plans_cache_provider = Some(cache_provider);
         self
     }
 
@@ -160,8 +173,6 @@ impl DataFusionBuilder {
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
     pub fn build(self) -> DataFusion {
-        const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
-
         let mut state = SessionStateBuilder::new()
             .with_config(self.config)
             .with_default_features()
@@ -219,17 +230,25 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
-        let cached_plans = CacheBuilder::new(DEFAULT_CACHED_PLANS_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(3600)) // 1 hour TTL
-            .build();
+        let caching = Caching::new();
+        let caching = if let Some(cache_provider) = self.plans_cache_provider {
+            caching.with_plans_cache(cache_provider)
+        } else {
+            caching
+        };
+
+        let caching = if let Some(cache_provider) = self.results_cache_provider {
+            caching.with_results_cache(cache_provider)
+        } else {
+            caching
+        };
 
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            cache_provider: RwLock::new(self.cache_provider),
+            caching: Arc::new(caching),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
-            cached_plans,
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

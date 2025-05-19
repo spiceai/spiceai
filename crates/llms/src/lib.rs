@@ -24,3 +24,8 @@ pub mod openai;
 pub mod perplexity;
 pub mod progress;
 pub mod xai;
+
+pub enum HealthCheck {
+    Required,
+    Skip,
+}

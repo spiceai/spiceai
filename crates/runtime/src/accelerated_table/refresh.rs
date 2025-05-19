@@ -654,7 +654,6 @@ impl Refresher {
                             if let Some(cache_provider) = &cache_provider {
                                 if let Err(e) = cache_provider
                                     .invalidate_for_table(dataset_name.clone())
-                                    .await
                                 {
                                     tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }

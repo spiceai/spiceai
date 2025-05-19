@@ -46,6 +46,11 @@ on:
         required: true
         default: '30'
         type: string
+      concurrency_count:
+        description: 'How many concurrent client connections to use?'
+        required: true
+        default: '10'
+        type: string
       runner_type:
         description: 'Runner type'
         required: true
@@ -108,17 +113,20 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --concurrency 8
+            --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
           S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -127,6 +135,7 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
@@ -134,6 +143,10 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
 
       - name: Run the throughput test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -147,17 +160,20 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency 8
+            --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
           S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -166,6 +182,7 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
@@ -173,3 +190,7 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
