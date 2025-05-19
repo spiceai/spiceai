@@ -93,7 +93,6 @@ impl Runtime {
         .await
         .boxed()
         .context(UnableToInitializeEmbeddingModelSnafu)?;
-
         l.health()
             .await
             .boxed()

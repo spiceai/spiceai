@@ -41,7 +41,6 @@ impl Runtime {
             .boxed()
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
-
         Ok(l)
     }
 }
