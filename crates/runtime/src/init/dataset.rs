@@ -325,7 +325,9 @@ impl Runtime {
 
         // Test dataset connectivity by attempting to get a read provider.
         let federated_table = match connector.read_provider(&ds).await {
-            Ok(provider) => FederatedTable::new(provider),
+            Ok(provider) => {
+                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&connector)).await
+            }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
@@ -537,7 +539,8 @@ impl Runtime {
             }
             .build()
         })?;
-        let federated_table = FederatedTable::new(read_table);
+        let federated_table =
+            FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
 
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
