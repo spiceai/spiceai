@@ -95,7 +95,7 @@ impl FederatedTable {
 
         let federated_schema = table_provider.schema();
 
-        if federated_schema != accelerated_schema {
+        if schema_difference(&accelerated_schema, &federated_schema).is_some() {
             return Self::Deferred(Self::new_deferred_with_schema(
                 Arc::clone(&dataset),
                 data_connector,
