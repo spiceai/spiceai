@@ -65,7 +65,7 @@ pub fn from_access_token(
     Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
-        health_check: super::HealthCheck::Required,
+        health_check: HealthCheck::Required,
     }
 }
 
@@ -74,7 +74,7 @@ pub fn from_token_provider(
     model: &str,
     token_provider: Arc<dyn TokenProvider>,
     user_agent: Option<&'static str>,
-    health_check: super::HealthCheck,
+    health_check: HealthCheck,
 ) -> Databricks {
     let mut cfg = HostedModelConfig::from_url(
         format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
