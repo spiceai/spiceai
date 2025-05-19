@@ -229,7 +229,7 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
             .enumerate()
             .map(|(i, durations)| {
                 QueryMetric::new_from_durations(
-                    format!("{i}").as_str(),
+                    format!("{i}").into(),
                     durations,
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,

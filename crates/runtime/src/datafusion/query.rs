@@ -435,7 +435,7 @@ mod tests {
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
             )
-            .with_cache_provider(cache_provider)
+            .with_results_cache_provider(cache_provider)
             .build(),
         );
 

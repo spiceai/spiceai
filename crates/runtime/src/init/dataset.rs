@@ -32,6 +32,7 @@ use crate::{
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
+        deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
     },
     embeddings::connector::EmbeddingConnector,
@@ -73,7 +74,12 @@ impl Runtime {
             return;
         }
 
-        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
+        // Before loading datasets, we must initialize views accelerators (if any).
+        // This is required for acceleration federation for some engines (e.g. `DuckDB`).
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        self.initialize_views_accelerators(&valid_views).await;
+
+        let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
 
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
@@ -206,7 +212,14 @@ impl Runtime {
             .get_dataconnector_from_source(source, params)
             .await
         {
-            Ok(data_connector) => data_connector,
+            Ok(data_connector) => {
+                // if connector marked as deferred, replace it with stub DeferredConnector
+                if data_connector.deferred_load() {
+                    Arc::new(DeferredConnector::new(data_connector)) as Arc<dyn DataConnector>
+                } else {
+                    data_connector
+                }
+            }
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status
@@ -325,7 +338,9 @@ impl Runtime {
 
         // Test dataset connectivity by attempting to get a read provider.
         let federated_table = match connector.read_provider(&ds).await {
-            Ok(provider) => FederatedTable::new(provider),
+            Ok(provider) => {
+                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&connector)).await
+            }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
@@ -373,15 +388,17 @@ impl Runtime {
                     dataset_registered_trace(
                         connector.as_ref(),
                         &ds,
-                        self.df.cache_provider().is_some()
+                        self.df.results_cache_provider().is_some()
                     )
                 );
-                if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-                    if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
-                        tracing::warn!(
-                            "Unable to add dataset {} for availability monitoring: {err}",
-                            &ds.name
-                        );
+                if !connector.deferred_load() {
+                    if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+                        if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
+                            tracing::warn!(
+                                "Unable to add dataset {} for availability monitoring: {err}",
+                                &ds.name
+                            );
+                        }
                     }
                 }
                 let engine = ds.acceleration.as_ref().map_or_else(
@@ -537,7 +554,8 @@ impl Runtime {
             }
             .build()
         })?;
-        let federated_table = FederatedTable::new(read_table);
+        let federated_table =
+            FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
 
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
@@ -667,7 +685,7 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
+        let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         for ds in initialized_datasets {
@@ -720,7 +738,10 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
+    async fn initialize_datasets_accelerators(
+        &self,
+        datasets: &[Arc<Dataset>],
+    ) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let mut initialized_datasets = vec![];

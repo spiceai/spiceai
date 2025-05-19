@@ -204,14 +204,14 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
 
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         let baseline = QueryMetric::new_from_durations(
-            "baseline",
+            "baseline".into(),
             &self.state.baseline_results.durations,
             QueryStatus::Passed,
             system_time_to_unix_epoch_ms(self.start_time)?,
             system_time_to_unix_epoch_ms(self.state.end_time)?,
         )?;
         let spice = QueryMetric::new_from_durations(
-            "spice",
+            "spice".into(),
             &self.state.spice_results.durations,
             QueryStatus::Passed,
             system_time_to_unix_epoch_ms(self.start_time)?,

@@ -57,7 +57,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_query_set(queries.clone())
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
-            .with_validate(args.validate),
+            .with_validate(args.validate)
+            .with_disable_caching(args.disable_caching),
     )
     .with_spiced_instance(spiced_instance)
     .with_explain_plan_snapshot()
@@ -92,14 +93,22 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
+    let mut failures = Vec::new();
     for query in &metrics.metrics {
-        let query_name = query.query_name.clone();
-        let row_count = row_counts.get(&query_name).unwrap_or(&0);
-        let attributes = vec![KeyValue::new("query_name", query_name)];
+        let query_name = &query.query_name;
+        let row_count = row_counts.get(query_name).unwrap_or(&0);
+        let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-        let status: u64 = u64::from(match query.query_status {
+        let status: u64 = u64::from(match &query.query_status {
             QueryStatus::Passed => true,
-            QueryStatus::Failed => false,
+            QueryStatus::Failed(reason) => {
+                if let Some(reason) = reason {
+                    failures.push(format!("{query_name}: {reason}"));
+                } else {
+                    failures.push(format!("{query_name}: failed with an undetermined error"));
+                }
+                false
+            }
         });
 
         crate::metrics::QUERY_STATUS.record(status, &attributes);
@@ -126,7 +135,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     if !test_succeeded {
         return Err(anyhow::anyhow!(
-            "Benchmark test failed due to failed queries"
+            "Benchmark test failed due to failed queries:\n{}",
+            failures.join("\n")
         ));
     }
 

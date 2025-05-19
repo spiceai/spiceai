@@ -345,7 +345,7 @@ pub async fn create_synced_internal_accelerated_table(
     let source_table_provider =
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
             .await?;
-    let federated_table = Arc::new(FederatedTable::new(source_table_provider));
+    let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
 
     let accelerated_table_provider = accelerator_engine_registry
         .create_accelerator_table(

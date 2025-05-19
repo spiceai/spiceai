@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::args::CommonArgs;
 use test_framework::{
@@ -32,7 +32,7 @@ pub(crate) mod load;
 pub(crate) mod throughput;
 mod util;
 pub(crate) mod vector_search;
-pub(crate) type RowCounts = BTreeMap<String, usize>;
+pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
 pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
     if !args.metrics {

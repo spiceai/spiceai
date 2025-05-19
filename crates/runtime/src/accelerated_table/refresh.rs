@@ -654,7 +654,6 @@ impl Refresher {
                             if let Some(cache_provider) = &cache_provider {
                                 if let Err(e) = cache_provider
                                     .invalidate_for_table(dataset_name.clone())
-                                    .await
                                 {
                                     tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
@@ -901,7 +900,7 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("mem table should be created"),
         );
-        let federated = Arc::new(FederatedTable::new(mem_table));
+        let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
         let arr = StringArray::from(existing_data);
 
@@ -1107,7 +1106,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                     .expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = StringArray::from(existing_data);
 
@@ -1254,7 +1253,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                     .expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = UInt64Array::from(existing_data);
 
@@ -1451,7 +1450,7 @@ mod tests {
             let mem_table = Arc::new(
                 MemTable::try_new(Arc::clone(&schema), data).expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = UInt64Array::from(existing_data);
             let batch =

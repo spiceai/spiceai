@@ -70,6 +70,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("The timeout setting for object store client."),
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+    ParameterSpec::component("sql_warehouse_id")
+        .secret()
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
