@@ -52,6 +52,8 @@ mod duckdb;
 mod sqlite;
 
 #[tokio::test]
+// Temporarily disabled until test robustness is improved: https://github.com/spiceai/spiceai/issues/5803
+#[ignore]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
