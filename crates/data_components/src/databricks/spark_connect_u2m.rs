@@ -25,14 +25,12 @@ use uuid::Uuid;
 use crate::{Read, spark_connect::SparkConnect};
 use token_provider::TokenProvider;
 
-type SparkSession = SparkConnect;
-
 #[derive(Clone)]
 pub struct DatabricksSparkConnectU2M {
     /// Base connection string without access token
     base_connection: String,
 
-    session_pool: Arc<RwLock<HashMap<String, Arc<RwLock<SparkSession>>>>>,
+    session_pool: Arc<RwLock<HashMap<String, Arc<RwLock<SparkConnect>>>>>,
 
     token_provider: Arc<dyn TokenProvider>,
 }
@@ -57,7 +55,7 @@ impl DatabricksSparkConnectU2M {
 
     async fn get_session(
         &self,
-    ) -> Result<Arc<RwLock<SparkSession>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<RwLock<SparkConnect>>, Box<dyn std::error::Error + Send + Sync>> {
         let access_token = self.token_provider.get_token();
 
         {
