@@ -38,6 +38,11 @@ spice datasets
 			return
 		}
 
+		if rtcontext.IsCloud() {
+			slog.Error("`spice datasets ` does not support `--cloud`.")
+			return
+		}
+
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
 			slog.Error("listing dataset statuses", "error", err)

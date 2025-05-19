@@ -52,6 +52,12 @@ sql> show tables
 			return
 		}
 
+		if rtcontext.IsCloud() {
+			// https://github.com/spiceai/spiceai/issues/5870
+			slog.Error("`spice sql` does not support `--cloud`.")
+			return
+		}
+
 		_, err = rtcontext.Version()
 		if err != nil {
 			slog.Error("Failed to run `spice sql`: The Spice runtime is not installed. Run `spice install` and retry.")
