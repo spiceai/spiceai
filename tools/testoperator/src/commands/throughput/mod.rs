@@ -75,7 +75,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
-            .with_end_condition(EndCondition::QuerySetCompleted(5000)),
+            .with_end_condition(EndCondition::QuerySetCompleted(2000)),
     )
     .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
