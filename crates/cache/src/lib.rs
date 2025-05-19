@@ -28,6 +28,7 @@ use std::time::UNIX_EPOCH;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
@@ -40,7 +41,6 @@ use fundu::ParseError;
 use futures::Stream;
 use futures::task::{Context, Poll};
 use lru_cache::LruCache;
-use simple_cache::TableInvalidator;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::HashingAlgorithm;
 use spicepod::component::runtime::ResultsCache;
@@ -50,7 +50,7 @@ mod metrics;
 mod simple_cache;
 mod utils;
 
-pub use simple_cache::{CacheProvider, SimpleCache};
+pub use simple_cache::SimpleCache;
 use std::sync::RwLock;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
@@ -77,16 +77,42 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
-pub enum CacheType {
-    Results,
-    Plans,
+pub(crate) trait Sizeable {
+    fn get_memory_size(&self) -> usize;
+}
+
+pub trait HashProvider {
+    fn hasher(&self) -> Box<dyn Hasher>;
+}
+
+#[async_trait]
+pub trait CacheProvider<V: Clone + Send + Sync + 'static>: HashProvider + std::fmt::Debug {
+    async fn get_raw_key(&self, key: &u64) -> Option<V>;
+    async fn put_raw_key(&self, key: &u64, value: V);
+    fn invalidate_all(&self);
+    fn size_bytes(&self) -> u64;
+    fn item_count(&self) -> u64;
+    async fn checkpoint(&self);
+}
+
+pub trait TableInvalidator {
+    #[allow(clippy::missing_errors_doc)]
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
 }
 
 #[derive(Default)]
 pub struct Caching {
     pub results: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
     pub plans: RwLock<Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for Caching {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caching")
+            .field("results", &self.results)
+            .field("plans", &self.plans)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Caching {
@@ -144,7 +170,7 @@ pub enum CacheKey<'a> {
 
 impl CacheKey<'_> {
     #[must_use]
-    pub fn as_raw_key<T: Hasher + Send + Sync>(&self, mut hasher: T) -> RawCacheKey {
+    pub fn as_raw_key<T: Hasher>(&self, mut hasher: T) -> RawCacheKey {
         match self {
             Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
             Self::Query(sql, param_values) => {
@@ -301,13 +327,11 @@ impl QueryResultsCacheProvider {
                     cache_max_size,
                     ttl,
                     ahash::RandomState::default(),
-                    config.hashing_algorithm,
                 )),
                 HashingAlgorithm::Siphash => Arc::new(LruCache::new(
                     cache_max_size,
                     ttl,
                     std::hash::RandomState::default(),
-                    config.hashing_algorithm,
                 )),
             },
             cache_max_size,
@@ -388,7 +412,7 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn hasher(&self) -> Box<dyn Hasher + Send + Sync> {
+    pub fn hasher(&self) -> Box<dyn Hasher> {
         self.cache.hasher()
     }
 

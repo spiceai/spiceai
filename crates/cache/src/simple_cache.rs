@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Result;
+use crate::{CacheProvider, HashProvider};
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
 use moka::future::Cache;
-use spicepod::component::runtime::HashingAlgorithm;
 use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
@@ -28,57 +26,39 @@ pub struct SimpleCache<
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
-    hashing_algorithm: HashingAlgorithm,
+    hasher: T,
+}
+
+impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    std::fmt::Debug for SimpleCache<V, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleCache")
+            .field("cache_size", &self.cache.weighted_size())
+            .field("item_count", &self.cache.entry_count())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     SimpleCache<V, T>
 {
-    pub fn new(
-        cache_max_size: u64,
-        ttl: Duration,
-        hasher: T,
-        hashing_algorithm: HashingAlgorithm,
-    ) -> Self {
+    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
-            .build_with_hasher(hasher);
+            .build_with_hasher(hasher.clone());
 
-        SimpleCache {
-            cache,
-            hashing_algorithm,
-        }
+        SimpleCache { cache, hasher }
     }
-}
-
-pub trait HashProvider {
-    fn hasher(&self) -> Box<dyn Hasher + Send + Sync>;
-}
-
-#[async_trait]
-pub trait CacheProvider<V: Clone + Send + Sync + 'static>: HashProvider {
-    async fn get_raw_key(&self, key: &u64) -> Option<V>;
-    async fn put_raw_key(&self, key: &u64, value: V);
-    fn invalidate_all(&self);
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
-    async fn checkpoint(&self);
-}
-
-pub trait TableInvalidator {
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
 }
 
 impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> HashProvider
     for SimpleCache<V, T>
 {
-    fn hasher(&self) -> Box<dyn Hasher + Send + Sync> {
-        match self.hashing_algorithm {
-            HashingAlgorithm::Siphash => Box::new(std::hash::DefaultHasher::new()),
-            HashingAlgorithm::Ahash => Box::new(ahash::AHasher::default()),
-        }
+    fn hasher(&self) -> Box<dyn Hasher> {
+        Box::new(self.hasher.build_hasher())
     }
 }
 
@@ -119,6 +99,7 @@ mod tests {
     use crate::CachedQueryResult;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::hash::RandomState;
@@ -147,15 +128,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
     ) {
         let cache: SimpleCache<CachedQueryResult, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 
@@ -174,15 +154,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(
-        #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
-    ) {
+    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
         let cache: SimpleCache<CachedQueryResult, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -191,15 +168,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_invalidate_all<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
     ) {
         let cache: SimpleCache<CachedQueryResult, _> =
-            SimpleCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let result = create_test_cached_result();
 
         // Put a value in the cache
@@ -220,15 +196,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(
-        #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
-    ) {
+    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
         let cache: SimpleCache<CachedQueryResult, _> =
-            SimpleCache::new(10, Duration::from_millis(100), hasher, hashing_algorithm);
+            SimpleCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 

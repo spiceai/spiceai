@@ -55,13 +55,11 @@ impl Runtime {
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
                     std::hash::RandomState::default(),
-                    HashingAlgorithm::Siphash,
                 )),
                 HashingAlgorithm::Ahash => Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
                     ahash::RandomState::default(),
-                    HashingAlgorithm::Ahash,
                 )),
             };
 

@@ -17,14 +17,14 @@ limitations under the License.
 use crate::CacheProvider;
 use crate::CachedQueryResult;
 use crate::FailedToInvalidateCacheSnafu;
+use crate::HashProvider;
 use crate::Result;
-use crate::simple_cache::HashProvider;
-use crate::simple_cache::TableInvalidator;
+use crate::Sizeable;
+use crate::TableInvalidator;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
-use spicepod::component::runtime::HashingAlgorithm;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -36,11 +36,18 @@ pub struct LruCache<
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
-    hashing_algorithm: HashingAlgorithm,
+    hasher: T,
 }
 
-pub trait Sizeable {
-    fn get_memory_size(&self) -> usize;
+impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    std::fmt::Debug for LruCache<V, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LruCache")
+            .field("cache_size", &self.cache.weighted_size())
+            .field("item_count", &self.cache.entry_count())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Sizeable for CachedQueryResult {
@@ -55,12 +62,7 @@ impl Sizeable for CachedQueryResult {
 impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     LruCache<V, T>
 {
-    pub fn new(
-        cache_max_size: u64,
-        ttl: Duration,
-        hasher: T,
-        hashing_algorithm: HashingAlgorithm,
-    ) -> Self {
+    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
@@ -82,23 +84,17 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
             .max_capacity(cache_max_size)
             .eviction_policy(moka::policy::EvictionPolicy::lru())
             .support_invalidation_closures()
-            .build_with_hasher(hasher);
+            .build_with_hasher(hasher.clone());
 
-        LruCache {
-            cache,
-            hashing_algorithm,
-        }
+        LruCache { cache, hasher }
     }
 }
 
 impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     HashProvider for LruCache<V, T>
 {
-    fn hasher(&self) -> Box<dyn Hasher + Send + Sync> {
-        match self.hashing_algorithm {
-            HashingAlgorithm::Siphash => Box::new(std::hash::DefaultHasher::new()),
-            HashingAlgorithm::Ahash => Box::new(ahash::AHasher::default()),
-        }
+    fn hasher(&self) -> Box<dyn Hasher> {
+        Box::new(self.hasher.build_hasher())
     }
 }
 
@@ -183,15 +179,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
     ) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            LruCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 
@@ -210,15 +205,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(
-        #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
-    ) {
+    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            LruCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -227,15 +219,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_invalidate_for_table<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
     ) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, hashing_algorithm);
+            LruCache::new(10, Duration::from_secs(60), hasher);
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
@@ -261,15 +252,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default(), HashingAlgorithm::Siphash)]
-    #[case::ahash(ahash::RandomState::default(), HashingAlgorithm::Ahash)]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(
-        #[case] hasher: T,
-        #[case] hashing_algorithm: HashingAlgorithm,
-    ) {
+    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher, hashing_algorithm);
+            LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 

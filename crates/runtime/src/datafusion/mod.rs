@@ -279,7 +279,7 @@ impl std::fmt::Debug for DataFusion {
             .field("runtime_status", &self.runtime_status)
             .field("data_writers", &self.data_writers)
             .field("accelerated_tables", &self.accelerated_tables)
-            .field("cache_provider", &self.caching.results)
+            .field("caching", &self.caching)
             .finish_non_exhaustive()
     }
 }
@@ -1604,7 +1604,6 @@ async fn wait_until_dependent_tables_are_ready(
 #[cfg(test)]
 mod tests {
     use cache::{CacheKey, SimpleCache};
-    use spicepod::component::runtime::HashingAlgorithm;
 
     use crate::builder::RuntimeBuilder;
 
@@ -1622,7 +1621,6 @@ mod tests {
             512,
             Duration::from_secs(3600),
             std::hash::RandomState::default(),
-            HashingAlgorithm::default(),
         ));
         let df = Arc::new(
             DataFusion::builder(

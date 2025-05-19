@@ -97,7 +97,7 @@ impl Query {
         };
 
         let plan_hasher = df.plans_cache_provider().map_or(
-            Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher + Send + Sync>,
+            Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher>,
             |p| p.hasher(),
         );
 
@@ -306,7 +306,6 @@ mod tests {
             512,
             Duration::from_secs(3600),
             std::hash::RandomState::default(),
-            HashingAlgorithm::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
@@ -436,7 +435,6 @@ mod tests {
             512,
             Duration::from_secs(3600),
             std::hash::RandomState::default(),
-            HashingAlgorithm::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
@@ -505,7 +503,6 @@ mod tests {
             512,
             Duration::from_secs(3600),
             std::hash::RandomState::default(),
-            HashingAlgorithm::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
