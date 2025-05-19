@@ -12448,6 +12448,7 @@ dependencies = [
 name = "test-framework"
 version = "1.4.0-unstable"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "app",
  "arrow",

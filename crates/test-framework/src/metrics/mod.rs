@@ -45,24 +45,24 @@ pub fn to_i32(value: usize) -> i32 {
     value as i32
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum QueryStatus {
     #[default]
     Passed,
-    Failed,
+    Failed(Option<Arc<str>>),
 }
 
 impl Display for QueryStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryStatus::Passed => write!(f, "passed"),
-            QueryStatus::Failed => write!(f, "failed"),
+            QueryStatus::Failed(_) => write!(f, "failed"),
         }
     }
 }
 
 pub struct QueryMetric<T: ExtendedMetrics> {
-    pub query_name: String,
+    pub query_name: Arc<str>,
     pub query_status: QueryStatus,
     pub started_at: usize,
     pub finished_at: usize,
@@ -78,20 +78,20 @@ pub struct QueryMetric<T: ExtendedMetrics> {
 
 impl<T: ExtendedMetrics> QueryMetric<T> {
     pub fn new_from_durations(
-        name: &str,
+        name: Arc<str>,
         durations: &Vec<Duration>,
         query_status: QueryStatus,
         started_at: usize,
         finished_at: usize,
     ) -> Result<Self> {
         if durations.is_empty() {
-            return Ok(Self::new(name).failed());
+            return Ok(Self::new(Arc::clone(&name)).failed_with_status(query_status));
         }
 
         let iterations = durations.len();
         let durations = durations.statistical_set()?;
         Ok(Self {
-            query_name: name.to_string(),
+            query_name: name,
             query_status,
             started_at,
             finished_at,
@@ -107,15 +107,20 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn failed(mut self) -> Self {
-        self.query_status = QueryStatus::Failed;
+    pub fn failed_with_status(mut self, query_status: QueryStatus) -> Self {
+        if matches!(query_status, QueryStatus::Failed(_)) {
+            self.query_status = query_status;
+        } else {
+            self.query_status = QueryStatus::Failed(None);
+        }
+
         self
     }
 
     #[must_use]
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: Arc<str>) -> Self {
         Self {
-            query_name: name.to_string(),
+            query_name: name,
             query_status: QueryStatus::Passed,
             started_at: 0,
             finished_at: 0,
@@ -221,6 +226,65 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         } else {
             sorted_durations
         })
+    }
+}
+
+impl StatisticsCollector<BTreeMap<Arc<str>, Duration>, BTreeMap<Arc<str>, Vec<Duration>>>
+    for BTreeMap<Arc<str>, Vec<Duration>>
+{
+    fn percentile(&self, percentile: f64) -> Result<BTreeMap<Arc<str>, Duration>> {
+        let mut percentiles = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            percentiles.insert(Arc::clone(query), durations.percentile(percentile)?);
+        }
+        Ok(percentiles)
+    }
+
+    fn median(&self) -> Result<BTreeMap<Arc<str>, Duration>> {
+        let mut medians = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            medians.insert(Arc::clone(query), durations.median()?);
+        }
+        Ok(medians)
+    }
+
+    fn min_duration(&self) -> Result<BTreeMap<Arc<str>, Duration>> {
+        let mut mins = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            mins.insert(Arc::clone(query), durations.min_duration()?);
+        }
+        Ok(mins)
+    }
+
+    fn max_duration(&self) -> Result<BTreeMap<Arc<str>, Duration>> {
+        let mut maxes = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            maxes.insert(Arc::clone(query), durations.max_duration()?);
+        }
+        Ok(maxes)
+    }
+
+    fn statistical_set(&self) -> Result<BTreeMap<Arc<str>, Vec<Duration>>> {
+        let mut statistical_sets = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            statistical_sets.insert(Arc::clone(query), durations.statistical_set()?);
+        }
+        Ok(statistical_sets)
     }
 }
 
@@ -531,7 +595,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Arc::new(StringArray::from(spiced_version)),
             Arc::new(UInt64Array::from(started_at)),
             Arc::new(UInt64Array::from(finished_at)),
-            Arc::new(StringArray::from(query_name)),
+            Arc::new(StringArray::from(
+                query_name
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from(query_status)),
             Arc::new(UInt64Array::from(min_duration_ms)),
             Arc::new(UInt64Array::from(max_duration_ms)),
@@ -573,7 +642,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
     /// Builds record batches for the test run
     /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
-    pub fn build_run(&self, status: QueryStatus) -> Result<Vec<RecordBatch>> {
+    pub fn build_run(&self, status: &QueryStatus) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string()];
         let spiced_version = vec![self.spiced_version.to_string()];
         let run_name = vec![self.run_name.clone()];
@@ -588,11 +657,11 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                 .metrics
                 .iter()
                 .all(|m| m.query_status == QueryStatus::Passed)
-                && status == QueryStatus::Passed
+                && status.clone() == QueryStatus::Passed
             {
                 QueryStatus::Passed
             } else {
-                QueryStatus::Failed
+                QueryStatus::Failed(None)
             },
         ];
 
@@ -648,7 +717,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     }
 
     pub fn show_run(&self, status: Option<QueryStatus>) -> Result<()> {
-        print_batches(&self.build_run(status.unwrap_or_default())?)?;
+        print_batches(&self.build_run(&status.unwrap_or_default())?)?;
 
         Ok(())
     }

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -116,10 +117,10 @@ pub struct Running {
     end_condition: EndCondition,
 }
 pub struct Completed {
-    pub(crate) query_durations: BTreeMap<String, Vec<Duration>>,
-    pub(crate) query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
-    pub(crate) row_counts: BTreeMap<String, Vec<usize>>,
-    pub(crate) query_statuses: BTreeMap<String, QueryStatus>,
+    pub(crate) query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
+    pub(crate) query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
+    pub(crate) row_counts: BTreeMap<Arc<str>, Vec<usize>>,
+    pub(crate) query_statuses: BTreeMap<Arc<str>, QueryStatus>,
     pub(crate) test_duration: Duration,
     pub(crate) end_time: SystemTime,
     pub(crate) query_count: usize,
@@ -252,8 +253,12 @@ impl SpiceTest<Running> {
                     .entry(query)
                     .and_modify(|existing_status| {
                         // If the worker reports failure, update the status to Failed
-                        if worker_status == QueryStatus::Failed {
-                            *existing_status = QueryStatus::Failed;
+                        if matches!(existing_status, QueryStatus::Failed(_)) {
+                            return; // don't update any existing status message
+                        }
+
+                        if matches!(worker_status, QueryStatus::Failed(_)) {
+                            *existing_status = worker_status.clone();
                         }
                     })
                     .or_insert(worker_status);
@@ -289,7 +294,7 @@ impl SpiceTest<Running> {
 
 impl SpiceTest<Completed> {
     #[must_use]
-    pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
+    pub fn get_query_durations(&self) -> &BTreeMap<Arc<str>, Vec<Duration>> {
         &self.state.query_durations
     }
 
@@ -297,7 +302,7 @@ impl SpiceTest<Completed> {
     ///
     /// Only valid when the `EndCondition` is `QuerySetCompleted`.
     #[must_use]
-    pub fn get_query_iteration_durations(&self) -> &BTreeMap<String, (SystemTime, SystemTime)> {
+    pub fn get_query_iteration_durations(&self) -> &BTreeMap<Arc<str>, (SystemTime, SystemTime)> {
         &self.state.query_iteration_durations
     }
 
@@ -336,7 +341,7 @@ impl SpiceTest<Completed> {
 
     /// Validates that row counts are consistent across queries
     /// Each query should return the same number of rows
-    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<String, usize>> {
+    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<Arc<str>, usize>> {
         // validate that row counts are consistent across queries - each query should return the same number of rows
         let mut returned_row_counts = BTreeMap::new();
         for (query, counts) in &self.state.row_counts {
@@ -350,7 +355,7 @@ impl SpiceTest<Completed> {
                 ));
             }
 
-            returned_row_counts.insert(query.clone(), *first);
+            returned_row_counts.insert(Arc::clone(query), *first);
         }
 
         Ok(returned_row_counts)
@@ -413,11 +418,11 @@ impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed>
                     .state
                     .query_statuses
                     .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
+                    .unwrap_or(&QueryStatus::Failed(None))
                     .to_owned();
 
                 let metric = QueryMetric::new_from_durations(
-                    query,
+                    Arc::clone(query),
                     durations,
                     query_status,
                     system_time_to_unix_epoch_ms(query_start_time)?,
@@ -467,11 +472,11 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
                     .state
                     .query_statuses
                     .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
+                    .unwrap_or(&QueryStatus::Failed(None))
                     .to_owned();
 
                 QueryMetric::new_from_durations(
-                    query,
+                    Arc::clone(query),
                     durations,
                     query_status,
                     system_time_to_unix_epoch_ms(query_start_time)?,
