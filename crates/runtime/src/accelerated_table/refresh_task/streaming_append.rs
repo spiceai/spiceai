@@ -63,9 +63,8 @@ impl RefreshTask {
                         initial_load_completed.store(true, Ordering::Relaxed);
 
                         if let Some(cache_provider) = &cache_provider {
-                            if let Err(e) = cache_provider
-                                .invalidate_for_table(dataset_name.clone())
-                                .await
+                            if let Err(e) =
+                                cache_provider.invalidate_for_table(dataset_name.clone())
                             {
                                 tracing::error!(
                                     "Failed to invalidate cached results for dataset {}: {e}",

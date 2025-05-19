@@ -373,7 +373,7 @@ impl Runtime {
                     dataset_registered_trace(
                         connector.as_ref(),
                         &ds,
-                        self.df.cache_provider().is_some()
+                        self.df.results_cache_provider().is_some()
                     )
                 );
                 if let Some(datasets_health_monitor) = &self.datasets_health_monitor {

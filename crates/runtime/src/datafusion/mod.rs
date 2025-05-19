@@ -43,7 +43,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::{QueryResultsCacheProvider, RawCacheKey};
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -59,7 +59,6 @@ use datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
-use moka::future::Cache;
 use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -266,9 +265,7 @@ pub struct DataFusion {
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
-    cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
-    cached_plans: Cache<u64, LogicalPlan>,
-
+    caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -282,7 +279,7 @@ impl std::fmt::Debug for DataFusion {
             .field("runtime_status", &self.runtime_status)
             .field("data_writers", &self.data_writers)
             .field("accelerated_tables", &self.accelerated_tables)
-            .field("cache_provider", &self.cache_provider)
+            .field("caching", &self.caching)
             .finish_non_exhaustive()
     }
 }
@@ -314,9 +311,18 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
-    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
-        if let Ok(mut a) = self.cache_provider.write() {
+    pub fn set_results_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
+        if let Ok(mut a) = self.caching.results.write() {
             *a = Some(Arc::new(cache_provider));
+        }
+    }
+
+    pub fn set_logical_plan_cache_provider(
+        &self,
+        cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+    ) {
+        if let Ok(mut a) = self.caching.plans.write() {
+            *a = Some(cache_provider);
         }
     }
 
@@ -876,7 +882,7 @@ impl DataFusion {
 
         accelerated_table_builder.ready_state(dataset.ready_state);
 
-        accelerated_table_builder.cache_provider(self.cache_provider());
+        accelerated_table_builder.cache_provider(self.results_cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
@@ -979,8 +985,18 @@ impl DataFusion {
         );
     }
 
-    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
-        let Ok(provider) = self.cache_provider.read() else {
+    pub fn results_cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
+        let Ok(provider) = self.caching.results.read() else {
+            return None;
+        };
+
+        provider.clone()
+    }
+
+    pub fn plans_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>> {
+        let Ok(provider) = self.caching.plans.read() else {
             return None;
         };
 
@@ -1365,7 +1381,7 @@ impl DataFusion {
             refresh,
         );
         builder.initial_load_complete(initial_load_complete);
-        builder.cache_provider(self.cache_provider());
+        builder.cache_provider(self.results_cache_provider());
         builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);
@@ -1494,7 +1510,11 @@ impl DataFusion {
         key: &RawCacheKey,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        if let Some(plan) = self.cached_plans.get(&key.as_u64()).await {
+        let Some(plans_cache) = self.plans_cache_provider() else {
+            return session.create_logical_plan(sql).await;
+        };
+
+        if let Some(plan) = plans_cache.get_raw_key(&key.as_u64()).await {
             tracing::trace!("using cached plan for {sql}");
             return Ok(plan);
         }
@@ -1502,14 +1522,16 @@ impl DataFusion {
         let plan = session.create_logical_plan(sql).await?;
 
         tracing::trace!("caching plan for {sql}");
-        self.cached_plans.insert(key.as_u64(), plan.clone()).await;
+        plans_cache.put_raw_key(&key.as_u64(), plan.clone()).await;
 
         Ok(plan)
     }
 
     pub(crate) fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
-        self.cached_plans.invalidate_all();
+        if let Some(cache_provider) = self.plans_cache_provider() {
+            cache_provider.invalidate_all();
+        }
     }
 }
 
@@ -1581,7 +1603,7 @@ async fn wait_until_dependent_tables_are_ready(
 
 #[cfg(test)]
 mod tests {
-    use cache::CacheKey;
+    use cache::{CacheKey, SimpleCache};
 
     use crate::builder::RuntimeBuilder;
 
@@ -1590,14 +1612,22 @@ mod tests {
     #[tokio::test]
     async fn test_get_or_create_logical_plan() {
         static SQL: &str = "SELECT 1";
-        let raw_cache_key = CacheKey::Query(SQL, None).as_raw_key();
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
 
         let runtime = RuntimeBuilder::new().build().await;
+
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ));
         let df = Arc::new(
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
+            .with_plans_cache_provider(plan_cache_provider)
             .build(),
         );
 
@@ -1607,15 +1637,23 @@ mod tests {
             .await
             .expect("logical plan");
 
-        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
-        assert_eq!(df.cached_plans.entry_count(), 1);
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+
+        cache_provider.checkpoint().await; // Ensure entry gets logged
+        assert_eq!(cache_provider.item_count(), 1);
+        drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
         df.get_or_create_logical_plan(&session, &raw_cache_key, SQL)
             .await
             .expect("logical plan");
 
-        df.cached_plans.run_pending_tasks().await; // Ensure entry gets logged
-        assert_eq!(df.cached_plans.entry_count(), 1);
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await; // Ensure entry gets logged
+        assert_eq!(cache_provider.item_count(), 1);
     }
 }

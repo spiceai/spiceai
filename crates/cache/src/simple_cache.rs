@@ -14,111 +14,57 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::CacheProvider;
-use crate::CachedQueryResult;
-use crate::FailedToInvalidateCacheSnafu;
-use crate::HashProvider;
-use crate::Result;
-use crate::Sizeable;
-use crate::TableInvalidator;
+use crate::{CacheProvider, HashProvider};
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
 use moka::future::Cache;
-use snafu::ResultExt;
-use std::hash::BuildHasher;
-use std::hash::Hasher;
-use std::sync::Arc;
+use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
 // 'static is required by a bound from moka::Cache
-pub struct LruCache<
-    V: Sizeable + Clone + Send + Sync + 'static,
+pub struct SimpleCache<
+    V: Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
     hasher: T,
 }
 
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    std::fmt::Debug for LruCache<V, T>
+impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    std::fmt::Debug for SimpleCache<V, T>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LruCache")
+        f.debug_struct("SimpleCache")
             .field("cache_size", &self.cache.weighted_size())
             .field("item_count", &self.cache.entry_count())
             .finish_non_exhaustive()
     }
 }
 
-impl Sizeable for CachedQueryResult {
-    fn get_memory_size(&self) -> usize {
-        self.records
-            .iter()
-            .map(arrow::array::RecordBatch::get_array_memory_size)
-            .sum()
-    }
-}
-
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    LruCache<V, T>
+impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    SimpleCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
-            .weigher(|_key, value: &V| -> u32 {
-                let val: usize = value.get_memory_size();
-
-                match val.try_into() {
-                    Ok(val) => val,
-                    Err(e) => {
-                        // This should never happen, as the size of record batches should be less than u32::MAX
-                        tracing::warn!(
-                            "Lru cache: Failed to convert query result size to u32: {}",
-                            e
-                        );
-                        // Return the maximum value if we can't convert, so that we don't cache this record.
-                        u32::MAX
-                    }
-                }
-            })
             .max_capacity(cache_max_size)
-            .eviction_policy(moka::policy::EvictionPolicy::lru())
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        LruCache { cache, hasher }
+        SimpleCache { cache, hasher }
     }
 }
 
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    HashProvider for LruCache<V, T>
+impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> HashProvider
+    for SimpleCache<V, T>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
     }
 }
 
-impl<T: BuildHasher + Clone + Send + Sync + 'static> TableInvalidator
-    for LruCache<CachedQueryResult, T>
-{
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name = Arc::clone(table_name);
-        self.cache
-            .invalidate_entries_if(move |_key, value| value.input_tables.contains(&table_ref))
-            .context(FailedToInvalidateCacheSnafu { table_name })?;
-
-        Ok(())
-    }
-}
-
 #[async_trait]
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    CacheProvider<V> for LruCache<V, T>
+impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    CacheProvider<V> for SimpleCache<V, T>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await
@@ -150,11 +96,14 @@ mod tests {
     use crate::CacheKey;
 
     use super::*;
+    use crate::CachedQueryResult;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::hash::RandomState;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn create_test_record_batch() -> RecordBatch {
@@ -185,8 +134,8 @@ mod tests {
     async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 
@@ -209,8 +158,8 @@ mod tests {
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -222,14 +171,11 @@ mod tests {
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_invalidate_for_table<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_invalidate_all<T: BuildHasher + Clone + Send + Sync + 'static>(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
-        let table_ref = TableReference::Bare {
-            table: Arc::from("test_table"),
-        };
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_secs(60), hasher);
         let result = create_test_cached_result();
 
         // Put a value in the cache
@@ -242,9 +188,7 @@ mod tests {
         assert!(retrieved.is_some());
 
         // Invalidate the cache for the table
-        cache
-            .invalidate_for_table(table_ref)
-            .expect("should invalidate cache");
+        cache.invalidate_all();
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
@@ -256,8 +200,8 @@ mod tests {
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher);
+        let cache: SimpleCache<CachedQueryResult, _> =
+            SimpleCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result();
 

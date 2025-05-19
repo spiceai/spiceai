@@ -19,6 +19,7 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
+use llms::HealthCheck;
 use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
@@ -158,6 +159,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
+                    HealthCheck::Required,
                 ),
             ) as Arc<dyn Embed>)
         }
@@ -181,6 +183,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
+                    HealthCheck::Skip,
                 ),
             ) as Arc<dyn Embed>)
         }

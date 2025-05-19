@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
@@ -22,6 +23,9 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest = "0.25.0"
 
 [features]
 default = []

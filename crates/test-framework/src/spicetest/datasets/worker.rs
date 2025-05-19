@@ -208,13 +208,9 @@ impl SpiceTestQueryWorker {
 
                         if self.explain_plan_snapshot && self.id == 0 {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
-                            if let Err(e) = record_explain_plan(
-                                &self.flight_client,
-                                self.name.as_str(),
-                                &query.name,
-                                &query.sql,
-                            )
-                            .await
+                            if let Err(e) =
+                                record_explain_plan(&self.flight_client, self.name.as_str(), query)
+                                    .await
                             {
                                 println!(
                                     "Worker {} - Query '{}' explain plan failed: {}",
