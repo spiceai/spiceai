@@ -81,10 +81,18 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     let mut spiced_instance = test.end()?;
     spiced_instance.stop()?;
 
-    let Some(baseline) = results.metrics.iter().find(|q| q.query_name == "baseline") else {
+    let Some(baseline) = results
+        .metrics
+        .iter()
+        .find(|q| q.query_name == "baseline".into())
+    else {
         return Err(anyhow::anyhow!("Baseline results not found"));
     };
-    let Some(spice) = results.metrics.iter().find(|q| q.query_name == "spice") else {
+    let Some(spice) = results
+        .metrics
+        .iter()
+        .find(|q| q.query_name == "spice".into())
+    else {
         return Err(anyhow::anyhow!("Spice results not found"));
     };
 

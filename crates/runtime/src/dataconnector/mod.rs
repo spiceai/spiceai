@@ -290,6 +290,14 @@ pub enum DataConnectorError {
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
+
+    #[snafu(display(
+        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled.\nVerify if the remote table schema update is expected and rebuild the acceleration if necessary."
+    ))]
+    SchemaMismatch {
+        dataset_name: String,
+        differences: String,
+    },
 }
 
 pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;

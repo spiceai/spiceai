@@ -178,9 +178,16 @@ impl SpicedInstance {
     /// # Errors
     ///
     /// - If the flight client fails to be created
-    pub async fn flight_client(&self, api_key: Option<String>) -> Result<FlightClient> {
+    pub async fn flight_client(
+        &self,
+        api_key: Option<String>,
+        disable_caching: bool,
+    ) -> Result<FlightClient> {
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
+        if disable_caching {
+            metadata.insert("cache-control", "no-cache".parse()?);
+        }
 
         let credentials = if let Some(api_key) = api_key {
             Credentials::new("", api_key.into())

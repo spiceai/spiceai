@@ -36,19 +36,25 @@ use runtime::{
     flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
 };
 use runtime_auth::FlightBasicAuth;
+use spicepod::component::dataset::Dataset;
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;
 
-use crate::{configure_test_datafusion, utils::wait_until_true};
+use crate::{
+    configure_test_datafusion,
+    utils::{runtime_ready_check, wait_until_true},
+};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
+mod do_get;
 mod do_put;
 mod prepared_statements;
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
+    test_dataset: Option<Dataset>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
@@ -75,8 +81,24 @@ async fn start_spice_test_app(
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let app = app::AppBuilder::new("test_app").build();
+    let app = if let Some(dataset) = test_dataset {
+        app::AppBuilder::new("test_app")
+            .with_dataset(dataset)
+            .build()
+    } else {
+        app::AppBuilder::new("test_app").build()
+    };
     let rt = Arc::new(rt_builder.with_app(app).build().await);
+
+    let cloned_rt = Arc::clone(&rt);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+        }
+        () = cloned_rt.load_components() => {}
+    };
+
+    runtime_ready_check(&rt).await;
 
     let df = rt.datafusion();
 

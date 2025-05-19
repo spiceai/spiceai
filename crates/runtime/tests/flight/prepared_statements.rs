@@ -19,7 +19,7 @@ async fn test_basic_binding() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let (channel, _df) = start_spice_test_app(None, None).await?;
+            let (channel, _df) = start_spice_test_app(None, None, None).await?;
 
             let mut client = FlightSqlServiceClient::new(channel);
             let param_batch = create_param_batch(
@@ -46,7 +46,7 @@ async fn test_question_mark_placeholder() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let (channel, _df) = start_spice_test_app(None, None).await?;
+            let (channel, _df) = start_spice_test_app(None, None, None).await?;
 
             let mut client = FlightSqlServiceClient::new(channel);
             let param_batch = create_param_batch(
@@ -75,7 +75,7 @@ async fn test_multiple_parameters() -> Result<(), anyhow::Error> {
         .scope(async {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
-            let (channel, _df) = start_spice_test_app(Some(auth), None).await?;
+            let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
 
             let test_record_batch = test_record_batch()?;
 

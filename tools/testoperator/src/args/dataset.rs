@@ -39,6 +39,10 @@ pub struct DatasetTestArgs {
 
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
+
+    /// Whether to disable results caching, by supplying the cache control header through flight
+    #[arg(long)]
+    pub(crate) disable_caching: bool,
 }
 
 #[derive(Clone, ValueEnum, Debug)]

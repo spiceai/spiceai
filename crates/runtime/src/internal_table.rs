@@ -127,7 +127,9 @@ pub async fn create_internal_accelerated_table(
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
         get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime)).await?;
-    let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
+    let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
+        &source_table_provider,
+    )));
     let accelerated_table_provider = runtime
         .accelerator_engine_registry()
         .create_accelerator_table(

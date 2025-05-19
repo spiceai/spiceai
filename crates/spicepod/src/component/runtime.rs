@@ -103,6 +103,15 @@ pub enum CacheKeyType {
     Sql,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HashingAlgorithm {
+    #[default]
+    Siphash,
+    Ahash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ResultsCache {
@@ -113,6 +122,8 @@ pub struct ResultsCache {
     pub eviction_policy: Option<String>,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    #[serde(default)]
+    pub hashing_algorithm: HashingAlgorithm,
 }
 
 const fn default_true() -> bool {
@@ -127,6 +138,7 @@ impl Default for ResultsCache {
             item_ttl: None,
             eviction_policy: None,
             cache_key_type: CacheKeyType::default(),
+            hashing_algorithm: HashingAlgorithm::default(),
         }
     }
 }

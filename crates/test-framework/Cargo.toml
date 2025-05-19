@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash.workspace = true
 anyhow = "1.0.95"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }

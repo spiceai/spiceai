@@ -355,6 +355,47 @@ jobs:
             mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
           fi;
 
+  upload_to_minio:
+    name: Upload artifacts to MinIO
+    needs: build
+    runs-on: spiceai-dev-runners
+    if: inputs.platform_option == 'Linux x64'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: download artifacts - spice_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_linux_x86_64
+
+      - name: download artifacts - spiced_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_linux_x86_64
+      
+      - name: download artifacts - spiced_models_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_linux_x86_64
+      
+      - name: download artifacts - spiced_odbc_models_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_odbc_models_linux_x86_64
+
+      - name: Upload artifacts to Minio
+        run: |
+            mc cp spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_linux_x86_64.tar.gz
+            mc cp spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_models_linux_x86_64.tar.gz
+            mc cp spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_odbc_models_linux_x86_64.tar.gz
+            mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/spice_linux_x86_64.tar.gz
+
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build

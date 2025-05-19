@@ -32,8 +32,12 @@ use tonic::{async_trait, transport::Channel};
 /// # Errors
 ///
 /// - If the flight client fails to query
-pub async fn query_to_batches(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
-    let mut stream = client.query(sql).await?;
+pub async fn query_to_batches(
+    client: &FlightClient,
+    sql: &str,
+    params: Option<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let mut stream = client.query_with_params(sql, params).await?;
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
         batches.push(batch?);
