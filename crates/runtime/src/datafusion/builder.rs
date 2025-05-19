@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::{Arc, RwLock},
 };
@@ -249,6 +249,8 @@ impl DataFusionBuilder {
             data_writers: RwLock::new(HashSet::new()),
             caching: Arc::new(caching),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
+            deferred_tables: TokioRwLock::new(HashMap::new()),
+            cached_plans,
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

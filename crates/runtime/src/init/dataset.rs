@@ -32,6 +32,7 @@ use crate::{
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
+        deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
     },
     embeddings::connector::EmbeddingConnector,
@@ -206,7 +207,14 @@ impl Runtime {
             .get_dataconnector_from_source(source, params)
             .await
         {
-            Ok(data_connector) => data_connector,
+            Ok(data_connector) => {
+                // if connector marked as deferred, replace it with stub DeferredConnector
+                if data_connector.deferred_load() {
+                    Arc::new(DeferredConnector::new(data_connector)) as Arc<dyn DataConnector>
+                } else {
+                    data_connector
+                }
+            }
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status
@@ -376,12 +384,14 @@ impl Runtime {
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
-                    if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
-                        tracing::warn!(
-                            "Unable to add dataset {} for availability monitoring: {err}",
-                            &ds.name
-                        );
+                if !connector.deferred_load() {
+                    if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
+                        if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
+                            tracing::warn!(
+                                "Unable to add dataset {} for availability monitoring: {err}",
+                                &ds.name
+                            );
+                        }
                     }
                 }
                 let engine = ds.acceleration.as_ref().map_or_else(
