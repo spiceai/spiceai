@@ -545,7 +545,7 @@ impl DataFusion {
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
 
-            let federated_table = FederatedTable::new(read_provider);
+            let federated_table = FederatedTable::new_unchecked(read_provider);
             self.register_federated_table(
                 &deferred_registration.dataset,
                 Arc::clone(&deferred_registration.connector),
