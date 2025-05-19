@@ -292,7 +292,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Schema mismatch between federated table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled."
+        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled.\nVerify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
     SchemaMismatch {
         dataset_name: String,

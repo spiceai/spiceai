@@ -160,9 +160,9 @@ pub fn schema_meta_get_computed_columns(
     }
 }
 
-/// Returns a string describing the difference between two schemas.
+/// Returns a string describing the difference between two schemas, if any.
 #[must_use]
-pub fn schema_difference(expected: &Schema, actual: &Schema) -> String {
+pub fn schema_difference(expected: &Schema, actual: &Schema) -> Option<String> {
     let mut differences = Vec::new();
 
     // Check for missing columns in actual schema
@@ -191,37 +191,19 @@ pub fn schema_difference(expected: &Schema, actual: &Schema) -> String {
                 actual_field.data_type(),
             ) {
                 differences.push(format!(
-                    "The type of `{}` changed from `{}` to `{}`",
-                    expected_field.name(),
-                    expected_field.data_type(),
-                    actual_field.data_type()
-                ));
-            }
-
-            // Check for nullability changes
-            if expected_field.is_nullable() != actual_field.is_nullable() {
-                differences.push(format!(
-                    "The column `{}` changed from {} to {}",
-                    expected_field.name(),
-                    if expected_field.is_nullable() {
-                        "nullable"
-                    } else {
-                        "non-nullable"
-                    },
-                    if actual_field.is_nullable() {
-                        "nullable"
-                    } else {
-                        "non-nullable"
-                    }
+                    "The type of `{column_name}` changed from `{expected_type}` to `{actual_type}`",
+                    column_name = expected_field.name(),
+                    expected_type = expected_field.data_type(),
+                    actual_type = actual_field.data_type()
                 ));
             }
         }
     }
 
     if differences.is_empty() {
-        "The schemas are identical".to_string()
+        None
     } else {
-        differences.join(". ")
+        Some(differences.join(". "))
     }
 }
 
@@ -299,6 +281,9 @@ mod tests {
         ]);
 
         let diff = schema_difference(&expected, &actual);
+        let Some(diff) = diff else {
+            panic!("should return a string");
+        };
         assert!(diff.contains("The column `name` is missing"));
         assert!(diff.contains("The column `extra` is unexpected"));
         assert!(diff.contains("The type of `age` changed from `Int32` to `Utf8`"));
@@ -317,7 +302,7 @@ mod tests {
         ]);
 
         let diff = schema_difference(&expected, &actual);
-        assert!(diff.contains("The column `name` changed from nullable to non-nullable"));
+        assert!(diff.is_none());
     }
 
     #[test]
@@ -328,6 +313,6 @@ mod tests {
         ]);
 
         let diff = schema_difference(&schema, &schema);
-        assert_eq!(diff, "The schemas are identical");
+        assert!(diff.is_none());
     }
 }
