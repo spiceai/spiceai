@@ -72,7 +72,10 @@ nsql> How much money have I made in each country?
 		cmd.Println("Welcome to the Spice.ai NSQL REPL!")
 
 		rtcontext, err := context.FromFlags(cmd.Flags())
-
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 		rtcontext.RequireModelsFlavor(cmd)
 
 		model, err := cmd.Flags().GetString(constants.ModelKeyFlag)

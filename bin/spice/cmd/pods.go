@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"log/slog"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -33,6 +34,10 @@ spice pods
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
 		if err != nil {
 			slog.Error("listing spiced pods", "error", err)
