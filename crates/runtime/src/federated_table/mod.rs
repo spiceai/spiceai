@@ -186,9 +186,9 @@ impl FederatedTable {
                     Ok(table_provider) => {
                         let federated_schema = table_provider.schema();
 
-                        if federated_schema != accelerated_schema {
-                            let differences =
-                                schema_difference(&accelerated_schema, &federated_schema);
+                        if let Some(differences) =
+                            schema_difference(&accelerated_schema, &federated_schema)
+                        {
                             let error = DataConnectorError::SchemaMismatch {
                                 dataset_name: dataset_name.to_string(),
                                 differences,
