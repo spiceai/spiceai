@@ -114,7 +114,7 @@ impl DatabricksAuthExtension {
                 let tr = TableReference::from(ds.name.clone());
 
                 if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
-                    tracing::warn!("Failed to load dataset {:?}: {}", tr, err);
+                    tracing::warn!("Failed to load dataset {:?}: {}", ds.name, err);
                 }
             }
         }
