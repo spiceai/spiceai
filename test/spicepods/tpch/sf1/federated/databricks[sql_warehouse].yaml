@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: databricks[sql_warehouse]-federated
+name: databricks[federated]-sql_warehouse
 
 datasets:
   - from: databricks:spiceai_sandbox.tpch.partsupp
