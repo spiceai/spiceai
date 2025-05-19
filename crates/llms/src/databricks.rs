@@ -33,6 +33,7 @@ use token_provider::TokenProvider;
 use tracing::Instrument;
 
 use crate::{
+    HealthCheck,
     chat::{Chat, nsql::SqlGeneration},
     config::{GenericAuthMechanism, HostedModelConfig},
     embeddings::Embed,
@@ -42,7 +43,7 @@ use crate::{
 pub struct Databricks {
     pub model: String,
     client: Client<HostedModelConfig>,
-    needs_health_check: bool,
+    health_check: HealthCheck,
 }
 
 #[must_use]
@@ -64,7 +65,7 @@ pub fn from_access_token(
     Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
-        needs_health_check: true,
+        health_check: super::HealthCheck::Required,
     }
 }
 
@@ -73,7 +74,7 @@ pub fn from_token_provider(
     model: &str,
     token_provider: Arc<dyn TokenProvider>,
     user_agent: Option<&'static str>,
-    needs_health_check: bool,
+    health_check: super::HealthCheck,
 ) -> Databricks {
     let mut cfg = HostedModelConfig::from_url(
         format!("https://{endpoint}/serving-endpoints/{model}/invocations").as_str(),
@@ -89,7 +90,7 @@ pub fn from_token_provider(
     Databricks {
         model: model.to_string(),
         client: Client::with_config(cfg),
-        needs_health_check,
+        health_check,
     }
 }
 
@@ -102,7 +103,7 @@ impl Chat for Databricks {
     /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
     #[allow(deprecated)]
     async fn health(&self) -> super::chat::Result<()> {
-        if !self.needs_health_check {
+        if matches!(self.health_check, HealthCheck::Skip) {
             return Ok(());
         }
 
@@ -156,7 +157,7 @@ impl Chat for Databricks {
 #[async_trait]
 impl Embed for Databricks {
     async fn health(&self) -> super::embeddings::Result<()> {
-        if !self.needs_health_check {
+        if matches!(self.health_check, HealthCheck::Skip) {
             return Ok(());
         }
 

@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 use llms::{
+    HealthCheck,
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
     perplexity::PerplexitySonar,
@@ -297,7 +298,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
-                    true,
+                    HealthCheck::Required,
                 )
             ) as Arc<dyn Chat>)
         }
@@ -321,7 +322,7 @@ async fn databricks(
                     model_id.as_str(),
                     token_provider,
                     user_agent,
-                    false,
+                    HealthCheck::Skip,
                 ),
             ) as Arc<dyn Chat>)
         }
