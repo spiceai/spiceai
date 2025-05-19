@@ -73,7 +73,12 @@ impl Runtime {
             return;
         }
 
-        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
+        // Before loading datasets, we must initialize views accelerators (if any).
+        // This is required for acceleration federation for some engines (e.g. `DuckDB`).
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        self.initialize_views_accelerators(&valid_views).await;
+
+        let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
 
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
@@ -667,7 +672,7 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
+        let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         for ds in initialized_datasets {
@@ -720,7 +725,10 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
+    async fn initialize_datasets_accelerators(
+        &self,
+        datasets: &[Arc<Dataset>],
+    ) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let mut initialized_datasets = vec![];
