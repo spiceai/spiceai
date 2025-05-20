@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::{
     array::RecordBatch,
-    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
     ipc::reader::StreamReader,
 };
 use async_trait::async_trait;
@@ -84,6 +84,9 @@ pub enum Error {
 
     #[snafu(display("A fully-qualified path is required: {reason}"))]
     FullyQualifiedPath { reason: String },
+
+    #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
+    ParseError { reason: String },
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -345,6 +348,24 @@ struct ExternalLink {
     next_chunk_internal_link: Option<String>,
 }
 
+// Helper function to find the index of the matching closing '>' for a given '<'
+fn find_matching_closing_bracket(input: &str, start: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in input[start..].char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None // No matching '>' found
+}
+
 fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
     let type_name_upper = type_name.to_uppercase();
 
@@ -389,6 +410,24 @@ fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
         return Ok(DataType::Decimal128(precision, scale));
     }
 
+    if type_name_upper.starts_with("STRUCT") {
+        let open_bracket = type_name.find('<').ok_or_else(|| Error::UnsupportedType {
+            ty: type_name.to_string(),
+        })?;
+
+        let close_bracket =
+            find_matching_closing_bracket(type_name, open_bracket).ok_or_else(|| {
+                Error::UnsupportedType {
+                    ty: type_name.to_string(),
+                }
+            })?;
+
+        let inner = &type_name[open_bracket + 1..close_bracket].trim();
+
+        let fields = parse_struct_fields(inner)?;
+        return Ok(DataType::Struct(Fields::from(fields)));
+    }
+
     Ok(match type_name_upper.as_str() {
         "BOOLEAN" => DataType::Boolean,
         "TINYINT" => DataType::Int8,
@@ -405,6 +444,54 @@ fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
         "VOID" => DataType::Null,
         ty => return Err(Error::UnsupportedType { ty: ty.to_string() }),
     })
+}
+
+fn parse_struct_fields(inner: &str) -> Result<Vec<Field>, Error> {
+    let mut fields = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (i, c) in inner.chars().enumerate() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                let field_def = &inner[start..i].trim();
+                if !field_def.is_empty() {
+                    let (name, ty) = parse_field_def(field_def)?;
+                    fields.push(Field::new(name, map_databricks_type(ty)?, true));
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < inner.len() {
+        let field_def = &inner[start..].trim();
+        if !field_def.is_empty() {
+            let (name, ty) = parse_field_def(field_def)?;
+            fields.push(Field::new(name, map_databricks_type(ty)?, true));
+        }
+    }
+
+    if fields.is_empty() {
+        return Err(Error::ParseError {
+            reason: "Empty STRUCT definition".to_string(),
+        });
+    }
+
+    Ok(fields)
+}
+
+fn parse_field_def(field_def: &str) -> Result<(&str, &str), Error> {
+    let parts: Vec<&str> = field_def.splitn(2, ':').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(Error::ParseError {
+            reason: format!("Invalid field definition: {field_def}"),
+        });
+    }
+    Ok((parts[0], parts[1]))
 }
 
 fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
@@ -571,6 +658,7 @@ mod tests {
         DataType::Timestamp(TimeUnit::Microsecond, tz.map(Into::into))
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_map_databricks_type() {
         let test_cases = &[
@@ -623,6 +711,46 @@ mod tests {
                 "ARRAY<STRING> mapping failed",
             ),
             (
+                "STRUCT<ID:INT,NAME:STRING>",
+                Ok(DataType::Struct(Fields::from(vec![
+                    Field::new("ID", DataType::Int32, true),
+                    Field::new("NAME", DataType::Utf8, true),
+                ]))),
+                "STRUCT<ID:INT,NAME:STRING> mapping failed",
+            ),
+            (
+                "STRUCT<ID:INT,INFO:STRUCT<NAME:STRING,AGE:INT>>",
+                Ok(DataType::Struct(Fields::from(vec![
+                    Field::new("ID", DataType::Int32, true),
+                    Field::new(
+                        "INFO",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("NAME", DataType::Utf8, true),
+                            Field::new("AGE", DataType::Int32, true),
+                        ])),
+                        true,
+                    ),
+                ]))),
+                "Nested STRUCT<ID:INT,INFO:STRUCT<NAME:STRING,AGE:INT>> mapping failed",
+            ),
+            (
+                "STRUCT<A:STRUCT<B:STRUCT<C:INT>>>",
+                Ok(DataType::Struct(Fields::from(vec![Field::new(
+                    "A",
+                    DataType::Struct(Fields::from(vec![Field::new(
+                        "B",
+                        DataType::Struct(Fields::from(vec![Field::new(
+                            "C",
+                            DataType::Int32,
+                            true,
+                        )])),
+                        true,
+                    )])),
+                    true,
+                )]))),
+                "Deeply nested STRUCT<A:STRUCT<B:STRUCT<C:INT>>> mapping failed",
+            ),
+            (
                 "UNKNOWN",
                 Err(Error::UnsupportedType {
                     ty: "UNKNOWN".to_string(),
@@ -650,7 +778,7 @@ mod tests {
             match (result, expected) {
                 (Ok(got), Ok(want)) => assert_eq!(got, *want, "{error_msg}"),
                 (Err(_), Err(_)) => {}
-                _ => panic!("{error_msg}"),
+                (got, want) => panic!("{error_msg}: got: {got:?}, want: {want:?}"),
             }
         }
     }
