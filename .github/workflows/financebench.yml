@@ -100,31 +100,40 @@ jobs:
             const matrix = [
               {
                 name: "gpt-4o",
+                run_on_schedule: false,
                 spicepod: "./test/financebench/spicepod_openai.yaml"
               },
               {
                 name: "gpt-4.1",
+                run_on_schedule: true,
                 spicepod: "./test/financebench/spicepod_openai.yaml"
               },
               {
                 name: "o1",
+                run_on_schedule: false,
                 spicepod: "./test/financebench/spicepod_openai.yaml"
               },
               {
                 name: "o3-mini",
+                run_on_schedule: false,
                 spicepod: "./test/financebench/spicepod_openai.yaml"
               },
               {
                 name: "o4-mini",
+                run_on_schedule: true,
                 spicepod: "./test/financebench/spicepod_openai.yaml"
               }
             ];
 
-            const model_option = context.payload.inputs.model_option;
             let filtered = matrix;
-
-            if (model_option !== 'all') {
-              filtered = filtered.filter(m => m.name === model_option);
+            if (context.eventName === 'schedule') {
+              filtered = filtered.filter(m => m.run_on_schedule === true);
+            } 
+            else {
+              const model_option = context.payload.inputs.model_option;
+              if (model_option !== 'all') {
+                filtered = filtered.filter(m => m.name === model_option);
+              }
             }
 
             return filtered;
