@@ -215,7 +215,15 @@ impl Runtime {
             Ok(data_connector) => {
                 // if connector marked as deferred, replace it with stub DeferredConnector
                 if data_connector.deferred_load() {
-                    Arc::new(DeferredConnector::new(data_connector)) as Arc<dyn DataConnector>
+                    // If the dataset has embeddings, datafusion needs to load the wrapped connector when it is ready
+                    if ds.has_embeddings() {
+                        let connector =
+                            EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
+                        Arc::new(DeferredConnector::new(Arc::new(connector)))
+                            as Arc<dyn DataConnector>
+                    } else {
+                        Arc::new(DeferredConnector::new(data_connector)) as Arc<dyn DataConnector>
+                    }
                 } else {
                     data_connector
                 }
@@ -329,7 +337,7 @@ impl Runtime {
         }
 
         // Only wrap data connector when necessary.
-        let connector = if ds.has_embeddings() {
+        let connector = if ds.has_embeddings() && !data_connector.deferred_load() {
             let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
             Arc::new(connector) as Arc<dyn DataConnector>
         } else {
