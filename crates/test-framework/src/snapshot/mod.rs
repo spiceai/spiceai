@@ -58,7 +58,7 @@ pub async fn record_explain_plan(
         filters => vec![
             (path_filter_pattern.as_str(), "/data"),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
-            (r"grouping\(item\.i_(?:category|class)\),\s*grouping\(item\.i_(?:category|class)\)", "<GROUPING_PAIR>")
+            (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>")
         ],
     }, {
         let result = panic::catch_unwind(|| {
