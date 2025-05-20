@@ -41,7 +41,7 @@ while read -r hash; do
         pr_number=$(echo "$mapping" | cut -d' ' -f2)
         username=$(echo "$mapping" | cut -d' ' -f3)
         subject=$(git log --format=%s -n 1 "$hash")
-        echo "- $subject by @$username in https://github.com/$owner/$repo/pull/$pr_number"
+        echo "- $subject by [@$username](https://github.com/$username) in [#$pr_number](https://github.com/$owner/$repo/pull/$pr_number)"
     else
         echo "Warning: No PR found for commit $hash" >&2
     fi

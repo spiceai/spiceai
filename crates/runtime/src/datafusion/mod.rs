@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self};
+use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -260,6 +261,11 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
+struct DeferredTableRegistration {
+    dataset: Arc<Dataset>,
+    connector: Arc<dyn DataConnector>,
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     runtime_status: Arc<status::RuntimeStatus>,
@@ -267,6 +273,8 @@ pub struct DataFusion {
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
+    deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
+
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
@@ -444,8 +452,23 @@ impl DataFusion {
                 data_connector,
                 federated_read_table,
             } => {
-                self.register_federated_table(&dataset, data_connector, federated_read_table)
-                    .await?;
+                if let Some(deferred_connector) =
+                    data_connector.as_any().downcast_ref::<DeferredConnector>()
+                {
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+
+                    self.deferred_tables.write().await.insert(
+                        dataset.name.to_string(),
+                        DeferredTableRegistration {
+                            dataset: Arc::clone(&dataset),
+                            connector: deferred_connector.source(),
+                        },
+                    );
+                } else {
+                    self.register_federated_table(&dataset, data_connector, federated_read_table)
+                        .await?;
+                }
             }
         }
 
@@ -511,6 +534,32 @@ impl DataFusion {
             .context(UnableToGetTableSnafu)?;
 
         Ok(table_provider)
+    }
+
+    pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
+        let deferred_tables = self.deferred_tables.read().await;
+        if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
+            let read_provider = deferred_registration
+                .connector
+                .read_provider(&deferred_registration.dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?;
+
+            let federated_table = FederatedTable::new_unchecked(read_provider);
+            self.register_federated_table(
+                &deferred_registration.dataset,
+                Arc::clone(&deferred_registration.connector),
+                federated_table,
+            )
+            .await?;
+
+            drop(deferred_tables);
+
+            let mut deferred_tables = self.deferred_tables.write().await;
+            deferred_tables.remove(&table_reference.to_string());
+        }
+
+        Ok(())
     }
 
     async fn ensure_sink_dataset(
