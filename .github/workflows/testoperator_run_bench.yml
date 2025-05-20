@@ -54,7 +54,7 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-          - 'spicea-runners'
+          - 'spiceai-runners'
           - 'spiceai-large-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
