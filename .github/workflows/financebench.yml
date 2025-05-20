@@ -4,18 +4,20 @@ name: financebench
 on:
   workflow_dispatch:
     inputs:
-        model_option:
-          description: "Which model do you want to test? (Default is ALL)"
-          required: false
-          type: choice
-          options:
-            - "all"
-            - "gpt-4o"
-            - "gpt-4.1"
-            - "o1"
-            - "o3-mini"
-            - "o4-mini"
-          default: "all"
+      model_option:
+        description: 'Which model do you want to test? (Default is ALL)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'gpt-4o'
+          - 'gpt-4.1'
+          - 'o1'
+          - 'o3-mini'
+          - 'o4-mini'
+        default: 'all'
+  schedule:
+    - cron: '0 4 * * 2,5' # Every Monday and Thursday at 8pm PST (4am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -42,7 +44,7 @@ jobs:
         run: |
           mv target/release/testoperator testoperator
           chmod +x testoperator
-          
+
       - name: Save spice artifact
         uses: actions/upload-artifact@v4
         with:
@@ -146,7 +148,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: testoperator
-  
+
       - name: Download spiced
         uses: actions/download-artifact@v4
         with:
@@ -169,4 +171,3 @@ jobs:
             --model ${{ matrix.target.name }} \
             --ready-wait 180 \
             --metrics
-  
