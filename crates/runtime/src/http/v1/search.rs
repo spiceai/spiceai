@@ -13,9 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::embeddings::vector_search::{
-    self, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson, VectorSearch,
-    to_matches_sorted,
+use crate::search::{
+    Error as VectorSearchError,
+    request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
+    types::Match,
+    types::to_matches_sorted,
+    vector_search::VectorSearch,
 };
 use axum::{
     Extension, Json,
@@ -147,8 +150,8 @@ pub(crate) async fn post(
         },
         Err(e) => {
             let error_type = match e {
-                vector_search::Error::NoTablesWithEmbeddingsFound {}
-                | vector_search::Error::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                VectorSearchError::NoTablesWithEmbeddingsFound {}
+                | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
 

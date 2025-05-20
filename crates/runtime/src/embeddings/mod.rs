@@ -20,7 +20,6 @@ pub mod execution_plan;
 pub mod metrics;
 pub mod table;
 pub mod task;
-pub mod vector_search;
 
 /// Converts string-like Arrow types into an iterator [`Option<Box<dyn Iterator<Item = Option<&str>>>>`]. If the downcast conversion
 /// fails, returns `None`.
@@ -40,4 +39,57 @@ macro_rules! convert_string_arrow_to_iterator {
                 .downcast_ref::<LargeStringArray>()
                 .map(|arr| Box::new(arr.iter()) as Box<dyn Iterator<Item = Option<&str>> + Send>))
     }};
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use datafusion::common::utils::quote_identifier;
+
+    use crate::{embedding_col, offset_col};
+
+    #[test]
+    fn test_quoting_embedding_columns() {
+        // lowercase
+        assert_eq!(offset_col!("embedding"), "embedding_offset");
+        assert_eq!(embedding_col!("embedding"), "embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            quote_identifier(&embedding_col!("embedding")),
+            "embedding_embedding"
+        );
+        assert_eq!(
+            offset_col!(quote_identifier("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            embedding_col!(quote_identifier("embedding")),
+            "embedding_embedding"
+        );
+
+        // mixed case
+        assert_eq!(offset_col!("Embedding"), "Embedding_offset");
+        assert_eq!(embedding_col!("Embedding"), "Embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("Embedding")),
+            "\"Embedding_offset\""
+        );
+
+        assert_eq!(
+            quote_identifier(&embedding_col!("Embedding")),
+            "\"Embedding_embedding\""
+        );
+
+        assert_eq!(
+            offset_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_offset"
+        );
+
+        assert_eq!(
+            embedding_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_embedding"
+        );
+    }
 }

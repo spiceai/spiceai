@@ -50,7 +50,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (path, test) in tests {
+    let total_tests = tests.len();
+    for (index, (path, test)) in tests.into_iter().enumerate() {
         let mut payload = match (test_type, &test.tests) {
             (
                 TestType::Benchmark,
@@ -142,7 +143,10 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 
         payload = map_numbers_to_strings(payload);
 
-        println!("Dispatching {test_type} test from {path:#?}");
+        println!(
+            "{index}/{total_tests} - Dispatching {test_type} test from {path:#?}",
+            index = index + 1
+        );
         GitHubWorkflow::new(
             "spiceai",
             "spiceai",

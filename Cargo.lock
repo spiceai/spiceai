@@ -10728,6 +10728,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "schemars",
  "scopeguard",
+ "search",
  "secrecy",
  "serde",
  "serde_json",
@@ -11245,6 +11246,18 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "search"
+version = "1.4.0-unstable"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "serde_json",
+ "snafu",
+]
 
 [[package]]
 name = "secrecy"

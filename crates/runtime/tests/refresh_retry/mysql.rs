@@ -43,8 +43,7 @@ use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-refresh-retry-mysql";
-const MYSQL_PORT: u16 = 13307;
+const MYSQL_PORT: u16 = 13327;
 
 #[instrument]
 async fn init_mysql_db() -> Result<(), anyhow::Error> {
@@ -77,7 +76,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 #[instrument]
 async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+    let running_container = start_mysql_docker_container(MYSQL_PORT)
         .await
         .map_err(|e| {
             tracing::error!("start_mysql_docker_container: {e}");

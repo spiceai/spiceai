@@ -17,6 +17,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/search",
     "crates/spice_cloud",
     "crates/spicepod",
     "crates/telemetry",
@@ -86,10 +87,7 @@ datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
 datafusion-functions-json = "0.46"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.10", features = [
-    "default-engine",
-    "arrow-54",
-] }
+delta_kernel = { version = "0.10", features = ["default-engine", "arrow-54"] }
 dotenvy = "0.15"
 duckdb = "1.1.3"
 fundu = "2.0.1"
