@@ -281,7 +281,7 @@ async fn track_metrics(
 
     let response = Arc::clone(&request_context)
         .scope(async move {
-            request_context.run_extensions().await;
+            request_context.load_extensions().await;
             next.run(req).await
         })
         .await;

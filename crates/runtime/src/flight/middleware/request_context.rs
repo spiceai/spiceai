@@ -98,7 +98,7 @@ where
             );
 
         Box::pin(async move {
-            request_context.run_extensions().await;
+            request_context.load_extensions().await;
             request_context.scope(inner.call(req)).await
         })
     }
