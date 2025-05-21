@@ -79,7 +79,7 @@ keyring = { version = "3.6.2", features = [
     "linux-native",
 ], optional = true }
 llms = { path = "../llms" }
-logos = "0.15.0"
+logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true

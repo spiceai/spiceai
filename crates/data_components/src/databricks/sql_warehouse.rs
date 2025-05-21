@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::{
     array::RecordBatch,
-    datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
+    datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
 use async_trait::async_trait;
@@ -41,6 +41,8 @@ use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
 use std::{io::Cursor, pin::Pin, sync::Arc};
 use token_provider::TokenProvider;
+
+mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -348,152 +350,6 @@ struct ExternalLink {
     next_chunk_internal_link: Option<String>,
 }
 
-// Helper function to find the index of the matching closing '>' for a given '<'
-fn find_matching_closing_bracket(input: &str, start: usize) -> Option<usize> {
-    let mut depth = 0;
-    for (i, c) in input[start..].char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None // No matching '>' found
-}
-
-fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
-    let type_name_upper = type_name.to_uppercase();
-
-    if type_name_upper.starts_with("ARRAY") {
-        let inner_type = type_name
-            .split('<')
-            .nth(1)
-            .ok_or_else(|| Error::UnsupportedType {
-                ty: type_name.to_string(),
-            })?
-            .trim_end_matches('>')
-            .trim();
-
-        let inner_data_type = map_databricks_type(inner_type)?;
-        return Ok(DataType::List(Arc::new(Field::new(
-            "item",
-            inner_data_type,
-            true,
-        ))));
-    }
-
-    if type_name_upper.starts_with("DECIMAL") {
-        let (precision, scale) = match type_name.split_once('(') {
-            Some((_, params)) => {
-                let params = params.trim_end_matches(')').trim();
-                let parts: Vec<_> = params.split(',').map(str::trim).collect();
-                if parts.len() != 2 {
-                    return Err(Error::UnsupportedType {
-                        ty: type_name.to_string(),
-                    });
-                }
-                let precision: u8 = parts[0].parse().map_err(|_| Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                })?;
-                let scale: i8 = parts[1].parse().map_err(|_| Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                })?;
-                (precision, scale)
-            }
-            None => (10, 0),
-        };
-        return Ok(DataType::Decimal128(precision, scale));
-    }
-
-    if type_name_upper.starts_with("STRUCT") {
-        let open_bracket = type_name.find('<').ok_or_else(|| Error::UnsupportedType {
-            ty: type_name.to_string(),
-        })?;
-
-        let close_bracket =
-            find_matching_closing_bracket(type_name, open_bracket).ok_or_else(|| {
-                Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                }
-            })?;
-
-        let inner = &type_name[open_bracket + 1..close_bracket].trim();
-
-        let fields = parse_struct_fields(inner)?;
-        return Ok(DataType::Struct(Fields::from(fields)));
-    }
-
-    Ok(match type_name_upper.as_str() {
-        "BOOLEAN" => DataType::Boolean,
-        "TINYINT" => DataType::Int8,
-        "SMALLINT" => DataType::Int16,
-        "INT" => DataType::Int32,
-        "BIGINT" => DataType::Int64,
-        "FLOAT" => DataType::Float32,
-        "DOUBLE" => DataType::Float64,
-        "STRING" | "CHAR" | "VARCHAR" => DataType::Utf8,
-        "BINARY" => DataType::Binary,
-        "DATE" => DataType::Date32,
-        "TIMESTAMP" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        "TIMESTAMP_NTZ" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "VOID" => DataType::Null,
-        ty => return Err(Error::UnsupportedType { ty: ty.to_string() }),
-    })
-}
-
-fn parse_struct_fields(inner: &str) -> Result<Vec<Field>, Error> {
-    let mut fields = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, c) in inner.chars().enumerate() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            ',' if depth == 0 => {
-                let field_def = &inner[start..i].trim();
-                if !field_def.is_empty() {
-                    let (name, ty) = parse_field_def(field_def)?;
-                    fields.push(Field::new(name, map_databricks_type(ty)?, true));
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    if start < inner.len() {
-        let field_def = &inner[start..].trim();
-        if !field_def.is_empty() {
-            let (name, ty) = parse_field_def(field_def)?;
-            fields.push(Field::new(name, map_databricks_type(ty)?, true));
-        }
-    }
-
-    if fields.is_empty() {
-        return Err(Error::ParseError {
-            reason: "Empty STRUCT definition".to_string(),
-        });
-    }
-
-    Ok(fields)
-}
-
-fn parse_field_def(field_def: &str) -> Result<(&str, &str), Error> {
-    let parts: Vec<&str> = field_def.splitn(2, ':').map(str::trim).collect();
-    if parts.len() != 2 {
-        return Err(Error::ParseError {
-            reason: format!("Invalid field definition: {field_def}"),
-        });
-    }
-    Ok((parts[0], parts[1]))
-}
-
 fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
     let data_array = json_value
         .get("result")
@@ -536,7 +392,10 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
                 reason: format!("data_array[{i}][1] is not a string"),
             })?;
 
-        let field = Field::new(col_name, map_databricks_type(data_type_str)?, true);
+        let data_type = datatypes::Parser::new(data_type_str)
+            .parse()
+            .map_err(|reason| Error::ParseError { reason })?;
+        let field: Field = Field::new(col_name, data_type, false);
 
         fields.push(field);
     }
@@ -647,139 +506,5 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .create_federated_table_provider()
                 .context(TableProviderCreationFailedSnafu)?,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn timestamp_type(tz: Option<String>) -> DataType {
-        DataType::Timestamp(TimeUnit::Microsecond, tz.map(Into::into))
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn test_map_databricks_type() {
-        let test_cases = &[
-            ("BOOLEAN", Ok(DataType::Boolean), "BOOLEAN mapping failed"),
-            ("TINYINT", Ok(DataType::Int8), "TINYINT mapping failed"),
-            ("SMALLINT", Ok(DataType::Int16), "SMALLINT mapping failed"),
-            ("INT", Ok(DataType::Int32), "INT mapping failed"),
-            ("BIGINT", Ok(DataType::Int64), "BIGINT mapping failed"),
-            ("FLOAT", Ok(DataType::Float32), "FLOAT mapping failed"),
-            ("DOUBLE", Ok(DataType::Float64), "DOUBLE mapping failed"),
-            ("STRING", Ok(DataType::Utf8), "STRING mapping failed"),
-            ("CHAR", Ok(DataType::Utf8), "CHAR mapping failed"),
-            ("VARCHAR", Ok(DataType::Utf8), "VARCHAR mapping failed"),
-            ("BINARY", Ok(DataType::Binary), "BINARY mapping failed"),
-            ("DATE", Ok(DataType::Date32), "DATE mapping failed"),
-            (
-                "TIMESTAMP",
-                Ok(timestamp_type(Some("UTC".into()))),
-                "TIMESTAMP mapping failed",
-            ),
-            (
-                "TIMESTAMP_NTZ",
-                Ok(timestamp_type(None)),
-                "TIMESTAMP_NTZ mapping failed",
-            ),
-            ("VOID", Ok(DataType::Null), "VOID mapping failed"),
-            (
-                "DECIMAL(8,4)",
-                Ok(DataType::Decimal128(8, 4)),
-                "DECIMAL(8,4) mapping failed",
-            ),
-            (
-                "DECIMAL",
-                Ok(DataType::Decimal128(10, 0)),
-                "Plain DECIMAL mapping failed",
-            ),
-            (
-                "DECIMAL(10,2)",
-                Ok(DataType::Decimal128(10, 2)),
-                "DECIMAL(10,2) mapping failed",
-            ),
-            (
-                "decimal(5,0)",
-                Ok(DataType::Decimal128(5, 0)),
-                "Case-insensitive DECIMAL(5,0) mapping failed",
-            ),
-            (
-                "ARRAY<STRING>",
-                Ok(DataType::new_list(DataType::Utf8, true)),
-                "ARRAY<STRING> mapping failed",
-            ),
-            (
-                "STRUCT<ID:INT,NAME:STRING>",
-                Ok(DataType::Struct(Fields::from(vec![
-                    Field::new("ID", DataType::Int32, true),
-                    Field::new("NAME", DataType::Utf8, true),
-                ]))),
-                "STRUCT<ID:INT,NAME:STRING> mapping failed",
-            ),
-            (
-                "STRUCT<ID:INT,INFO:STRUCT<NAME:STRING,AGE:INT>>",
-                Ok(DataType::Struct(Fields::from(vec![
-                    Field::new("ID", DataType::Int32, true),
-                    Field::new(
-                        "INFO",
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("NAME", DataType::Utf8, true),
-                            Field::new("AGE", DataType::Int32, true),
-                        ])),
-                        true,
-                    ),
-                ]))),
-                "Nested STRUCT<ID:INT,INFO:STRUCT<NAME:STRING,AGE:INT>> mapping failed",
-            ),
-            (
-                "STRUCT<A:STRUCT<B:STRUCT<C:INT>>>",
-                Ok(DataType::Struct(Fields::from(vec![Field::new(
-                    "A",
-                    DataType::Struct(Fields::from(vec![Field::new(
-                        "B",
-                        DataType::Struct(Fields::from(vec![Field::new(
-                            "C",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        true,
-                    )])),
-                    true,
-                )]))),
-                "Deeply nested STRUCT<A:STRUCT<B:STRUCT<C:INT>>> mapping failed",
-            ),
-            (
-                "UNKNOWN",
-                Err(Error::UnsupportedType {
-                    ty: "UNKNOWN".to_string(),
-                }),
-                "UNKNOWN type should fail",
-            ),
-            (
-                "DECIMAL(abc)",
-                Err(Error::UnsupportedType {
-                    ty: "DECIMAL(abc)".to_string(),
-                }),
-                "Malformed DECIMAL should fail",
-            ),
-            (
-                "DECIMAL(8,)",
-                Err(Error::UnsupportedType {
-                    ty: "DECIMAL(8,)".to_string(),
-                }),
-                "Incomplete DECIMAL parameters should fail",
-            ),
-        ];
-
-        for (input, expected, error_msg) in test_cases {
-            let result = map_databricks_type(input);
-            match (result, expected) {
-                (Ok(got), Ok(want)) => assert_eq!(got, *want, "{error_msg}"),
-                (Err(_), Err(_)) => {}
-                (got, want) => panic!("{error_msg}: got: {got:?}, want: {want:?}"),
-            }
-        }
     }
 }
