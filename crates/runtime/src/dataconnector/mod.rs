@@ -44,6 +44,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use datafusion_table_providers::UnsupportedTypeAction;
@@ -528,11 +529,7 @@ pub async fn get_data(
             // converts the plan to federated where the correct dialect is
             // applied
             let schema = table_provider.schema();
-            let columns: Vec<Expr> = schema
-                .fields()
-                .iter()
-                .map(|f| Expr::Column(f.name().clone().into()))
-                .collect();
+            let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
 
             let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
                 .map_err(find_datafusion_root)?
