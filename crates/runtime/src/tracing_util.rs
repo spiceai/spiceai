@@ -26,6 +26,8 @@ use crate::{
     dataconnector::DataConnector,
 };
 
+use std::fmt::Write;
+
 // Format: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (duckdb), results cache enabled.
 pub fn dataset_registered_trace(
     data_connector: &dyn DataConnector,
@@ -35,10 +37,11 @@ pub fn dataset_registered_trace(
     let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
     if let Some(acceleration) = &ds.acceleration {
         if acceleration.enabled {
-            info.push_str(&format!(
+            let _ = write!(
+                info,
                 ", acceleration ({})",
                 acceleration_info(Some(data_connector), acceleration)
-            ));
+            );
         }
     }
 
@@ -58,10 +61,11 @@ pub fn view_registered_trace(
     let mut info = format!("View {table} registered");
     if let Some(acceleration) = acceleration {
         if acceleration.enabled {
-            info.push_str(&format!(
+            let _ = write!(
+                info,
                 ", acceleration ({})",
                 acceleration_info(None, acceleration)
-            ));
+            );
         }
     }
 
@@ -97,11 +101,11 @@ fn acceleration_info(
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
-        info.push_str(&format!(", {refresh_interval:#?} refresh"));
+        let _ = write!(info, ", {refresh_interval:#?} refresh");
     }
     if let Some(retention_check_interval) = &acceleration.retention_check_interval {
         if acceleration.retention_check_enabled {
-            info.push_str(&format!(", {retention_check_interval} retention"));
+            let _ = write!(info, ", {retention_check_interval} retention");
         }
     }
     if acceleration.on_zero_results == ZeroResultsAction::UseSource {

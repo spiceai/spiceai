@@ -45,7 +45,7 @@ impl Tooling {
                 let catalog_name = c.name();
                 if default_catalog_names().contains(&catalog_name) {
                     return c.all().await;
-                };
+                }
 
                 // If non-default catalog, tool name must be prefixed by catalog.
                 c.all()

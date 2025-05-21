@@ -19,6 +19,7 @@ use std::sync::Arc;
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
+use std::fmt::Write;
 use url::Url;
 
 use token_provider::TokenProvider;
@@ -138,7 +139,7 @@ impl UnityCatalog {
         );
 
         if let Some(port) = parsed_url.port() {
-            endpoint.push_str(&format!(":{port}"));
+            let _ = write!(endpoint, ":{port}");
         }
 
         tracing::debug!("parse_catalog_url: endpoint: {}", endpoint);

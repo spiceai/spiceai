@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
@@ -96,7 +97,7 @@ impl ModelSource for SpiceAI {
         match version.as_str() {
             "latest" => {}
             _ => {
-                url.push_str(&format!("?training_run_id={version}"));
+                let _ = write!(url, "?training_run_id={version}");
             }
         }
 

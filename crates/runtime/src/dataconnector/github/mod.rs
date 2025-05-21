@@ -997,7 +997,7 @@ where
                     .iter_mut()
                     .for_each(|item| all_selections.push(item));
             }
-            graphql_parser::query::Selection::FragmentSpread(_) => continue,
+            graphql_parser::query::Selection::FragmentSpread(_) => {}
         }
     }
 

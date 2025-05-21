@@ -67,9 +67,7 @@ impl DatabricksDelta {
         let mut storage_options = HashMap::new();
         for (key, value) in &self.storage_options {
             match key.as_ref() {
-                "token" | "endpoint" => {
-                    continue;
-                }
+                "token" | "endpoint" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.clone());
                 }

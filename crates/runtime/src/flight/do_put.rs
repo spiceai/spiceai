@@ -84,7 +84,7 @@ pub(crate) async fn handle(
     // Check if the request should be rate limited.
     if let Some(rate_limit_check) = rate_limit_check_fn {
         rate_limit_check()?;
-    };
+    }
 
     match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
         Some(principal) => {

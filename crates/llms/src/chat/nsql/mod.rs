@@ -16,6 +16,8 @@ use async_openai::{
     types::{CreateChatCompletionRequest, CreateChatCompletionResponse},
 };
 
+use std::fmt::Write;
+
 pub mod default;
 pub(crate) mod json;
 pub(crate) mod structured_output;
@@ -76,10 +78,11 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
 fn failed_attempts_formatted(attempts: &Vec<FailedAttempt>) -> String {
     let mut previous_attempts = String::new();
     for attempt in attempts {
-        previous_attempts.push_str(&format!(
+        let _ = write!(
+            previous_attempts,
             "sql: `{}`\nerror: `{}`\n\n",
             attempt.attempted_query, attempt.error_message
-        ));
+        );
     }
     previous_attempts
 }

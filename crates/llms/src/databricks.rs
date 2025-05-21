@@ -60,7 +60,7 @@ pub fn from_access_token(
 
     if let Some(user_agent) = user_agent {
         cfg = cfg.with_header("user-agent", user_agent);
-    };
+    }
 
     Databricks {
         model: model.to_string(),
@@ -85,7 +85,7 @@ pub fn from_token_provider(
 
     if let Some(user_agent) = user_agent {
         cfg = cfg.with_header("user-agent", user_agent);
-    };
+    }
 
     Databricks {
         model: model.to_string(),

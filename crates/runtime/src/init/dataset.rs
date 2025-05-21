@@ -135,7 +135,6 @@ impl Runtime {
                 );
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Error);
-                continue;
             }
         }
 
