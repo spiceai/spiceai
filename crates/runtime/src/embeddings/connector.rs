@@ -173,4 +173,8 @@ impl DataConnector for EmbeddingConnector {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
+
+    fn deferred_load(&self) -> bool {
+        self.inner_connector.deferred_load()
+    }
 }

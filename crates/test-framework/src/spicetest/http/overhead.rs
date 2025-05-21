@@ -269,7 +269,6 @@ impl OverHeadWorker {
                     Err(e) => {
                         eprintln!("Worker {} - Request failed: {}", self.id, e);
                         error_count += 1;
-                        continue;
                     }
                 }
             }

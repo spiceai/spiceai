@@ -185,7 +185,7 @@ fn create_flight_client(
         client
             .add_header("authorization", &format!("Bearer {api_key}"))
             .map_err(anyhow::Error::from)?;
-    };
+    }
 
     Ok(client)
 }

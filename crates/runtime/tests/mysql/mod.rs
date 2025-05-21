@@ -34,8 +34,8 @@ use mysql_async::{Params, Row};
 use runtime::Runtime;
 use tracing::instrument;
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mysql";
-const MYSQL_PORT: u16 = 13316;
+const MYSQL_PORT1: u16 = 13316;
+const MYSQL_PORT2: u16 = 13317;
 
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -222,7 +222,7 @@ async fn mysql_integration_test() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                start_mysql_docker_container(MYSQL_PORT1)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mysql_docker_container: {e}");
@@ -231,7 +231,7 @@ async fn mysql_integration_test() -> Result<(), String> {
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_db(MYSQL_PORT)
+                init_mysql_db(MYSQL_PORT1)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -241,7 +241,7 @@ async fn mysql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_integration_test")
-                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
+                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT1, false))
                 .build();
 
             let mut rt = Runtime::builder()
@@ -311,7 +311,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                start_mysql_docker_container(MYSQL_PORT2)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mysql_docker_container: {e}");
@@ -320,7 +320,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_utf8mb4_db(MYSQL_PORT)
+                init_mysql_utf8mb4_db(MYSQL_PORT2)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -334,7 +334,7 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset(
                     "test_utf8mb4",
                     "test_default",
-                    MYSQL_PORT,
+                    MYSQL_PORT2,
                     false,
                 ))
                 .build();

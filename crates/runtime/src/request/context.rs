@@ -183,7 +183,7 @@ impl RequestContext {
         }
     }
 
-    pub async fn run_extensions(&self) {
+    pub async fn load_extensions(&self) {
         if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
             extension.load_u2m_components().await;
         }

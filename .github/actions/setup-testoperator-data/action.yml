@@ -11,6 +11,11 @@ inputs:
       - 'tpch[parameterized]'
       - 'tpcds'
       - 'clickbench'
+  is_dev:
+    description: "Is this running on the dev runners?"
+    required: true
+    type: boolean
+    default: false
 
 runs:
   using: 'composite'
@@ -24,21 +29,61 @@ runs:
 
     - name: Download DuckDB TPCH Data
       shell: bash
-      if: inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]'
+      if: inputs.is_dev == 'true' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
+
+    - name: Download DuckDB TPCDS Data
+      shell: bash
+      if: inputs.is_dev == 'true' && inputs.query_set == 'tpcds'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
+
+    - name: Download File Connector TPCH Data
+      shell: bash
+      if: inputs.is_dev == 'true' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      run: |
+        cd /opt/spiced/data
+        mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
+    
+    - name: Download File Connector TPCDS Data
+      shell: bash
+      if: inputs.is_dev == 'true' && inputs.query_set == 'tpcds'
+      run: |
+        cd /opt/spiced/data
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
+        mkdir ./sf0_01
+        cd ./sf0_01
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/* ./
+    
+    - name: Download File Connector ClickBench Data
+      shell: bash
+      if: inputs.is_dev == 'true' && inputs.query_set == 'clickbench'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
+        mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
+    
+    # These should get deleted once the dev migration is completed. The folder layout is different to dev
+    - name: Download DuckDB TPCH Data
+      shell: bash
+      if: inputs.is_dev == 'false' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/duckdb/tpch.db ./
 
     - name: Download DuckDB TPCDS Data
       shell: bash
-      if: inputs.query_set == 'tpcds'
+      if: inputs.is_dev == 'false' && inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/duckdb/tpcds.db ./
 
     - name: Download File Connector TPCH Data
       shell: bash
-      if: inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]'
+      if: inputs.is_dev == 'false' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
@@ -52,7 +97,7 @@ runs:
     
     - name: Download File Connector TPCDS Data
       shell: bash
-      if: inputs.query_set == 'tpcds'
+      if: inputs.is_dev == 'false' && inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
@@ -108,7 +153,7 @@ runs:
     
     - name: Download File Connector ClickBench Data
       shell: bash
-      if: inputs.query_set == 'clickbench'
+      if: inputs.is_dev == 'false' && inputs.query_set == 'clickbench'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/clickbench/hits_partitioned/hits_0.parquet ./

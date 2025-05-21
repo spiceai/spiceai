@@ -22,8 +22,10 @@ use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
-    embeddings::vector_search::{
-        SearchRequest, SearchRequestAIJson, VectorSearch, parse_explicit_primary_keys,
+    search::{
+        request::{SearchRequest, SearchRequestAIJson},
+        util::parse_explicit_primary_keys,
+        vector_search::VectorSearch,
     },
     tools::{SpiceModelTool, utils::parameters},
 };

@@ -196,9 +196,9 @@ impl ToolUsingChat {
     ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
-    ///     requested.
+    ///   requested.
     /// - `Some(messages)` if spiced runtime tools were used. The returned messages are ready to be
-    ///     reprocessed by the model.
+    ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
         original_messages: Vec<ChatCompletionRequestMessage>,

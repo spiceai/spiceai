@@ -24,10 +24,13 @@ use clap::Parser;
 use futures::{StreamExt, TryStreamExt, stream};
 use runtime::{
     dataupdate::DataUpdate,
-    embeddings::vector_search::{
-        self, SearchRequest, VectorSearch, VectorSearchResult, parse_explicit_primary_keys,
-    },
     request::{Protocol, RequestContext, UserAgent},
+    search::{
+        request::SearchRequest,
+        types::VectorSearchResult,
+        util::parse_explicit_primary_keys,
+        vector_search::{self, VectorSearch},
+    },
 };
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::embeddings::EmbeddingChunkConfig;

@@ -414,7 +414,7 @@ pub fn subscribe_to_append_stream(
                 while let Some(decoded_data) = stream.next().await {
                     match decoded_data {
                         Ok(decoded_data) => match decoded_data.payload {
-                            DecodedPayload::None | DecodedPayload::Schema(_) => continue,
+                            DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)

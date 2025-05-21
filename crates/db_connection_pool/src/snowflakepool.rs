@@ -22,7 +22,7 @@ use pkcs8::{LineEnding, SecretDocument};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, fmt::Write, fs, sync::Arc};
 
 use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
@@ -169,10 +169,10 @@ impl SnowflakeConnectionPool {
 
         let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
-            join_push_context_str.push_str(&format!(",warehouse={warehouse}"));
+            let _ = write!(join_push_context_str, ",warehouse={warehouse}");
         }
         if let Some(role) = role {
-            join_push_context_str.push_str(&format!(",role={role}"));
+            let _ = write!(join_push_context_str, ",role={role}");
         }
 
         Ok(Self {

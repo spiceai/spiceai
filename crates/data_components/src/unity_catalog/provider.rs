@@ -27,6 +27,7 @@ use snafu::prelude::*;
 use std::{
     any::Any,
     collections::HashMap,
+    fmt::Write,
     sync::{Arc, RwLock},
 };
 
@@ -249,13 +250,15 @@ impl UnityCatalogSchemaProvider {
                 self.schema.catalog_name, self.schema.name
             );
             if !removed_tables.is_empty() {
-                message.push_str(&format!("Tables removed: {}.", removed_tables.join(", ")));
+                let _ = write!(message, "Tables removed: {}.", removed_tables.join(", "));
             }
             if !new_table_providers.is_empty() {
                 if !removed_tables.is_empty() {
                     message.push(' ');
                 }
-                message.push_str(&format!(
+
+                let _ = write!(
+                    message,
                     "Tables added: {}.",
                     new_table_providers
                         .keys()
@@ -263,7 +266,7 @@ impl UnityCatalogSchemaProvider {
                         .collect::<Vec<_>>()
                         .as_slice()
                         .join(", ")
-                ));
+                );
             }
             tracing::info!("{}", message);
         }

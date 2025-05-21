@@ -29,10 +29,9 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+use crate::search::vector_search::VectorSearch;
 use crate::{
-    Runtime, config,
-    embeddings::vector_search::{self, parse_explicit_primary_keys},
-    metrics as runtime_metrics,
+    Runtime, config, metrics as runtime_metrics, search::util::parse_explicit_primary_keys,
     tls::TlsConfig,
 };
 
@@ -66,7 +65,7 @@ pub(crate) async fn start<A>(
 where
     A: ToSocketAddrs + Debug,
 {
-    let vsearch = Arc::new(vector_search::VectorSearch::new(
+    let vsearch = Arc::new(VectorSearch::new(
         Arc::clone(&rt.df),
         Arc::clone(&rt.embeds),
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,

@@ -123,6 +123,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 schemars = "0.8.22"
+search = { path = "../search" }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
