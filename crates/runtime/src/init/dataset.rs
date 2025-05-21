@@ -30,8 +30,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     dataconnector::{
-        self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
-        DataConnectorError, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, ConnectorParamsBuilder, DataConnector, DataConnectorError,
+        ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
     },
@@ -201,25 +201,13 @@ impl Runtime {
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-
         let source = ds.source();
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .build(self.secrets())
-            .await
-            .context(UnableToInitializeDataConnectorSnafu)?;
 
         let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(source, params)
+            .get_dataconnector_from_dataset(Arc::clone(&ds))
             .await
         {
-            Ok(data_connector) => {
-                // if connector marked as deferred, replace it with stub DeferredConnector
-                if data_connector.deferred_load() {
-                    Arc::new(DeferredConnector::new(data_connector)) as Arc<dyn DataConnector>
-                } else {
-                    data_connector
-                }
-            }
+            Ok(data_connector) => data_connector,
             Err(err) => {
                 let ds_name = &ds.name;
                 self.status
@@ -328,24 +316,16 @@ impl Runtime {
             }
         }
 
-        // Only wrap data connector when necessary.
-        let connector = if ds.has_embeddings() {
-            let connector = EmbeddingConnector::new(data_connector, Arc::clone(&self.embeds));
-            Arc::new(connector) as Arc<dyn DataConnector>
-        } else {
-            data_connector
-        };
-
         // Test dataset connectivity by attempting to get a read provider.
-        let federated_table = match connector.read_provider(&ds).await {
+        let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
-                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&connector)).await
+                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&data_connector)).await
             }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) =
-                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&connector)).await
+                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector)).await
                 {
                     tracing::warn!(
                         "Unable to connect to the remote source for {}. Data will be served from the pre-existing accelerated table for {} while attempting to establish the connection.\n\n{err}",
@@ -374,7 +354,7 @@ impl Runtime {
             .register_dataset(
                 Arc::clone(&ds),
                 RegisterDatasetContext {
-                    data_connector: Arc::clone(&connector),
+                    data_connector: Arc::clone(&data_connector),
                     federated_read_table: federated_table,
                     source: source.to_string(),
                     accelerated_table,
@@ -386,12 +366,12 @@ impl Runtime {
                 tracing::info!(
                     "{}",
                     dataset_registered_trace(
-                        connector.as_ref(),
+                        data_connector.as_ref(),
                         &ds,
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if !connector.deferred_load() {
+                if !data_connector.deferred_load() {
                     if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                         if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
                             tracing::warn!(
@@ -579,29 +559,48 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) async fn get_dataconnector_from_source(
+    pub(crate) async fn get_dataconnector_from_dataset(
         &self,
-        source: &str,
-        params: ConnectorParams,
+        ds: Arc<Dataset>,
     ) -> Result<Arc<dyn DataConnector>> {
+        let source = ds.source();
+
+        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+            .build(self.secrets())
+            .await
+            .context(UnableToInitializeDataConnectorSnafu)?;
+
         // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
         if source == LOCALPOD_DATACONNECTOR {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        match dataconnector::create_new_connector(source, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
-            None => {
+        let mut data_connector =
+            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
+                dc.context(UnableToInitializeDataConnectorSnafu {})?
+            } else {
                 if source == ODBC_DATACONNECTOR {
-                    OdbcNotInstalledSnafu.fail()
-                } else {
-                    UnknownDataConnectorSnafu {
-                        data_connector: source,
-                    }
-                    .fail()
+                    return Err(OdbcNotInstalledSnafu.build());
                 }
-            }
+
+                return Err(UnknownDataConnectorSnafu {
+                    data_connector: source,
+                }
+                .build());
+            };
+
+        if ds.has_embeddings() {
+            data_connector = Arc::new(EmbeddingConnector::new(
+                data_connector,
+                Arc::clone(&self.embeds),
+            ));
         }
+
+        if data_connector.deferred_load() {
+            data_connector = Arc::new(DeferredConnector::new(data_connector));
+        }
+
+        Ok(data_connector)
     }
 
     async fn register_dataset(
