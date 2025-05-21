@@ -79,8 +79,7 @@ $ spice trace ai_chat --include-input --truncate=120
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			return
@@ -195,7 +194,6 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 func init() {
 	RootCmd.AddCommand(traceCmd)
 	traceCmd.Flags().StringVar(&id, "id", "", "Return the trace with the given id")
-	traceCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 	traceCmd.Flags().BoolVar(&include_input, "include-input", false, "Include input data in the trace")
 	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")

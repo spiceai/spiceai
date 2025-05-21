@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -58,10 +59,12 @@ spice eval tetris --model "my_model"`,
 
 		postBody := string(body)
 
-		rtcontext := context.NewContext()
-
-		url := fmt.Sprintf("/v1/evals/%s", evalName)
-		response, err := api.PostRuntime[[]EvalResponse](rtcontext, url, &postBody)
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
+		response, err := api.PostRuntime[[]EvalResponse](rtcontext, fmt.Sprintf("/v1/evals/%s", evalName), &postBody)
 		if err != nil {
 			slog.Error("running evaluation", "error", err)
 			return
@@ -77,6 +80,5 @@ spice eval tetris --model "my_model"`,
 
 func init() {
 	evalCmd.Flags().String("model", "", "Model to evaluate")
-
 	RootCmd.AddCommand(evalCmd)
 }
