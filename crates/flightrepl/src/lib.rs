@@ -340,7 +340,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
                 last_error = Some(status);
-                continue;
             }
             Err(e) => {
                 println!(

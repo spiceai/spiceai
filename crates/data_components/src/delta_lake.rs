@@ -124,9 +124,7 @@ impl DeltaTable {
         let mut storage_options: HashMap<String, String> = HashMap::new();
         for (key, value) in options {
             match key.as_ref() {
-                "token" | "endpoint" => {
-                    continue;
-                }
+                "token" | "endpoint" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }

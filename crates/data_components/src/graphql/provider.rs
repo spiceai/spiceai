@@ -97,7 +97,7 @@ impl GraphQLTableProviderBuilder {
                     self.context.clone().and_then(|o| o.error_checker()),
                 )
                 .await?;
-        };
+        }
 
         let result = self
             .client

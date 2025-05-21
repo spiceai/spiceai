@@ -364,7 +364,7 @@ pub(crate) mod tests {
         match SearchRequest::parse_where_cond("column = 'value'".to_string()) {
             Ok(r) => assert_eq!(r.to_string(), "column = 'value'"),
             Err(e) => panic!("{}", e),
-        };
+        }
 
         // Test with WHERE keyword
         let result = SearchRequest::parse_where_cond("WHERE column = 'value'".to_string());
