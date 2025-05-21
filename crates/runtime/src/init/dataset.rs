@@ -577,19 +577,19 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector = match dataconnector::create_new_connector(source, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {})?,
-            None => {
+        let mut data_connector =
+            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
+                dc.context(UnableToInitializeDataConnectorSnafu {})?
+            } else {
                 if source == ODBC_DATACONNECTOR {
                     return Err(OdbcNotInstalledSnafu.build());
-                } else {
-                    return Err(UnknownDataConnectorSnafu {
-                        data_connector: source,
-                    }
-                    .build());
                 }
-            }
-        };
+
+                return Err(UnknownDataConnectorSnafu {
+                    data_connector: source,
+                }
+                .build());
+            };
 
         if ds.has_embeddings() {
             data_connector = Arc::new(EmbeddingConnector::new(
@@ -603,31 +603,6 @@ impl Runtime {
         }
 
         Ok(data_connector)
-    }
-
-    pub(crate) async fn get_dataconnector_from_source(
-        &self,
-        source: &str,
-        params: ConnectorParams,
-    ) -> Result<Arc<dyn DataConnector>> {
-        // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
-        if source == LOCALPOD_DATACONNECTOR {
-            return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
-        }
-
-        match dataconnector::create_new_connector(source, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
-            None => {
-                if source == ODBC_DATACONNECTOR {
-                    OdbcNotInstalledSnafu.fail()
-                } else {
-                    UnknownDataConnectorSnafu {
-                        data_connector: source,
-                    }
-                    .fail()
-                }
-            }
-        }
     }
 
     async fn register_dataset(
