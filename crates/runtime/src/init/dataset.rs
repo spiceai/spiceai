@@ -30,8 +30,8 @@ use crate::{
         builder::DatasetBuilder,
     },
     dataconnector::{
-        self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
-        DataConnectorError, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, ConnectorParamsBuilder, DataConnector, DataConnectorError,
+        ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
     },
@@ -201,16 +201,10 @@ impl Runtime {
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-
         let source = ds.source();
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .build(self.secrets())
-            .await
-            .context(UnableToInitializeDataConnectorSnafu)?;
 
         let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_dataset(Arc::clone(&ds), params)
-            // .get_dataconnector_from_source(source, params)
+            .get_dataconnector_from_dataset(Arc::clone(&ds))
             .await
         {
             Ok(data_connector) => data_connector,
@@ -568,9 +562,13 @@ impl Runtime {
     pub(crate) async fn get_dataconnector_from_dataset(
         &self,
         ds: Arc<Dataset>,
-        params: ConnectorParams,
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
+
+        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+            .build(self.secrets())
+            .await
+            .context(UnableToInitializeDataConnectorSnafu)?;
 
         // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
         if source == LOCALPOD_DATACONNECTOR {
