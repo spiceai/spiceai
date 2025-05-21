@@ -130,7 +130,7 @@ impl Runtime {
                     metrics::views::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
                 }
-            };
+            }
         }
     }
 

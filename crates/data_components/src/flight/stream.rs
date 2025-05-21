@@ -227,8 +227,8 @@ fn subscribe_to_stream(
                 while let Some(decoded_data) = stream.next().await {
                     match decoded_data {
                         Ok(decoded_data) => match decoded_data.payload {
-                          DecodedPayload::None => continue,
-                          DecodedPayload::Schema(_) => continue,
+                          DecodedPayload::None => {},
+                          DecodedPayload::Schema(_) => {},
                           DecodedPayload::RecordBatch(batch) => yield Ok(batch),
                         },
                         Err(error) => {

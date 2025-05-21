@@ -167,7 +167,6 @@ impl Chat for RouterModel {
                                 .content(e.to_string())
                                 .to_jsonl(),
                             );
-                            continue
                         },
 
                         // Check if first item in stream is `Err` since this is a common error by providers.
@@ -184,7 +183,6 @@ impl Chat for RouterModel {
                                         .content(e.to_string())
                                         .to_jsonl(),
                                     );
-                                    continue
                                 },
                                 None | Some(Ok(_)) => return Ok(peekable),
                             }
@@ -254,7 +252,6 @@ impl Chat for RouterModel {
                                 .content(e.to_string())
                                 .to_jsonl(),
                             );
-                            continue
                         },
 
                         Ok(resp) => return Ok(resp),

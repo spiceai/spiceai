@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
+    fmt::Write,
     sync::{Arc, LazyLock},
 };
 
@@ -63,7 +64,7 @@ fn hash_string(val: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(val);
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
-        hash.push_str(&format!("{b:02x}"));
+        let _ = write!(hash, "{b:02x}");
         hash
     })
 }

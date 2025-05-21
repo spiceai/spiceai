@@ -377,7 +377,7 @@ impl PaginationParameters {
         tracing::trace!("For PaginationParameters, searching json_pointer path: {current_path}");
         for selection in selections {
             match selection {
-                graphql_parser::query::Selection::FragmentSpread(_) => continue,
+                graphql_parser::query::Selection::FragmentSpread(_) => {}
                 graphql_parser::query::Selection::InlineFragment(InlineFragment {
                     selection_set,
                     ..

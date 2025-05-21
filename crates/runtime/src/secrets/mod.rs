@@ -156,7 +156,7 @@ impl Secrets {
         for store in self.stores.values() {
             match store.get_secret(key).await {
                 Ok(Some(secret)) => return Ok(Some(secret)),
-                Ok(None) => continue,
+                Ok(None) => {}
                 Err(e) => return Err(e),
             }
         }
