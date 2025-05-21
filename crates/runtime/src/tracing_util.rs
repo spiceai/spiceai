@@ -105,7 +105,7 @@ fn acceleration_info(
     }
     if let Some(retention_check_interval) = &acceleration.retention_check_interval {
         if acceleration.retention_check_enabled {
-            let _ = write!(info, ", {retention_check_interval:#?} retention");
+            let _ = write!(info, ", {retention_check_interval} retention");
         }
     }
     if acceleration.on_zero_results == ZeroResultsAction::UseSource {
