@@ -23,6 +23,7 @@ use spicepod::{
     param::ParamValue,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{
@@ -113,13 +114,15 @@ impl DatabricksAuthExtension {
                 })
                 .collect();
 
-            for ds in databricks_u2m_datasets {
+            let dataset_futures = databricks_u2m_datasets.into_iter().map(|ds| {
+                let df = Arc::clone(&df);
                 let tr = TableReference::from(ds.name.clone());
-
-                if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
-                    tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
-                }
-            }
+                Box::pin(async move {
+                    if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
+                        tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            });
 
             let databricks_u2m_catalogs: Vec<Catalog> = app
                 .catalogs
@@ -140,11 +143,18 @@ impl DatabricksAuthExtension {
                 })
                 .collect();
 
-            for catalog in databricks_u2m_catalogs {
-                if let Err(err) = df.load_deferred_catalog(catalog.name.as_str()).await {
-                    tracing::warn!("Failed to load catalog {}: {}", catalog.name, err);
-                }
-            }
+            let catalog_futures = databricks_u2m_catalogs.into_iter().map(|catalog| {
+                let df = Arc::clone(&df);
+                let name = catalog.name.clone();
+                Box::pin(async move {
+                    if let Err(err) = df.load_deferred_catalog(name.as_str()).await {
+                        tracing::warn!("Failed to load catalog {}: {}", name, err);
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            });
+
+            let all_futures: Vec<_> = dataset_futures.chain(catalog_futures).collect();
+            futures::future::join_all(all_futures).await;
         }
     }
 }
