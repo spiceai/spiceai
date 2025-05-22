@@ -131,7 +131,7 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        JoinPushDown::Disallow
+        JoinPushDown::AllowedFor(self.api.sql_warehouse_id.clone())
     }
 }
 
