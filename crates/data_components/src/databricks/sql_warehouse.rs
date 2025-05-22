@@ -530,6 +530,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 fn databricks_dialect() -> dialect::CustomDialect {
     dialect::CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
+        .with_interval_style(dialect::IntervalStyle::MySQL)
         .build()
 }
 
