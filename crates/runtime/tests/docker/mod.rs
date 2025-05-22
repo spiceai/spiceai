@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use bollard::{
     Docker,
@@ -29,9 +32,17 @@ use bollard::{
     },
 };
 use futures::StreamExt;
+use tokio::sync::Semaphore;
+
+// Limit the number of concurrent container operations to avoid overwhelming the Docker daemon and containers stopping due to OOM
+static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(3)));
+
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
+    // Store the permit to release it when the container is dropped
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl RunningContainer<'_> {
@@ -139,6 +150,14 @@ impl<'a> ContainerRunner<'a> {
             remove(&self.docker, self.name).await?;
         }
 
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(300), // Timeout after 5min
+            CONTAINER_SEMAPHORE.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for available container slot"))?
+        .map_err(|_| anyhow::anyhow!("Failed to acquire container permit"))?;
+
         self.pull_image().await?;
 
         let options = CreateContainerOptions {
@@ -219,6 +238,7 @@ impl<'a> ContainerRunner<'a> {
         Ok(RunningContainer::<'a> {
             name: self.name,
             docker: self.docker,
+            _permit: permit,
         })
     }
 

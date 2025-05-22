@@ -359,7 +359,7 @@ jobs:
     name: Upload artifacts to MinIO
     needs: build
     runs-on: spiceai-dev-runners
-    if: inputs.platform_option == 'Linux x64' || inputs.platform_option == 'all'
+    if: inputs.platform_option == 'Linux x64' || inputs.platform_option == 'all' || github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - name: Setup MinIO

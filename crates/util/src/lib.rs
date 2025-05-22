@@ -88,7 +88,7 @@ pub async fn force_shutdown_signal() {
     }) {
         tracing::error!("Failed to set listener for Ctrl-C: {err}");
         // do not exit; otherwise, it will be interpreted as a force shutdown signal
-    };
+    }
     on_second_ctrl_c.await.ok();
 }
 

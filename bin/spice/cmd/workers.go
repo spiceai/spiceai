@@ -32,13 +32,7 @@ var workersCmd = &cobra.Command{
 spice workers
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			rtcontext = context.NewHttpsContext(rootCertPath)
-		}
-
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			return
@@ -58,6 +52,5 @@ spice workers
 }
 
 func init() {
-	workersCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	RootCmd.AddCommand(workersCmd)
 }

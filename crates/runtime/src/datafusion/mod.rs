@@ -1349,7 +1349,7 @@ impl DataFusion {
                 tracing::error!("Failed to create view: {e}");
                 status.update_view(table, status::ComponentStatus::Error);
                 return;
-            };
+            }
             tracing::info!("{}", view_registered_trace(table, None));
             status.update_view(table, status::ComponentStatus::Ready);
         });

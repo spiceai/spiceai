@@ -15,15 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.3 (May 2025)
-
-**Focus:** Cloud Integration
-
-- Upgrade to DataFusion v46.
-- **Ingestion**:
-  - Support write operations to Spice Cloud.
-- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
-
 ### v1.4 (June 2025)
 
 **Focus:** Search
@@ -35,6 +26,9 @@ To propose features or report issues, please [file an issue](https://github.com/
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
 - **Catalog Connectors**
   - AWS Glue Catalog Connector (Beta).
+- **Ingestion**:
+  - Support write operations to Spice Cloud.
+- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
 
 ### v1.5 (July 2025)
 

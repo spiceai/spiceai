@@ -48,8 +48,7 @@ spice version
 		var rtversion string
 		var err error
 
-		rtcontext := context.NewContext()
-		err = rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("initializing runtime context", "error", err)
 			os.Exit(1)

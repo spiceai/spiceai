@@ -45,12 +45,14 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 }
 
 const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
+const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
 
 #[instrument]
 pub async fn start_mysql_docker_container(
-    container_name: &'static str,
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
+    let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
+    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(format!("{}mysql:latest", container_registry()))
         .add_port_binding(3306, port)

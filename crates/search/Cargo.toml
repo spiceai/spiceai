@@ -1,0 +1,18 @@
+[package]
+description = "Components for a search system "
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "search"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
