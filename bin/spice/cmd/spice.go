@@ -17,12 +17,14 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -58,6 +60,10 @@ func init() {
 	RootCmd.PersistentFlags().BoolVar(&verbosity.VeryVerbose, "very-verbose", false, "Very verbose logging")
 	RootCmd.PersistentFlags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.PersistentFlags().String("api-key", "", "The API key to use for authentication")
+	RootCmd.PersistentFlags().Bool(constants.CloudKeyFlag, false, fmt.Sprintf("Use cloud instance of Spice. Requires `--%s", constants.ApiKeyFlag))
+	RootCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "http://localhost:8090", "HTTP endpoint of Spice")
+	RootCmd.PersistentFlags().String(constants.UserAgentKeyFlag, util.GetSpiceUserAgent("spice"), "The user agent to use for all HTTP requests")
+	RootCmd.PersistentFlags().String(constants.TlsRootCertificateFile, "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 }
 
 func initConfig() {

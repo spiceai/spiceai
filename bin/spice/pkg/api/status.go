@@ -58,6 +58,28 @@ func (cs ComponentStatus) String() string {
 	}
 }
 
+type SchemaField struct {
+	Name          string            `json:"name"`
+	DataType      string            `json:"data_type"`
+	Nullable      bool              `json:"nullable"`
+	DictID        int               `json:"dict_id"`
+	DictIsOrdered bool              `json:"dict_is_ordered"`
+	Metadata      map[string]string `json:"metadata"`
+}
+
+type Schema struct {
+	Fields   []SchemaField     `json:"fields"`
+	Metadata map[string]string `json:"metadata"`
+}
+
+// This is the format when `v1/sql` uses 'Accept: application/vnd.spiceai.sql.v1+json'
+// Since it is for a static SQL query, we know the format of the data (i.e. `ComponentStatusResult`).
+type ComponentStatusResponse struct {
+	RowCount int                     `json:"row_count"`
+	Schema   []Schema                `json:"schema"`
+	Data     []ComponentStatusResult `json:"data"`
+}
+
 type ComponentStatusResult struct {
 	Name          string `json:"name"`
 	Status        int    `json:"status"`
@@ -87,23 +109,23 @@ func GetDatasetsWithStatus(rtContext *context.RuntimeContext) ([]Dataset, error)
 func GetComponentStatuses(rtContext *context.RuntimeContext) (map[string]ComponentStatus, map[string]ComponentStatus, error) {
 	componentStatusQuery := `
 WITH combined_data AS (
-    SELECT 
-        array_element(attributes, 1)['str'] AS name, 
-        data_number.int_value AS status, 
-        'models' AS component_type, 
+    SELECT
+        array_element(attributes, 1)['str'] AS name,
+        data_number.int_value AS status,
+        'models' AS component_type,
         time_unix_nano
-    FROM runtime.metrics 
-    WHERE name = 'models_status'
-    
+    FROM runtime.metrics
+    WHERE name = 'model_load_state'
+
     UNION ALL
-    
-    SELECT 
-        array_element(attributes, 1)['str'] AS name, 
-        data_number.int_value AS status, 
-        'datasets' AS component_type, 
+
+    SELECT
+        array_element(attributes, 1)['str'] AS name,
+        data_number.int_value AS status,
+        'datasets' AS component_type,
         time_unix_nano
-    FROM runtime.metrics 
-    WHERE name = 'datasets_status'
+    FROM runtime.metrics
+    WHERE name = 'dataset_load_state'
 ),
 ranked_data AS (
     SELECT
@@ -123,11 +145,7 @@ FROM
 WHERE
     rn = 1 AND name NOT LIKE 'runtime.%';
 `
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/v1/sql", rtContext.HttpEndpoint()), bytes.NewReader([]byte(componentStatusQuery)))
-	if err != nil {
-		return nil, nil, err
-	}
-	resp, err := rtContext.Client().Do(req)
+	resp, err := rtContext.Do("POST", "/v1/sql", bytes.NewReader([]byte(componentStatusQuery)), "Accept", "application/vnd.spiceai.sql.v1+json")
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return nil, nil, nil
@@ -154,9 +172,9 @@ WHERE
 		return nil, nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 	// Parse the JSON response
-	var componentStatuses []ComponentStatusResult
+	var componentStatusResponse ComponentStatusResponse
 	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&componentStatuses)
+	err = decoder.Decode(&componentStatusResponse)
 	if err == io.EOF {
 		return nil, nil, nil
 	} else if err != nil {
@@ -164,7 +182,8 @@ WHERE
 	}
 	datasetsStatusMap := make(map[string]ComponentStatus)
 	modelStatusMap := make(map[string]ComponentStatus)
-	for _, status := range componentStatuses {
+
+	for _, status := range componentStatusResponse.Data {
 		switch status.ComponentType {
 		case "models":
 			modelStatusMap[status.Name] = ComponentStatus(status.Status)

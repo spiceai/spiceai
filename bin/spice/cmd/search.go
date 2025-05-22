@@ -30,6 +30,7 @@ import (
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -70,15 +71,13 @@ spice search
 spice search --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := context.NewContext().WithCloud(cloud)
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
 
-		if !cloud {
+		if !rtcontext.IsCloud() {
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
@@ -194,31 +193,11 @@ func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling search request body: %w", err)
 	}
-
-	url := fmt.Sprintf("%s/v1/search", rtcontext.HttpEndpoint())
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("error creating search request: %w", err)
-	}
-
-	headers := rtcontext.GetHeaders()
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := rtcontext.Client().Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-
-	return response, nil
+	return rtcontext.Do("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 func init() {
-	searchCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for search (default: false)")
-	searchCmd.Flags().String(modelKeyFlag, "", "Model to use for search")
-	searchCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for search (default: http://localhost:8090)")
+	searchCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 
 	RootCmd.AddCommand(searchCmd)

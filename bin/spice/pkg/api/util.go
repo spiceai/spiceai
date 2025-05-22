@@ -34,43 +34,24 @@ const (
 )
 
 func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string, body *string) (T, error) {
-	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
 	var resp *http.Response
 	var err error
 
 	switch method {
 	case GET:
-		var request *http.Request
-		request, err = http.NewRequest("GET", url, nil)
-		if err != nil {
-			return *new(T), fmt.Errorf("error creating request: %w", err)
-		}
-		headers := rtcontext.GetHeaders()
-		for key, value := range headers {
-			request.Header.Set(key, value)
-		}
-		request.Header.Set("Content-Type", "application/json")
-		resp, err = rtcontext.Client().Do(request)
+		resp, err = rtcontext.Do("GET", path, nil, "Content-Type", "application/json")
+
 	case POST:
 		var reader io.Reader
-		var request *http.Request
 		if body != nil {
 			reader = strings.NewReader(*body)
 		}
-		request, err = http.NewRequest("POST", url, reader)
-		if err != nil {
-			return *new(T), fmt.Errorf("error creating request: %w", err)
-		}
-		headers := rtcontext.GetHeaders()
-		for key, value := range headers {
-			request.Header.Set(key, value)
-		}
 
 		if body != nil {
-			// Otherwise server will fail parsing empty HTTP body.
-			request.Header.Set("Content-Type", "application/json")
+			resp, err = rtcontext.Do("POST", path, reader, "Content-Type", "application/json")
+		} else {
+			resp, err = rtcontext.Do("POST", path, reader)
 		}
-		resp, err = rtcontext.Client().Do(request)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}
@@ -79,7 +60,7 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return *new(T), rtcontext.RuntimeUnavailableError()
 		}
-		return *new(T), fmt.Errorf("error performing request to %s: %w", url, err)
+		return *new(T), fmt.Errorf("error performing request to %s%s: %w", rtcontext.HttpEndpoint(), path, err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
