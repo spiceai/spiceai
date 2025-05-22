@@ -87,11 +87,7 @@ spice refresh taxi_trips
 
 		slog.Info(fmt.Sprintf("Refreshing dataset %s ...\n", dataset))
 
-		rtcontext := context.NewContext()
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			rtcontext = context.NewHttpsContext(rootCertPath)
-		}
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			return
@@ -115,7 +111,6 @@ spice refresh taxi_trips
 }
 
 func init() {
-	refreshCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	refreshCmd.Flags().String(refreshSqlFlag, "", "'refresh_sql' to refresh a dataset.")
 	refreshCmd.Flags().String(refreshModeFlag, "", "'refresh_mode', one of: full, append")
 	refreshCmd.Flags().String(maxJitterFlag, "", "'refresh_jitter_max', a duration string (e.g. '1m') to specify the maximum jitter allowed for the refresh operation")
