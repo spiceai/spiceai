@@ -58,8 +58,6 @@ pub enum Token<'input> {
     Struct,
     #[regex("(?i)VARIANT")]
     Variant,
-    #[regex("(?i)OBJECT")]
-    Object,
     #[regex("(?i)NOT")]
     Not,
     #[regex("(?i)NULL")]
@@ -215,7 +213,6 @@ impl<'input> Parser<'input> {
             }
             Some(Ok(Token::Map)) => self.parse_map(),
             Some(Ok(Token::Struct)) => self.parse_struct(),
-            Some(Ok(Token::Object)) => self.parse_object(),
             _ => Err(format!("Unexpected token: {:?}", self.current)),
         }
     }
@@ -238,28 +235,6 @@ impl<'input> Parser<'input> {
     }
 
     fn parse_struct(&mut self) -> Result<ArrowDataType, String> {
-        self.advance();
-        self.expect(&Token::LAngle)?;
-        let mut fields = Vec::new();
-        if self.current != Some(Ok(Token::RAngle)) {
-            loop {
-                let field = self.parse_field()?;
-                fields.push(field);
-                if self.current == Some(Ok(Token::Comma)) {
-                    self.advance();
-                    if self.current == Some(Ok(Token::RAngle)) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-        self.expect(&Token::RAngle)?;
-        Ok(ArrowDataType::Struct(fields.into()))
-    }
-
-    fn parse_object(&mut self) -> Result<ArrowDataType, String> {
         self.advance();
         self.expect(&Token::LAngle)?;
         let mut fields = Vec::new();
