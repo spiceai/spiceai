@@ -18,7 +18,10 @@ use app::App;
 use datafusion::sql::TableReference;
 use http::HeaderMap;
 use secrecy::SecretString;
-use spicepod::{component::dataset::Dataset, param::ParamValue};
+use spicepod::{
+    component::{catalog::Catalog, dataset::Dataset},
+    param::ParamValue,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -115,6 +118,31 @@ impl DatabricksAuthExtension {
 
                 if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
                     tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
+                }
+            }
+
+            let databricks_u2m_catalogs: Vec<Catalog> = app
+                .catalogs
+                .iter()
+                .filter_map(|catalog| {
+                    let params = catalog.params.as_ref()?;
+                    let Some(ParamValue::String(client_id)) =
+                        params.data.get("databricks_client_id")
+                    else {
+                        return None;
+                    };
+
+                    if !client_ids.contains(client_id) {
+                        return None;
+                    }
+
+                    Some(catalog.clone())
+                })
+                .collect();
+
+            for catalog in databricks_u2m_catalogs {
+                if let Err(err) = df.load_deferred_catalog(catalog.name.as_str()).await {
+                    tracing::warn!("Failed to load catalog {}: {}", catalog.name, err);
                 }
             }
         }
