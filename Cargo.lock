@@ -3219,6 +3219,7 @@ dependencies = [
  "imap",
  "indexmap 2.9.0",
  "itertools 0.14.0",
+ "logos",
  "mailparse",
  "object_store",
  "rdkafka",
