@@ -50,6 +50,7 @@ iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
+logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
