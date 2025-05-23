@@ -144,7 +144,7 @@ fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
 ///
 /// [`OnStartup`] indicates that the component should be initialized when runtime started.
 /// [`OnTrigger`] indicates that the component should be initialized when a specific trigger event occurs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum ComponentInitialization {
     OnStartup,
     OnTrigger,
