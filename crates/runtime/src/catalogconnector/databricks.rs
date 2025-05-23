@@ -267,7 +267,7 @@ impl CatalogConnector for Databricks {
     }
 
     fn initialization(&self) -> ComponentInitialization {
-        self.initialization.clone()
+        self.initialization
     }
 }
 
