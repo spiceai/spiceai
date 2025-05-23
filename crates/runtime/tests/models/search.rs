@@ -64,7 +64,7 @@ pub async fn run_search_test(base_url: &str, ts: &SearchTestCase) -> Result<(), 
         Err(e) => {
             insta::assert_snapshot!(format!("{}_error_response", ts.name), e.to_string());
         }
-    };
+    }
     Ok(())
 }
 
