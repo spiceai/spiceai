@@ -180,13 +180,13 @@ mod search {
         let app = AppBuilder::new("text-to-sql")
             .with_dataset(item_tpch_dataset_w_embeddings(
                 "item",
-                "openai_embeddings",
+                "hf_minilm",
                 Some(vec!["i_item_sk".to_string()]),
                 None,
             ))
             .with_dataset(catalog_page_tpch_dataset_w_embeddings(
                 "catalog_page_with_chunking",
-                "openai_embeddings",
+                "hf_minilm",
                 Some(vec!["cp_catalog_page_sk".to_string()]),
                 Some(EmbeddingChunkConfig {
                     enabled: true,
@@ -197,7 +197,7 @@ mod search {
             ))
             .with_dataset(catalog_page_tpch_dataset_w_embeddings(
                 "catalog_page_with_chunking_no_pk",
-                "openai_embeddings",
+                "hf_minilm",
                 None,
                 Some(EmbeddingChunkConfig {
                     enabled: true,
