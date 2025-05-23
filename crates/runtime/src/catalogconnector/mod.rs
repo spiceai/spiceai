@@ -30,6 +30,7 @@ use crate::{
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use datafusion::catalog::CatalogProvider;
+use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -80,6 +81,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "databricks")]
 pub mod databricks;
+pub mod deferred;
 pub mod iceberg;
 pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
@@ -198,6 +200,11 @@ pub trait CatalogConnector: Send + Sync {
         _runtime: Arc<Runtime>,
         _catalog: &Catalog,
     ) -> Result<Arc<dyn RefreshableCatalogProvider>>;
+
+    /// Returns whether the catalog connector load should be deferred.
+    fn deferred_load(&self) -> bool {
+        false
+    }
 }
 
 pub async fn get_catalog_provider(
@@ -206,8 +213,16 @@ pub async fn get_catalog_provider(
     catalog: &Catalog,
     refresh_interval: Option<Duration>,
 ) -> Result<Arc<dyn CatalogProvider>> {
+    if connector.deferred_load() {
+        return Ok(Arc::new(DeferredCatalogProvider::new(
+            runtime,
+            connector,
+            catalog.clone(),
+        )));
+    }
+
     let provider = RefreshingCatalogProvider::new(
-        connector
+        Arc::clone(&connector)
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )

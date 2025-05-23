@@ -182,6 +182,7 @@ impl Runtime {
 
         self.df
             .register_catalog(&catalog.name, catalog_provider)
+            .await
             .boxed()
             .context(UnableToLoadCatalogConnectorSnafu {
                 catalog: catalog.name.clone(),
