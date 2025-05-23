@@ -509,7 +509,7 @@ impl DataConnector for Databricks {
     }
 
     fn initialization(&self) -> ComponentInitialization {
-        self.initialization.clone()
+        self.initialization
     }
 }
 
