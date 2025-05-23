@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use super::DataConnector;
-use crate::component::dataset::Dataset;
+use crate::component::{ComponentInitialization, dataset::Dataset};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -65,8 +65,8 @@ impl DataConnector for DeferredConnector {
         Ok(Arc::new(self.clone()))
     }
 
-    fn deferred_load(&self) -> bool {
-        true
+    fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnTrigger
     }
 }
 
