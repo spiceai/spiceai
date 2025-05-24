@@ -71,12 +71,10 @@ fn json_to_scalar(json: &Value) -> Result<ScalarValue, Error> {
         Value::Null => Ok(ScalarValue::Utf8(None)),
         Value::Bool(b) => Ok(ScalarValue::Boolean(Some(*b))),
         Value::Number(n) => {
-            if let Some(i) = n.as_u64() {
-                Ok(ScalarValue::UInt64(Some(i)))
+            if let Some(i) = n.as_i64() {
+                Ok(ScalarValue::Int64(Some(i)))
             } else if let Some(f) = n.as_f64() {
                 Ok(ScalarValue::Float64(Some(f)))
-            } else if let Some(i) = n.as_i64() {
-                Ok(ScalarValue::Int64(Some(i)))
             } else {
                 Err(Error::UnsupportedJsonNumberFormat)
             }
