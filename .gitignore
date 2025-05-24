@@ -11,6 +11,7 @@ cmd/spiced/spiced
 cmd/spiced/.spice
 cmd/spiced/data
 spicepods
+Makefile.local
 
 *.parquet
 spicepod.yaml

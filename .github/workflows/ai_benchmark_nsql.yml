@@ -4,20 +4,22 @@ name: ai benchmark (nsql)
 on:
   workflow_dispatch:
     inputs:
-        model_option:
-          description: "Which model do you want to test? (Default is ALL)"
-          required: false
-          type: choice
-          options:
-            - "all"
-            - "gpt-4o"
-            - "gpt-4o-mini"
-            - "o1"
-            - "o3_mini"
-            - "llama3-3B-Instruct"
-            - "claude-3-5-sonnet"
-            - "grok2"
-          default: "all"
+      model_option:
+        description: 'Which model do you want to test? (Default is ALL)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'gpt-4o'
+          - 'gpt-4o-mini'
+          - 'o1'
+          - 'o3_mini'
+          - 'llama3-3B-Instruct'
+          - 'claude-3-5-sonnet'
+          - 'grok2'
+        default: 'all'
+  schedule:
+    - cron: '0 1 * * 2,5' # Every Monday and Thursday at 5pm PST (1am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -44,7 +46,7 @@ jobs:
         run: |
           mv target/release/testoperator testoperator
           chmod +x testoperator
-          
+
       - name: Save spice artifact
         uses: actions/upload-artifact@v4
         with:
@@ -161,7 +163,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: testoperator
-  
+
       - name: Download spiced
         uses: actions/download-artifact@v4
         with:

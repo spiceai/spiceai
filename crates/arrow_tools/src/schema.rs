@@ -74,6 +74,13 @@ pub fn verify_schema(
             continue;
         }
 
+        // We set the DataFusion option `df_config.options_mut().optimizer.expand_views_at_output = true`
+        // to expand views at the output of a query. This means that a query that expects a
+        // `Utf8View` will be expanded to a `LargeUtf8` in the result set.
+        if a_data_type == &DataType::Utf8View && b_data_type == &DataType::LargeUtf8 {
+            continue;
+        }
+
         if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
@@ -153,6 +160,53 @@ pub fn schema_meta_get_computed_columns(
     }
 }
 
+/// Returns a string describing the difference between two schemas, if any.
+#[must_use]
+pub fn schema_difference(expected: &Schema, actual: &Schema) -> Option<String> {
+    let mut differences = Vec::new();
+
+    // Check for missing columns in actual schema
+    for field in expected.fields() {
+        if !actual.fields().iter().any(|f| f.name() == field.name()) {
+            differences.push(format!("The column `{}` is missing", field.name()));
+        }
+    }
+
+    // Check for extra columns in actual schema
+    for field in actual.fields() {
+        if !expected.fields().iter().any(|f| f.name() == field.name()) {
+            differences.push(format!("The column `{}` is unexpected", field.name()));
+        }
+    }
+
+    // Check for type mismatches in common columns
+    for expected_field in expected.fields() {
+        if let Some(actual_field) = actual
+            .fields()
+            .iter()
+            .find(|f| f.name() == expected_field.name())
+        {
+            if !DFSchema::datatype_is_semantically_equal(
+                expected_field.data_type(),
+                actual_field.data_type(),
+            ) {
+                differences.push(format!(
+                    "The type of `{column_name}` changed from `{expected_type}` to `{actual_type}`",
+                    column_name = expected_field.name(),
+                    expected_type = expected_field.data_type(),
+                    actual_type = actual_field.data_type()
+                ));
+            }
+        }
+    }
+
+    if differences.is_empty() {
+        None
+    } else {
+        Some(differences.join(". "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +264,55 @@ mod tests {
         assert_eq!(computed_columns.len(), 2);
         assert_eq!(computed_columns[0].name(), "name_embedding");
         assert_eq!(computed_columns[1].name(), "name_offset");
+    }
+
+    #[test]
+    fn test_schema_difference() {
+        let expected = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+
+        let actual = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("age", DataType::Utf8, true),
+            Field::new("extra", DataType::Float64, false),
+        ]);
+
+        let diff = schema_difference(&expected, &actual);
+        let Some(diff) = diff else {
+            panic!("should return a string");
+        };
+        assert!(diff.contains("The column `name` is missing"));
+        assert!(diff.contains("The column `extra` is unexpected"));
+        assert!(diff.contains("The type of `age` changed from `Int32` to `Utf8`"));
+    }
+
+    #[test]
+    fn test_schema_difference_nullability() {
+        let expected = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let actual = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+
+        let diff = schema_difference(&expected, &actual);
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn test_schema_difference_identical() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let diff = schema_difference(&schema, &schema);
+        assert!(diff.is_none());
     }
 }

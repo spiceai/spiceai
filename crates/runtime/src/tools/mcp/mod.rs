@@ -21,7 +21,7 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
-use mcp_client::{Error as McpError, transport::Error as TransportError};
+use rmcp::Error as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -41,8 +41,9 @@ pub enum Error {
         "Error occured in underlying communication to MCP tool. Error: {}",
         source
     ))]
-    UnderlyingTransportError { source: TransportError },
-
+    UnderlyingTransportError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[snafu(display(
         "Error occured in initialization client connection with underlying MCP server. Error: {}",
         source

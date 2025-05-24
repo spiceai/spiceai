@@ -910,6 +910,13 @@
         }
       }
     },
+    "HashingAlgorithm": {
+      "type": "string",
+      "enum": [
+        "siphash",
+        "ahash"
+      ]
+    },
     "IndexType": {
       "type": "string",
       "enum": [
@@ -1171,6 +1178,14 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "hashing_algorithm": {
+          "default": "siphash",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HashingAlgorithm"
+            }
           ]
         },
         "item_ttl": {

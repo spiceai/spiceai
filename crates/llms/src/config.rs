@@ -16,13 +16,10 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::config::Config;
-use reqwest::header::{
-    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue,
-};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
-use std::sync::LazyLock;
-
-static DUMMY_API_KEY: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(String::new()));
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use secrecy::SecretString;
+use std::sync::Arc;
+use token_provider::{StaticTokenProvider, TokenProvider};
 
 /// A generic configuration for any hosted `OpenAI` API client.
 ///
@@ -35,29 +32,22 @@ pub struct HostedModelConfig {
     pub default_headers: HeaderMap,
 }
 
-impl Default for HostedModelConfig {
-    fn default() -> Self {
+impl HostedModelConfig {
+    pub fn from_url(url: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Self {
             auth: None,
-            base_url: "http://localhost:8090/v1".to_string(),
+            base_url: url.to_string(),
             default_headers: headers,
         }
-    }
-}
-
-impl HostedModelConfig {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Set the API key for authentication.
     #[must_use]
     pub fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
         if let Some(key) = api_key {
-            self.auth = Some(GenericAuthMechanism::ApiKey(SecretString::from(key.into())));
+            self.auth = Some(GenericAuthMechanism::from_api_key(key));
         }
         self
     }
@@ -66,17 +56,8 @@ impl HostedModelConfig {
     #[must_use]
     pub fn with_bearer_token<S: Into<String>>(mut self, token: Option<S>) -> Self {
         if let Some(token) = token {
-            self.auth = Some(GenericAuthMechanism::BearerToken(SecretBox::from(
-                token.into(),
-            )));
+            self.auth = Some(GenericAuthMechanism::from_bearer_token(token));
         }
-        self
-    }
-
-    /// Override the base URL for API calls.
-    #[must_use]
-    pub fn with_base_url<S: Into<String>>(mut self, base_url: S) -> Self {
-        self.base_url = base_url.into();
         self
     }
 
@@ -87,31 +68,44 @@ impl HostedModelConfig {
     }
 
     /// Add (or override) a default header.
-    pub fn with_header<V>(mut self, key: &'static str, value: V) -> Result<Self, InvalidHeaderValue>
-    where
-        V: Into<String>,
-    {
-        self.default_headers.insert(
-            HeaderName::from_static(key),
-            HeaderValue::from_str(&value.into())?,
-        );
-        Ok(self)
+    #[must_use]
+    pub fn with_header(mut self, key: &'static str, value: &'static str) -> Self {
+        self = self.with_header_value(key, HeaderValue::from_static(value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_header_value(mut self, key: &'static str, value: HeaderValue) -> Self {
+        self.default_headers
+            .insert(HeaderName::from_static(key), value);
+        self
     }
 }
 
 /// A generic authentication mechanism that supports either an API key or a Bearer token.
 #[derive(Clone, Debug)]
 pub enum GenericAuthMechanism {
-    ApiKey(SecretString),
-    BearerToken(SecretString),
+    ApiKey(Arc<dyn TokenProvider>),
+    BearerToken(Arc<dyn TokenProvider>),
 }
 
 impl GenericAuthMechanism {
     pub fn from_api_key<S: Into<String>>(api_key: S) -> Self {
-        Self::ApiKey(SecretBox::from(api_key.into()))
+        GenericAuthMechanism::from_api_key_provider(Arc::new(StaticTokenProvider::new(
+            SecretString::new(api_key.into().into()),
+        )))
     }
+    pub fn from_api_key_provider(provider: Arc<dyn TokenProvider>) -> Self {
+        Self::ApiKey(provider)
+    }
+
     pub fn from_bearer_token<S: Into<String>>(bearer_token: S) -> Self {
-        Self::BearerToken(SecretBox::from(bearer_token.into()))
+        GenericAuthMechanism::from_bearer_token_provider(Arc::new(StaticTokenProvider::new(
+            SecretString::from(bearer_token.into()),
+        )))
+    }
+    pub fn from_bearer_token_provider(provider: Arc<dyn TokenProvider>) -> Self {
+        Self::BearerToken(provider)
     }
 }
 
@@ -122,8 +116,8 @@ impl Config for HostedModelConfig {
         // Insert authentication header if available.
         if let Some(auth) = &self.auth {
             match auth {
-                GenericAuthMechanism::ApiKey(key) => {
-                    match HeaderValue::from_str(key.expose_secret()) {
+                GenericAuthMechanism::ApiKey(prov) => {
+                    match HeaderValue::from_str(prov.get_token().as_str()) {
                         Ok(value) => {
                             headers.insert("x-api-key", value);
                         }
@@ -134,8 +128,8 @@ impl Config for HostedModelConfig {
                         }
                     }
                 }
-                GenericAuthMechanism::BearerToken(token) => {
-                    match HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())) {
+                GenericAuthMechanism::BearerToken(prov) => {
+                    match HeaderValue::from_str(&format!("Bearer {}", prov.get_token())) {
                         Ok(value) => {
                             headers.insert(AUTHORIZATION, value);
                         }
@@ -153,7 +147,7 @@ impl Config for HostedModelConfig {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        format!("{}{path}", self.base_url.as_str())
     }
 
     fn query(&self) -> Vec<(&str, &str)> {
@@ -161,15 +155,15 @@ impl Config for HostedModelConfig {
     }
 
     fn api_base(&self) -> &str {
-        &self.base_url
+        self.base_url.as_str()
     }
 
-    fn api_key(&self) -> &SecretString {
-        // This is a bit of a hack, will result in valid, understandable auth errors.
+    fn api_key(&self) -> Arc<SecretString> {
         match &self.auth {
-            Some(GenericAuthMechanism::ApiKey(key)) => key,
-            Some(GenericAuthMechanism::BearerToken(token)) => token,
-            None => &DUMMY_API_KEY,
+            Some(GenericAuthMechanism::BearerToken(prov) | GenericAuthMechanism::ApiKey(prov)) => {
+                Arc::new(SecretString::from(prov.get_token()))
+            }
+            _ => Arc::new(SecretString::from(String::new())),
         }
     }
 }

@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::Read;
-use crate::token_provider::TokenProvider;
 use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use arrow::datatypes::SchemaRef;
@@ -25,6 +24,7 @@ use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use token_provider::TokenProvider;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
@@ -67,9 +67,7 @@ impl DatabricksDelta {
         let mut storage_options = HashMap::new();
         for (key, value) in &self.storage_options {
             match key.as_ref() {
-                "token" | "endpoint" => {
-                    continue;
-                }
+                "token" | "endpoint" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.clone());
                 }

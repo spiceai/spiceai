@@ -100,6 +100,17 @@ pub fn new_openai_client(
     }
 }
 
+#[must_use]
+pub fn new_openai_client_with_config<C: async_openai::config::Config>(
+    model: String,
+    cfg: C,
+) -> Openai<C> {
+    Openai {
+        client: Client::with_config(cfg),
+        model,
+    }
+}
+
 impl<C: Config> Openai<C> {
     /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
     /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).

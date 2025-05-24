@@ -11,9 +11,8 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-core", optional = true }
+rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "63ffdaea73ccce4c12f5eb88d1d4e146fa8a8387", optional = true }
 serde_json.workspace = true
 
 [features]
-mcp = ["dep:mcp-client", "dep:mcp-core"]
+mcp = ["dep:rmcp"]

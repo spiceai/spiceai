@@ -36,9 +36,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 
 use super::metrics;
@@ -427,6 +427,7 @@ pub struct Refresher {
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl Refresher {
@@ -452,6 +453,7 @@ impl Refresher {
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
             disable_federation: false,
+            semaphore: None,
         }
     }
 
@@ -485,6 +487,11 @@ impl Refresher {
     /// Disable refresh queries federation for this refresher
     pub fn disable_federation(&mut self, disable: bool) -> &mut Self {
         self.disable_federation = disable;
+        self
+    }
+
+    pub fn semaphore(&mut self, semaphore: Arc<Semaphore>) -> &mut Self {
+        self.semaphore = Some(semaphore);
         self
     }
 
@@ -561,15 +568,21 @@ impl Refresher {
             }
         };
 
-        let mut refresh_task_runner = RefreshTaskRunner::new(
+        let mut refresh_task_runner = RefreshTaskRunner::builder(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
-            self.disable_federation,
-        );
+        )
+        .with_disable_federation(self.disable_federation);
+
+        if let Some(semaphore) = &self.semaphore {
+            refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
+        }
+
+        let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
         self.refresh_task_runner = Some(refresh_task_runner);
@@ -641,7 +654,6 @@ impl Refresher {
                             if let Some(cache_provider) = &cache_provider {
                                 if let Err(e) = cache_provider
                                     .invalidate_for_table(dataset_name.clone())
-                                    .await
                                 {
                                     tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
@@ -704,14 +716,15 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(
-            RefreshTask::new(
+            RefreshTask::builder(
                 Arc::clone(&self.runtime_status),
                 self.dataset_name.clone(),
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
             )
-            .with_disable_federation(self.disable_federation),
+            .with_disable_federation(self.disable_federation)
+            .build(),
         );
 
         let refresh_defaults = Arc::clone(&self.refresh);
@@ -740,14 +753,15 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(
-            RefreshTask::new(
+            RefreshTask::builder(
                 Arc::clone(&self.runtime_status),
                 self.dataset_name.clone(),
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
             )
-            .with_disable_federation(self.disable_federation),
+            .with_disable_federation(self.disable_federation)
+            .build(),
         );
 
         let cache_provider = self.cache_provider.clone();
@@ -886,7 +900,7 @@ mod tests {
             MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                 .expect("mem table should be created"),
         );
-        let federated = Arc::new(FederatedTable::new(mem_table));
+        let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
         let arr = StringArray::from(existing_data);
 
@@ -1092,7 +1106,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                     .expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = StringArray::from(existing_data);
 
@@ -1239,7 +1253,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
                     .expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = UInt64Array::from(existing_data);
 
@@ -1436,7 +1450,7 @@ mod tests {
             let mem_table = Arc::new(
                 MemTable::try_new(Arc::clone(&schema), data).expect("mem table should be created"),
             );
-            let federated = Arc::new(FederatedTable::new(mem_table));
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
 
             let arr = UInt64Array::from(existing_data);
             let batch =

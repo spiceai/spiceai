@@ -32,14 +32,14 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Trait for objects that can open a path for reading.
-pub trait ReadablePath<T> {
+pub trait ReadablePath {
     /// Opens the given path and returns an object that implements `Read`.
     fn open(&self, path: impl Into<PathBuf>) -> Result<Box<dyn io::Read>>;
 }
 
 pub struct StdFileSystem;
 
-impl<T> ReadablePath<T> for StdFileSystem {
+impl ReadablePath for StdFileSystem {
     fn open(&self, path: impl Into<PathBuf>) -> Result<Box<dyn io::Read>> {
         let path = path.into();
         let file =
@@ -48,7 +48,7 @@ impl<T> ReadablePath<T> for StdFileSystem {
     }
 }
 
-pub trait ReadableYaml<T>: ReadablePath<T> {
+pub trait ReadableYaml: ReadablePath {
     fn open_yaml(
         &self,
         base_path: impl Into<PathBuf>,
@@ -72,4 +72,4 @@ pub trait ReadableYaml<T>: ReadablePath<T> {
     }
 }
 
-impl<T: ReadablePath<T>> ReadableYaml<T> for T {}
+impl ReadableYaml for StdFileSystem {}

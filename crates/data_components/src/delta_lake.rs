@@ -19,12 +19,13 @@ use async_trait::async_trait;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
 };
 use datafusion::datasource::physical_plan::{
-    FileScanConfig, ParquetExec, ParquetFileReaderFactory,
+    FileScanConfig, ParquetFileReaderFactory, ParquetSource,
 };
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
@@ -42,11 +43,11 @@ use delta_kernel::Table;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::expressions::{
-    BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator,
+    BinaryOperator, DecimalData, Expression, JunctionOperator, Scalar, UnaryOperator,
 };
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
-use delta_kernel::schema::PrimitiveType;
+use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
@@ -123,9 +124,7 @@ impl DeltaTable {
         let mut storage_options: HashMap<String, String> = HashMap::new();
         for (key, value) in options {
             match key.as_ref() {
-                "token" | "endpoint" => {
-                    continue;
-                }
+                "token" | "endpoint" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
@@ -210,18 +209,20 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let file_scan_config =
-            FileScanConfig::new(ObjectStoreUrl::local_filesystem(), Arc::clone(schema))
-                .with_limit(limit)
-                .with_projection(new_projections)
-                .with_table_partition_cols(partition_cols.to_vec())
-                .with_file_group(partitioned_files.to_vec());
-        let exec = ParquetExec::builder(file_scan_config)
+        let parquet_source = ParquetSource::new(TableParquetOptions::default())
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
-            .with_predicate(Arc::clone(physical_expr))
-            .build();
+            .with_predicate(Arc::clone(schema), Arc::clone(physical_expr));
+        let file_scan_config = FileScanConfig::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::clone(schema),
+            Arc::new(parquet_source),
+        )
+        .with_limit(limit)
+        .with_projection(new_projections)
+        .with_table_partition_cols(partition_cols.to_vec())
+        .with_file_group(partitioned_files.to_vec());
 
-        Arc::new(exec)
+        file_scan_config.build()
     }
 }
 
@@ -255,8 +256,8 @@ fn map_delta_data_type_to_arrow_data_type(
             delta_kernel::schema::PrimitiveType::TimestampNtz => {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             }
-            delta_kernel::schema::PrimitiveType::Decimal(p, s) => {
-                DataType::Decimal128(*p, *s as i8)
+            delta_kernel::schema::PrimitiveType::Decimal(d) => {
+                DataType::Decimal128(d.precision(), d.scale() as i8)
             }
         },
         delta_kernel::schema::DataType::Array(array_type) => DataType::List(Arc::new(Field::new(
@@ -741,11 +742,15 @@ async fn get_parquet_access_plan(
 #[derive(Debug, PartialEq)]
 enum DeltaBinaryOperator {
     BinaryOperator(BinaryOperator),
-    VariadicOperator(VariadicOperator),
+    JunctionOperator(JunctionOperator),
 }
 
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
 #[allow(clippy::too_many_lines)]
+#[allow(
+    deprecated,
+    reason = "Needed to exhaustively match on all expression types"
+)]
 fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     match expr {
         Expr::BinaryExpr(binary) => {
@@ -757,8 +762,8 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
                 DeltaBinaryOperator::BinaryOperator(op) => {
                     Some(Expression::binary(op, left, right))
                 }
-                DeltaBinaryOperator::VariadicOperator(op) => {
-                    Some(Expression::variadic(op, vec![left, right]))
+                DeltaBinaryOperator::JunctionOperator(op) => {
+                    Some(Expression::junction(op, vec![left, right]))
                 }
             }
         }
@@ -836,8 +841,8 @@ fn to_delta_kernel_binary_op(op: Operator) -> Option<DeltaBinaryOperator> {
         Operator::NotEq => Some(DeltaBinaryOperator::BinaryOperator(
             BinaryOperator::NotEqual,
         )),
-        Operator::And => Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::And)),
-        Operator::Or => Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::Or)),
+        Operator::And => Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::And)),
+        Operator::Or => Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::Or)),
         Operator::IsDistinctFrom
         | Operator::IsNotDistinctFrom
         | Operator::RegexMatch
@@ -905,10 +910,14 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         ScalarValue::Float64(None) => Some(Scalar::Null(
             delta_kernel::schema::DataType::Primitive(PrimitiveType::Double),
         )),
-        ScalarValue::Decimal128(Some(v), p, s) => Some(Scalar::Decimal(v, p, s as u8)),
-        ScalarValue::Decimal128(None, p, s) => Some(Scalar::Null(
-            delta_kernel::schema::DataType::Primitive(PrimitiveType::Decimal(p, s as u8)),
+        ScalarValue::Decimal128(Some(v), p, s) => Some(Scalar::Decimal(
+            DecimalData::try_new(v, DecimalType::try_new(p, s as u8).ok()?).ok()?,
         )),
+        ScalarValue::Decimal128(None, p, s) => {
+            Some(Scalar::Null(delta_kernel::schema::DataType::Primitive(
+                PrimitiveType::Decimal(DecimalType::try_new(p, s as u8).ok()?),
+            )))
+        }
         ScalarValue::Utf8(Some(v))
         | ScalarValue::Utf8View(Some(v))
         | ScalarValue::LargeUtf8(Some(v)) => Some(Scalar::String(v)),
@@ -1005,8 +1014,8 @@ fn filters_to_delta_kernel_expr(filters: &[Expr]) -> Option<ExpressionRef> {
         Some(Arc::new(expr))
     } else {
         // Multiple filters are present, so we need to combine them using an AND operation
-        let variadic_expr = Expression::variadic(VariadicOperator::And, exprs);
-        Some(Arc::new(variadic_expr))
+        let junction_expr = Expression::junction(JunctionOperator::And, exprs);
+        Some(Arc::new(junction_expr))
     }
 }
 
@@ -1238,11 +1247,11 @@ mod tests {
         // Test variadic operators
         assert_eq!(
             to_delta_kernel_binary_op(Operator::And),
-            Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::And))
+            Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::And))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Or),
-            Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::Or))
+            Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::Or))
         );
 
         // Test unsupported operators
@@ -1388,7 +1397,9 @@ mod tests {
         let scalar = ScalarValue::Decimal128(Some(1234), 10, 2);
         let dk_scalar = to_delta_kernel_scalar(scalar)
             .expect("Failed to convert Decimal128 scalar to delta kernel scalar");
-        assert!(matches!(dk_scalar, Scalar::Decimal(v, p, s) if v == 1234 && p == 10 && s == 2));
+        assert!(
+            matches!(dk_scalar, Scalar::Decimal(v) if v == DecimalData::try_new(1234, DecimalType::try_new(10, 2).expect("valid decimal")).expect("valid decimal"))
+        );
 
         // Test binary data
         let binary_data = vec![1, 2, 3, 4];

@@ -14,9 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod auth;
 pub mod delta;
 pub mod spark_connect;
+pub mod sql_warehouse;
+
+use std::sync::LazyLock;
 
 pub use delta::DatabricksDelta;
 pub use spark_connect::DatabricksSparkConnect;
+pub use sql_warehouse::DatabricksSqlWarehouse;
+
+const SPICE_USER_AGENT_PREFIX: &str = "SpiceAI_";
+
+static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
+    let product = std::env::var("SPICE_PRODUCT_NAME").unwrap_or("OSS".to_string());
+    let version = env!("CARGO_PKG_VERSION");
+    format!("{SPICE_USER_AGENT_PREFIX}{product}/{version}")
+});
+
+#[must_use]
+pub fn user_agent() -> &'static str {
+    &USER_AGENT
+}

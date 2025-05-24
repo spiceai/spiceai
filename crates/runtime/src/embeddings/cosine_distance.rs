@@ -229,27 +229,31 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    let mut a1_length: f64 = 0.0;
-    let mut a2_length: f64 = 0.0;
+    Ok(Some(cosine_distance(&float_vals1, &float_vals2)))
+}
 
-    let sum_squares: f64 = float_vals1
+fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
+    let mut x_length: f64 = 0.0;
+    let mut y_length: f64 = 0.0;
+
+    let sum_squares: f64 = x
         .iter()
-        .zip(float_vals2.iter())
+        .zip(y.iter())
         .map(|(v1, v2)| {
             let a = v1.unwrap_or(0.0);
             let b = v2.unwrap_or(0.0);
 
-            a1_length += a * a;
-            a2_length += b * b;
+            x_length += a * a;
+            y_length += b * b;
 
             a * b
         })
         .sum();
 
-    let similarity = sum_squares / (a1_length.sqrt() * a2_length.sqrt());
+    let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
 
     // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
-    Ok(Some((1.0 - similarity) / 2.0))
+    (1.0 - similarity) / 2.0
 }
 
 /// Converts an array of any numeric type to a `Float64Array`.
@@ -273,5 +277,37 @@ fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
             Ok(converted)
         }
         _ => exec_err!("Unsupported array type for conversion to Float64Array"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::Float64Array;
+
+    use super::cosine_distance;
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn test_cosine_distance() {
+        assert_eq!(
+            0.0,
+            cosine_distance(
+                &Float64Array::from(vec![1.0, 2.0, 3.0]),
+                &Float64Array::from(vec![1.0, 2.0, 3.0])
+            )
+        );
+
+        assert_eq!(
+            1.0,
+            cosine_distance(
+                &Float64Array::from(vec![1.0, 2.0, 3.0]),
+                &Float64Array::from(vec![-1.0, -2.0, -3.0])
+            )
+        );
+        let dist = cosine_distance(
+            &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
+            &Float64Array::from(vec![-42.0, 123.0, -3.0]),
+        );
+        assert!((0.0..=1.0).contains(&dist));
     }
 }

@@ -121,6 +121,24 @@ impl View {
         }
         None
     }
+
+    #[must_use]
+    pub async fn is_accelerator_initialized(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            let Some(accelerator) = self
+                .runtime()
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration.engine)
+                .await
+            else {
+                return false; // if the accelerator engine is not found, it's impossible for it to be initialized
+            };
+
+            return accelerator.is_initialized(self);
+        }
+
+        false
+    }
 }
 
 pub struct ViewBuilder {

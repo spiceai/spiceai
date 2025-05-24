@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::arrow::struct_builder::StructBuilder;
-
 use super::change_event::Field as ChangeEventField;
+use crate::arrow::struct_builder::StructBuilder;
 use arrow::{
     array::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder,

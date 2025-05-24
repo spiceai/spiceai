@@ -392,3 +392,88 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+#[tokio::test]
+async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let mut parts_ds = get_s3_dataset(
+                "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/",
+                "parts",
+            );
+
+            // refer to s3 bucket containing `customer` schema objects to infer schema
+            if let Some(params) = parts_ds.params.as_mut() {
+                params.data.insert(
+                    "schema_source_path".to_string(),
+                    ParamValue::String(
+                        "s3://databricks-workspace-stack-473ec-bucket/unity-catalog/8429759719709712/__unitystorage/catalogs/fa937541-ca24-4f62-a93b-088db0fb40af/tables/e0dcf887-3bef-4c85-8863-e786e74756de/part_key=0/part-00091-21d6926a-7a96-4159-afe6-25c9f574110e.c000.snappy.parquet"
+                            .to_string(),
+                    ),
+                );
+                params.data.insert(
+                    "s3_auth".to_string(),
+                    ParamValue::String("key".to_string()),
+                );
+                params.data.insert(
+                    "s3_key".to_string(),
+                    ParamValue::String("${secrets:NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID}".to_string()),
+                );
+                params.data.insert(
+                    "s3_secret".to_string(),
+                    ParamValue::String("${secrets:NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY}".to_string()),
+                );
+                params.data.insert(
+                    "s3_region".to_string(),
+                    ParamValue::String("us-east-1".to_string()),
+                );
+                params.data.insert(
+                    "hive_partitioning_enabled".to_string(),
+                    ParamValue::Bool(true),
+                );
+            }
+
+            let app = AppBuilder::new("s3_schema_source_path_authenticated")
+                .with_dataset(parts_ds)
+                .build();
+
+            let rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let query = "describe parts;";
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let schema = arrow::util::pretty::pretty_format_batches(&batches)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(format!("s3_schema_source_path_authenticated_parts"), schema);
+
+            Ok(())
+        })
+        .await
+}

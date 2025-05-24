@@ -7,7 +7,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.2.1-unstable"
+    "version": "1.4.0-unstable"
   },
   "servers": [
     {
@@ -742,40 +742,6 @@
           },
           "404": {
             "description": "Namespace does not exist"
-          }
-        }
-      }
-    },
-    "/v1/mcp/event": {
-      "post": {
-        "tags": [
-          "mcp"
-        ],
-        "summary": "Send message to MCP server",
-        "description": "Send message to the MCP endoint, for a given session.",
-        "operationId": "mcp_event",
-        "parameters": [
-          {
-            "name": "sessionId",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "Message accepted. Response will stream via SSE."
-          },
-          "404": {
-            "description": "Session not found. No active session for the given `session_id`."
-          },
-          "413": {
-            "description": "Payload too large. Maximum allowed size is 4MB."
-          },
-          "500": {
-            "description": "Internal server error. An unexpected issue occurred."
           }
         }
       }

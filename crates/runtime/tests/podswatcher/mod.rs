@@ -17,14 +17,12 @@ limitations under the License.
 use std::{path::PathBuf, sync::Arc};
 
 use app::AppBuilder;
-use futures::StreamExt;
 
-use crate::utils::wait_until_true;
+use crate::utils::{run_query, wait_until_true};
 use crate::{
     init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
-use arrow::record_batch::RecordBatch;
 
 use runtime::{Runtime, auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
 
@@ -64,17 +62,6 @@ fn write_spicepod_yaml(content: &str) -> Result<(), anyhow::Error> {
     let spicepod_file_path = get_test_dir().join("spicepod.yaml");
     std::fs::write(spicepod_file_path, content)?;
     Ok(())
-}
-
-async fn run_query(rt: &Arc<Runtime>, query: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let mut result = rt.datafusion().query_builder(query).build().run().await?;
-
-    let mut results: Vec<RecordBatch> = vec![];
-    while let Some(batch) = result.data.next().await {
-        results.push(batch?);
-    }
-
-    Ok(results)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -9,8 +9,8 @@ description: "Query: tpcds_q90"
 |               |   Projection: CAST(at.amc AS Decimal128(15, 4)) / CAST(pt.pmc AS Decimal128(15, 4)) AS am_pm_ratio                                                                                   |
 |               |     Cross Join:                                                                                                                                                                      |
 |               |       SubqueryAlias: at                                                                                                                                                              |
-|               |         Projection: count(*) AS amc                                                                                                                                                  |
-|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                              |
+|               |         Projection: count(Int64(1)) AS amc                                                                                                                                           |
+|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                          |
 |               |             Projection:                                                                                                                                                              |
 |               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                         |
 |               |                 Projection: web_sales.ws_web_page_sk                                                                                                                                 |
@@ -32,8 +32,8 @@ description: "Query: tpcds_q90"
 |               |                     Filter: web_page.wp_char_count >= Int32(2500) AND web_page.wp_char_count <= Int32(5200)                                                                          |
 |               |                       TableScan: web_page projection=[wp_web_page_sk, wp_char_count], partial_filters=[web_page.wp_char_count >= Int32(2500), web_page.wp_char_count <= Int32(5200)] |
 |               |       SubqueryAlias: pt                                                                                                                                                              |
-|               |         Projection: count(*) AS pmc                                                                                                                                                  |
-|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                              |
+|               |         Projection: count(Int64(1)) AS pmc                                                                                                                                           |
+|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                          |
 |               |             Projection:                                                                                                                                                              |
 |               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                         |
 |               |                 Projection: web_sales.ws_web_page_sk                                                                                                                                 |
@@ -57,10 +57,10 @@ description: "Query: tpcds_q90"
 | physical_plan | SortExec: TopK(fetch=100), expr=[am_pm_ratio@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                        |
 |               |   ProjectionExec: expr=[CAST(amc@0 AS Decimal128(15, 4)) / CAST(pmc@1 AS Decimal128(15, 4)) as am_pm_ratio]                                                                          |
 |               |     CrossJoinExec                                                                                                                                                                    |
-|               |       ProjectionExec: expr=[count(*)@0 as amc]                                                                                                                                       |
-|               |         AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                                           |
+|               |       ProjectionExec: expr=[count(Int64(1))@0 as amc]                                                                                                                                |
+|               |         AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                                    |
 |               |           CoalescePartitionsExec                                                                                                                                                     |
-|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                                     |
+|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                                              |
 |               |               ProjectionExec: expr=[]                                                                                                                                                |
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
 |               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                         |
@@ -117,10 +117,10 @@ description: "Query: tpcds_q90"
 |               |                                       CoalescePartitionsExec                                                                                                                         |
 |               |                                         RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                        |
 |               |                                           DuckSqlExec sql= SELECT "wp_web_page_sk", "wp_char_count" FROM web_page WHERE (wp_char_count >= 2500) AND (wp_char_count <= 5200)          |
-|               |       ProjectionExec: expr=[count(*)@0 as pmc]                                                                                                                                       |
-|               |         AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                                           |
+|               |       ProjectionExec: expr=[count(Int64(1))@0 as pmc]                                                                                                                                |
+|               |         AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                                    |
 |               |           CoalescePartitionsExec                                                                                                                                                     |
-|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                                     |
+|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                                              |
 |               |               ProjectionExec: expr=[]                                                                                                                                                |
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
 |               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                         |

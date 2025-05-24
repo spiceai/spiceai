@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 use llms::{
+    HealthCheck,
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
     perplexity::PerplexitySonar,
@@ -23,10 +24,13 @@ use llms::{
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::SecretString;
 use serde_json::Value;
+use snafu::ResultExt;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use token_provider::registry::TokenProviderRegistry;
 
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
+use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{
     Runtime,
     tools::{options::SpiceToolsOptions, utils::get_tools},
@@ -51,7 +55,7 @@ pub async fn try_to_chat_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    let model = construct_model(component, params)?;
+    let model = construct_model(component, params, rt.token_provider_registry()).await?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -85,9 +89,10 @@ pub async fn try_to_chat_model(
     Ok(tool_model)
 }
 
-pub fn construct_model(
+pub async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
+    token_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -102,7 +107,7 @@ pub fn construct_model(
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
-        ModelSource::Databricks => databricks(model_id, params),
+        ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -222,18 +227,15 @@ fn huggingface(
     llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
 }
 
-fn databricks(
+async fn databricks(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    // Required parameters
     let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
         return Err(LlmError::MissingParamError {
             param_key: "databricks_endpoint",
-        });
-    };
-    let Some(token) = extract_secret!(params, "databricks_token") else {
-        return Err(LlmError::MissingParamError {
-            param_key: "databricks_token",
         });
     };
     let Some(model_id) = model_id else {
@@ -242,13 +244,89 @@ fn databricks(
         });
     };
 
-    Ok(Arc::new(llms::openai::new_openai_client(
-        model_id,
-        Some(format!("https://{endpoint}/serving-endpoints").as_str()),
-        Some(token),
-        None,
-        None,
-    )) as Arc<dyn Chat>)
+    // Optional parameters.
+    let token_opt = extract_secret!(params, "databricks_token");
+    let client_id = extract_secret!(params, "databricks_client_id");
+    let client_secret = extract_secret!(params, "databricks_client_secret");
+
+    #[cfg(feature = "databricks")]
+    let user_agent = Some(data_components::databricks::user_agent());
+    #[cfg(not(feature = "databricks"))]
+    let user_agent: Option<&'static str> = None;
+
+    match (token_opt, client_id, client_secret) {
+        (Some(_), Some(_) | None, Some(_)) => {
+            Err(LlmError::FailedToLoadModel {
+                source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided, not both.".into(),
+            })
+        }
+        (Some(_), Some(_), None) | (None, None, None) => {
+            Err(LlmError::FailedToLoadModel {
+                source: "Either `databricks_token` or `databricks_client_id` and `databricks_client_secret` should be provided.".into(),
+            })
+        }
+        (None, None, Some(_client_secret)) => {
+            Err(LlmError::FailedToLoadModel {
+                source: "If `databricks_client_secret` is provided, `databricks_client_id` must also be provided.".into(),
+            })
+        }
+        (Some(token), None, None) => Ok(Arc::new(llms::databricks::from_access_token(
+            endpoint,
+            model_id.as_str(),
+            token,
+            user_agent,
+        )) as Arc<dyn Chat>),
+        (None, Some(client_id), Some(client_secret)) => {
+            let token_provider = token_provider_registry
+                .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                    DatabricksM2MTokenProvider::try_new(
+                        endpoint.to_string(),
+                        client_id.to_string(),
+                        client_secret.into(),
+                    )
+                    .await
+                })
+                .await
+            .map_err(|e| LlmError::FailedToLoadModel {
+                source: Box::from(format!(
+                    "Could not retrieve M2M tokens from Databricks. Error: {e}"
+                )),
+            })?;
+            Ok(Arc::new(
+                llms::databricks::from_token_provider(
+                    endpoint,
+                    model_id.as_str(),
+                    token_provider,
+                    user_agent,
+                    HealthCheck::Required,
+                )
+            ) as Arc<dyn Chat>)
+        }
+        (None, Some(client_id), None) => {
+            let token_provider = token_provider_registry
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                    Ok(DatabricksU2MTokenProvider::new(
+                        endpoint.to_string(),
+                        client_id.to_string(),
+                    ))
+                })
+                .await.boxed().map_err(|e| LlmError::FailedToLoadModel {
+                source: Box::from(format!(
+                    "Could not retrieve U2M tokens from Databricks. Error: {e}"
+                )),
+            })?;
+
+            Ok(Arc::new(
+                llms::databricks::from_token_provider(
+                    endpoint,
+                    model_id.as_str(),
+                    token_provider,
+                    user_agent,
+                    HealthCheck::Skip,
+                ),
+            ) as Arc<dyn Chat>)
+        }
+    }
 }
 
 fn openai(

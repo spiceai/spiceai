@@ -31,16 +31,9 @@ import (
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
-)
-
-const (
-	cloudKeyFlag        = "cloud"
-	modelKeyFlag        = "model"
-	httpEndpointKeyFlag = "http-endpoint"
-	userAgentKeyFlag    = "user-agent"
-	temperatureFlag     = "temperature"
 )
 
 type Message struct {
@@ -147,9 +140,7 @@ spice chat --model <model> "What is Spice.ai?"
 `,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := context.NewContext().WithCloud(cloud)
-		err := rtcontext.Init(cmd.Flags())
+		rtcontext, err := context.FromFlags(cmd.Flags())
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
@@ -165,18 +156,11 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
-		userAgent, _ := cmd.Flags().GetString(userAgentKeyFlag)
-		if userAgent != "" {
-			rtcontext.SetUserAgent(userAgent)
-		} else {
-			rtcontext.SetUserAgentClient("chat")
-		}
-
-		if !cloud {
+		if !rtcontext.IsCloud() {
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
-		model, err := cmd.Flags().GetString(modelKeyFlag)
+		model, err := cmd.Flags().GetString("model")
 		if err != nil {
 			slog.Error("could not get model flag", "error", err)
 			os.Exit(1)
@@ -440,25 +424,7 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request body: %w", err)
 	}
-
-	url := fmt.Sprintf("%s/v1/chat/completions", rtcontext.HttpEndpoint())
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-
-	headers := rtcontext.GetHeaders()
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := rtcontext.Client().Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-
-	return response, nil
+	return rtcontext.Do("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
@@ -480,11 +446,8 @@ func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error)
 }
 
 func init() {
-	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
-	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
-	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
-	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
-	chatCmd.Flags().Float32(temperatureFlag, 1, "Model temperature for chat request")
+	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
+	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
 
 	RootCmd.AddCommand(chatCmd)
 }

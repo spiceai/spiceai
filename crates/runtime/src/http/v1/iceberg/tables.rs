@@ -21,17 +21,23 @@ use super::{
     error::{IcebergResponseError, InternalServerErrorCode},
     namespace::{Namespace, NamespacePath},
 };
-use crate::DataFusion;
 use crate::datafusion::is_spice_internal_schema;
+use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
+    request::{AsyncMarker, RequestContext},
+};
 use arrow::datatypes::Schema as ArrowSchema;
 use axum::{
-    Extension, Json,
+    Json,
     extract::Path,
     http::status,
     response::{IntoResponse, Response},
 };
 use datafusion::sql::TableReference;
-use iceberg::{arrow::arrow_schema_to_schema, spec::Schema};
+use iceberg::{
+    arrow::arrow_schema_to_schema,
+    spec::{PartitionSpec, Schema, SortOrder},
+};
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
@@ -50,16 +56,16 @@ const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
         (status = 404, description = "Table does not exist")
     )
 ))]
-pub(crate) async fn head(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path((namespace, table)): Path<(NamespacePath, String)>,
-) -> Response {
+pub(crate) async fn head(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
     let Some(table_reference) = table_reference(&namespace, &table) else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    match datafusion.get_table(&table_reference).await {
+    match df.get_table(&table_reference).await {
         Some(_) => status::StatusCode::OK.into_response(),
         None => status::StatusCode::NOT_FOUND.into_response(),
     }
@@ -89,6 +95,7 @@ impl Serialize for TableFormatVersion {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TableMetadata {
     format_version: TableFormatVersion,
@@ -97,8 +104,21 @@ struct TableMetadata {
     location: String,
 
     /// Iceberg schemas, see `<https://apache.github.io/iceberg/spec/#schemas>`.
-    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object, example="2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"))]
+    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
     schemas: Vec<Schema>,
+
+    // The following fields are part of the Iceberg Table Metadata V2 spec - but we don't do anything with them yet
+    last_updated_ms: i64,
+    last_column_id: u32,
+    last_sequence_number: u64,
+    current_schema_id: u32,
+    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
+    partition_specs: Vec<PartitionSpec>,
+    default_spec_id: u32,
+    last_partition_id: u32,
+    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
+    sort_orders: Vec<SortOrder>,
+    default_sort_order_id: u32,
 }
 
 /// Get a table.
@@ -128,16 +148,17 @@ struct TableMetadata {
         )))
     )
 ))]
-pub(crate) async fn get(
-    Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path((namespace, table)): Path<(NamespacePath, String)>,
-) -> Response {
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let namespace = Namespace::from(namespace);
     let Some(table_reference) = table_reference(&namespace, &table) else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    let Some(table) = datafusion.get_table(&table_reference).await else {
+    let Some(table) = df.get_table(&table_reference).await else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
@@ -154,11 +175,31 @@ pub(crate) async fn get(
         }
     };
 
+    let last_updated_ms = chrono::Utc::now().timestamp_millis();
+
+    let partition_specs = if let Ok(partition_spec) = PartitionSpec::builder(iceberg_schema.clone())
+        .with_spec_id(0)
+        .build()
+    {
+        vec![partition_spec]
+    } else {
+        vec![]
+    };
+
     let metadata = TableMetadata {
         format_version: TableFormatVersion::V2,
         table_uuid: Uuid::new_v4(),
         location: format!("spice.ai/{table_reference}"),
         schemas: vec![iceberg_schema],
+        last_column_id: arrow_schema.fields.len() as u32,
+        last_updated_ms,
+        last_sequence_number: 0,
+        current_schema_id: 0,
+        partition_specs,
+        default_spec_id: 0,
+        last_partition_id: 1000,
+        sort_orders: vec![SortOrder::unsorted_order()],
+        default_sort_order_id: 0,
     };
 
     let response = LoadTableResponse { metadata };

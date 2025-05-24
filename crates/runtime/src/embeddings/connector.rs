@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
@@ -172,5 +173,9 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
+    }
+
+    fn initialization(&self) -> ComponentInitialization {
+        self.inner_connector.initialization()
     }
 }

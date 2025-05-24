@@ -16,9 +16,12 @@ limitations under the License.
 
 use crate::{
     App, Runtime,
-    component::dataset::{
-        Dataset,
-        acceleration::{Engine, Mode},
+    component::{
+        dataset::{
+            Dataset,
+            acceleration::{Engine, Mode},
+        },
+        view::View,
     },
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
@@ -36,8 +39,9 @@ use datafusion_table_providers::{
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
+use itertools::Itertools;
 use snafu::prelude::*;
-use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
+use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
 use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
@@ -290,10 +294,9 @@ impl DataAccelerator for DuckDBAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
+        mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cmd = cmd.clone();
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
@@ -316,30 +319,42 @@ impl DataAccelerator for DuckDBAccelerator {
                 let datasets: Vec<Arc<Dataset>> = Arc::clone(&source.runtime())
                     .get_initialized_datasets(&source.app(), crate::LogErrors(false))
                     .await;
+
+                let views: Vec<Arc<View>> = Arc::clone(&source.runtime())
+                    .get_initialized_views(&source.app(), crate::LogErrors(false))
+                    .await;
+
                 let self_path = self.file_path(source)?;
                 let attach_databases = datasets
-                    .iter()
-                    .filter_map(|other_dataset| {
-                        if other_dataset
-                            .acceleration
-                            .as_ref()
+                    .into_iter()
+                    .map(|ds| ds as Arc<dyn AccelerationSource>)
+                    .chain(
+                        views
+                            .into_iter()
+                            .map(|view| view as Arc<dyn AccelerationSource>),
+                    )
+                    .filter_map(|other_source| {
+                        if other_source
+                            .acceleration()
                             .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
                         {
-                            if other_dataset.name() == source.name() {
+                            if other_source.name() == source.name() {
                                 None
                             } else {
-                                let other_path = self.file_path(other_dataset.as_ref());
+                                let other_path = self.file_path(other_source.as_ref());
                                 other_path.ok().filter(|p| p != &self_path)
                             }
                         } else {
                             None
                         }
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<HashSet<_>>(); // collect unique paths using HashSet
 
                 if !attach_databases.is_empty() {
-                    cmd.options
-                        .insert("attach_databases".to_string(), attach_databases.join(";"));
+                    cmd.options.insert(
+                        "attach_databases".to_string(),
+                        attach_databases.iter().join(";"),
+                    );
                 }
             }
         }
@@ -438,7 +453,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(&external_table, None)
+            .create_external_table(external_table, None)
             .await
             .expect("table should be created");
 

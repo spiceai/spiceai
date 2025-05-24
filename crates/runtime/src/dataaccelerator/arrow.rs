@@ -61,11 +61,11 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
+        cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.arrow_factory, &ctx.state(), cmd)
+        TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await
             .boxed()
     }

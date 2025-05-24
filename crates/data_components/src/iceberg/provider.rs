@@ -205,11 +205,11 @@ impl IcebergSchemaProvider {
             .iter()
             .map(|name| {
                 let client_clone = Arc::clone(&client);
-                let name_clone = name.clone();
+                let name_clone = Arc::new(name.clone());
                 let semaphore_clone = Arc::clone(&load_semaphore);
                 async move {
                     // Map the inner Result to include the table name
-                    Self::load_table(client_clone, &name_clone, semaphore_clone)
+                    Self::load_table(client_clone, Arc::clone(&name_clone), semaphore_clone)
                         .await
                         .map(|opt_provider| (name_clone, opt_provider))
                 }
@@ -232,7 +232,7 @@ impl IcebergSchemaProvider {
 
     async fn load_table(
         client: Arc<RestCatalog>,
-        table_name: &TableIdent,
+        table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Acquire a permit from the semaphore to limit concurrent table loads
@@ -241,11 +241,14 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        match client.load_table(table_name).await {
-            Ok(table) => match IcebergTableProvider::try_new_from_table(table).await {
-                Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
-                Err(e) => Err(handle_iceberg_error(e)),
-            },
+        match client.load_table(&table_name).await {
+            Ok(_table) => {
+                match IcebergTableProvider::try_new(client, Arc::unwrap_or_clone(table_name)).await
+                {
+                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
+                    Err(e) => Err(handle_iceberg_error(e)),
+                }
+            }
             Err(e) => {
                 // If the table doesn't exist, return None instead of an error
                 let err_msg = e.to_string();

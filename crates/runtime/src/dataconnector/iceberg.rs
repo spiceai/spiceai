@@ -21,7 +21,7 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use iceberg::{Catalog, TableIdent};
+use iceberg::TableIdent;
 use iceberg_catalog_rest::RestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
@@ -148,17 +148,8 @@ impl DataConnector for IcebergDataConnector {
         let namespace_ident = namespace.name().clone();
         let table_identifier = TableIdent::new(namespace_ident, table_name);
 
-        let iceberg_table = catalog_client
-            .load_table(&table_identifier)
-            .await
-            .map_err(|e| Error::UnableToGetReadProvider {
-                dataconnector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
-
         // Create a DataFusion TableProvider from the Iceberg table
-        let table_provider = IcebergTableProvider::try_new_from_table(iceberg_table)
+        let table_provider = IcebergTableProvider::try_new(catalog_client, table_identifier)
             .await
             .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),

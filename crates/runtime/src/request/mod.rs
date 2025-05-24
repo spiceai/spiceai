@@ -17,10 +17,12 @@ limitations under the License.
 mod baggage;
 mod cache_control;
 mod context;
+mod databricks;
 mod protocol;
 mod user_agent;
 
 pub use cache_control::*;
 pub use context::*;
+pub use databricks::*;
 pub use protocol::*;
 pub use user_agent::*;

@@ -229,7 +229,7 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
             .enumerate()
             .map(|(i, durations)| {
                 QueryMetric::new_from_durations(
-                    format!("{i}").as_str(),
+                    format!("{i}").into(),
                     durations,
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,
@@ -326,11 +326,9 @@ impl ConsistencyWorker {
                     Ok(Err(e)) => {
                         eprintln!("Worker {} - Request failed: {}", self.id, e);
                         error_count += 1;
-                        continue;
                     }
                     Err(_) => {
                         eprintln!("Worker {} - Request timed out.", self.id);
-                        continue;
                     }
                 }
             }

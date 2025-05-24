@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -65,7 +66,15 @@ func NewContext() *RuntimeContext {
 	return rtcontext
 }
 
-func NewHttpsContext(rootCertPath string) *RuntimeContext {
+func FromFlags(flags *pflag.FlagSet) (*RuntimeContext, error) {
+	ctx := NewContext()
+	if err := ctx.Init(flags); err != nil {
+		return nil, err
+	}
+	return ctx, nil
+}
+
+func TlsHttpClient(rootCertPath string) http.Client {
 	rootCert, err := os.ReadFile(rootCertPath)
 	if err != nil {
 		panic(err)
@@ -84,14 +93,9 @@ func NewHttpsContext(rootCertPath string) *RuntimeContext {
 		TLSClientConfig: tlsConfig,
 	}
 
-	client := &http.Client{
+	return http.Client{
 		Transport: transport,
 	}
-
-	rtcontext := &RuntimeContext{
-		httpClient: client,
-	}
-	return rtcontext
 }
 
 func (c *RuntimeContext) Client() *http.Client {
@@ -111,15 +115,47 @@ func (c *RuntimeContext) PodsDir() string {
 }
 
 func (c *RuntimeContext) HttpEndpoint() string {
+	if c.IsCloud() {
+		return "https://data.spiceai.io"
+	}
+
+	if endpoint, err := c.flags.GetString(constants.HttpEndpointKeyFlag); err == nil && endpoint != "" {
+		return endpoint
+	}
+
+	return "http://127.0.0.1:8090"
+}
+
+func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
+	request, err := http.NewRequest(method, fmt.Sprintf("%s%s", c.HttpEndpoint(), path), body)
+	if err != nil {
+		return nil, fmt.Errorf("error sending HTTP request: %w", err)
+	}
+
+	headers := c.GetHeaders()
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+
+	for i := 0; i < len(additionalHeaders); i += 2 {
+		request.Header.Set(additionalHeaders[i], additionalHeaders[i+1])
+	}
+
+	return c.httpClient.Do(request)
+}
+
+func (c *RuntimeContext) HttpSocketAddress() string {
 	if endpoint, err := c.flags.GetString("http-endpoint"); err == nil && endpoint != "" {
 		return endpoint
 	}
 
 	if c.IsCloud() {
-		return "https://data.spiceai.io"
+		slog.Warn("Attempting to get socket address for HTTP endpoint when `--cloud` enabled")
 	}
 
-	return "http://127.0.0.1:8090"
+	// Note socket address, not HTTP address
+	return "127.0.0.1:8090"
+
 }
 
 func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
@@ -146,11 +182,22 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	}
 
 	if apiKey, ok := dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
-		if err := flags.Set("api-key", apiKey); err != nil {
+		if err := flags.Set(constants.ApiKeyFlag, apiKey); err != nil {
 			return fmt.Errorf("failed to set api-key flag from SPICE_SPICEAI_API_KEY environment variable: %w", err)
 		}
 	}
 
+	client := http.Client{}
+	rootCertPath, err := flags.GetString(constants.TlsRootCertificateFile)
+	if err != nil {
+		return err
+	}
+	cloud, _ := flags.GetBool(constants.CloudKeyFlag)
+	c.isCloud = cloud
+	if rootCertPath != "" {
+		client = TlsHttpClient(rootCertPath)
+	}
+	c.httpClient = &client
 	return nil
 }
 
@@ -360,7 +407,7 @@ func (c *RuntimeContext) WithCloud(isCloud bool) *RuntimeContext {
 }
 
 func (c *RuntimeContext) GetApiKey() (string, error) {
-	return c.flags.GetString("api-key")
+	return c.flags.GetString(constants.ApiKeyFlag)
 }
 
 func (c *RuntimeContext) SetUserAgent(userAgent string) {
@@ -430,17 +477,17 @@ func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error)
 }
 
 func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
-	if rootCertPath, err := c.flags.GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
+	if rootCertPath, err := c.flags.GetString(constants.TlsRootCertificateFile); err == nil && rootCertPath != "" {
 		args = append(args, "--tls-root-certificate-file", rootCertPath)
 	}
 
-	if apiKey, err := c.flags.GetString("api-key"); err == nil && apiKey != "" {
+	if apiKey, err := c.flags.GetString(constants.ApiKeyFlag); err == nil && apiKey != "" {
 		args = append(args, "--api-key", apiKey)
 	}
 
 	if c.userAgent != "" {
 		args = append(args, "--user-agent", c.userAgent)
-	} else if userAgent, err := c.flags.GetString("user-agent"); err == nil && userAgent != "" {
+	} else if userAgent, err := c.flags.GetString(constants.UserAgentKeyFlag); err == nil && userAgent != "" {
 		args = append(args, "--user-agent", userAgent)
 	}
 
@@ -456,7 +503,7 @@ func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
 		}
 	}
 
-	args = append(args, "--http-endpoint", c.HttpEndpoint())
+	args = append(args, "--http", c.HttpSocketAddress())
 
 	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
 		args = append(args, "--metrics", endpoint)

@@ -18,12 +18,12 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
-use registry::token_provider::TokenProviderRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
@@ -93,14 +93,15 @@ pub mod objectstore;
 mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
-mod registry;
 pub mod request;
+pub mod search;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
+mod token_providers;
 pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
@@ -522,7 +523,7 @@ impl Runtime {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
-                    Arc::clone(&self_ref.df),
+                    Arc::clone(&self_ref),
                     cloned_tls_config,
                     cloned_endpoint_auth,
                     Arc::clone(&self_ref.rate_limits),

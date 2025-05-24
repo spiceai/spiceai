@@ -95,6 +95,14 @@ pub enum Error {
         "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
+    MissingParamError { param_key: &'static str },
+
+    #[snafu(display(
+        "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
+    ))]
+    ModelNotProvided { model_source: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

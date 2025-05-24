@@ -19,9 +19,10 @@ use std::sync::Arc;
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
+use std::fmt::Write;
 use url::Url;
 
-use crate::token_provider::{self, TokenProvider};
+use token_provider::TokenProvider;
 
 pub mod provider;
 
@@ -79,6 +80,7 @@ pub struct UnityCatalog {
     endpoint: String,
     token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,10 +98,18 @@ impl UnityCatalog {
             endpoint_str = format!("https://{endpoint_str}");
         }
 
+        let mut user_agent: Option<String> = None;
+        #[cfg(feature = "databricks")]
+        // Include user_agent, if connects to Databricks instance
+        if endpoint.0.contains("databricks") {
+            user_agent = Some(crate::databricks::user_agent().to_string());
+        }
+
         Self {
             endpoint: endpoint_str,
             token_provider,
             client: reqwest::Client::new(),
+            user_agent,
         }
     }
 
@@ -129,7 +139,7 @@ impl UnityCatalog {
         );
 
         if let Some(port) = parsed_url.port() {
-            endpoint.push_str(&format!(":{port}"));
+            let _ = write!(endpoint, ":{port}");
         }
 
         tracing::debug!("parse_catalog_url: endpoint: {}", endpoint);
@@ -165,12 +175,7 @@ impl UnityCatalog {
     pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
         let table_name = table_reference.to_string();
         let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
-        let response = self
-            .get_req(&path)
-            .await?
-            .send()
-            .await
-            .context(ConnectionSnafu)?;
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
         if response.status().is_success() {
             let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
@@ -187,12 +192,7 @@ impl UnityCatalog {
 
     pub async fn get_catalog(&self, catalog_id: &str) -> Result<Option<UCCatalog>> {
         let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
-        let response = self
-            .get_req(&path)
-            .await?
-            .send()
-            .await
-            .context(ConnectionSnafu)?;
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
         tracing::debug!("get_catalog: Response status: {}", response.status());
 
@@ -211,12 +211,7 @@ impl UnityCatalog {
 
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
-        let response = self
-            .get_req(&path)
-            .await?
-            .send()
-            .await
-            .context(ConnectionSnafu)?;
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
         tracing::debug!("list_schemas: Response status: {}", response.status());
 
@@ -241,12 +236,7 @@ impl UnityCatalog {
         let path = format!(
             "/api/2.1/unity-catalog/tables?catalog_name={catalog_id}&schema_name={schema_name}"
         );
-        let response = self
-            .get_req(&path)
-            .await?
-            .send()
-            .await
-            .context(ConnectionSnafu)?;
+        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
 
         tracing::debug!("list_tables: Response status: {}", response.status());
 
@@ -263,20 +253,20 @@ impl UnityCatalog {
         }
     }
 
-    async fn get_req(&self, path: &str) -> Result<reqwest::RequestBuilder> {
+    fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
         let full_url = format!("{}{path}", self.endpoint);
         tracing::debug!("Sending request to {full_url}");
         let mut builder = self.client.get(full_url);
 
         if let Some(token_provider) = &self.token_provider {
-            let token = token_provider
-                .get_token()
-                .await
-                .context(UnableToGetTokenSnafu)?;
             tracing::debug!("Adding bearer token to request");
-            builder = builder.bearer_auth(token);
+            builder = builder.bearer_auth(token_provider.get_token());
         }
-        Ok(builder)
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header("User-Agent", user_agent);
+        }
+
+        builder
     }
 }
 

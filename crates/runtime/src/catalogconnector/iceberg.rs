@@ -29,6 +29,7 @@ use iceberg_catalog_rest::RestCatalogConfig;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use std::fmt::Write;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -367,7 +368,7 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
     // Add any path segments before v1 to the base URI
     if v1_idx > 0 {
         let prefix_path = segments[..v1_idx].join("/");
-        base_uri.push_str(&format!("/{prefix_path}"));
+        let _ = write!(base_uri, "/{prefix_path}");
     }
 
     // Find the "namespaces" segment

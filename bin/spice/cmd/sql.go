@@ -21,6 +21,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -46,13 +47,19 @@ sql> show tables
 `,
 	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		if err := rtcontext.Init(cmd.Flags()); err != nil {
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			return
 		}
 
-		_, err := rtcontext.Version()
+		if rtcontext.IsCloud() {
+			// https://github.com/spiceai/spiceai/issues/5870
+			slog.Error("`spice sql` does not support `--cloud`.")
+			return
+		}
+
+		_, err = rtcontext.Version()
 		if err != nil {
 			slog.Error("Failed to run `spice sql`: The Spice runtime is not installed. Run `spice install` and retry.")
 			return
@@ -81,11 +88,9 @@ sql> show tables
 }
 
 func init() {
-	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
-	sqlCmd.Flags().String("user-agent", "", "The user agent to use for all requests")
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
 	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://localhost:50051")
-	sqlCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP endpoint. Defaults to http://localhost:8090")
-
+	// Must override `--http-endpoint` to provide socket address (i.e. 0.0.0.0:8090), not http endpoint (http://localhost:8090). `spice sql` uses flight endpoint.
+	sqlCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "0.0.0.0:8090", "HTTP endpoint of Spice")
 	RootCmd.AddCommand(sqlCmd)
 }

@@ -53,20 +53,21 @@ async fn databricks_spark_connect_m2m_integration_test_catalog() -> Result<(), a
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                // We may need to wait for the cluster to startup and become ready, so wait for up to 10 minutes
+                () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
                     panic!("Timeout waiting for components to load");
                 }
-() = cloned_rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.tpch.lineitem LIMIT 10",
+                "select * from db_uc.tpch.nation order by n_nationkey limit 10",
                 "select_tpch",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 4, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                     }
 
@@ -83,7 +84,7 @@ async fn databricks_spark_connect_m2m_integration_test_catalog() -> Result<(), a
                 })),
             ),
             (
-                "SELECT * FROM db_uc.tpcds.catalog_sales LIMIT 10",
+                "SELECT * FROM db_uc.tpcds.catalog_sales ORDER BY cs_ext_sales_price, cs_order_number ASC LIMIT 10;",
                 "select_tpcds",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {

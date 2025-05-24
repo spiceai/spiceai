@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, hash::Hasher, sync::Arc};
 
-use cache::{CacheKey, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream};
+use cache::{
+    CacheKey, CachedStream, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream,
+};
 use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
-    physical_plan::memory::MemoryStream,
     sql::TableReference,
 };
 use snafu::ResultExt;
@@ -38,17 +39,17 @@ use super::{
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
-    Plan(LogicalPlan, QueryTracker, RequestCacheManager),
+    Plan(LogicalPlan, Option<QueryTracker>, RequestCacheManager),
     Cached(QueryResult),
 }
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: QueryResultsCacheStatus,
-    pub(super) raw_cache_key: Option<RawCacheKey>,
+    pub(super) raw_cache_key: RawCacheKey,
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: Option<RawCacheKey>) -> Self {
+    fn new(cache_status: QueryResultsCacheStatus, raw_cache_key: RawCacheKey) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -62,8 +63,8 @@ impl RequestCacheManager {
 
 enum CacheResult {
     Hit(QueryResult),
-    MissOrSkipped(QueryTracker, QueryResultsCacheStatus),
-    WrongCacheKeyType(QueryTracker),
+    MissOrSkipped(Option<QueryTracker>, QueryResultsCacheStatus),
+    WrongCacheKeyType(Option<QueryTracker>),
 }
 
 impl Query {
@@ -74,33 +75,47 @@ impl Query {
         request_context: Arc<RequestContext>,
         sql: &str,
         parameters: Option<ParamValues>,
-        tracker: QueryTracker,
+        tracker: Option<QueryTracker>,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
-        let (tracker, cache_status, sql_cache_key) = match Self::try_get_cached_result(
+        let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
+        let (tracker, cache_status, sql_raw_cache_key) = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::Query(sql, parameters.as_ref()),
+            &sql_cache_key,
         )
         .await?
         {
             (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
-            (CacheResult::MissOrSkipped(tracker, status), sql_cache_key) => {
-                (tracker, Some(status), sql_cache_key)
+            (CacheResult::MissOrSkipped(tracker, status), sql_raw_cache_key) => {
+                (tracker, Some(status), sql_raw_cache_key)
             }
-            (CacheResult::WrongCacheKeyType(tracker), sql_cache_key) => {
-                (tracker, None, sql_cache_key)
+            (CacheResult::WrongCacheKeyType(tracker), sql_raw_cache_key) => {
+                (tracker, None, sql_raw_cache_key)
             }
         };
 
-        let plan = match df.get_or_create_logical_plan(session, sql).await {
+        let plan_hasher = df.plans_cache_provider().map_or(
+            Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher>,
+            |p| p.hasher(),
+        );
+
+        let sql_raw_cache_key =
+            sql_raw_cache_key.unwrap_or_else(|| sql_cache_key.as_raw_key(plan_hasher));
+
+        let plan = match df
+            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
+            .await
+        {
             Ok(plan) => plan,
             Err(e) => {
                 let e = find_datafusion_root(e);
                 let error_code = ErrorCode::from(&e);
                 let snafu_error = super::Error::UnableToExecuteQuery { source: e };
-                tracker.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                if let Some(t) = tracker {
+                    t.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                }
                 return Err(snafu_error);
             }
         };
@@ -118,7 +133,7 @@ impl Query {
             df,
             Arc::clone(&request_context),
             tracker,
-            CacheKey::LogicalPlan(&plan),
+            &CacheKey::LogicalPlan(&plan),
         )
         .await?
         {
@@ -133,10 +148,10 @@ impl Query {
             ),
         };
 
-        let raw_cache_key = sql_cache_key.or(plan_cache_key);
+        let raw_cache_key = plan_cache_key.unwrap_or(sql_raw_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
-        tracker = tracker.results_cache_hit(false);
+        tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
             plan,
@@ -148,10 +163,10 @@ impl Query {
     async fn try_get_cached_result(
         df: &DataFusion,
         request_context: Arc<RequestContext>,
-        mut tracker: QueryTracker,
-        key: CacheKey<'_>,
+        mut tracker: Option<QueryTracker>,
+        key: &CacheKey<'_>,
     ) -> super::Result<(CacheResult, Option<RawCacheKey>)> {
-        let Some(cache_provider) = df.cache_provider() else {
+        let Some(cache_provider) = df.results_cache_provider() else {
             return Ok((
                 CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheDisabled),
                 None,
@@ -160,26 +175,24 @@ impl Query {
 
         let cache_control = request_context.cache_control();
 
-        // If the user requested no caching, skip the cache lookup
-        let CacheControl::Cache(cache_key) = cache_control else {
-            return Ok((
-                CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass),
-                None,
-            ));
-        };
-
         // Validate that the provided cache key is the correct type for this request
-        match (cache_key, &key) {
-            (CacheKeyType::Default, CacheKey::LogicalPlan(_))
-            | (CacheKeyType::Raw, CacheKey::Query(_, _)) => {}
+        match (cache_control, &key) {
+            (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
+            | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _)) => {}
+            (CacheControl::NoCache, _) => {
+                return Ok((
+                    CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass),
+                    Some(key.as_raw_key(cache_provider.hasher())),
+                ));
+            }
             _ => {
                 return Ok((CacheResult::WrongCacheKeyType(tracker), None));
             }
         }
 
-        let raw_key = key.as_raw_key();
+        let raw_key = key.as_raw_key(cache_provider.hasher());
 
-        let cached_result = match cache_provider.get_raw_key(raw_key).await {
+        let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
             Ok(None) => {
                 return Ok((
@@ -190,16 +203,13 @@ impl Query {
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };
 
-        tracker = tracker
-            .datasets(cached_result.input_tables)
-            .results_cache_hit(true);
+        tracker = tracker.map(|t| {
+            t.datasets(cached_result.input_tables)
+                .results_cache_hit(true)
+        });
 
         let record_batch_stream =
-            match MemoryStream::try_new(cached_result.records.to_vec(), cached_result.schema, None)
-            {
-                Ok(stream) => stream,
-                Err(e) => return Err(super::Error::UnableToCreateMemoryStream { source: e }),
-            };
+            CachedStream::try_new(cached_result.records, cached_result.schema);
 
         Ok((
             CacheResult::Hit(QueryResult::new(
@@ -220,7 +230,7 @@ impl Query {
         plan: &LogicalPlan,
         cache_status: QueryResultsCacheStatus,
     ) -> QueryResultsCacheStatus {
-        match df.cache_provider() {
+        match df.results_cache_provider() {
             Some(provider) if provider.cache_is_enabled_for_plan(plan) => cache_status,
             _ => QueryResultsCacheStatus::CacheDisabled,
         }
@@ -232,7 +242,7 @@ impl Query {
         plan_cache_key: RawCacheKey,
         datasets: Arc<HashSet<TableReference>>,
     ) -> SendableRecordBatchStream {
-        if let Some(cache_provider) = df.cache_provider() {
+        if let Some(cache_provider) = df.results_cache_provider() {
             to_cached_record_batch_stream(cache_provider, stream, plan_cache_key, datasets)
         } else {
             stream
@@ -244,12 +254,12 @@ impl Query {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use futures::TryStreamExt;
 
-    use cache::{CacheKey, QueryResultsCacheProvider, QueryResultsCacheStatus};
-    use spicepod::component::runtime::ResultsCache;
+    use cache::{CacheKey, QueryResultsCacheProvider, QueryResultsCacheStatus, SimpleCache};
+    use spicepod::component::runtime::{HashingAlgorithm, ResultsCache};
 
     use crate::{
         builder::RuntimeBuilder,
@@ -270,14 +280,11 @@ mod tests {
     #[tokio::test]
     async fn test_request_cache_manager() {
         let cache_status = QueryResultsCacheStatus::CacheHit;
-        let raw_cache_key = CacheKey::Query("test-key", None).as_raw_key();
+        let raw_cache_key =
+            CacheKey::Query("test-key", None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
 
-        let manager = RequestCacheManager::new(cache_status, Some(raw_cache_key));
+        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
         assert!(manager.should_cache_results());
-
-        let disabled_manager =
-            RequestCacheManager::new(QueryResultsCacheStatus::CacheDisabled, None);
-        assert!(!disabled_manager.should_cache_results());
     }
 
     #[tokio::test]
@@ -289,17 +296,25 @@ mod tests {
             item_ttl: Some("10m".to_string()),
             eviction_policy: None,
             cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
+            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_cache_provider(Arc::new(cache_provider))
+            .with_results_cache_provider(Arc::new(cache_provider))
+            .with_plans_cache_provider(plan_cache_provider)
             .build(),
         );
 
@@ -410,17 +425,25 @@ mod tests {
             item_ttl: Some("10m".to_string()),
             eviction_policy: None,
             cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
+            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_cache_provider(Arc::new(cache_provider))
+            .with_results_cache_provider(Arc::new(cache_provider))
+            .with_plans_cache_provider(plan_cache_provider)
             .build(),
         );
 
@@ -470,17 +493,25 @@ mod tests {
             item_ttl: Some("10m".to_string()),
             eviction_policy: None,
             cache_key_type: spicepod::component::runtime::CacheKeyType::Plan,
+            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_secs(3600),
+            std::hash::RandomState::default(),
+        ));
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_cache_provider(Arc::new(cache_provider))
+            .with_results_cache_provider(Arc::new(cache_provider))
+            .with_plans_cache_provider(plan_cache_provider)
             .build(),
         );
 

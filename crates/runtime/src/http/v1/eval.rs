@@ -29,8 +29,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     Runtime,
-    datafusion::DataFusion,
+    datafusion::request_context_extension::get_current_datafusion,
     model::{EvalScorerRegistry, LLMModelStore, handle_eval_run, sql_query_for},
+    request::{AsyncMarker, RequestContext},
 };
 
 #[cfg(feature = "openapi")]
@@ -92,7 +93,6 @@ pub(crate) struct RunEval {
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
     accept: Option<TypedHeader<Accept>>,
@@ -100,6 +100,9 @@ pub(crate) async fn post(
     Json(req): Json<RunEval>,
 ) -> Response {
     let model = req.model;
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let evals = rt.evals.read().await;
     let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {

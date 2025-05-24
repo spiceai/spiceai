@@ -43,6 +43,8 @@ const (
 	privateKeyPathFlag    = "private-key-path"
 	passphraseFlag        = "passphrase"
 	token                 = "token"
+	clientId              = "client-id"
+	clientSecret          = "client-secret"
 	accessKeyFlag         = "access-key"
 	accessSecretFlag      = "access-secret"
 	sparkRemoteFlag       = "spark_remote"
@@ -391,8 +393,11 @@ var databricksCmd = &cobra.Command{
 	Use:   "databricks",
 	Short: "Login to a Databricks instance",
 	Example: `
-# Using Spark Connect
+# Using Spark Connect and Personal Access Token
 spice login databricks --token <access-token>
+
+# Using Spark Connect and Service Principal
+spice login databricks --client-id <client-id> --client-secret <client-secret>
 
 # Using Delta Lake directly against AWS S3
 spice login databricks --token <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
@@ -412,13 +417,34 @@ spice login databricks --token <access-token> --google-service-account-path /pat
 			os.Exit(1)
 		}
 
-		if db_token == "" {
-			cmd.Println("No Databricks Access Token provided, use --token")
+		db_client_id, err := cmd.Flags().GetString(clientId)
+		if err != nil {
+			slog.Error("getting flag", "flag", clientId, "error", err)
 			os.Exit(1)
 		}
 
-		params := map[string]string{
-			api.AUTH_PARAM_TOKEN: db_token,
+		db_client_secret, err := cmd.Flags().GetString(clientSecret)
+		if err != nil {
+			slog.Error("getting flag", "flag", clientSecret, "error", err)
+			os.Exit(1)
+		}
+
+		// Ensure that either --token is provided OR both --client-id and --client-secret are provided, but not all or neither.
+		if (db_token == "") == (db_client_id == "" || db_client_secret == "") {
+			cmd.Println("You must provide either --token OR both --client-id and --client-secret for Databricks authentication.")
+			os.Exit(1)
+		}
+
+		var params map[string]string
+		if db_token != "" {
+			params = map[string]string{
+				api.AUTH_PARAM_TOKEN: db_token,
+			}
+		} else {
+			params = map[string]string{
+				api.AUTH_PARAM_CLIENT_ID:     db_client_id,
+				api.AUTH_PARAM_CLIENT_SECRET: db_client_secret,
+			}
 		}
 
 		awsRegion, err := cmd.Flags().GetString(awsRegion)
@@ -586,6 +612,8 @@ func init() {
 	loginCmd.AddCommand(dremioCmd)
 
 	databricksCmd.Flags().StringP(token, "p", "", "Access Token")
+	databricksCmd.Flags().String(clientId, "", "Client ID")
+	databricksCmd.Flags().String(clientSecret, "", "Client Secret")
 	databricksCmd.Flags().String(awsRegion, "", "AWS Region")
 	databricksCmd.Flags().String(awsAccessKeyId, "", "AWS Access Key ID")
 	databricksCmd.Flags().String(awsSecret, "", "AWS Secret Access Key")

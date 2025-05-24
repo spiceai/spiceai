@@ -19,16 +19,16 @@ use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
+use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::dataconnector::ConnectorParams;
 use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
 use crate::get_params_with_secrets;
+use crate::token_providers::databricks::AuthCredentials;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
-use data_components::databricks::auth::AuthCredentials;
 use data_components::delta_lake::DeltaTableFactory;
-use data_components::token_provider::StaticTokenProvider;
 use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
 use data_components::unity_catalog::UCTable;
@@ -40,17 +40,26 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use token_provider::StaticTokenProvider;
 
 #[derive(Clone)]
 pub struct Databricks {
     params: Parameters,
+    initialization: ComponentInitialization,
 }
 
 impl Databricks {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+        let component_initialization =
+            match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
+                Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
+                _ => ComponentInitialization::OnStartup,
+            };
+
         Arc::new(Self {
             params: params.parameters,
+            initialization: component_initialization,
         })
     }
 }
@@ -70,6 +79,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("The timeout setting for object store client."),
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+    ParameterSpec::component("sql_warehouse_id")
+        .secret()
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
@@ -166,6 +178,17 @@ impl CatalogConnector for Databricks {
                     connector_component: ConnectorComponent::from(catalog),
                 })?
             }
+            AuthCredentials::U2M(client_id) => DatabricksDataConnector::get_u2m_token_provider(
+                endpoint,
+                client_id,
+                &runtime.token_provider_registry,
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
         };
 
         let unity_catalog =
@@ -241,6 +264,10 @@ impl CatalogConnector for Databricks {
         };
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
+    }
+
+    fn initialization(&self) -> ComponentInitialization {
+        self.initialization
     }
 }
 
