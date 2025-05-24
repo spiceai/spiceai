@@ -85,6 +85,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 &schema,
                 primary_key.as_slice(),
             ));
+            println!("Aadditional_columns: {:#?}", additional_columns);
 
             // Since we know what the `SEARCH_VALUE_COLUMN_NAME` column for the i'th column will be in the final schema,
             // we can add it to the `matches` map now.
@@ -302,6 +303,8 @@ fn coalesce_columns(cols: &[String], tables: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use super::*;
 
     #[test]
@@ -357,5 +360,20 @@ mod tests {
             5,
             3
         ));
+    }
+
+    #[test]
+    fn test_additional_columns_of_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Int8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("additional", DataType::Int8, false),
+        ]));
+        let primary_keys = vec!["pk".to_string()];
+        assert_eq!(
+            additional_columns_of_schema(&schema, primary_keys.as_slice()),
+            vec!["additional".to_string()]
+        )
     }
 }

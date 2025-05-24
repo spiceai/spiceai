@@ -119,7 +119,10 @@ fn from_single_input(
         .fields()
         .iter()
         .filter_map(|f| {
-            if f.name() == SEARCH_VALUE_COLUMN_NAME || primary_key.contains(f.name()) {
+            if f.name() == SEARCH_SCORE_COLUMN_NAME
+                || f.name() == SEARCH_VALUE_COLUMN_NAME
+                || primary_key.contains(f.name())
+            {
                 None
             } else {
                 Some(f.name().to_string())

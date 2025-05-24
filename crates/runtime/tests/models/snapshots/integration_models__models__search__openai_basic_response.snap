@@ -9,8 +9,7 @@ snapshot_kind: text
     {
       "data": {
         "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA",
-        "score": 0.7684853959656397
+        "i_item_id": "AAAAAAAADBAAAAAA"
       },
       "dataset": "item",
       "matches": {
@@ -19,13 +18,12 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 0.7684853959656397
+      "score": 0.768
     },
     {
       "data": {
         "i_color": "spring",
-        "i_item_id": "AAAAAAAAHAAAAAAA",
-        "score": 0.7484044591790506
+        "i_item_id": "AAAAAAAAHAAAAAAA"
       },
       "dataset": "item",
       "matches": {
@@ -34,7 +32,7 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.7484044591790506
+      "score": 0.748
     }
   ]
 }

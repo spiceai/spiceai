@@ -15,7 +15,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032787
+      "score": 0.032
     },
     {
       "dataset": "multi_column_search",
@@ -26,7 +26,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.032258
+      "score": 0.032
     },
     {
       "dataset": "multi_column_search",
@@ -37,7 +37,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.031746
+      "score": 0.031
     }
   ]
 }

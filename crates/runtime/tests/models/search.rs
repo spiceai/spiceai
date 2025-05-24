@@ -74,6 +74,22 @@ fn normalize_search_response(mut json: Value) -> String {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
+    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
+        for m in matches {
+            if let Some(obj) = m.as_object_mut() {
+                if let Some(Value::Number(n)) = obj.get("score") {
+                    if let Some(score) = n.as_f64() {
+                        if let Some(truncated_score) =
+                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
+                        // Keep 2 decimals
+                        {
+                            obj.insert("score".to_string(), Value::Number(truncated_score));
+                        }
+                    };
+                }
+            }
+        }
+    }
 
     sort_json_keys(&mut json);
 

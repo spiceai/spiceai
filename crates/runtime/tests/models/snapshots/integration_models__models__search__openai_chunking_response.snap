@@ -7,9 +7,6 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "matches": [
     {
-      "data": {
-        "score": 0.689184478264627
-      },
       "dataset": "catalog_page_with_chunking",
       "matches": {
         "cp_description": "In general basic characters welcome. Clearly lively friends con"
@@ -17,7 +14,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.689184478264627
+      "score": 0.689
     }
   ]
 }

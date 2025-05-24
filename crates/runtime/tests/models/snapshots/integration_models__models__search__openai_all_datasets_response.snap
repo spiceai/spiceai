@@ -7,9 +7,6 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "matches": [
     {
-      "data": {
-        "score": 0.7684853959656397
-      },
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": "Patient"
@@ -17,12 +14,9 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 0.7684853959656397
+      "score": 0.768
     },
     {
-      "data": {
-        "score": 0.7484044591790506
-      },
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": "New"
@@ -30,7 +24,7 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.7484044591790506
+      "score": 0.748
     }
   ]
 }

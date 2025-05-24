@@ -7,24 +7,18 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "matches": [
     {
-      "data": {
-        "score": 0.7865954360422975
-      },
       "dataset": "clickbench_no_chunking",
       "matches": {
         "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
       },
-      "score": 0.7865954360422975
+      "score": 0.786
     },
     {
-      "data": {
-        "score": 0.7865954360422975
-      },
       "dataset": "clickbench_no_chunking",
       "matches": {
         "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
       },
-      "score": 0.7865954360422975
+      "score": 0.786
     }
   ]
 }
