@@ -18,6 +18,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::TcpStream,
     ops::Range,
+    sync::Arc,
     time::Duration,
 };
 
@@ -33,7 +34,7 @@ use object_store::{
 use ssh2::Session;
 
 #[derive(Debug)]
-pub struct SFTPObjectStore {
+struct SFTPClient {
     user: String,
     password: String,
     host: String,
@@ -41,15 +42,8 @@ pub struct SFTPObjectStore {
     timeout: Option<Duration>,
 }
 
-impl std::fmt::Display for SFTPObjectStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SFTP")
-    }
-}
-
-impl SFTPObjectStore {
-    #[must_use]
-    pub fn new(
+impl SFTPClient {
+    fn new(
         user: String,
         password: String,
         host: String,
@@ -62,17 +56,6 @@ impl SFTPObjectStore {
             host,
             port,
             timeout,
-        }
-    }
-
-    // TODO: Helper to allow static lifetime for walk_path
-    fn clone_for_static(&self) -> SFTPObjectStore {
-        SFTPObjectStore {
-            user: self.user.clone(),
-            password: self.password.clone(),
-            host: self.host.clone(),
-            port: self.port.clone(),
-            timeout: self.timeout,
         }
     }
 
@@ -100,6 +83,32 @@ impl SFTPObjectStore {
             .map_err(handle_error)?;
 
         Ok(session)
+    }
+}
+
+#[derive(Debug)]
+pub struct SFTPObjectStore {
+    client: Arc<SFTPClient>,
+}
+
+impl std::fmt::Display for SFTPObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SFTP")
+    }
+}
+
+impl SFTPObjectStore {
+    #[must_use]
+    pub fn new(
+        user: String,
+        password: String,
+        host: String,
+        port: String,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            client: Arc::new(SFTPClient::new(user, password, host, port, timeout)),
+        }
     }
 }
 
@@ -136,7 +145,7 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.get_client()?;
+        let client = self.client.get_client()?;
         let mut file = client
             .sftp()
             .map_err(handle_error)?
@@ -233,16 +242,15 @@ impl ObjectStore for SFTPObjectStore {
             .map(ToOwned::to_owned)
             .map_or("/".to_string(), |x| x.to_string());
 
-        // TODO: This is a workaround to allow the stream to be static
-        let that = self.clone_for_static();
+        let client = Arc::clone(&self.client);
 
         let stream = stream! {
-            let client = that.get_client()?;
+            let session = client.get_client()?;
 
             let mut queue = vec![location];
 
             while let Some(item) = queue.pop() {
-                let list = client
+                let list = session
                     .sftp()
                     .map_err(handle_error)?
                     .readdir(std::path::Path::new(&item))
