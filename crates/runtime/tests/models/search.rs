@@ -71,14 +71,6 @@ pub async fn run_search_test(base_url: &str, ts: &SearchTestCase) -> Result<(), 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
 /// values such as duration with placeholder.
 fn normalize_search_response(mut json: Value) -> String {
-    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
-        for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                obj.remove("score");
-            }
-        }
-    }
-
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
@@ -162,7 +154,6 @@ pub(crate) async fn run_search(
         .await
 }
 
-#[ignore = "Non-deterministic order of search results makes snapshot testing unreliable"]
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut chunked = catalog_page_tpch_dataset_w_embeddings(
@@ -223,7 +214,6 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     .await
 }
 
-#[ignore = "Non-deterministic order of search results makes snapshot testing unreliable"]
 #[tokio::test]
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
@@ -286,7 +276,6 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     .await
 }
 
-#[ignore = "Non-deterministic order of search results makes snapshot testing unreliable"]
 #[tokio::test]
 async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
