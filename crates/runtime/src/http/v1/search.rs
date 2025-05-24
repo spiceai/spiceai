@@ -152,6 +152,11 @@ pub(crate) async fn post(
             let error_type = match e {
                 VectorSearchError::NoTablesWithEmbeddingsFound {}
                 | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                VectorSearchError::CandidateAggregationError { ref source }
+                    if source.is_user_error() =>
+                {
+                    StatusCode::BAD_REQUEST
+                }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
 

@@ -47,6 +47,13 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 }
+
+impl Error {
+    pub fn is_user_error(&self) -> bool {
+        matches!(self, Error::NoPrimaryKey)
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Standard interface for algorithms that decide how to aggregate the results from [`super::generation::CandidateGeneration::search`] into a single-ordered set.

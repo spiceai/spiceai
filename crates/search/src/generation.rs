@@ -23,6 +23,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Standard interface to generate search candidates from a given table/dataset/source for subsequent aggregation in a hybrid search system.

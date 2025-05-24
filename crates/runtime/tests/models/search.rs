@@ -286,7 +286,6 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     .await
 }
 
-#[ignore = "Non-deterministic order of search results makes snapshot testing unreliable"]
 #[tokio::test]
 async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
@@ -308,7 +307,7 @@ async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
     run_search(
         app,
         vec![SearchTestCase {
-            name: "mulit_column_no_pks_basic",
+            name: "multi_column_no_pks_basic",
             body: json!({
                 "text": "new patient",
                 "limit": 2,
