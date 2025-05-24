@@ -1,6 +1,0 @@
----
-source: crates/runtime/tests/models/search.rs
-expression: e.to_string()
-snapshot_kind: text
----
-HTTP error: 500 Internal Server Error - Error occurred aggregating candidate search results: Cannot aggregate candidates from multiple sources (e.g. embedded columns of a dataset) when the dataset has no primary key.

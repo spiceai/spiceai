@@ -297,7 +297,7 @@ async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
     run_search(
         app,
         vec![SearchTestCase {
-            name: "mulit_column_no_pks_basic",
+            name: "multi_column_no_pks_basic",
             body: json!({
                 "text": "new patient",
                 "limit": 2,
