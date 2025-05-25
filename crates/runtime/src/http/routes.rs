@@ -206,7 +206,8 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))
             .layer(Extension(vector_search))
-            .layer(Extension(Arc::clone(&rt.embeds)));
+            .layer(Extension(Arc::clone(&rt.embeds)))
+            .layer(Extension(Arc::clone(&rt.workers)));
     }
 
     #[cfg(feature = "mcp")]

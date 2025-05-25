@@ -67,6 +67,8 @@ impl From<&RouterConfig> for RoutingStrategy {
 pub struct Worker {
     pub name: String,
 
+    pub r#type: Option<String>,
+
     pub description: Option<String>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -90,6 +92,7 @@ impl WithDependsOn<Worker> for Worker {
     fn depends_on(&self, _depends_on: &[String]) -> Worker {
         Worker {
             name: self.name.clone(),
+            r#type: self.r#type.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
             models: self.models.clone(),

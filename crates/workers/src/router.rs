@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 pub struct RouterModel {
-    router_name: String,
+    pub router_name: String,
     models_cfg: Vec<worker::RouterConfig>,
     state: RouterState,
     models: Arc<RwLock<HashMap<String, Arc<dyn Chat>>>>,

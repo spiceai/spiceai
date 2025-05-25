@@ -27,6 +27,7 @@ use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
+use worker::Worker;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -107,6 +108,7 @@ pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod view;
+mod worker;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -363,6 +365,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    workers: Arc<RwLock<HashMap<String, Arc<dyn Worker>>>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
