@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_flight::sql::client::{FlightSqlServiceClient, PreparedStatement};
 use futures::TryStreamExt as _;
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
@@ -312,6 +312,93 @@ async fn test_more_than_ten_question_mark_parameters() -> Result<(), anyhow::Err
                 "more_than_ten_question_mark_parameters_table_content",
                 results_str
             );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_parameters_in_case_expressions() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (channel, _df) = start_spice_test_app(None, None, None).await?;
+
+            let mut client = FlightSqlServiceClient::new(channel);
+
+            // Test CASE WHEN ? THEN 'foo' (searched CASE with parameter in condition)
+            let query1 = "SELECT CASE WHEN ? THEN 'foo' ELSE 'bar' END AS result";
+            let prepared_stmt1 = get_prepared_statement(&mut client, query1).await?;
+
+            let parameter_schema1 = prepared_stmt1.parameter_schema()?;
+            assert_eq!(parameter_schema1.fields().len(), 1);
+            assert_eq!(parameter_schema1.field(0).name(), "$1");
+            assert_eq!(
+                parameter_schema1.field(0).data_type(),
+                &arrow::datatypes::DataType::Boolean
+            );
+
+            let param_batch1 = create_param_batch(
+                vec![("$1", arrow::datatypes::DataType::Boolean, false)],
+                vec![Arc::new(BooleanArray::from(vec![true])) as Arc<dyn arrow::array::Array>],
+            )?;
+
+            let results1 =
+                execute_prepared_statement(&mut client, prepared_stmt1, param_batch1).await?;
+
+            let results1_str =
+                arrow::util::pretty::pretty_format_batches(&results1).expect("pretty batches");
+            insta::assert_snapshot!("case_when_parameter_table_content", results1_str);
+
+            // Test CASE 'foo' WHEN ? THEN 'bar' (simple CASE with parameter in WHEN)
+            let query2 = "SELECT CASE 'foo' WHEN ? THEN 'bar' ELSE 'baz' END AS result";
+            let prepared_stmt2 = get_prepared_statement(&mut client, query2).await?;
+
+            let parameter_schema2 = prepared_stmt2.parameter_schema()?;
+            assert_eq!(parameter_schema2.fields().len(), 1);
+            assert_eq!(parameter_schema2.field(0).name(), "$1");
+            assert_eq!(
+                parameter_schema2.field(0).data_type(),
+                &arrow::datatypes::DataType::Utf8
+            );
+
+            let param_batch2 = create_param_batch(
+                vec![("$1", arrow::datatypes::DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec!["foo"])) as Arc<dyn arrow::array::Array>],
+            )?;
+
+            let results2 =
+                execute_prepared_statement(&mut client, prepared_stmt2, param_batch2).await?;
+
+            let results2_str =
+                arrow::util::pretty::pretty_format_batches(&results2).expect("pretty batches");
+            insta::assert_snapshot!("case_simple_parameter_table_content", results2_str);
+
+            // Test with false condition to ensure ELSE clause works
+            let query3 = "SELECT CASE WHEN ? THEN 'foo' ELSE 'bar' END AS result";
+            let prepared_stmt3 = get_prepared_statement(&mut client, query3).await?;
+
+            let parameter_schema3 = prepared_stmt3.parameter_schema()?;
+            assert_eq!(parameter_schema3.fields().len(), 1);
+            assert_eq!(parameter_schema3.field(0).name(), "$1");
+            assert_eq!(
+                parameter_schema3.field(0).data_type(),
+                &arrow::datatypes::DataType::Boolean
+            );
+
+            let param_batch3 = create_param_batch(
+                vec![("$1", arrow::datatypes::DataType::Boolean, false)],
+                vec![Arc::new(BooleanArray::from(vec![false])) as Arc<dyn arrow::array::Array>],
+            )?;
+
+            let results3 =
+                execute_prepared_statement(&mut client, prepared_stmt3, param_batch3).await?;
+
+            let results3_str =
+                arrow::util::pretty::pretty_format_batches(&results3).expect("pretty batches");
+            insta::assert_snapshot!("case_when_parameter_false_table_content", results3_str);
 
             Ok(())
         })
