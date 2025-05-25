@@ -113,7 +113,7 @@ mod tests {
         let json = json!([1, "hello", true, null]);
         let got = convert_json_to_param_values(json).expect("convert to param values");
         let want = ParamValues::List(vec![
-            ScalarValue::UInt64(Some(1)),
+            ScalarValue::Int64(Some(1)),
             ScalarValue::Utf8(Some("hello".to_string())),
             ScalarValue::Boolean(Some(true)),
             ScalarValue::Utf8(None),
@@ -127,7 +127,7 @@ mod tests {
         let json = json!({"x": 42, "y": "world", "z": false});
         let got = convert_json_to_param_values(json).expect("convert to param values");
         let mut want = HashMap::new();
-        want.insert("x".to_string(), ScalarValue::UInt64(Some(42)));
+        want.insert("x".to_string(), ScalarValue::Int64(Some(42)));
         want.insert(
             "y".to_string(),
             ScalarValue::Utf8(Some("world".to_string())),
