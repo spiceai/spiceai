@@ -26,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      validate_results:
+        description: 'Validate results?'
+        required: false
+        type: boolean
+        default: false
       scheduled:
         description: 'Run schedule?'
         required: false
@@ -129,7 +134,7 @@ jobs:
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }} \
-            --validate
+            --validate ${{ github.event.inputs.validate_results }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
