@@ -128,7 +128,8 @@ jobs:
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
+            --validate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
