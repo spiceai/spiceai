@@ -84,7 +84,6 @@ jobs:
           os: 'linux'
 
       - name: Check if sccache can be set up
-        if: runner.os != 'macOS'
         run: |
           if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
