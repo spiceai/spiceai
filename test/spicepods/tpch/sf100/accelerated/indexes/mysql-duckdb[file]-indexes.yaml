@@ -16,6 +16,8 @@ definitions:
     enabled: true
     engine: duckdb
     mode: file
+    params:
+      duckdb_memory_limit: 60gb
 
 datasets:
   - from: mysql:customer
