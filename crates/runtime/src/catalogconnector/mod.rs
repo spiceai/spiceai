@@ -23,7 +23,7 @@ use std::{
 
 use crate::{
     Runtime,
-    component::catalog::Catalog,
+    component::{ComponentInitialization, catalog::Catalog},
     dataconnector::{ConnectorComponent, ConnectorParams},
     parameters::{ParameterSpec, Parameters},
 };
@@ -201,9 +201,9 @@ pub trait CatalogConnector: Send + Sync {
         _catalog: &Catalog,
     ) -> Result<Arc<dyn RefreshableCatalogProvider>>;
 
-    /// Returns whether the catalog connector load should be deferred.
-    fn deferred_load(&self) -> bool {
-        false
+    /// Returns whether the catalog connector should be initialized on startup or on trigger.
+    fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnStartup
     }
 }
 
@@ -213,7 +213,7 @@ pub async fn get_catalog_provider(
     catalog: &Catalog,
     refresh_interval: Option<Duration>,
 ) -> Result<Arc<dyn CatalogProvider>> {
-    if connector.deferred_load() {
+    if connector.initialization().is_on_trigger() {
         return Ok(Arc::new(DeferredCatalogProvider::new(
             runtime,
             connector,

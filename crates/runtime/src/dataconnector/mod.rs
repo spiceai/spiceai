@@ -17,6 +17,7 @@ limitations under the License.
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
 use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
+use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
@@ -501,9 +502,9 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         None
     }
 
-    /// Returns whether the data connector load should be deferred.
-    fn deferred_load(&self) -> bool {
-        false
+    /// Returns whether the data connector should be initialized on startup or on trigger.
+    fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnStartup
     }
 }
 

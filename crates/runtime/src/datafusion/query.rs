@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, collections::BTreeMap, sync::Arc};
+use std::{cell::LazyCell, sync::Arc};
 
 use ::cache::{QueryResult, get_logical_plan_input_tables};
 use arrow::{
@@ -297,7 +297,7 @@ impl Query {
 }
 
 fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataFusionError> {
-    let parameters = plan
+    let mut parameters: Vec<(String, arrow_schema::DataType)> = plan
         .get_parameter_types()?
         .into_iter()
         .map(|(name, dt)| {
@@ -309,7 +309,24 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
             // Other cases are not known
             (name, dt.unwrap_or(arrow_schema::DataType::UInt64))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect();
+
+    // Sort parameters by their numeric value to ensure correct ordering
+    // For example, $1, $2, ..., $9, $10, $11 instead of $1, $10, $11, $2, ...
+    parameters.sort_by(|a, b| {
+        let parse_param_num =
+            |param_name: &str| -> Option<u32> { param_name.strip_prefix('$')?.parse().ok() };
+
+        let a_num = parse_param_num(&a.0);
+        let b_num = parse_param_num(&b.0);
+
+        match (a_num, b_num) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less, // numeric params come before non-numeric
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.0.cmp(&b.0), // fallback to lexicographic for non-numeric params
+        }
+    });
 
     let maybe_schema = if parameters.is_empty() {
         None
@@ -507,6 +524,201 @@ mod tests {
         assert_eq!(
             query.results_cache_status,
             QueryResultsCacheStatus::CacheMiss
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_basic() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test basic parameter ordering with small numbers
+        let sql = "SELECT $1, $2, $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(field_names, vec!["$1", "$2", "$3"]);
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_with_double_digits() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test parameter ordering with more than 10 parameters
+        let sql = "SELECT $1, $10, $11, $12, $2, $3, $4, $5, $6, $7, $8, $9";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should be sorted numerically, not lexicographically
+        assert_eq!(
+            field_names,
+            vec![
+                "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$10", "$11", "$12"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_large_numbers() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with larger parameter numbers to ensure numeric sorting works correctly
+        let sql = "SELECT $1, $100, $11, $2, $20, $21, $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(
+            field_names,
+            vec!["$1", "$2", "$3", "$11", "$20", "$21", "$100"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_mixed_types() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with different parameter types in different positions
+        let sql = "SELECT $1::text, $10::int, $2::float";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should still be ordered numerically regardless of types
+        assert_eq!(field_names, vec!["$1", "$2", "$10"]);
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_empty() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with no parameters
+        let sql = "SELECT 1, 2, 3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        assert!(schema.is_none(), "should have no parameter schema");
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_with_limit() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test parameter ordering when parameters are used in LIMIT clause
+        let sql = "SELECT $1, $2 LIMIT $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(field_names, vec!["$1", "$2", "$3"]);
+
+        // Check that $3 exists (the type may vary based on DataFusion's inference)
+        let limit_field = schema.field_with_name("$3").expect("$3 field should exist");
+        // The actual type may be Int64 or UInt64 depending on DataFusion's type inference
+        assert!(
+            limit_field.data_type() == &arrow_schema::DataType::UInt64
+                || limit_field.data_type() == &arrow_schema::DataType::Int64,
+            "Expected UInt64 or Int64, got {:?}",
+            limit_field.data_type()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_non_standard_names() {
+        use std::collections::HashMap;
+
+        // Test edge case with non-standard parameter names
+
+        let mut param_types = HashMap::new();
+        param_types.insert("$1".to_string(), Some(arrow_schema::DataType::Int64));
+        param_types.insert("$10".to_string(), Some(arrow_schema::DataType::Utf8));
+        param_types.insert(
+            "non_numeric_param".to_string(),
+            Some(arrow_schema::DataType::Boolean),
+        );
+        param_types.insert("$2".to_string(), Some(arrow_schema::DataType::Float64));
+        param_types.insert(
+            "another_param".to_string(),
+            Some(arrow_schema::DataType::Int32),
+        );
+
+        // Manually set parameter types for testing - we need to create a plan that would have these parameters
+        // For testing purposes, we'll just test the sorting logic directly
+        let mut parameters: Vec<(String, arrow_schema::DataType)> = param_types
+            .into_iter()
+            .map(|(name, dt)| (name, dt.unwrap_or(arrow_schema::DataType::UInt64)))
+            .collect();
+
+        // Apply the same sorting logic as in parameter_schema_for_plan
+        parameters.sort_by(|a, b| {
+            let parse_param_num =
+                |param_name: &str| -> Option<u32> { param_name.strip_prefix('$')?.parse().ok() };
+
+            let a_num = parse_param_num(&a.0);
+            let b_num = parse_param_num(&b.0);
+
+            match (a_num, b_num) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less, // numeric params come before non-numeric
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0), // fallback to lexicographic for non-numeric params
+            }
+        });
+
+        let param_names: Vec<&str> = parameters.iter().map(|(name, _)| name.as_str()).collect();
+
+        // Numeric parameters should come first, sorted numerically
+        // Then non-numeric parameters sorted lexicographically
+        assert_eq!(
+            param_names,
+            vec!["$1", "$2", "$10", "another_param", "non_numeric_param"]
         );
     }
 }
