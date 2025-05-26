@@ -142,6 +142,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
@@ -212,6 +213,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
