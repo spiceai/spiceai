@@ -15,36 +15,22 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::Result;
+use crate::tasks::TaskRequest;
 
-pub trait TaskRequestChannel: Send + Sync {
-    /// Whether this task request channel needs to be notified when a task is completed.
-    fn needs_task_completion_notification(&self) -> bool;
-    /// Sets the cancellation token for this task request channel.
-    fn set_cancellation_token(&mut self, cancellation: Arc<CancellationToken>);
-    /// Sets the notification channel to notify when a task is completed.
-    fn set_task_completion_notification(&mut self, _notify: Arc<tokio::sync::Notify>) {}
-    /// Sets the reset notification channel to notify when the requestor should reset and wait for the next notification.
-    fn set_reset_notification(&mut self, notify: Arc<tokio::sync::Notify>);
-    /// Sets the submission channel to send the task request.
-    fn set_submission_channel(&mut self, tx: Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>);
-    /// Starts the task request channel and returns a handle to the background task.
-    #[allow(clippy::missing_errors_doc)]
-    fn start(&self) -> Result<JoinHandle<Result<()>>>;
-}
+use super::TaskRequestChannel;
 
 pub struct IntervalRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     notify: Option<Arc<tokio::sync::Notify>>,
     reset: Option<Arc<tokio::sync::Notify>>,
-    tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>>,
+    tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     interval: Duration,
 }
 
@@ -58,33 +44,6 @@ impl IntervalRequestChannel {
             tx: None,
             interval: Duration::from_secs(interval),
         }
-    }
-
-    #[must_use]
-    pub fn with_cancellation_token(mut self, cancellation: Arc<CancellationToken>) -> Self {
-        self.cancellation = Some(cancellation);
-        self
-    }
-
-    #[must_use]
-    pub fn with_task_completion_notification(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
-        self.notify = Some(notify);
-        self
-    }
-
-    #[must_use]
-    pub fn with_reset_notification(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
-        self.reset = Some(notify);
-        self
-    }
-
-    #[must_use]
-    pub fn with_submission_channel(
-        mut self,
-        tx: Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>,
-    ) -> Self {
-        self.tx = Some(tx);
-        self
     }
 }
 
@@ -105,7 +64,7 @@ impl TaskRequestChannel for IntervalRequestChannel {
         self.reset = Some(notify);
     }
 
-    fn set_submission_channel(&mut self, tx: Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>) {
+    fn set_submission_channel(&mut self, tx: Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>) {
         self.tx = Some(tx);
     }
 
@@ -168,7 +127,7 @@ impl TaskRequestChannel for IntervalRequestChannel {
                     }
                 }
 
-                tx.send(Arc::new(NewTaskRequest::new()))
+                tx.send(Arc::new(TaskRequest::default()))
                     .await
                     .context(crate::ChannelSendSnafu)?;
             }
@@ -176,54 +135,25 @@ impl TaskRequestChannel for IntervalRequestChannel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewTaskRequest {
-    pub cancel_running: bool,
-    pub clear_queue: bool,
-    pub created_at: Instant,
-}
-
-impl NewTaskRequest {
-    #[must_use]
-    pub fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            cancel_running: false,
-            clear_queue: false,
-            created_at: now,
-        }
-    }
-
-    #[must_use]
-    pub fn cancels_running(mut self) -> Self {
-        self.cancel_running = true;
-        self
-    }
-
-    #[must_use]
-    pub fn clears_queue(mut self) -> Self {
-        self.clear_queue = true;
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[tokio::test]
     async fn test_interval_request_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<NewTaskRequest>>(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
         let cancellation = Arc::new(CancellationToken::new());
         let notify = Arc::new(tokio::sync::Notify::new());
         let reset = Arc::new(tokio::sync::Notify::new());
 
-        let channel = IntervalRequestChannel::new(1)
-            .with_cancellation_token(Arc::clone(&cancellation))
-            .with_task_completion_notification(Arc::clone(&notify))
-            .with_reset_notification(Arc::clone(&reset))
-            .with_submission_channel(Arc::new(tx));
+        let mut channel = IntervalRequestChannel::new(1);
+        channel.set_cancellation_token(Arc::clone(&cancellation));
+        channel.set_task_completion_notification(Arc::clone(&notify));
+        channel.set_reset_notification(Arc::clone(&reset));
+        channel.set_submission_channel(Arc::new(tx));
 
         let channel_handle = channel.start().expect("To start request channel");
 
@@ -233,7 +163,7 @@ mod tests {
         let now = Instant::now();
         assert!(request.created_at <= now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request.cancel_running == false);
+        assert!(!request.cancel_running);
 
         // next request should wait for task notification
         tokio::select! {
@@ -250,9 +180,9 @@ mod tests {
         let request = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
-        assert!(request.created_at >= now);
+        assert!(request.created_at < now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request.cancel_running == false);
+        assert!(!request.cancel_running);
 
         cancellation.cancel();
         channel_handle
@@ -263,23 +193,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_channel_requestors() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<NewTaskRequest>>(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
         let cancellation = Arc::new(CancellationToken::new());
         let notify = Arc::new(tokio::sync::Notify::new());
         let reset = Arc::new(tokio::sync::Notify::new());
 
         let tx = Arc::new(tx);
-        let channel_one = IntervalRequestChannel::new(1)
-            .with_cancellation_token(Arc::clone(&cancellation))
-            .with_task_completion_notification(Arc::clone(&notify))
-            .with_reset_notification(Arc::clone(&reset))
-            .with_submission_channel(Arc::clone(&tx));
-        let channel_two = IntervalRequestChannel::new(1)
-            .with_cancellation_token(Arc::clone(&cancellation))
-            .with_task_completion_notification(Arc::clone(&notify))
-            .with_reset_notification(Arc::clone(&reset))
-            .with_submission_channel(Arc::clone(&tx));
+        let mut channel_one = IntervalRequestChannel::new(1);
+        channel_one.set_cancellation_token(Arc::clone(&cancellation));
+        channel_one.set_task_completion_notification(Arc::clone(&notify));
+        channel_one.set_reset_notification(Arc::clone(&reset));
+        channel_one.set_submission_channel(Arc::clone(&tx));
+        let mut channel_two = IntervalRequestChannel::new(1);
+        channel_two.set_cancellation_token(Arc::clone(&cancellation));
+        channel_two.set_task_completion_notification(Arc::clone(&notify));
+        channel_two.set_reset_notification(Arc::clone(&reset));
+        channel_two.set_submission_channel(Arc::clone(&tx));
 
         let handle_one = channel_one.start().expect("To start request channel");
         let handle_two = channel_two.start().expect("To start request channel");
@@ -290,11 +220,11 @@ mod tests {
         let request_two = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
-        assert!(request_one.created_at <= now);
-        assert!(request_two.created_at <= now);
+        assert!(request_one.created_at < now);
+        assert!(request_two.created_at < now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request_one.cancel_running == false);
-        assert!(request_two.cancel_running == false);
+        assert!(!request_one.cancel_running);
+        assert!(!request_two.cancel_running);
 
         cancellation.cancel();
         handle_one

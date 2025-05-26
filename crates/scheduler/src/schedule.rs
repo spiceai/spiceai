@@ -21,14 +21,14 @@ use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    evaluators::TaskRequestChannel,
+    channels::TaskRequestChannel,
     tasks::{RunningTask, ScheduledTask},
 };
 
 pub struct Schedule {
     id: Arc<str>,
     channels: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
-    components: Vec<Arc<dyn ScheduledTask>>,
+    tasks: Vec<Arc<dyn ScheduledTask>>,
 }
 
 impl Hash for Schedule {
@@ -49,7 +49,7 @@ impl Default for Schedule {
         Self {
             id: Uuid::new_v4().to_string().into(),
             channels: Vec::new(),
-            components: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 }
@@ -73,7 +73,7 @@ impl Schedule {
 
     #[must_use]
     pub fn add_component(mut self, component: Arc<dyn ScheduledTask>) -> Self {
-        self.components.push(component);
+        self.tasks.push(component);
         self
     }
 
@@ -81,7 +81,7 @@ impl Schedule {
     ///
     /// If any precondition is not met, the schedule will not execute.
     pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
-        let components = self.components.clone();
+        let components = self.tasks.clone();
         let handle = tokio::spawn(async move {
             let mut failed_components = Vec::new();
             for component in components {

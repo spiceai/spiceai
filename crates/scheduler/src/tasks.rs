@@ -14,14 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 use crate::Result;
 
@@ -29,6 +25,43 @@ use crate::Result;
 pub trait ScheduledTask: Send + Sync {
     /// Executes the defined component.
     async fn execute(&self) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRequest {
+    pub cancel_running: bool,
+    pub clear_queue: bool,
+    pub created_at: Instant,
+}
+
+impl Default for TaskRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskRequest {
+    #[must_use]
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            cancel_running: false,
+            clear_queue: false,
+            created_at: now,
+        }
+    }
+
+    #[must_use]
+    pub fn cancels_running(mut self) -> Self {
+        self.cancel_running = true;
+        self
+    }
+
+    #[must_use]
+    pub fn clears_queue(mut self) -> Self {
+        self.clear_queue = true;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -53,11 +86,4 @@ impl RunningTask {
     pub fn consume_for_handle(self) -> JoinHandle<Result<()>> {
         self.handle
     }
-}
-
-#[derive(PartialEq)]
-pub(crate) enum TaskStatus {
-    NotStarted,
-    Running,
-    Finished(Arc<Uuid>),
 }

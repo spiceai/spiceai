@@ -16,8 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use evaluators::NewTaskRequest;
 use snafu::prelude::*;
+use tasks::TaskRequest;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -29,13 +29,13 @@ pub enum Error {
     SubmissionChannelRequired,
     #[snafu(display("A channel send error occurred: {source}"))]
     ChannelSendError {
-        source: tokio::sync::mpsc::error::SendError<Arc<NewTaskRequest>>,
+        source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub mod evaluators;
+pub mod channels;
 pub mod schedule;
 pub mod scheduler;
 pub mod tasks;
