@@ -183,6 +183,7 @@ assignees: ''
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
 - [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) in the release branch (not in trunk).
 
+  - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
   - [ ] Docker build for the release branch completes (~2 hours).
   - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
 
@@ -201,6 +202,7 @@ assignees: ''
       - Build the CLI: `false`
       - Release Version: the version tag released.
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
+- [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.

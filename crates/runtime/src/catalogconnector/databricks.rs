@@ -19,6 +19,7 @@ use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
+use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::dataconnector::ConnectorParams;
 use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
@@ -44,13 +45,21 @@ use token_provider::StaticTokenProvider;
 #[derive(Clone)]
 pub struct Databricks {
     params: Parameters,
+    initialization: ComponentInitialization,
 }
 
 impl Databricks {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+        let component_initialization =
+            match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
+                Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
+                _ => ComponentInitialization::OnStartup,
+            };
+
         Arc::new(Self {
             params: params.parameters,
+            initialization: component_initialization,
         })
     }
 }
@@ -255,6 +264,10 @@ impl CatalogConnector for Databricks {
         };
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
+    }
+
+    fn initialization(&self) -> ComponentInitialization {
+        self.initialization
     }
 }
 

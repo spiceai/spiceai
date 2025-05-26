@@ -370,7 +370,7 @@ impl Runtime {
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if !data_connector.deferred_load() {
+                if !data_connector.initialization().is_on_trigger() {
                     if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                         if let Err(err) = datasets_health_monitor.register_dataset(&ds).await {
                             tracing::warn!(
@@ -595,7 +595,7 @@ impl Runtime {
             ));
         }
 
-        if data_connector.deferred_load() {
+        if data_connector.initialization().is_on_trigger() {
             data_connector = Arc::new(DeferredConnector::new(data_connector));
         }
 

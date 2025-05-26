@@ -39,6 +39,14 @@ on:
           - "Windows x64"
           - "macOS x64 (Intel)"
         default: "all"
+      profile_option:
+        description: "Which Rust build profile to use? (Default is release)"
+        required: false
+        type: choice
+        options:
+          - "release"
+          - "release-lto"
+        default: "release"
 
 jobs:
   setup-matrix:
@@ -106,6 +114,7 @@ jobs:
       GOVER: 1.24.2
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     strategy:
       matrix:
@@ -168,7 +177,7 @@ jobs:
       - name: Build spiced
         if: contains(matrix.target.tags, 'default')
         working-directory: bin/spiced
-        run: cargo build --release --features release  --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release  --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')

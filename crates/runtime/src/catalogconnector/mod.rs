@@ -23,13 +23,14 @@ use std::{
 
 use crate::{
     Runtime,
-    component::catalog::Catalog,
+    component::{ComponentInitialization, catalog::Catalog},
     dataconnector::{ConnectorComponent, ConnectorParams},
     parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use datafusion::catalog::CatalogProvider;
+use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -80,6 +81,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "databricks")]
 pub mod databricks;
+pub mod deferred;
 pub mod iceberg;
 pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
@@ -198,6 +200,11 @@ pub trait CatalogConnector: Send + Sync {
         _runtime: Arc<Runtime>,
         _catalog: &Catalog,
     ) -> Result<Arc<dyn RefreshableCatalogProvider>>;
+
+    /// Returns whether the catalog connector should be initialized on startup or on trigger.
+    fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnStartup
+    }
 }
 
 pub async fn get_catalog_provider(
@@ -206,8 +213,16 @@ pub async fn get_catalog_provider(
     catalog: &Catalog,
     refresh_interval: Option<Duration>,
 ) -> Result<Arc<dyn CatalogProvider>> {
+    if connector.initialization().is_on_trigger() {
+        return Ok(Arc::new(DeferredCatalogProvider::new(
+            runtime,
+            connector,
+            catalog.clone(),
+        )));
+    }
+
     let provider = RefreshingCatalogProvider::new(
-        connector
+        Arc::clone(&connector)
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )

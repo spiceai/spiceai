@@ -190,6 +190,13 @@ impl DataFusionBuilder {
         ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
         ctx.register_udf(crate::datafusion::udf::Least::new().into());
+        ctx.register_udf(
+            crate::datafusion::udf::alias::ScalarUDFAlias::new(
+                Arc::new(datafusion::functions::math::random::RandomFunc::default()),
+                "rand",
+            )
+            .into(),
+        );
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -250,6 +257,7 @@ impl DataFusionBuilder {
             caching: Arc::new(caching),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
+            deferred_catalogs: TokioRwLock::new(HashMap::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,

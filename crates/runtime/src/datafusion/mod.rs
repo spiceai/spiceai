@@ -21,6 +21,7 @@ use std::time::Duration;
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode, ReadyState};
 use crate::component::view::View;
@@ -274,6 +275,7 @@ pub struct DataFusion {
     caching: Arc<Caching>,
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
+    deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -401,8 +403,19 @@ impl DataFusion {
         Ok(())
     }
 
-    pub fn register_catalog(&self, name: &str, catalog: Arc<dyn CatalogProvider>) -> Result<()> {
-        self.ctx.register_catalog(name, catalog);
+    pub async fn register_catalog(
+        &self,
+        name: &str,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> Result<()> {
+        if let Some(deferred_catalog) = catalog.as_any().downcast_ref::<DeferredCatalogProvider>() {
+            self.deferred_catalogs
+                .write()
+                .await
+                .insert(name.to_string(), Arc::new(deferred_catalog.clone()));
+        } else {
+            self.ctx.register_catalog(name, catalog);
+        }
 
         Ok(())
     }
@@ -557,6 +570,22 @@ impl DataFusion {
 
             let mut deferred_tables = self.deferred_tables.write().await;
             deferred_tables.remove(&table_reference.to_string());
+        }
+
+        Ok(())
+    }
+
+    pub async fn load_deferred_catalog(&self, name: &str) -> Result<()> {
+        let deferred_catalogs = self.deferred_catalogs.read().await;
+        if let Some(catalog) = deferred_catalogs.get(name) {
+            if let Ok(provider) = catalog.get_catalog_provider().await {
+                self.ctx.register_catalog(name, Arc::clone(&provider));
+            }
+
+            drop(deferred_catalogs);
+
+            let mut deferred_catalogs = self.deferred_catalogs.write().await;
+            deferred_catalogs.remove(name);
         }
 
         Ok(())
