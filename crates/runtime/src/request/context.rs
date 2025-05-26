@@ -28,6 +28,8 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
+use crate::datafusion::DataFusion;
+
 use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
@@ -210,6 +212,7 @@ pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
     app: Option<Arc<App>>,
+    df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
     extensions: Extensions,
@@ -222,6 +225,7 @@ impl RequestContextBuilder {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
             app: None,
+            df: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
             extensions: Extensions::default(),
@@ -231,6 +235,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    #[must_use]
+    pub fn with_df_opt(mut self, df: Option<Arc<DataFusion>>) -> Self {
+        self.df = df;
         self
     }
 
@@ -250,7 +260,8 @@ impl RequestContextBuilder {
         self.baggage.extend(baggage::from_headers(headers));
 
         let app = self.app.as_ref().map(Arc::clone);
-        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, headers) {
+        let df = self.df.as_ref().map(Arc::clone);
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, &df, headers) {
             self.extensions
                 .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
         }
