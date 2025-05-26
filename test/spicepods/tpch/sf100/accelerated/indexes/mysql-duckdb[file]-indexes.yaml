@@ -34,7 +34,7 @@ datasets:
       engine: duckdb
       mode: file
       primary_key: (l_orderkey, l_linenumber)
-      refresh_sql: "SELECT * FROM lineitem LIMIT 450000000"
+      refresh_sql: "SELECT * FROM lineitem LIMIT 300000000"
       params:
         duckdb_memory_limit: 60gb
       indexes:
