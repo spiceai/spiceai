@@ -278,8 +278,8 @@ impl Scheduler<Running> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::channels::interval::IntervalRequestChannel;
-    use crate::channels::manual::ManualRequestChannel;
+    use crate::channel::interval::IntervalRequestChannel;
+    use crate::channel::manual::ManualRequestChannel;
     use crate::schedule::Schedule;
     use crate::tasks::{ScheduledTask, TaskRequest};
     use async_trait::async_trait;

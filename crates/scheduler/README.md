@@ -24,7 +24,7 @@ The `spice_scheduler` crate provides a flexible, asynchronous task scheduling fr
 use spice_scheduler::{
     schedule::Schedule,
     scheduler::Scheduler,
-    channels::interval::IntervalRequestChannel,
+    channel::interval::IntervalRequestChannel,
     tasks::ScheduledTask,
 };
 use std::sync::Arc;

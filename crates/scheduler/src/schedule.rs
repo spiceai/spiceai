@@ -21,7 +21,7 @@ use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    channels::TaskRequestChannel,
+    channel::TaskRequestChannel,
     tasks::{RunningTask, ScheduledTask},
 };
 
