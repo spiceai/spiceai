@@ -21,16 +21,14 @@ use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 use crate::{
-    evaluators::Evaluator,
-    precondition::Precondition,
-    tasks::{RunningTask, ScheduledTask, TaskRequest},
+    evaluators::TaskRequestChannel,
+    tasks::{RunningTask, ScheduledTask},
 };
 
 pub struct Schedule {
     id: Arc<str>,
-    evaluators: Vec<Arc<RwLock<dyn Evaluator>>>,
+    channels: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
     components: Vec<Arc<dyn ScheduledTask>>,
-    preconditions: Vec<Arc<dyn Precondition>>,
 }
 
 impl Hash for Schedule {
@@ -50,9 +48,8 @@ impl Default for Schedule {
     fn default() -> Self {
         Self {
             id: Uuid::new_v4().to_string().into(),
-            evaluators: Vec::new(),
+            channels: Vec::new(),
             components: Vec::new(),
-            preconditions: Vec::new(),
         }
     }
 }
@@ -69,8 +66,8 @@ impl Schedule {
     }
 
     #[must_use]
-    pub fn add_evaluator(mut self, evaluator: Arc<RwLock<dyn Evaluator>>) -> Self {
-        self.evaluators.push(evaluator);
+    pub fn add_channel(mut self, channel: Arc<RwLock<dyn TaskRequestChannel>>) -> Self {
+        self.channels.push(channel);
         self
     }
 
@@ -80,31 +77,10 @@ impl Schedule {
         self
     }
 
-    #[must_use]
-    pub fn add_precondition(mut self, precondition: Arc<dyn Precondition>) -> Self {
-        self.preconditions.push(precondition);
-        self
-    }
-
     /// Executes the components defined by this schedule.
     ///
     /// If any precondition is not met, the schedule will not execute.
-    pub(crate) async fn execute(
-        self: &Arc<Self>,
-        task: &Arc<TaskRequest>,
-        notifier: Arc<Notify>,
-    ) -> Option<RunningTask> {
-        for condition in &self.preconditions {
-            if !condition.check().await {
-                tracing::debug!(
-                    "Scheduler is skipping {}, because precondition {} is not met",
-                    self.id,
-                    condition.name()
-                );
-                return None;
-            }
-        }
-
+    pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
         let components = self.components.clone();
         let handle = tokio::spawn(async move {
             let mut failed_components = Vec::new();
@@ -118,16 +94,16 @@ impl Schedule {
                 // Log or handle the errors
             }
 
-            notifier.notify_one();
+            notifier.notify_waiters();
 
             Ok(())
         });
 
-        Some(RunningTask::new(Arc::clone(&task.evaluator_id), handle))
+        RunningTask::new(handle)
     }
 
     #[must_use]
-    pub(crate) fn evaluators(&self) -> &Vec<Arc<RwLock<dyn Evaluator>>> {
-        &self.evaluators
+    pub(crate) fn channels(&self) -> &Vec<Arc<RwLock<dyn TaskRequestChannel>>> {
+        &self.channels
     }
 }

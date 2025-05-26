@@ -31,81 +31,15 @@ pub trait ScheduledTask: Send + Sync {
     async fn execute(&self) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum TaskDelivery {
-    /// The task is scheduled for immediate execution, and clears the pending task queue
-    ImmediateAndClear,
-    /// The task is scheduled for immediate execution, but does not clear the pending task queue
-    Immediate,
-    /// The task is queued for execution at a specific time
-    Queued,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TaskRequest {
-    pub at: Instant,
-    pub delivery: TaskDelivery,
-    pub created_at: Instant,
-    pub evaluator_id: Arc<Uuid>, // the evaluator that created this task
-}
-
-impl TaskRequest {
-    #[must_use]
-    pub fn now(evaluator_id: Arc<Uuid>) -> Self {
-        let now = Instant::now();
-        Self {
-            at: now,
-            delivery: TaskDelivery::Queued,
-            created_at: now,
-            evaluator_id,
-        }
-    }
-
-    #[must_use]
-    pub fn from_secs(evaluator_id: Arc<Uuid>, secs: u64) -> Self {
-        let now = Instant::now();
-        Self {
-            at: now + Duration::from_secs(secs),
-            delivery: TaskDelivery::Queued,
-            created_at: now,
-            evaluator_id,
-        }
-    }
-
-    #[must_use]
-    pub fn immediate(mut self) -> Self {
-        self.delivery = TaskDelivery::Immediate;
-        self
-    }
-
-    #[must_use]
-    pub fn is_immediate(&self) -> bool {
-        matches!(
-            self.delivery,
-            TaskDelivery::Immediate | TaskDelivery::ImmediateAndClear
-        )
-    }
-
-    #[must_use]
-    pub fn immediate_clear(mut self) -> Self {
-        self.delivery = TaskDelivery::ImmediateAndClear;
-        self
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct RunningTask {
-    pub(crate) evaluator_id: Arc<Uuid>,
     pub(crate) handle: JoinHandle<Result<()>>,
 }
 
 impl RunningTask {
     #[must_use]
-    pub(crate) fn new(evaluator_id: Arc<Uuid>, handle: JoinHandle<Result<()>>) -> Self {
-        Self {
-            evaluator_id,
-            handle,
-        }
+    pub(crate) fn new(handle: JoinHandle<Result<()>>) -> Self {
+        Self { handle }
     }
 
     #[must_use]

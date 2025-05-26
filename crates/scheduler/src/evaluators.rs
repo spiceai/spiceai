@@ -15,141 +15,77 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::tasks::{TaskDelivery, TaskRequest};
 use crate::{Error, Result};
 
-#[derive(PartialEq)]
-pub enum EvaluatorType {
-    /// The evaluator returns the next request in the schedule, only if the current time is greater than the last request.
-    /// E.g. `.next()` -> 1am, at 12:30am `.next()` -> 1am, at 1:00 am `.next()` -> 2am.
-    Sequential,
-    /// The evaluator returns requests based on a fixed interval, anchored from a specific time.
-    /// E.g. `.next()` -> 1am, at 12:30am `.next()` -> 1:30am, at 1:00 am `.next()` -> 2:00am.
-    /// Resetting a timed evaluator should reset the anchor time to the current time.
-    Timed,
-    /// The evaluator returns interrupt requests.
-    /// Interrupts have the highest priority and should be delivered immediately.
-    /// The scheduler should abort any in-progress evaluation wait timers and deliver the interrupt request.
-    Interrupt,
-}
-
-pub trait Evaluator: Send + Sync {
-    /// Returns a unique identifier for this evaluator.
-    fn id(&self) -> Arc<Uuid>;
-    /// Returns the type of this evaluator.
-    fn evaluator_type(&self) -> EvaluatorType;
-    /// Returns the next task request for this evaluator.
-    fn evaluate(&mut self) -> Option<Arc<TaskRequest>>;
-    /// Clears the internal state of this evaluator to reset it to its initial state.
-    fn reset(&mut self);
-}
-
-pub struct IntervalEvaluator {
-    id: Arc<Uuid>,
-    interval: u64,
-    last_evaluated: Option<Instant>,
-}
-
-impl IntervalEvaluator {
-    #[must_use]
-    pub fn new(interval: u64) -> Self {
-        Self {
-            id: Arc::new(Uuid::new_v4()),
-            interval,
-            last_evaluated: None,
-        }
-    }
-}
-
-impl Evaluator for IntervalEvaluator {
-    fn evaluator_type(&self) -> EvaluatorType {
-        EvaluatorType::Timed
-    }
-
-    fn id(&self) -> Arc<Uuid> {
-        Arc::clone(&self.id)
-    }
-
-    fn evaluate(&mut self) -> Option<Arc<TaskRequest>> {
-        let now = Instant::now();
-        if let Some(last_evaluated) = self.last_evaluated {
-            if now.duration_since(last_evaluated).as_secs() < self.interval {
-                return None;
-            }
-        }
-
-        self.last_evaluated = Some(now);
-        Some(Arc::new(TaskRequest::from_secs(
-            Arc::clone(&self.id),
-            self.interval,
-        )))
-    }
-
-    fn reset(&mut self) {
-        self.last_evaluated = None;
-    }
-}
-
-pub struct ManualInterrupt {
-    id: Arc<Uuid>,
-    rx: tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>,
-}
-
-impl ManualInterrupt {
-    #[must_use]
-    pub fn new(rx: tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>) -> Self {
-        Self {
-            id: Arc::new(Uuid::new_v4()),
-            rx,
-        }
-    }
-}
-
-impl Evaluator for ManualInterrupt {
-    fn evaluator_type(&self) -> EvaluatorType {
-        EvaluatorType::Interrupt
-    }
-
-    fn id(&self) -> Arc<Uuid> {
-        Arc::clone(&self.id)
-    }
-
-    fn evaluate(&mut self) -> Option<Arc<TaskRequest>> {
-        match self.rx.try_recv() {
-            Ok(Some(instant)) => Some(instant),
-            Ok(None) => Some(Arc::new(TaskRequest::now(Arc::clone(&self.id)))),
-            Err(
-                tokio::sync::mpsc::error::TryRecvError::Empty
-                | tokio::sync::mpsc::error::TryRecvError::Disconnected,
-            ) => None, // no interrupts to send
-        }
-    }
-
-    fn reset(&mut self) {}
-}
-
-trait TaskRequestChannel: Send + Sync {
+pub trait TaskRequestChannel: Send + Sync {
+    /// Whether this task request channel needs to be notified when a task is completed.
     fn needs_task_completion_notification(&self) -> bool;
+    /// Sets the cancellation token for this task request channel.
     fn set_cancellation_token(&mut self, cancellation: Arc<CancellationToken>);
+    /// Sets the notification channel to notify when a task is completed.
     fn set_task_completion_notification(&mut self, _notify: Arc<tokio::sync::Notify>) {}
+    /// Sets the reset notification channel to notify when the requestor should reset and wait for the next notification.
     fn set_reset_notification(&mut self, notify: Arc<tokio::sync::Notify>);
+    /// Sets the submission channel to send the task request.
     fn set_submission_channel(&mut self, tx: Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>);
+    /// Starts the task request channel and returns a handle to the background task.
+    #[allow(clippy::missing_errors_doc)]
     fn start(&self) -> Result<JoinHandle<Result<()>>>;
 }
 
-struct IntervalRequestChannel {
+pub struct IntervalRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     notify: Option<Arc<tokio::sync::Notify>>,
     reset: Option<Arc<tokio::sync::Notify>>,
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>>,
-    interval: u64,
+    interval: Duration,
+}
+
+impl IntervalRequestChannel {
+    #[must_use]
+    pub fn new(interval: u64) -> Self {
+        Self {
+            cancellation: None,
+            notify: None,
+            reset: None,
+            tx: None,
+            interval: Duration::from_secs(interval),
+        }
+    }
+
+    #[must_use]
+    pub fn with_cancellation_token(mut self, cancellation: Arc<CancellationToken>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_completion_notification(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reset_notification(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.reset = Some(notify);
+        self
+    }
+
+    #[must_use]
+    pub fn with_submission_channel(
+        mut self,
+        tx: Arc<tokio::sync::mpsc::Sender<Arc<NewTaskRequest>>>,
+    ) -> Self {
+        self.tx = Some(tx);
+        self
+    }
 }
 
 impl TaskRequestChannel for IntervalRequestChannel {
@@ -227,12 +163,12 @@ impl TaskRequestChannel for IntervalRequestChannel {
                         tracing::debug!("Interval evaluator reset");
                         continue;
                     }
-                    () = tokio::time::sleep(tokio::time::Duration::from_secs(interval)) => {
+                    () = tokio::time::sleep(interval) => {
                         tracing::debug!("Interval evaluator interval elapsed");
                     }
                 }
 
-                tx.send(Arc::new(NewTaskRequest::now()))
+                tx.send(Arc::new(NewTaskRequest::new()))
                     .await
                     .context(crate::ChannelSendSnafu)?;
             }
@@ -242,20 +178,32 @@ impl TaskRequestChannel for IntervalRequestChannel {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewTaskRequest {
-    pub at: Instant,
-    pub delivery: TaskDelivery,
+    pub cancel_running: bool,
+    pub clear_queue: bool,
     pub created_at: Instant,
 }
 
 impl NewTaskRequest {
     #[must_use]
-    pub fn now() -> Self {
+    pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            at: now,
-            delivery: TaskDelivery::Queued,
+            cancel_running: false,
+            clear_queue: false,
             created_at: now,
         }
+    }
+
+    #[must_use]
+    pub fn cancels_running(mut self) -> Self {
+        self.cancel_running = true;
+        self
+    }
+
+    #[must_use]
+    pub fn clears_queue(mut self) -> Self {
+        self.clear_queue = true;
+        self
     }
 }
 
@@ -271,13 +219,11 @@ mod tests {
         let notify = Arc::new(tokio::sync::Notify::new());
         let reset = Arc::new(tokio::sync::Notify::new());
 
-        let channel = IntervalRequestChannel {
-            cancellation: Some(Arc::clone(&cancellation)),
-            notify: Some(Arc::clone(&notify)),
-            reset: Some(Arc::clone(&reset)),
-            tx: Some(Arc::new(tx)),
-            interval: 1,
-        };
+        let channel = IntervalRequestChannel::new(1)
+            .with_cancellation_token(Arc::clone(&cancellation))
+            .with_task_completion_notification(Arc::clone(&notify))
+            .with_reset_notification(Arc::clone(&reset))
+            .with_submission_channel(Arc::new(tx));
 
         let channel_handle = channel.start().expect("To start request channel");
 
@@ -285,10 +231,9 @@ mod tests {
         let request = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
-        assert!(request.at <= now);
-        assert!(request.at >= now.checked_sub(elapsed).expect("To subtract elapsed time"));
+        assert!(request.created_at <= now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request.delivery == TaskDelivery::Queued);
+        assert!(request.cancel_running == false);
 
         // next request should wait for task notification
         tokio::select! {
@@ -305,10 +250,9 @@ mod tests {
         let request = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
-        assert!(request.at <= now);
-        assert!(request.at >= now.checked_sub(elapsed).expect("To subtract elapsed time"));
+        assert!(request.created_at >= now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request.delivery == TaskDelivery::Queued);
+        assert!(request.cancel_running == false);
 
         cancellation.cancel();
         channel_handle
@@ -326,20 +270,16 @@ mod tests {
         let reset = Arc::new(tokio::sync::Notify::new());
 
         let tx = Arc::new(tx);
-        let channel_one = IntervalRequestChannel {
-            cancellation: Some(Arc::clone(&cancellation)),
-            notify: Some(Arc::clone(&notify)),
-            reset: Some(Arc::clone(&reset)),
-            tx: Some(Arc::clone(&tx)),
-            interval: 1,
-        };
-        let channel_two = IntervalRequestChannel {
-            cancellation: Some(Arc::clone(&cancellation)),
-            notify: Some(Arc::clone(&notify)),
-            reset: Some(Arc::clone(&reset)),
-            tx: Some(Arc::clone(&tx)),
-            interval: 1,
-        };
+        let channel_one = IntervalRequestChannel::new(1)
+            .with_cancellation_token(Arc::clone(&cancellation))
+            .with_task_completion_notification(Arc::clone(&notify))
+            .with_reset_notification(Arc::clone(&reset))
+            .with_submission_channel(Arc::clone(&tx));
+        let channel_two = IntervalRequestChannel::new(1)
+            .with_cancellation_token(Arc::clone(&cancellation))
+            .with_task_completion_notification(Arc::clone(&notify))
+            .with_reset_notification(Arc::clone(&reset))
+            .with_submission_channel(Arc::clone(&tx));
 
         let handle_one = channel_one.start().expect("To start request channel");
         let handle_two = channel_two.start().expect("To start request channel");
@@ -350,13 +290,11 @@ mod tests {
         let request_two = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
-        assert!(request_one.at <= now);
-        assert!(request_one.at >= now.checked_sub(elapsed).expect("To subtract elapsed time"));
-        assert!(request_two.at <= now);
-        assert!(request_two.at >= now.checked_sub(elapsed).expect("To subtract elapsed time"));
+        assert!(request_one.created_at <= now);
+        assert!(request_two.created_at <= now);
         assert!(elapsed.as_millis() >= 990 && elapsed.as_millis() <= 1010);
-        assert!(request_one.delivery == TaskDelivery::Queued);
-        assert!(request_two.delivery == TaskDelivery::Queued);
+        assert!(request_one.cancel_running == false);
+        assert!(request_two.cancel_running == false);
 
         cancellation.cancel();
         handle_one
