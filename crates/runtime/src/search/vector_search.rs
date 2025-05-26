@@ -18,16 +18,19 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
 use super::util::{get_embedding_table, user_tables_with_embeddings};
-use super::{Error, Result};
+use super::{CandidateAggregationSnafu, Error, Result};
 use crate::search::DataFusionSnafu;
 use crate::search::candidate::vector::VectorGeneration;
-use crate::search::types::VectorSearchTableResult;
-use crate::search::util::{collect_batches, get_primary_keys_with_overrides};
+use crate::search::types::{VectorSearchGenerationTableResult, VectorSearchTableResult};
+use crate::search::util::{embedding_columns_from_table, get_primary_keys_with_overrides};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, Ident};
 use itertools::Itertools;
-use search::CandidateGeneration;
+use search::aggregation::CandidateAggregation;
+use search::collect_batches;
+use search::{aggregation::reciprocal_rank::ReciprocalRankFusion, generation::CandidateGeneration};
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
@@ -62,19 +65,20 @@ impl VectorSearch {
     #[allow(clippy::too_many_arguments)]
     pub async fn individual_vector_search(
         &self,
-        tbl: TableReference,
+        tbl: &TableReference,
+        embedding_column: &str,
         query: &str,
         primary_keys: &[String],
         additional_columns: &[String],
         where_cond: Option<&Expr>,
         keywords: Vec<String>,
         limit: usize,
-    ) -> Result<(TableReference, VectorSearchTableResult)> {
+    ) -> Result<SendableRecordBatchStream> {
         tracing::debug!("Running vector search for table {:#?}", tbl);
 
         let table_provider = self
             .df
-            .get_table(&tbl)
+            .get_table(tbl)
             .await
             .ok_or(Error::DataSourcesNotFound {
                 data_source: vec![tbl.clone()],
@@ -86,22 +90,7 @@ impl VectorSearch {
             });
         };
 
-        let embedding_columns = embedding_table.get_embedding_columns();
-
-        // Only support one embedding column per table.
-        if embedding_columns.len() > 1 {
-            return Err(Error::IncorrectNumberOfEmbeddingColumns {
-                data_source: tbl.clone(),
-                num_embeddings: embedding_columns.len(),
-            });
-        }
-
-        let Some(embedding_column) = embedding_columns.first().cloned() else {
-            return Err(Error::NoEmbeddingColumns {
-                data_source: tbl.clone(),
-            });
-        };
-        let Some(model_name) = embedding_table.get_embedding_models_used().first().cloned() else {
+        let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column) else {
             return Err(Error::CannotVectorSearchDataset {
                 data_source: tbl.clone(),
             });
@@ -126,7 +115,7 @@ impl VectorSearch {
 
         let filters = keywords
             .iter()
-            .map(|k| SearchRequest::validate_keyword_to_ilike(k, embedding_column.as_str()))
+            .map(|k| SearchRequest::validate_keyword_to_ilike(k, embedding_column))
             .collect::<Result<Vec<Expr>>>()?;
         let mut filter_refs: Vec<&Expr> = filters.iter().collect();
 
@@ -142,14 +131,14 @@ impl VectorSearch {
 
         let generator = VectorGeneration::new(
             &self.df,
-            &tbl,
+            tbl,
             &embed,
             primary_keys,
-            embedding_column.as_str(),
-            embedding_table.is_chunked(embedding_column.as_str()),
+            embedding_column,
+            embedding_table.is_chunked(embedding_column),
         );
 
-        let search_result = generator
+        generator
             .search(
                 query.to_string(),
                 filter_refs.as_slice(),
@@ -157,33 +146,11 @@ impl VectorSearch {
                 limit,
             )
             .await
-            .map_err(|e| Error::CandidateGenerationError { source: e })?;
-
-        // TODO: Do not prematurely collect all results. https://github.com/spiceai/spiceai/issues/5848
-        let data = collect_batches(search_result)
-            .await
-            .boxed()
-            .context(DataFusionSnafu)?;
+            .map_err(|e| Error::CandidateGenerationError { source: e })
 
         // TODO: Filter results after the fact for filters that aren't supported by [`CandidateGeneration::supports_filter_pushdown`]. https://github.com/spiceai/spiceai/issues/5849
 
         // TODO: Retrieve columns from projection that aren't provided by candidate generator (see [`CandidateGeneration::supports_columns`]) https://github.com/spiceai/spiceai/issues/5850
-
-        let embedding_column = if embedding_table.is_chunked(embedding_column.as_str()) {
-            format!("{embedding_column}_chunk")
-        } else {
-            embedding_column.clone()
-        };
-
-        Ok((
-            tbl.clone(),
-            VectorSearchTableResult {
-                data,
-                primary_keys: primary_keys.to_vec(),
-                embedding_column,
-                additional_columns: additional_columns.iter().map(ToString::to_string).collect(),
-            },
-        ))
     }
 
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
@@ -220,20 +187,35 @@ impl VectorSearch {
                 .await?;
 
             // Search for each table is independent, but done in parallel.
-            let response: VectorSearchResult = futures::future::try_join_all(tables.into_iter().map(|tbl| {
+            let response: HashMap<TableReference, VectorSearchGenerationTableResult> = futures::future::try_join_all(tables.into_iter().map(|tbl| {
                 let keywords = keywords.clone();
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
-                self.individual_vector_search(
-                    tbl,
-                    query.as_str(),
-                    primary_keys,
-                    additional_columns.as_slice(),
-                    where_cond.as_ref(),
-                    keywords.clone(),
-                    *limit
-                )
+
+                async move {
+                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
+                    let mut results: Vec<SendableRecordBatchStream> = Vec::with_capacity(embedding_columns.len());
+
+                    for (i, col) in embedding_columns.iter().enumerate() {
+                        results.insert(i, self.individual_vector_search(
+                                &tbl,
+                                col.as_str(),
+                                query.as_str(),
+                                primary_keys,
+                                additional_columns.as_slice(),
+                                where_cond.as_ref(),
+                                keywords.clone(),
+                                1000
+                                // *limit
+                            ).await?
+                        );
+                    }
+
+                    Ok((tbl.clone(), VectorSearchGenerationTableResult{data: results, primary_keys: primary_keys.to_vec()}))
+                }
             }).collect::<Vec<_>>()).await?.into_iter().collect();
-            Ok(response)
+
+            self.aggregate_per_table(response, ReciprocalRankFusion, additional_columns.as_slice(), *limit).await
+
         }.instrument(span.clone()).await;
 
         match vector_search_result {
@@ -246,5 +228,46 @@ impl VectorSearch {
                 Err(e)
             }
         }
+    }
+
+    /// For each [`TableReference`] combine & order results from multiple [`CandidateGeneration::search`]s via a [`CandidateAggregation`] algorithm.
+    async fn aggregate_per_table(
+        &self,
+        generation_results: HashMap<TableReference, VectorSearchGenerationTableResult>,
+        aggregation: impl CandidateAggregation,
+        additional_columns: &[String],
+        limit: usize,
+    ) -> Result<VectorSearchResult> {
+        let mut result: VectorSearchResult = HashMap::with_capacity(generation_results.len());
+
+        for (
+            tbl,
+            VectorSearchGenerationTableResult {
+                data,
+                ref primary_keys,
+            },
+        ) in generation_results
+        {
+            let aggregated = aggregation
+                .aggregate(data, primary_keys.clone(), limit)
+                .await
+                .context(CandidateAggregationSnafu)?;
+
+            let data = collect_batches(aggregated)
+                .await
+                .boxed()
+                .context(DataFusionSnafu)?;
+
+            result.insert(
+                tbl,
+                VectorSearchTableResult {
+                    data,
+                    primary_keys: primary_keys.clone(),
+                    additional_columns: additional_columns.to_vec(),
+                },
+            );
+        }
+
+        Ok(result)
     }
 }

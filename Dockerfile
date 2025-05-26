@@ -13,18 +13,20 @@ COPY . /build
 WORKDIR /build
 
 ARG CARGO_FEATURES
+ARG RUST_PROFILE
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
 ENV CARGO_FEATURES=$CARGO_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
-    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
+    RUST_PROFILE=$RUST_PROFILE
 
 RUN \
     --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
-    cargo build --release --features ${CARGO_FEATURES:-default} && \
-    cp /build/target/release/spiced /root/spiced
+    cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
+    cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
 FROM debian:bookworm-slim as sandbox-setup
 

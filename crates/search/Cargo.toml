@@ -14,5 +14,10 @@ arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

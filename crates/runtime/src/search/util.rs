@@ -17,31 +17,15 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
-use arrow::array::RecordBatch;
-use datafusion::common::Constraint;
-use datafusion::error::DataFusionError;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
-use tokio_stream::StreamExt;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use crate::embeddings::table::EmbeddingTable;
-
-pub(super) async fn collect_batches(
-    mut stream: SendableRecordBatchStream,
-) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
-    let mut batches = Vec::new();
-    while let Some(batch) = stream.next().await {
-        batches.push(batch?);
-    }
-
-    Ok(batches)
-}
 
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
 /// This includes if the [`TableProvider`] is an [`AcceleratedTable`] with a [`EmbeddingTable`] underneath.
@@ -186,4 +170,26 @@ pub async fn user_tables_with_embeddings(
         }
     }
     Ok(tables_with_embeddings)
+}
+
+/// Returns the column names of a [`TableReference`] that have associated embedding column(s)
+///
+/// This includes per-row embeddings and chunked embeddings.
+pub async fn embedding_columns_from_table(
+    df: &Arc<DataFusion>,
+    tbl: &TableReference,
+) -> super::Result<Vec<String>> {
+    let table_provider = df
+        .get_table(tbl)
+        .await
+        .ok_or(super::Error::DataSourcesNotFound {
+            data_source: vec![tbl.clone()],
+        })?;
+
+    let Some(embedding_table) = get_embedding_table(&table_provider).await else {
+        return Err(super::Error::CannotVectorSearchDataset {
+            data_source: tbl.clone(),
+        });
+    };
+    Ok(embedding_table.get_embedding_columns())
 }

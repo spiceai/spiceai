@@ -32,13 +32,9 @@ use crate::{
     models::{
         create_api_bindings_config,
         embedding::{EmbeddingTestCase, run_embedding_tests},
-        get_taxi_trips_dataset, get_tpcds_dataset, normalize_chat_completion_response,
-        send_chat_completions_request,
+        get_taxi_trips_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
-    utils::{
-        runtime_ready_check, runtime_ready_check_with_timeout, test_request_context,
-        verify_env_secret_exists,
-    },
+    utils::{runtime_ready_check_with_timeout, test_request_context, verify_env_secret_exists},
 };
 
 use tokio::sync::Mutex;
@@ -171,180 +167,144 @@ mod search {
     use serde_json::json;
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
-    use crate::models::search::{TestCase, run_search_test};
+    use crate::models::search::{
+        SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
+        run_search,
+    };
 
     use super::*;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(item_tpch_dataset_w_embeddings(
+                "item",
+                "hf_minilm",
+                Some(vec!["i_item_sk".to_string()]),
+                None,
+            ))
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "catalog_page_with_chunking",
+                "hf_minilm",
+                Some(vec!["cp_catalog_page_sk".to_string()]),
+                Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            ))
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "catalog_page_with_chunking_no_pk",
+                "hf_minilm",
+                None,
+                Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            ))
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .build();
 
-        test_request_context()
-            .scope(async {
-                let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
-                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "i_item_desc".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: Some(vec!["i_item_sk".to_string()]),
-                    chunking: None,
-                }];
-
-                let mut ds_tpcds_cp_with_chunking =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"), Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page_with_chunking limit 20"));
-                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "cp_description".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 512,
-                        overlap_size: 128,
-                        trim_whitespace: false,
+        run_search(
+            app,
+            vec![
+                SearchTestCase {
+                    name: "hf_basic",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
+                        "datasets": ["item"],
+                        "additional_columns": ["i_color", "i_item_id"],
                     }),
-                }];
-
-                let mut ds_tpcds_cp_with_chunking_no_pk =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking_no_pk"), Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page_with_chunking_no_pk limit 20"));
-                ds_tpcds_cp_with_chunking_no_pk.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "cp_description".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: None,
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 512,
-                        overlap_size: 128,
-                        trim_whitespace: false,
+                },
+                SearchTestCase {
+                    name: "hf_all_datasets",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
                     }),
-                }];
-
-                let app = AppBuilder::new("text-to-sql")
-                    .with_dataset(ds_tpcds_item)
-                    .with_dataset(ds_tpcds_cp_with_chunking)
-                    .with_dataset(ds_tpcds_cp_with_chunking_no_pk)
-                    .with_embedding(get_huggingface_embeddings(
-                        "sentence-transformers/all-MiniLM-L6-v2",
-                        "hf_minilm",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = Arc::clone(&rt).load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let test_cases = [
-                    TestCase {
-                        name: "hf_basic",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                            "datasets": ["item"],
-                            "additional_columns": ["i_color", "i_item_id"],
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_all_datasets",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_columns",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "additional_columns": ["cp_department"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_columns2",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_columns_and_where",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "additional_columns": ["cp_department"],
-                            "where": "cp_catalog_number>0",
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_no_pk",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking_no_pk"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_column_no_pk",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking_no_pk"],
-                            "additional_columns": ["cp_department"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_column_no_pk2",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking_no_pk"],
-                            "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
-                            "limit": 1,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking_with_extra_columns_and_where_no_pk",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking_no_pk"],
-                            "additional_columns": ["cp_department"],
-                            "where": "cp_catalog_number>0",
-                            "limit": 1,
-                        }),
-                    },
-                ];
-
-                for ts in test_cases {
-                    run_search_test(http_base_url.as_str(), &ts).await?;
-                }
-                Ok(())
-            })
-            .await
+                },
+                SearchTestCase {
+                    name: "hf_chunking",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "additional_columns": ["cp_department"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns2",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns_and_where",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "additional_columns": ["cp_department"],
+                        "where": "cp_catalog_number>0",
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_column_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_department"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_column_no_pk2",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns_and_where_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_department"],
+                        "where": "cp_catalog_number>0",
+                        "limit": 1,
+                    }),
+                },
+            ],
+        ).await
     }
 }
 
@@ -500,6 +460,9 @@ fn get_huggingface_model(
     model
 }
 
-fn get_huggingface_embeddings(model: impl Into<String>, name: impl Into<String>) -> Embeddings {
+pub(crate) fn get_huggingface_embeddings(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> Embeddings {
     Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name)
 }
