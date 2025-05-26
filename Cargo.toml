@@ -191,11 +191,11 @@ arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0aa49f3
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0aa49f3e9f245eb529a5a1db8f2af606c40a8b9a" } # spiceai-54.3.1
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0aa49f3e9f245eb529a5a1db8f2af606c40a8b9a" } # spiceai-54.3.1
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "b50824db74a9ca2f6ab09820a6d06bd1076b1a68" }            # spiceai-46
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "b50824db74a9ca2f6ab09820a6d06bd1076b1a68" }     # spiceai-46
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "b50824db74a9ca2f6ab09820a6d06bd1076b1a68" }  # spiceai-46
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "b50824db74a9ca2f6ab09820a6d06bd1076b1a68" }       # spiceai-46
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "b50824db74a9ca2f6ab09820a6d06bd1076b1a68" } # spiceai-46
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6aba073851d13b25ccad0eaba943271c70aa588d" }            # spiceai-46
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "6aba073851d13b25ccad0eaba943271c70aa588d" }     # spiceai-46
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "6aba073851d13b25ccad0eaba943271c70aa588d" }  # spiceai-46
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6aba073851d13b25ccad0eaba943271c70aa588d" }       # spiceai-46
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "6aba073851d13b25ccad0eaba943271c70aa588d" } # spiceai-46
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4c752a172904a0c214fc37ab2d62e907eb16c8f" } # spiceai-46
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "dddeb8cf1c0b12968cb599aa22497920b3eadfdc" } # spiceai
