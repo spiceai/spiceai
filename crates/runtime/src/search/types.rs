@@ -21,15 +21,17 @@ use arrow::error::ArrowError;
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::format::to_markdown_documents;
 use datafusion::common::utils::quote_identifier;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
+use search::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 use crate::convert_string_arrow_to_iterator;
 use crate::datafusion::query::write_to_json_string;
 
-use super::{Error, FormattingSnafu, RecordProcessingSnafu, Result, SEARCH_SCORE_COLUMN_NAME};
+use super::{Error, FormattingSnafu, RecordProcessingSnafu, Result};
 
 pub type ModelKey = String;
 
@@ -38,15 +40,13 @@ pub struct VectorSearchTableResult {
     pub data: Vec<RecordBatch>,
 
     pub primary_keys: Vec<String>,
-    // original data, not the embedding vector.
-    pub embedding_column: String,
     pub additional_columns: Vec<String>,
 }
 
 impl VectorSearchTableResult {
     /// Return the underlying [`RecordBatch`]s as a pretty formatted table.
     pub fn to_pretty(&self) -> Result<impl Display, ArrowError> {
-        to_markdown_documents(&self.data, &self.embedding_column)
+        to_markdown_documents(&self.data, SEARCH_VALUE_COLUMN_NAME)
     }
 
     /// Return the primary keys of the [`VectorSearch::individual_search`] as an array of JSON objects.
@@ -135,7 +135,8 @@ impl VectorSearchTableResult {
 
     /// Return the input column that was embedded.
     pub fn embedding_columns_list(&self) -> Result<Vec<String>> {
-        let embedding_projection = get_projection(&self.schema(), &[self.embedding_column.clone()]);
+        let embedding_projection =
+            get_projection(&self.schema(), &[SEARCH_VALUE_COLUMN_NAME.to_string()]);
         let embedding_records = self
             .data
             .iter()
@@ -192,6 +193,12 @@ impl VectorSearchTableResult {
             })
             .collect::<Result<Vec<Match>>>()
     }
+}
+
+/// The results of [`CandidateGeneration::search`]'s on a single table.
+pub struct VectorSearchGenerationTableResult {
+    pub data: Vec<SendableRecordBatchStream>,
+    pub primary_keys: Vec<String>,
 }
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
