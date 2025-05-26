@@ -29,7 +29,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 **Focus:** Search
 
 - Upgrade to DataFusion v47.
-- Upgrade to DuckDB v1.2.x.
+- Upgrade to DuckDB v1.3.x.
 - [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
 - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
@@ -42,6 +42,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - Hash partitioning for improved query distribution and performance.
 - **Ingestion**:
+  - Support write operations to Spice Cloud.
   - Delta Lake write support for transactional data lakes.
   - Apache Iceberg write support for scalable table formats.
   - PostgreSQL write support for relational database integration.
