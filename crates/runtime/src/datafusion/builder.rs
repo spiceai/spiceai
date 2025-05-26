@@ -187,8 +187,6 @@ impl DataFusionBuilder {
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
         ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
-        ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
-        ctx.register_udf(crate::datafusion::udf::Least::new().into());
         ctx.register_udf(
             crate::datafusion::udf::alias::ScalarUDFAlias::new(
                 Arc::new(datafusion::functions::math::random::RandomFunc::default()),
