@@ -233,14 +233,19 @@ impl Scheduler<Running> {
 
                                         // If there is a running task, check its status or cancel it if required
                                         if let Some(task) = running_task.take() {
-                                            if task.is_finished() {
-                                                Self::finalise_running_task(task).await;
-                                            } else if task_request.cancel_running {
-                                                task.handle.abort();
-                                                Self::finalise_running_task(task).await;
-                                            } else {
-                                                running_task = Some(task);
-                                                continue;
+                                            match (task.is_finished(), task_request.cancel_running) {
+                                                (true, _) => {
+                                                    Self::finalise_running_task(task).await;
+                                                }
+                                                (false, true) => {
+                                                    task.handle.abort();
+                                                    Self::finalise_running_task(task).await;
+                                                }
+                                                _ => {
+                                                    // If the task is still running and not cancelled, put it back
+                                                    running_task = Some(task);
+                                                    continue;
+                                                }
                                             }
                                         }
 
