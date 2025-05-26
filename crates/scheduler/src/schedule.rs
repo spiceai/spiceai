@@ -78,8 +78,6 @@ impl Schedule {
     }
 
     /// Executes the components defined by this schedule.
-    ///
-    /// If any precondition is not met, the schedule will not execute.
     pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
         let components = self.tasks.clone();
         let handle = tokio::spawn(async move {
