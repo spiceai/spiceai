@@ -1,12 +1,3 @@
-##################################################################################################################################
-#                                                                                                                                #
-#  WARNING: TOOL-GENERATED FILE - DO NOT EDIT MANUALLY!                                                                          #
-#                                                                                                                                #
-#  Command: yq 'explode(.)' .github/workflow_templates/spiced_docker_nightly.yml > .github/workflows/spiced_docker_nightly.yml   #
-#                                                                                                                                #
-#  Keep this notice at the top of the file.                                                                                      #
-#                                                                                                                                #
-##################################################################################################################################
 name: spiced_docker_nightly
 on:
   schedule:
@@ -18,6 +9,14 @@ on:
         required: false
         type: boolean
         default: false
+      profile_option:
+        description: "Which Rust build profile to use? (Default is release)"
+        required: false
+        type: choice
+        options:
+          - "release"
+          - "release-lto"
+        default: "release"
 jobs:
   check_commits:
     runs-on: ubuntu-latest
@@ -71,6 +70,8 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
     runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
       - uses: actions/checkout@v4
       - name: Add nightly postfix to version in Cargo.toml
@@ -179,6 +180,8 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
     runs-on: spiceai-runners
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
       - uses: actions/checkout@v4
       - name: Add nightly postfix to version in Cargo.toml
