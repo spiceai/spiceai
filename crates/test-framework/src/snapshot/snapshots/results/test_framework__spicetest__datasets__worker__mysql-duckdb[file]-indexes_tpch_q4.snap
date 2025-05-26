@@ -5,9 +5,9 @@ description: "Query: tpch_q4"
 +-----------------+-------------+
 | o_orderpriority | order_count |
 +-----------------+-------------+
-| 1-URGENT        | 1051801     |
-| 2-HIGH          | 1051366     |
-| 3-MEDIUM        | 1051587     |
-| 4-NOT SPECIFIED | 1050950     |
-| 5-LOW           | 1051725     |
+| 1-URGENT        | 525654      |
+| 2-HIGH          | 525159      |
+| 3-MEDIUM        | 525961      |
+| 4-NOT SPECIFIED | 525226      |
+| 5-LOW           | 526363      |
 +-----------------+-------------+
