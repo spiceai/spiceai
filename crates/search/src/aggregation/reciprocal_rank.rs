@@ -76,7 +76,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             i,
             VectorSearchGenerationResult {
                 data: stream,
-                derived_column,
+                derived_from,
             },
         ) in data.into_iter().enumerate()
         {

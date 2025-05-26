@@ -47,5 +47,5 @@ pub struct VectorSearchGenerationTableResult {
 /// The results of a single [`CandidateGeneration::search`].
 pub struct VectorSearchGenerationResult {
     pub data: SendableRecordBatchStream,
-    pub derived_column: String,
+    pub derived_from: String,
 }

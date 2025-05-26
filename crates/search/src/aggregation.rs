@@ -102,7 +102,7 @@ fn from_single_input(
 ) -> AggregationResult {
     let VectorSearchGenerationResult {
         data,
-        derived_column,
+        derived_from: derived_column,
     } = input;
 
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the

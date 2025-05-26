@@ -22,6 +22,7 @@ use super::{CandidateAggregationSnafu, Error, Result};
 use crate::search::candidate::vector::VectorGeneration;
 use crate::search::util::{embedding_columns_from_table, get_primary_keys_with_overrides};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, Ident};
 use itertools::Itertools;
@@ -147,7 +148,7 @@ impl VectorSearch {
 
         Ok(VectorSearchGenerationResult {
             data,
-            derived_column: embedding_column.to_string(),
+            derived_from: embedding_column.to_string(),
         })
 
         // TODO: Filter results after the fact for filters that aren't supported by [`CandidateGeneration::supports_filter_pushdown`]. https://github.com/spiceai/spiceai/issues/5849
