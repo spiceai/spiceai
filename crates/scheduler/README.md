@@ -1,6 +1,6 @@
 # Spice Scheduler Crate
 
-The `spice_scheduler` crate provides a flexible, asynchronous task scheduling framework for Rust applications. It is designed to support complex scheduling scenarios, including interval-based and manual task triggering, with support for cancellation, notification, and queue management.
+The `scheduler` crate provides a flexible, asynchronous task scheduling framework for Rust applications. It is designed to support complex scheduling scenarios, including interval-based and manual task triggering, with support for cancellation, notification, and queue management.
 
 ## Features
 
@@ -18,10 +18,16 @@ The `spice_scheduler` crate provides a flexible, asynchronous task scheduling fr
 - **ScheduledTask:** Trait for components that can be scheduled and executed.
 - **Scheduler:** Manages the lifecycle of schedules and their execution.
 
+## Architecture
+
+This mermaid chart describes the role and flow of the scheduler, in the context of a service that performs data refreshes. This diagram includes elements from the roadmap, such as retry mechanisms and paralellism controls:
+
+![Mermaid chart describing the scheduler architecture](./chart.png)
+
 ### Example
 
 ```rust
-use spice_scheduler::{
+use scheduler::{
     schedule::Schedule,
     scheduler::Scheduler,
     channel::interval::IntervalRequestChannel,
@@ -35,7 +41,7 @@ struct MyTask;
 
 #[async_trait]
 impl ScheduledTask for MyTask {
-    async fn execute(&self) -> spice_scheduler::Result<()> {
+    async fn execute(&self) -> scheduler::Result<()> {
         println!("Task executed!");
         Ok(())
     }

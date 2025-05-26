@@ -26,8 +26,6 @@ pub mod interval;
 pub mod manual;
 
 pub trait TaskRequestChannel: Send + Sync {
-    /// Whether this task request channel needs to be notified when a task is completed.
-    fn needs_task_completion_notification(&self) -> bool;
     /// Sets the cancellation token for this task request channel.
     fn set_cancellation_token(&mut self, cancellation: Arc<CancellationToken>);
     /// Sets the notification channel to notify when a task is completed.

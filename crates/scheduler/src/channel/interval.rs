@@ -28,7 +28,7 @@ use super::TaskRequestChannel;
 
 pub struct IntervalRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
-    notify: Option<Arc<tokio::sync::Notify>>,
+    task_completion: Option<Arc<tokio::sync::Notify>>,
     reset: Option<Arc<tokio::sync::Notify>>,
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     interval: Duration,
@@ -39,7 +39,7 @@ impl IntervalRequestChannel {
     pub fn new(interval: u64) -> Self {
         Self {
             cancellation: None,
-            notify: None,
+            task_completion: None,
             reset: None,
             tx: None,
             interval: Duration::from_secs(interval),
@@ -48,16 +48,12 @@ impl IntervalRequestChannel {
 }
 
 impl TaskRequestChannel for IntervalRequestChannel {
-    fn needs_task_completion_notification(&self) -> bool {
-        true
-    }
-
     fn set_cancellation_token(&mut self, cancellation: Arc<CancellationToken>) {
         self.cancellation = Some(cancellation);
     }
 
     fn set_task_completion_notification(&mut self, notify: Arc<tokio::sync::Notify>) {
-        self.notify = Some(notify);
+        self.task_completion = Some(notify);
     }
 
     fn set_reset_notification(&mut self, notify: Arc<tokio::sync::Notify>) {
@@ -81,8 +77,8 @@ impl TaskRequestChannel for IntervalRequestChannel {
             .clone()
             .context(crate::NotificationChannelRequiredSnafu)?;
         // notification channel to notify the requestor that a task has been completed
-        let notify = self
-            .notify
+        let task_completion = self
+            .task_completion
             .clone()
             .context(crate::NotificationChannelRequiredSnafu)?;
         // request submission channel to send the request
@@ -107,7 +103,7 @@ impl TaskRequestChannel for IntervalRequestChannel {
                             tracing::debug!("Interval evaluator reset");
                             continue;
                         }
-                        () = notify.notified() => {
+                        () = task_completion.notified() => {
                             tracing::debug!("Interval evaluator notified");
                         }
                     }
@@ -146,12 +142,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
         let cancellation = Arc::new(CancellationToken::new());
-        let notify = Arc::new(tokio::sync::Notify::new());
+        let task_completion = Arc::new(tokio::sync::Notify::new());
         let reset = Arc::new(tokio::sync::Notify::new());
 
         let mut channel = IntervalRequestChannel::new(1);
         channel.set_cancellation_token(Arc::clone(&cancellation));
-        channel.set_task_completion_notification(Arc::clone(&notify));
+        channel.set_task_completion_notification(Arc::clone(&task_completion));
         channel.set_reset_notification(Arc::clone(&reset));
         channel.set_submission_channel(Arc::new(tx));
 
@@ -176,7 +172,7 @@ mod tests {
         }
 
         let now = Instant::now();
-        notify.notify_one();
+        task_completion.notify_one();
         let request = rx.recv().await.expect("To receive request");
         let elapsed = now.elapsed();
         let now = Instant::now();
@@ -196,18 +192,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(1);
 
         let cancellation = Arc::new(CancellationToken::new());
-        let notify = Arc::new(tokio::sync::Notify::new());
+        let task_completion = Arc::new(tokio::sync::Notify::new());
         let reset = Arc::new(tokio::sync::Notify::new());
 
         let tx = Arc::new(tx);
         let mut channel_one = IntervalRequestChannel::new(1);
         channel_one.set_cancellation_token(Arc::clone(&cancellation));
-        channel_one.set_task_completion_notification(Arc::clone(&notify));
+        channel_one.set_task_completion_notification(Arc::clone(&task_completion));
         channel_one.set_reset_notification(Arc::clone(&reset));
         channel_one.set_submission_channel(Arc::clone(&tx));
         let mut channel_two = IntervalRequestChannel::new(1);
         channel_two.set_cancellation_token(Arc::clone(&cancellation));
-        channel_two.set_task_completion_notification(Arc::clone(&notify));
+        channel_two.set_task_completion_notification(Arc::clone(&task_completion));
         channel_two.set_reset_notification(Arc::clone(&reset));
         channel_two.set_submission_channel(Arc::clone(&tx));
 

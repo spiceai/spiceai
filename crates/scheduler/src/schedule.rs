@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::hash::Hash;
 use std::sync::Arc;
 
 use tokio::sync::{Notify, RwLock};
@@ -22,34 +21,21 @@ use uuid::Uuid;
 
 use crate::{
     channel::TaskRequestChannel,
-    scheduler::TaskRequestChannels,
+    scheduler::{NotificationChannels, TaskRequestChannels},
     task::{RunningTask, ScheduledTask},
 };
 
 pub struct Schedule {
     id: Arc<str>,
-    channels: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
+    triggers: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
     tasks: Vec<Arc<dyn ScheduledTask>>,
 }
-
-impl Hash for Schedule {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
-
-impl PartialEq for Schedule {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-impl Eq for Schedule {}
 
 impl Default for Schedule {
     fn default() -> Self {
         Self {
             id: Uuid::new_v4().to_string().into(),
-            channels: Vec::new(),
+            triggers: Vec::new(),
             tasks: Vec::new(),
         }
     }
@@ -67,8 +53,8 @@ impl Schedule {
     }
 
     #[must_use]
-    pub fn add_channel(mut self, channel: Arc<RwLock<dyn TaskRequestChannel>>) -> Self {
-        self.channels.push(channel);
+    pub fn add_trigger(mut self, channel: Arc<RwLock<dyn TaskRequestChannel>>) -> Self {
+        self.triggers.push(channel);
         self
     }
 
@@ -102,8 +88,8 @@ impl Schedule {
     }
 
     #[must_use]
-    pub(crate) fn channels(&self) -> &Vec<Arc<RwLock<dyn TaskRequestChannel>>> {
-        &self.channels
+    pub(crate) fn triggers(&self) -> &Vec<Arc<RwLock<dyn TaskRequestChannel>>> {
+        &self.triggers
     }
 
     async fn finalise_running_task(task: RunningTask) {
@@ -124,20 +110,19 @@ impl Schedule {
     pub(crate) fn start(
         self: Arc<Self>,
         request_channels: TaskRequestChannels,
-        notification_channels: Arc<crate::scheduler::NotificationChannels>,
+        notification_channels: Arc<NotificationChannels>,
         cancellation_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> tokio::task::JoinHandle<crate::Result<()>> {
         let schedule_id = self.id();
-        let cloned_schedule_id = Arc::clone(&schedule_id);
         tokio::spawn(async move {
             let rx_lock = {
                 let channels = request_channels.read().await;
-                channels.get(&cloned_schedule_id).cloned()
+                channels.get(&schedule_id).cloned()
             };
 
             if let Some(rx_lock) = rx_lock {
                 let mut rx = rx_lock.write().await;
-                let mut running_task: Option<crate::task::RunningTask> = None;
+                let mut running_task: Option<RunningTask> = None;
                 loop {
                     tokio::select! {
                         () = cancellation_token.cancelled() => {

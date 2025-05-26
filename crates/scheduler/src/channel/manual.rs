@@ -28,7 +28,6 @@ use super::TaskRequestChannel;
 
 pub struct ManualRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
-    notify: Option<Arc<tokio::sync::Notify>>,
     reset: Option<Arc<tokio::sync::Notify>>,
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     rx: Arc<RwLock<tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>>>,
@@ -39,7 +38,6 @@ impl ManualRequestChannel {
     pub fn new(rx: tokio::sync::mpsc::Receiver<Option<Arc<TaskRequest>>>) -> Self {
         Self {
             cancellation: None,
-            notify: None,
             reset: None,
             tx: None,
             rx: Arc::new(RwLock::new(rx)),
@@ -48,17 +46,12 @@ impl ManualRequestChannel {
 }
 
 impl TaskRequestChannel for ManualRequestChannel {
-    fn needs_task_completion_notification(&self) -> bool {
-        self.notify.is_some()
-    }
-
     fn set_cancellation_token(&mut self, cancellation: Arc<CancellationToken>) {
         self.cancellation = Some(cancellation);
     }
 
-    fn set_task_completion_notification(&mut self, notify: Arc<tokio::sync::Notify>) {
-        self.notify = Some(notify);
-    }
+    // manual request channels do not require task completion notifications
+    fn set_task_completion_notification(&mut self, _notify: Arc<tokio::sync::Notify>) {}
 
     fn set_reset_notification(&mut self, notify: Arc<tokio::sync::Notify>) {
         self.reset = Some(notify);

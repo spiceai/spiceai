@@ -85,14 +85,11 @@ impl Scheduler<NotStarted> {
             let tx = Arc::new(tx);
             let schedule_id = schedule.id();
 
-            for channel_lock in schedule.channels() {
+            for channel_lock in schedule.triggers() {
                 let mut channel = channel_lock.write().await;
-                if channel.needs_task_completion_notification() {
-                    channel.set_task_completion_notification(Arc::clone(
-                        &notification_channels.completion,
-                    ));
-                }
-
+                channel.set_task_completion_notification(Arc::clone(
+                    &notification_channels.completion,
+                ));
                 channel.set_cancellation_token(Arc::clone(&cancellation_token));
                 channel.set_reset_notification(Arc::clone(&notification_channels.reset));
                 channel.set_submission_channel(Arc::clone(&tx));
@@ -311,7 +308,7 @@ mod test {
             .add_task(Arc::new(TestComponent {
                 name: Arc::from("test_scheduler"),
             }))
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler =
             Scheduler::<NotStarted>::new("test_scheduler".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
@@ -331,7 +328,7 @@ mod test {
     async fn test_scheduler_timing() {
         init_tracing(None);
         let schedule = Schedule::new()
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
             .add_task(Arc::new(TimedComponent {
                 name: "test_scheduler_timing".into(),
             }));
@@ -369,7 +366,7 @@ mod test {
             .add_task(Arc::new(TestComponent {
                 name: Arc::from("test_multi_component_schedule"),
             }))
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::<NotStarted>::new(
             "test_multi_component_schedule".into(),
             vec![Arc::new(schedule)],
@@ -393,12 +390,12 @@ mod test {
             .add_task(Arc::new(TestComponent {
                 name: Arc::from("test_multi_schedule"),
             }))
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let schedule_two = Schedule::new()
             .add_task(Arc::new(TestComponent {
                 name: Arc::from("test_multi_schedule"),
             }))
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::<NotStarted>::new(
             "test_multi_schedule".into(),
             vec![Arc::new(schedule_one), Arc::new(schedule_two)],
@@ -422,8 +419,8 @@ mod test {
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new()
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
-            .add_channel(manual_channel_lock)
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
+            .add_trigger(manual_channel_lock)
             .add_task(Arc::new(TestComponent {
                 name: "test_multi_evaluator_multi_component".into(),
             }))
@@ -457,7 +454,7 @@ mod test {
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new()
-            .add_channel(manual_channel_lock)
+            .add_trigger(manual_channel_lock)
             .add_task(Arc::new(TestComponent {
                 name: "test_manual_interrupts".into(),
             }));
@@ -486,7 +483,7 @@ mod test {
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new()
-            .add_channel(manual_channel_lock)
+            .add_trigger(manual_channel_lock)
             .add_task(Arc::new(TestComponent {
                 name: "test_manual_queued_with_interrupt".into(),
             }));
@@ -518,8 +515,8 @@ mod test {
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new()
-            .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
-            .add_channel(manual_channel_lock)
+            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
+            .add_trigger(manual_channel_lock)
             .add_task(Arc::new(LongComponent {
                 name: "test_manual_queue_clears_after_immediate".into(),
                 wait: 5,
