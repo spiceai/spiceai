@@ -25,7 +25,7 @@ use spice_scheduler::{
     schedule::Schedule,
     scheduler::Scheduler,
     channel::interval::IntervalRequestChannel,
-    tasks::ScheduledTask,
+    task::ScheduledTask,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;

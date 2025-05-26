@@ -22,7 +22,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Result, schedule::Schedule, tasks::RunningTask, tasks::TaskRequest};
+use crate::{Result, schedule::Schedule, task::RunningTask, task::TaskRequest};
 
 pub struct NotStarted {
     schedules: Vec<Arc<Schedule>>,
@@ -281,7 +281,7 @@ mod test {
     use crate::channel::interval::IntervalRequestChannel;
     use crate::channel::manual::ManualRequestChannel;
     use crate::schedule::Schedule;
-    use crate::tasks::{ScheduledTask, TaskRequest};
+    use crate::task::{ScheduledTask, TaskRequest};
     use async_trait::async_trait;
     use std::{
         sync::LazyLock,

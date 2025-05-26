@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use scheduler::Result;
-use scheduler::tasks::ScheduledTask;
+use scheduler::task::ScheduledTask;
 use tonic::async_trait;
 
 use crate::component::dataset::Dataset;

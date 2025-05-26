@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use snafu::prelude::*;
-use tasks::TaskRequest;
+use task::TaskRequest;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -38,4 +38,4 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub mod channel;
 pub mod schedule;
 pub mod scheduler;
-pub mod tasks;
+pub mod task;

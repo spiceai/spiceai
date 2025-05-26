@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::Result;
-use crate::tasks::TaskRequest;
+use crate::task::TaskRequest;
 
 pub mod interval;
 pub mod manual;

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     channel::TaskRequestChannel,
-    tasks::{RunningTask, ScheduledTask},
+    task::{RunningTask, ScheduledTask},
 };
 
 pub struct Schedule {
