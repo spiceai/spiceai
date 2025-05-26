@@ -22,19 +22,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Result, schedule::Schedule, task::RunningTask, task::TaskRequest};
+use crate::{Result, schedule::Schedule, task::TaskRequest};
 
 pub struct NotStarted {
     schedules: Vec<Arc<Schedule>>,
 }
 
 pub struct NotificationChannels {
-    completion: Arc<Notify>,
-    reset: Arc<Notify>,
+    pub(crate) completion: Arc<Notify>,
+    pub(crate) reset: Arc<Notify>,
 }
 
 type TaskRequestHandles = Arc<RwLock<HashMap<Arc<str>, Vec<JoinHandle<Result<()>>>>>>;
-type TaskRequestChannels = Arc<RwLock<HashMap<Arc<str>, Arc<RwLock<Receiver<Arc<TaskRequest>>>>>>>;
+pub(crate) type TaskRequestChannels =
+    Arc<RwLock<HashMap<Arc<str>, Arc<RwLock<Receiver<Arc<TaskRequest>>>>>>>;
 
 type SchedulerHandles = Arc<RwLock<HashMap<Arc<str>, Vec<JoinHandle<Result<()>>>>>>;
 
@@ -125,20 +126,6 @@ impl Scheduler<NotStarted> {
 }
 
 impl Scheduler<Running> {
-    async fn finalise_running_task(task: RunningTask) {
-        match task.consume_for_handle().await {
-            Ok(Ok(())) => {
-                tracing::debug!("Task executed successfully");
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Task execution failed: {e}");
-            }
-            Err(e) => {
-                tracing::error!("Task join error: {e}");
-            }
-        }
-    }
-
     pub async fn stop(self) {
         let cancellation_token = Arc::clone(&self.state.cancellation_token);
         cancellation_token.cancel();
@@ -200,73 +187,12 @@ impl Scheduler<Running> {
         for schedule in &schedules {
             let schedule = Arc::clone(schedule);
             let schedule_id = schedule.id();
-            let cloned_schedule_id = Arc::clone(&schedule_id);
-            let request_channels = Arc::clone(&state.request_channels);
-            let notification_channels = Arc::clone(&state.notification_channels);
-            let cancellation_token = Arc::clone(&cancellation_token);
 
-            let handle = tokio::spawn(async move {
-                let rx_lock = {
-                    let channels = request_channels.read().await;
-                    channels.get(&cloned_schedule_id).cloned()
-                };
-
-                if let Some(rx_lock) = rx_lock {
-                    let mut rx = rx_lock.write().await;
-                    let mut running_task: Option<RunningTask> = None;
-                    loop {
-                        tokio::select! {
-                            () = cancellation_token.cancelled() => {
-                                break;
-                            }
-                            maybe_task = rx.recv() => {
-                                match maybe_task {
-                                    Some(task_request) => {
-                                        // clear the queue if requested
-                                        if task_request.clear_queue {
-                                            for _ in 0..rx.len() {
-                                                if let Some(_task) = rx.recv().await {
-                                                    // Clear the queue
-                                                }
-                                            }
-                                        }
-
-                                        // If there is a running task, check its status or cancel it if required
-                                        if let Some(task) = running_task.take() {
-                                            match (task.is_finished(), task_request.cancel_running) {
-                                                (true, _) => {
-                                                    Self::finalise_running_task(task).await;
-                                                }
-                                                (false, true) => {
-                                                    task.handle.abort();
-                                                    Self::finalise_running_task(task).await;
-                                                }
-                                                _ => {
-                                                    // If the task is still running and not cancelled, put it back
-                                                    running_task = Some(task);
-                                                    continue;
-                                                }
-                                            }
-                                        }
-
-                                        // Notify task request channels to reset their clocks if applicable
-                                        notification_channels.reset.notify_waiters();
-
-                                        // Execute all components for this schedule
-                                        running_task = Some(schedule.execute(Arc::clone(&notification_channels.completion)));
-                                    }
-                                    None => {
-                                        // Channel closed, exit loop
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(())
-            });
+            let handle = schedule.start(
+                Arc::clone(&state.request_channels),
+                Arc::clone(&state.notification_channels),
+                Arc::clone(&cancellation_token),
+            );
 
             scheduler_handles
                 .entry(schedule_id)

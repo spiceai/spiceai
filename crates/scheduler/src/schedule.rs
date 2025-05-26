@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     channel::TaskRequestChannel,
+    scheduler::TaskRequestChannels,
     task::{RunningTask, ScheduledTask},
 };
 
@@ -103,5 +104,92 @@ impl Schedule {
     #[must_use]
     pub(crate) fn channels(&self) -> &Vec<Arc<RwLock<dyn TaskRequestChannel>>> {
         &self.channels
+    }
+
+    async fn finalise_running_task(task: RunningTask) {
+        match task.consume_for_handle().await {
+            Ok(Ok(())) => {
+                tracing::debug!("Task executed successfully");
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Task execution failed: {e}");
+            }
+            Err(e) => {
+                tracing::error!("Task join error: {e}");
+            }
+        }
+    }
+
+    /// Starts the schedule's main loop, returning a `JoinHandle`.
+    pub(crate) fn start(
+        self: Arc<Self>,
+        request_channels: TaskRequestChannels,
+        notification_channels: Arc<crate::scheduler::NotificationChannels>,
+        cancellation_token: Arc<tokio_util::sync::CancellationToken>,
+    ) -> tokio::task::JoinHandle<crate::Result<()>> {
+        let schedule_id = self.id();
+        let cloned_schedule_id = Arc::clone(&schedule_id);
+        tokio::spawn(async move {
+            let rx_lock = {
+                let channels = request_channels.read().await;
+                channels.get(&cloned_schedule_id).cloned()
+            };
+
+            if let Some(rx_lock) = rx_lock {
+                let mut rx = rx_lock.write().await;
+                let mut running_task: Option<crate::task::RunningTask> = None;
+                loop {
+                    tokio::select! {
+                        () = cancellation_token.cancelled() => {
+                            break;
+                        }
+                        maybe_task = rx.recv() => {
+                            match maybe_task {
+                                Some(task_request) => {
+                                    // clear the queue if requested
+                                    if task_request.clear_queue {
+                                        for _ in 0..rx.len() {
+                                            if let Some(_task) = rx.recv().await {
+                                                // Clear the queue
+                                            }
+                                        }
+                                    }
+
+                                    // If there is a running task, check its status or cancel it if required
+                                    if let Some(task) = running_task.take() {
+                                        match (task.is_finished(), task_request.cancel_running) {
+                                            (true, _) => {
+                                                Self::finalise_running_task(task).await;
+                                            }
+                                            (false, true) => {
+                                                task.handle.abort();
+                                                Self::finalise_running_task(task).await;
+                                            }
+                                            _ => {
+                                                // If the task is still running and not cancelled, put it back
+                                                running_task = Some(task);
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    // Notify task request channels to reset their clocks if applicable
+                                    notification_channels.reset.notify_waiters();
+
+                                    // Execute all components for this schedule
+                                    running_task = Some(self.execute(Arc::clone(&notification_channels.completion)));
+                                }
+                                None => {
+                                    // Channel closed, exit loop
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
     }
 }
