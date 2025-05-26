@@ -44,7 +44,7 @@ impl ScheduledTask for MyTask {
 #[tokio::main]
 async fn main() {
     let schedule = Schedule::new()
-        .add_component(Arc::new(MyTask))
+        .add_task(Arc::new(MyTask))
         .add_channel(Arc::new(RwLock::new(IntervalRequestChannel::new(5)))); // every 5 seconds
 
     let scheduler = Scheduler::new("example_scheduler".into(), vec![Arc::new(schedule)]);

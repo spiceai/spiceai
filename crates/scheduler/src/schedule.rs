@@ -72,23 +72,23 @@ impl Schedule {
     }
 
     #[must_use]
-    pub fn add_component(mut self, component: Arc<dyn ScheduledTask>) -> Self {
-        self.tasks.push(component);
+    pub fn add_task(mut self, task: Arc<dyn ScheduledTask>) -> Self {
+        self.tasks.push(task);
         self
     }
 
     /// Executes the components defined by this schedule.
     pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
-        let components = self.tasks.clone();
+        let tasks = self.tasks.clone();
         let handle = tokio::spawn(async move {
-            let mut failed_components = Vec::new();
-            for component in components {
-                if let Err(e) = component.execute().await {
-                    failed_components.push(e);
+            let mut failed_tasks = Vec::new();
+            for task in tasks {
+                if let Err(e) = task.execute().await {
+                    failed_tasks.push(e);
                 }
             }
 
-            if !failed_components.is_empty() {
+            if !failed_tasks.is_empty() {
                 // Log or handle the errors
             }
 
