@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::{
     array::RecordBatch,
-    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
+    datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
 use async_trait::async_trait;
@@ -41,6 +41,8 @@ use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
 use std::{io::Cursor, pin::Pin, sync::Arc};
 use token_provider::TokenProvider;
+
+mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -84,6 +86,9 @@ pub enum Error {
 
     #[snafu(display("A fully-qualified path is required: {reason}"))]
     FullyQualifiedPath { reason: String },
+
+    #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
+    ParseError { reason: String },
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -126,7 +131,7 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        JoinPushDown::Disallow
+        JoinPushDown::AllowedFor(self.api.sql_warehouse_id.clone())
     }
 }
 
@@ -345,68 +350,6 @@ struct ExternalLink {
     next_chunk_internal_link: Option<String>,
 }
 
-fn map_databricks_type(type_name: &str) -> Result<DataType, Error> {
-    let type_name_upper = type_name.to_uppercase();
-
-    if type_name_upper.starts_with("ARRAY") {
-        let inner_type = type_name
-            .split('<')
-            .nth(1)
-            .ok_or_else(|| Error::UnsupportedType {
-                ty: type_name.to_string(),
-            })?
-            .trim_end_matches('>')
-            .trim();
-
-        let inner_data_type = map_databricks_type(inner_type)?;
-        return Ok(DataType::List(Arc::new(Field::new(
-            "item",
-            inner_data_type,
-            true,
-        ))));
-    }
-
-    if type_name_upper.starts_with("DECIMAL") {
-        let (precision, scale) = match type_name.split_once('(') {
-            Some((_, params)) => {
-                let params = params.trim_end_matches(')').trim();
-                let parts: Vec<_> = params.split(',').map(str::trim).collect();
-                if parts.len() != 2 {
-                    return Err(Error::UnsupportedType {
-                        ty: type_name.to_string(),
-                    });
-                }
-                let precision: u8 = parts[0].parse().map_err(|_| Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                })?;
-                let scale: i8 = parts[1].parse().map_err(|_| Error::UnsupportedType {
-                    ty: type_name.to_string(),
-                })?;
-                (precision, scale)
-            }
-            None => (10, 0),
-        };
-        return Ok(DataType::Decimal128(precision, scale));
-    }
-
-    Ok(match type_name_upper.as_str() {
-        "BOOLEAN" => DataType::Boolean,
-        "TINYINT" => DataType::Int8,
-        "SMALLINT" => DataType::Int16,
-        "INT" => DataType::Int32,
-        "BIGINT" => DataType::Int64,
-        "FLOAT" => DataType::Float32,
-        "DOUBLE" => DataType::Float64,
-        "STRING" | "CHAR" | "VARCHAR" => DataType::Utf8,
-        "BINARY" => DataType::Binary,
-        "DATE" => DataType::Date32,
-        "TIMESTAMP" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        "TIMESTAMP_NTZ" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "VOID" => DataType::Null,
-        ty => return Err(Error::UnsupportedType { ty: ty.to_string() }),
-    })
-}
-
 fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
     let data_array = json_value
         .get("result")
@@ -449,7 +392,10 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
                 reason: format!("data_array[{i}][1] is not a string"),
             })?;
 
-        let field = Field::new(col_name, map_databricks_type(data_type_str)?, true);
+        let data_type = datatypes::Parser::new(data_type_str)
+            .parse()
+            .map_err(|reason| Error::ParseError { reason })?;
+        let field: Field = Field::new(col_name, data_type, false);
 
         fields.push(field);
     }
@@ -530,6 +476,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 fn databricks_dialect() -> dialect::CustomDialect {
     dialect::CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
+        .with_interval_style(dialect::IntervalStyle::MySQL)
         .build()
 }
 
@@ -560,98 +507,5 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .create_federated_table_provider()
                 .context(TableProviderCreationFailedSnafu)?,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn timestamp_type(tz: Option<String>) -> DataType {
-        DataType::Timestamp(TimeUnit::Microsecond, tz.map(Into::into))
-    }
-
-    #[test]
-    fn test_map_databricks_type() {
-        let test_cases = &[
-            ("BOOLEAN", Ok(DataType::Boolean), "BOOLEAN mapping failed"),
-            ("TINYINT", Ok(DataType::Int8), "TINYINT mapping failed"),
-            ("SMALLINT", Ok(DataType::Int16), "SMALLINT mapping failed"),
-            ("INT", Ok(DataType::Int32), "INT mapping failed"),
-            ("BIGINT", Ok(DataType::Int64), "BIGINT mapping failed"),
-            ("FLOAT", Ok(DataType::Float32), "FLOAT mapping failed"),
-            ("DOUBLE", Ok(DataType::Float64), "DOUBLE mapping failed"),
-            ("STRING", Ok(DataType::Utf8), "STRING mapping failed"),
-            ("CHAR", Ok(DataType::Utf8), "CHAR mapping failed"),
-            ("VARCHAR", Ok(DataType::Utf8), "VARCHAR mapping failed"),
-            ("BINARY", Ok(DataType::Binary), "BINARY mapping failed"),
-            ("DATE", Ok(DataType::Date32), "DATE mapping failed"),
-            (
-                "TIMESTAMP",
-                Ok(timestamp_type(Some("UTC".into()))),
-                "TIMESTAMP mapping failed",
-            ),
-            (
-                "TIMESTAMP_NTZ",
-                Ok(timestamp_type(None)),
-                "TIMESTAMP_NTZ mapping failed",
-            ),
-            ("VOID", Ok(DataType::Null), "VOID mapping failed"),
-            (
-                "DECIMAL(8,4)",
-                Ok(DataType::Decimal128(8, 4)),
-                "DECIMAL(8,4) mapping failed",
-            ),
-            (
-                "DECIMAL",
-                Ok(DataType::Decimal128(10, 0)),
-                "Plain DECIMAL mapping failed",
-            ),
-            (
-                "DECIMAL(10,2)",
-                Ok(DataType::Decimal128(10, 2)),
-                "DECIMAL(10,2) mapping failed",
-            ),
-            (
-                "decimal(5,0)",
-                Ok(DataType::Decimal128(5, 0)),
-                "Case-insensitive DECIMAL(5,0) mapping failed",
-            ),
-            (
-                "ARRAY<STRING>",
-                Ok(DataType::new_list(DataType::Utf8, true)),
-                "ARRAY<STRING> mapping failed",
-            ),
-            (
-                "UNKNOWN",
-                Err(Error::UnsupportedType {
-                    ty: "UNKNOWN".to_string(),
-                }),
-                "UNKNOWN type should fail",
-            ),
-            (
-                "DECIMAL(abc)",
-                Err(Error::UnsupportedType {
-                    ty: "DECIMAL(abc)".to_string(),
-                }),
-                "Malformed DECIMAL should fail",
-            ),
-            (
-                "DECIMAL(8,)",
-                Err(Error::UnsupportedType {
-                    ty: "DECIMAL(8,)".to_string(),
-                }),
-                "Incomplete DECIMAL parameters should fail",
-            ),
-        ];
-
-        for (input, expected, error_msg) in test_cases {
-            let result = map_databricks_type(input);
-            match (result, expected) {
-                (Ok(got), Ok(want)) => assert_eq!(got, *want, "{error_msg}"),
-                (Err(_), Err(_)) => {}
-                _ => panic!("{error_msg}"),
-            }
-        }
     }
 }

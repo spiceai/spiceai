@@ -52,8 +52,6 @@ mod duckdb;
 mod sqlite;
 
 #[tokio::test]
-// Temporarily disabled until test robustness is improved: https://github.com/spiceai/spiceai/issues/5803
-#[ignore]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -65,13 +63,9 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 
         let config = vec![
             #[cfg(feature = "duckdb")]
-            ("duckdb", None),
-            #[cfg(feature = "duckdb")]
-            ("duckdb", Some("./.spice/my_duckdb.db")),
+            ("duckdb", Some("spill_to_disk_duckdb.db")),
             #[cfg(feature = "sqlite")]
-            ("sqlite", None),
-            #[cfg(feature = "sqlite")]
-            ("sqlite", Some("./.spice/my_sqlite.db")),
+            ("sqlite", Some("spill_to_disk_sqlite.db")),
         ];
 
         for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
@@ -134,6 +128,7 @@ async fn execute_spill_to_disk_and_rehydration(
     for file_path in [
         accelerated_db_file_path.clone(),
         format!("{accelerated_db_file_path}-wal"),
+        format!("{accelerated_db_file_path}.wal"),
         format!("{accelerated_db_file_path}-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
@@ -164,6 +159,7 @@ async fn execute_spill_to_disk_and_rehydration(
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
+    drop(rt);
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
@@ -191,8 +187,10 @@ async fn execute_spill_to_disk_and_rehydration(
     let restart1_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
     insta::assert_snapshot!("records", restart1_items_pretty);
-
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    rt.shutdown().await;
     drop(rt);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Restart the runtime with updated app definition that includes primary key and indexes
     let rt = init_spice_app(engine, db_file_path, true).await?;
@@ -335,7 +333,6 @@ fn create_test_dataset(
     ds
 }
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-rehydration-retry-mysql";
 const MYSQL_PORT: u16 = 13337;
 
 #[instrument]
@@ -368,7 +365,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
 #[instrument]
 async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+    let running_container = start_mysql_docker_container(MYSQL_PORT)
         .await
         .map_err(|e| {
             tracing::error!("Failed to start MySQL Docker container: {e}");

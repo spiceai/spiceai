@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: databricks[federated]-sql_warehouse
+name: databricks[sql_warehouse]-federated
 
 datasets:
   - from: databricks:spiceai_sandbox.tpch.partsupp
@@ -8,9 +8,9 @@ datasets:
     params: &databricks_sql_warehouse_params
       mode: sql_warehouse
       client_timeout: 600s
-      databricks_token: ${ secrets:DATABRICKS_TOKEN }
-      databricks_endpoint: ${ secrets:DATABRICKS_HOST }
-      databricks_sql_warehouse_id: ${ secrets:DATABRICKS_SQL_WAREHOUSE_ID }
+      databricks_token: ${ secrets:SQL_WAREHOUSE_DATABRICKS_TOKEN }
+      databricks_endpoint: ${ secrets:SQL_WAREHOUSE_DATABRICKS_HOST }
+      databricks_sql_warehouse_id: ${ secrets:SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }
   - from: databricks:spiceai_sandbox.tpch.customer
     name: customer
     params: *databricks_sql_warehouse_params
