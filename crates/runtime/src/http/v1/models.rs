@@ -164,9 +164,7 @@ pub(crate) async fn get(
     let workers = worker_registry
         .iter()
         .filter_map(|(name, worker)| {
-            if Arc::clone(worker).as_model().is_none() {
-                return None; // Skip workers that are not models
-            };
+            Arc::clone(worker).as_model()?;
             Some(OpenAIModel {
                 id: name.clone(),
                 object: "model".to_string(),
@@ -177,7 +175,7 @@ pub(crate) async fn get(
         })
         .collect::<Vec<OpenAIModel>>();
 
-    let models = [workers, models].concat().to_vec();
+    let models = [workers, models].concat().clone();
 
     match params.format {
         Format::Json => (

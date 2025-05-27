@@ -240,7 +240,7 @@ impl RuntimeStatus {
     }
 
     /// Returns the status of all registered workers.
-    pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
+    #[must_use] pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
         self.get_statuses_of_prefix("worker:")
     }
 
