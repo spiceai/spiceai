@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display};
 
-use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use arrow_tools::format::to_markdown_documents;
 use datafusion::common::utils::quote_identifier;
 use datafusion::sql::TableReference;
@@ -26,17 +25,12 @@ use futures::StreamExt;
 use itertools::Itertools;
 use search::aggregation::AggregationResult;
 use search::collect_batches;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, aggregation::Error as SearchError,
-};
+use search::{SEARCH_SCORE_COLUMN_NAME, aggregation::Error as SearchError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
-use crate::convert_string_arrow_to_iterator;
-use crate::datafusion::query::write_to_json_string;
-
-use super::{CandidateAggregationSnafu, Error, FormattingSnafu, RecordProcessingSnafu, Result};
+use super::{CandidateAggregationSnafu, Result};
 
 pub type ModelKey = String;
 
@@ -106,11 +100,9 @@ impl Match {
 }
 
 pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowError> {
-    let columns: Vec<_> = agg.matches.values().flatten().collect();
-
     // Add primary keys, 'score' & additional data columns to the document header.
     let header_fields = [
-        vec![SEARCH_SCORE_COLUMN_NAME],
+        vec![SEARCH_SCORE_COLUMN_NAME.to_string()],
         agg.primary_key.clone(),
         agg.data_columns.clone(),
     ]
@@ -128,16 +120,17 @@ pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowErro
                     to_markdown_documents(
                         rb.as_slice(),
                         col,
-                        &derived_from,
+                        Some(derived_from.as_str()),
                         header_fields.as_slice(),
                     )
                 })
-                .collect::<Result<Vec<_>>, _>()
+                .collect::<Result<Vec<String>, ArrowError>>()
         })
-        .collect::<Result<Vec<Vec<_>>, _>>()?
+        .collect::<Result<Vec<Vec<String>>, ArrowError>>()?
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()?;
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<String>>();
 
     Ok(doc_sets.join("\n"))
 }
@@ -158,21 +151,6 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
 
     matches.truncate(limit);
     Ok(matches)
-}
-
-/// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
-fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec<usize> {
-    tracing::trace!("vector search result schema: {schema:?}");
-    tracing::trace!("vector search projection column names: {column_names:?}");
-    column_names
-        .iter()
-        .filter_map(|name| {
-            schema
-                .index_of(quote_identifier(name).to_string().as_str())
-                .ok()
-                .or(schema.index_of(name.as_str()).ok())
-        })
-        .collect_vec()
 }
 
 pub async fn to_matches(

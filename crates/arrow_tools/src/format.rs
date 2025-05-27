@@ -22,8 +22,6 @@ use arrow_schema::{ArrowError, DataType, Field};
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::schema;
-
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
 /// Note: Operations do not preserve all original data, and as such, should be used for human display purposes only.
@@ -376,7 +374,7 @@ Cras venenatis euismod malesuada.",
         )?;
 
         let formatted = to_markdown_documents(
-            &[batch],
+            &[batch.clone()],
             "content_chunk",
             None,
             &["location".to_string(), "dist".to_string()],
@@ -385,6 +383,17 @@ Cras venenatis euismod malesuada.",
         .to_string();
 
         insta::assert_snapshot!(formatted);
+
+        let formatted = to_markdown_documents(
+            &[batch],
+            "content_chunk",
+            Some("content"),
+            &["location".to_string(), "dist".to_string()],
+        )
+        .expect("format record batch")
+        .to_string();
+
+        insta::assert_snapshot!("with_alias", formatted);
 
         Ok(())
     }
