@@ -11,6 +11,12 @@ The `scheduler` crate provides a flexible, asynchronous task scheduling framewor
 - **Async/Await:** Fully asynchronous, leveraging Tokio for concurrency.
 - **Extensible:** Easily add new types of channels or scheduled tasks.
 
+## Packaged Triggers
+
+- **Manual:** Passthrough task requests from a managed channel, or send `None` to generate requests which interrupt in-progress tasks.
+- **Interval:** Run tasks on a set interval, determined at the last completion time of the task.
+- **Cron:** Run tasks based on cron expressions, based on the seconds-optional cron expression format (like `*/5 * * * * *` for at every 5th second).
+
 ## Concepts
 
 - **Schedule:** A collection of tasks and channels (triggers).
@@ -76,4 +82,3 @@ The following features are planned:
 
 - **Retry Mechanisms:** Support for automatic retries of failed tasks, with configurable backoff strategies and retry limits.
 - **Parallelism Controls:** Ability to limit the number of concurrently running tasks per schedule or globally, to better manage resource usage.
-- **Cron Scheduling:** Native support for cron-like scheduling expressions, enabling more flexible and calendar-based task triggers.

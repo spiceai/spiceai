@@ -31,6 +31,10 @@ pub enum Error {
     ChannelSendError {
         source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
+    #[snafu(display("Failed to parse cron expression: {source}"))]
+    FailedToParseCron { source: croner::errors::CronError },
+    #[snafu(display("Failed to determine next cron expression run time: {source}"))]
+    FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
