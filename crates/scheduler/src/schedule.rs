@@ -28,17 +28,7 @@ use crate::{
 pub struct Schedule {
     id: Arc<str>,
     triggers: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
-    tasks: Vec<Arc<dyn ScheduledTask>>,
-}
-
-impl Default for Schedule {
-    fn default() -> Self {
-        Self {
-            id: Uuid::new_v4().to_string().into(),
-            triggers: Vec::new(),
-            tasks: Vec::new(),
-        }
-    }
+    task: Arc<dyn ScheduledTask>,
 }
 
 impl Schedule {
@@ -48,8 +38,12 @@ impl Schedule {
     }
 
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(task: Arc<dyn ScheduledTask>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string().into(),
+            triggers: Vec::new(),
+            task,
+        }
     }
 
     #[must_use]
@@ -58,25 +52,12 @@ impl Schedule {
         self
     }
 
-    #[must_use]
-    pub fn add_task(mut self, task: Arc<dyn ScheduledTask>) -> Self {
-        self.tasks.push(task);
-        self
-    }
-
     /// Executes the components defined by this schedule.
     pub(crate) fn execute(self: &Arc<Self>, notifier: Arc<Notify>) -> RunningTask {
-        let tasks = self.tasks.clone();
+        let task = Arc::clone(&self.task);
         let handle = tokio::spawn(async move {
-            let mut failed_tasks = Vec::new();
-            for task in tasks {
-                if let Err(e) = task.execute().await {
-                    failed_tasks.push(e);
-                }
-            }
-
-            if !failed_tasks.is_empty() {
-                // Log or handle the errors
+            if (task.execute().await).is_err() {
+                // Log or handle the error when retry stategy is implemented
             }
 
             notifier.notify_waiters();

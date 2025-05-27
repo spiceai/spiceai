@@ -236,7 +236,7 @@ mod test {
         map.insert(Arc::from("test_scheduler"), 0);
         map.insert(Arc::from("test_multi_schedule"), 0);
         map.insert(Arc::from("test_multi_component_schedule"), 0);
-        map.insert(Arc::from("test_multi_evaluator_multi_component"), 0);
+        map.insert(Arc::from("test_multi_evaluator"), 0);
         map.insert(Arc::from("test_manual_interrupts"), 0);
         map.insert(Arc::from("test_manual_queued_with_interrupt"), 0);
         map.insert(Arc::from("test_manual_queue_clears_after_immediate"), 0);
@@ -304,11 +304,10 @@ mod test {
 
     #[tokio::test]
     async fn test_scheduler() {
-        let schedule = Schedule::new()
-            .add_task(Arc::new(TestComponent {
-                name: Arc::from("test_scheduler"),
-            }))
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let schedule = Schedule::new(Arc::new(TestComponent {
+            name: Arc::from("test_scheduler"),
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler =
             Scheduler::<NotStarted>::new("test_scheduler".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
@@ -327,11 +326,10 @@ mod test {
     #[tokio::test]
     async fn test_scheduler_timing() {
         init_tracing(None);
-        let schedule = Schedule::new()
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
-            .add_task(Arc::new(TimedComponent {
-                name: "test_scheduler_timing".into(),
-            }));
+        let schedule = Schedule::new(Arc::new(TimedComponent {
+            name: "test_scheduler_timing".into(),
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::new("test_scheduler_timing".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -358,44 +356,15 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_multi_component_schedule() {
-        let schedule = Schedule::new()
-            .add_task(Arc::new(TestComponent {
-                name: Arc::from("test_multi_component_schedule"),
-            }))
-            .add_task(Arc::new(TestComponent {
-                name: Arc::from("test_multi_component_schedule"),
-            }))
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
-        let scheduler = Scheduler::<NotStarted>::new(
-            "test_multi_component_schedule".into(),
-            vec![Arc::new(schedule)],
-        );
-        let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_multi_component_schedule")
-            .expect("To get test execution count");
-        assert!(
-            *count == 8 || *count == 10,
-            "Test component should have executed 8 or 10 times, but got {count}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_multi_schedule() {
-        let schedule_one = Schedule::new()
-            .add_task(Arc::new(TestComponent {
-                name: Arc::from("test_multi_schedule"),
-            }))
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
-        let schedule_two = Schedule::new()
-            .add_task(Arc::new(TestComponent {
-                name: Arc::from("test_multi_schedule"),
-            }))
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let schedule_one = Schedule::new(Arc::new(TestComponent {
+            name: Arc::from("test_multi_schedule"),
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let schedule_two = Schedule::new(Arc::new(TestComponent {
+            name: Arc::from("test_multi_schedule"),
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::<NotStarted>::new(
             "test_multi_schedule".into(),
             vec![Arc::new(schedule_one), Arc::new(schedule_two)],
@@ -414,23 +383,16 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_multi_evaluator_multi_component() {
+    async fn test_multi_evaluator() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new()
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
-            .add_trigger(manual_channel_lock)
-            .add_task(Arc::new(TestComponent {
-                name: "test_multi_evaluator_multi_component".into(),
-            }))
-            .add_task(Arc::new(TestComponent {
-                name: "test_multi_evaluator_multi_component".into(),
-            }));
-        let scheduler = Scheduler::new(
-            "test_multi_evaluator_multi_component".into(),
-            vec![Arc::new(schedule)],
-        );
+        let schedule = Schedule::new(Arc::new(TestComponent {
+            name: "test_multi_evaluator".into(),
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
+        .add_trigger(manual_channel_lock);
+        let scheduler = Scheduler::new("test_multi_evaluator".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         tx.send(Some(Arc::new(TaskRequest::default().clears_queue())))
@@ -440,11 +402,11 @@ mod test {
         scheduler.stop().await;
         let map_lock = TEST_EXECUTION_COUNT.read().await;
         let count = map_lock
-            .get("test_multi_evaluator_multi_component")
+            .get("test_multi_evaluator")
             .expect("To get test execution count");
         assert!(
-            *count == 8 || *count == 10,
-            "Test component should have executed 8 or 10 times, but got {count}"
+            *count == 4 || *count == 5,
+            "Test component should have executed 4 or 5 times, but got {count}"
         );
     }
 
@@ -453,11 +415,10 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new()
-            .add_trigger(manual_channel_lock)
-            .add_task(Arc::new(TestComponent {
-                name: "test_manual_interrupts".into(),
-            }));
+        let schedule = Schedule::new(Arc::new(TestComponent {
+            name: "test_manual_interrupts".into(),
+        }))
+        .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new("test_manual_interrupts".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
         tx.send(None).await.expect("To send task request");
@@ -482,11 +443,10 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new()
-            .add_trigger(manual_channel_lock)
-            .add_task(Arc::new(TestComponent {
-                name: "test_manual_queued_with_interrupt".into(),
-            }));
+        let schedule = Schedule::new(Arc::new(TestComponent {
+            name: "test_manual_queued_with_interrupt".into(),
+        }))
+        .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new(
             "test_manual_queued_with_interrupt".into(),
             vec![Arc::new(schedule)],
@@ -497,7 +457,7 @@ mod test {
                 .await
                 .expect("To send task request");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
         scheduler.stop().await;
         let map_lock = TEST_EXECUTION_COUNT.read().await;
         let count = map_lock
@@ -514,13 +474,12 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new()
-            .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
-            .add_trigger(manual_channel_lock)
-            .add_task(Arc::new(LongComponent {
-                name: "test_manual_queue_clears_after_immediate".into(),
-                wait: 5,
-            }));
+        let schedule = Schedule::new(Arc::new(LongComponent {
+            name: "test_manual_queue_clears_after_immediate".into(),
+            wait: 5,
+        }))
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
+        .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new(
             "test_manual_queue_clears_after_immediate".into(),
             vec![Arc::new(schedule)],
