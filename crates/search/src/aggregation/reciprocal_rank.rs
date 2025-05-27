@@ -85,15 +85,14 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 &schema,
                 primary_key.as_slice(),
             ));
-            println!("Aadditional_columns: {:#?}", additional_columns);
 
             // Since we know what the `SEARCH_VALUE_COLUMN_NAME` column for the i'th column will be in the final schema,
             // we can add it to the `matches` map now.
             matches
-                .get_mut(derived_column.as_str())
+                .get_mut(derived_from.as_str())
                 .map(|v| v.push(ith_search_value_column(i)))
                 .unwrap_or_else(|| {
-                    matches.insert(derived_column.clone(), vec![ith_search_value_column(i)]);
+                    matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
                 });
 
             let data = collect_batches(stream).await.context(DatafusionSnafu)?;
@@ -374,6 +373,6 @@ mod tests {
         assert_eq!(
             additional_columns_of_schema(&schema, primary_keys.as_slice()),
             vec!["additional".to_string()]
-        )
+        );
     }
 }

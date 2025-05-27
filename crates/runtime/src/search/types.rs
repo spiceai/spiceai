@@ -21,7 +21,6 @@ use arrow::error::ArrowError;
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::format::to_markdown_documents;
 use datafusion::common::utils::quote_identifier;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;

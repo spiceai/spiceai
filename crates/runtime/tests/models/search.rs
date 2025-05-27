@@ -85,7 +85,7 @@ fn normalize_search_response(mut json: Value) -> String {
                         {
                             obj.insert("score".to_string(), Value::Number(truncated_score));
                         }
-                    };
+                    }
                 }
             }
         }

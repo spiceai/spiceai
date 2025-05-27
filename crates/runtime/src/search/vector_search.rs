@@ -22,7 +22,6 @@ use super::{CandidateAggregationSnafu, Error, Result};
 use crate::search::candidate::vector::VectorGeneration;
 use crate::search::util::{embedding_columns_from_table, get_primary_keys_with_overrides};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, Ident};
 use itertools::Itertools;

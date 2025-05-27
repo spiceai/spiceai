@@ -61,6 +61,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn is_user_error(&self) -> bool {
         matches!(self, Error::NoPrimaryKey)
     }
@@ -103,6 +104,17 @@ pub struct AggregationResult {
     /// ```
     /// Note: `"body"` need not be in `data_columns`.
     pub matches: HashMap<String, Vec<String>>,
+}
+
+impl std::fmt::Debug for AggregationResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AggregationResult")
+            .field("schema", &self.data.schema())
+            .field("primary_keys", &self.primary_key.as_slice())
+            .field("data", &self.data_columns.as_slice())
+            .field("matches", &self.matches)
+            .finish_non_exhaustive()
+    }
 }
 
 fn from_single_input(
