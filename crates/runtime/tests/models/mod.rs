@@ -35,6 +35,7 @@ mod embedding;
 mod hf;
 mod local;
 mod openai;
+mod search;
 mod tools;
 
 mod nsql {
@@ -124,45 +125,6 @@ mod nsql {
 
         insta::assert_snapshot!(format!("{}_tasks", ts.name), response,);
 
-        Ok(())
-    }
-}
-
-mod search {
-    use http::{
-        HeaderMap, HeaderValue,
-        header::{ACCEPT, CONTENT_TYPE},
-    };
-
-    use crate::models::{http_post, normalize_search_response};
-
-    pub struct TestCase {
-        pub name: &'static str,
-        pub body: serde_json::Value,
-    }
-
-    pub async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
-        tracing::info!("Running test cases {}", ts.name);
-
-        // Call /v1/search, check response
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response_str = http_post(
-            &format!("{base_url}/v1/search").to_string(),
-            &ts.body.to_string(),
-            headers,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
-
-        let response = serde_json::from_str(&response_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
-
-        insta::assert_snapshot!(
-            format!("{}_response", ts.name),
-            normalize_search_response(response)
-        );
         Ok(())
     }
 }
@@ -257,26 +219,6 @@ fn get_tpcds_dataset(
         ..Default::default()
     });
     dataset
-}
-
-/// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values such as duration with placeholder.
-fn normalize_search_response(mut json: Value) -> String {
-    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
-        for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                obj.remove("score");
-            }
-        }
-    }
-
-    if let Some(duration) = json.get_mut("duration_ms") {
-        *duration = json!("duration_ms_val");
-    }
-
-    sort_json_keys(&mut json);
-
-    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
