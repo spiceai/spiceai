@@ -195,7 +195,7 @@ mod tests {
         let next_now = Local::now();
         let elapsed = next_now.signed_duration_since(now).num_milliseconds();
         assert!(
-            elapsed >= 4950 && elapsed <= 5050,
+            (4950..=5050).contains(&elapsed),
             "The next request should be sent after 5 seconds"
         );
         assert!(
@@ -326,7 +326,7 @@ mod tests {
         let next_now = Local::now();
         let elapsed = next_now.signed_duration_since(now).num_milliseconds();
         assert!(
-            elapsed >= 5950 || elapsed <= 6050,
+            (59900..=60100).contains(&elapsed),
             "The next request should be sent around the minute mark"
         );
         assert_eq!(
