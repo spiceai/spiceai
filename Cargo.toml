@@ -26,6 +26,7 @@ members = [
     "crates/tools",
     "crates/util",
     "crates/workers",
+    "crates/scheduler",
     "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
