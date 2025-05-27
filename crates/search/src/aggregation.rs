@@ -160,14 +160,17 @@ fn from_single_input(
 }
 
 impl AggregationResult {
+    /// Returns a row-based JSON representation of the primary key column(s) in a [`RecordBatch`].
     pub fn primary_key_json(&self, rb: &RecordBatch) -> Result<Vec<HashMap<String, Value>>> {
         self.columns_as_json(rb, &self.primary_key)
     }
 
+    /// Returns a row-based JSON representation of the data columns in a [`RecordBatch`].
     pub fn data_json(&self, rb: &RecordBatch) -> Result<Vec<HashMap<String, Value>>> {
         self.columns_as_json(rb, &self.data_columns)
     }
 
+    /// Returns the [`SEARCH_SCORE_COLUMN_NAME`] values from a [`RecordBatch`].
     pub fn score_values(&self, rb: &RecordBatch) -> Result<Vec<f64>> {
         let Some(scores) = rb.column_by_name(SEARCH_SCORE_COLUMN_NAME) else {
             return Err(Error::InconsistentAggregationResult {
@@ -191,6 +194,7 @@ impl AggregationResult {
         }
     }
 
+    /// Converts a subset of columns from a [`RecordBatch`] into a row-based JSON representation.
     pub fn columns_as_json(
         &self,
         rb: &RecordBatch,
@@ -217,7 +221,7 @@ impl AggregationResult {
     }
 }
 
-pub fn write_to_json_string(
+fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();

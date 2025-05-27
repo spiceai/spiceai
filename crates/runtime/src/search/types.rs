@@ -17,9 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display};
 
 use arrow::error::ArrowError;
-use arrow_schema::SchemaRef;
 use arrow_tools::format::to_markdown_documents;
-use datafusion::common::utils::quote_identifier;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -153,6 +151,7 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
     Ok(matches)
 }
 
+/// Consumes [`AggregationResult`] and converts all results to [`Match`] format.
 pub async fn to_matches(
     tbl: &TableReference,
     mut result: AggregationResult,
