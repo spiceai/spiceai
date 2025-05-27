@@ -380,16 +380,16 @@ impl GlueCatalog {
 }
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("glue_aws_region")
+    ParameterSpec::component("aws_region")
         .description("The AWS region to use for Glue.")
         .secret(),
-    ParameterSpec::component("glue_aws_access_key_id")
+    ParameterSpec::component("aws_access_key_id")
         .description("The AWS access key ID to use for Glue.")
         .secret(),
-    ParameterSpec::component("glue_aws_secret_access_key")
+    ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for Glue.")
         .secret(),
-    ParameterSpec::component("glue_aws_session_token")
+    ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use for Glue.")
         .secret(),
 ];
@@ -450,7 +450,7 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
 async fn load_config(params: &Parameters) -> SdkConfig {
     // Get and own all parameter values upfront
     let region = params
-        .get("glue_aws_region")
+        .get("aws_region")
         .expose()
         .ok()
         .unwrap_or_else(|| {
@@ -461,19 +461,19 @@ async fn load_config(params: &Parameters) -> SdkConfig {
         .to_string();
 
     let access_key_id = params
-        .get("glue_aws_access_key_id")
+        .get("aws_access_key_id")
         .expose()
         .ok()
         .map(ToString::to_string);
 
     let secret_access_key = params
-        .get("glue_aws_secret_access_key")
+        .get("aws_secret_access_key")
         .expose()
         .ok()
         .map(ToString::to_string);
 
     let session_token = params
-        .get("glue_aws_session_token")
+        .get("aws_session_token")
         .expose()
         .ok()
         .map(ToString::to_string);
