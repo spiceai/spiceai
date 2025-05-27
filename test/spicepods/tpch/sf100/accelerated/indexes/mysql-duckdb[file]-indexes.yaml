@@ -12,10 +12,6 @@ definitions:
     mysql_user: ${env:MYSQL_USER}
     mysql_pass: ${env:MYSQL_PASSWORD}
     mysql_sslmode: disabled
-  - &acceleration
-    enabled: true
-    engine: duckdb
-    mode: file
 
 datasets:
   - from: mysql:customer
@@ -38,6 +34,9 @@ datasets:
       engine: duckdb
       mode: file
       primary_key: (l_orderkey, l_linenumber)
+      refresh_sql: "SELECT * FROM lineitem LIMIT 300000000"
+      params:
+        duckdb_memory_limit: 60gb
       indexes:
         l_suppkey: enabled
         l_shipdate: enabled

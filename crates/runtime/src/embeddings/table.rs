@@ -248,6 +248,13 @@ impl EmbeddingTable {
             .collect()
     }
 
+    #[must_use]
+    pub fn get_embedding_model_used_by(&self, column: &str) -> Option<String> {
+        self.embedded_columns
+            .get(column)
+            .map(|cfg| cfg.model_name.clone())
+    }
+
     /// Get the names of the embedding columns that must be augmented (i.e. not in the base table).
     ///
     /// These are the underlying columns, not the embedding columns (e.g. `content`, not `content_embedding` or `content_offset`).

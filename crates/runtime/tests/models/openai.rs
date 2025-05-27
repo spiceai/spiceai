@@ -139,198 +139,135 @@ mod search {
 
     use crate::models::{
         get_small_clickbench_dataset,
-        search::{TestCase, run_search_test},
+        search::{
+            SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
+            run_search,
+        },
     };
 
     use super::*;
 
     #[tokio::test]
     async fn openai_test_search() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
-
-        test_request_context()
-            .scope(async {
-                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-
-                let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
-                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "i_item_desc".to_string(),
-                    model: "openai_embeddings".to_string(),
-                    primary_keys: Some(vec!["i_item_sk".to_string()]),
-                    chunking: None,
-                }];
-
-                let mut ds_tpcds_cp_with_chunking =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"), Some("select cp_description, cp_catalog_page_sk from catalog_page_with_chunking limit 20"));
-                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "cp_description".to_string(),
-                    model: "openai_embeddings".to_string(),
-                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 512,
-                        overlap_size: 128,
-                        trim_whitespace: false,
-                    }),
-                }];
-
-                let app = AppBuilder::new("search_app")
-                    // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
-                    .with_dataset(get_taxi_trips_dataset())
-                    .with_dataset(ds_tpcds_item)
-                    .with_dataset(ds_tpcds_cp_with_chunking)
-                    .with_embedding(get_openai_embeddings(
-                        Some("text-embedding-3-small"),
-                        "openai_embeddings",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let _ = init_tracing_with_task_history(None, &rt);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = Arc::clone(&rt).load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let test_cases = [
-                    TestCase {
-                        name: "openai_basic",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                            "datasets": ["item"],
-                            "additional_columns": ["i_color", "i_item_id"],
-                        }),
-                    },
-                    TestCase {
-                        name: "openai_all_datasets",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                        }),
-                    },
-                    TestCase {
-                        name: "openai_chunking",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "limit": 1,
-                        }),
-                    },
-                ];
-
-                for ts in test_cases {
-                    run_search_test(http_base_url.as_str(), &ts).await?;
-                }
-                Ok(())
-            })
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
+            .map_err(anyhow::Error::msg)?;
+        let app = AppBuilder::new("search_app")
+            // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
+            .with_dataset(get_taxi_trips_dataset())
+            .with_dataset(item_tpch_dataset_w_embeddings(
+                "item",
+                "openai_embeddings",
+                Some(vec!["i_item_sk".to_string()]),
+                None,
+            ))
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "catalog_page_with_chunking",
+                "openai_embeddings",
+                Some(vec!["cp_catalog_page_sk".to_string()]),
+                Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            ))
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .build();
+
+        run_search(
+            app,
+            vec![
+                SearchTestCase {
+                    name: "openai_basic",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
+                        "datasets": ["item"],
+                        "additional_columns": ["i_color", "i_item_id"],
+                    }),
+                },
+                SearchTestCase {
+                    name: "openai_all_datasets",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
+                    }),
+                },
+                SearchTestCase {
+                    name: "openai_chunking",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "limit": 1,
+                    }),
+                },
+            ],
+        )
+        .await
     }
 
     #[tokio::test]
     async fn test_search_column_casing() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
-
-        test_request_context()
-            .scope(async {
-                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-
-                let mut clickbench_dataset_no_chunking =
-                    get_small_clickbench_dataset("clickbench_no_chunking");
-                let mut clickbench_dataset_chunking =
-                    get_small_clickbench_dataset("clickbench_chunking");
-                clickbench_dataset_no_chunking.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "Referer".to_string(),
-                    model: "openai_embeddings".to_string(),
-                    primary_keys: None,
-                    chunking: None,
-                }];
-
-                clickbench_dataset_chunking.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "Referer".to_string(),
-                    model: "openai_embeddings".to_string(),
-                    primary_keys: None,
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 512,
-                        overlap_size: 128,
-                        trim_whitespace: false,
-                    }),
-                }];
-
-                let app = AppBuilder::new("search_app")
-                    .with_dataset(clickbench_dataset_no_chunking)
-                    .with_dataset(clickbench_dataset_chunking)
-                    .with_embedding(get_openai_embeddings(
-                        Some("text-embedding-3-small"),
-                        "openai_embeddings",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let _ = init_tracing_with_task_history(None, &rt);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = Arc::clone(&rt).load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let test_cases = [
-                    TestCase {
-                        name: "openai_casing_no_chunking",
-                        body: json!({
-                            "text": "go.mail",
-                            "limit": 2,
-                            "datasets": ["clickbench_no_chunking"],
-                        }),
-                    },
-                    TestCase {
-                        name: "openai_casing_chunking",
-                        body: json!({
-                            "text": "go.mail",
-                            "limit": 2,
-                            "datasets": ["clickbench_chunking"],
-                        }),
-                    },
-                ];
-
-                for ts in test_cases {
-                    run_search_test(http_base_url.as_str(), &ts).await?;
-                }
-                Ok(())
-            })
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut clickbench_dataset_no_chunking =
+            get_small_clickbench_dataset("clickbench_no_chunking");
+        let mut clickbench_dataset_chunking = get_small_clickbench_dataset("clickbench_chunking");
+        clickbench_dataset_no_chunking.embeddings = vec![ColumnEmbeddingConfig {
+            column: "Referer".to_string(),
+            model: "openai_embeddings".to_string(),
+            primary_keys: None,
+            chunking: None,
+        }];
+
+        clickbench_dataset_chunking.embeddings = vec![ColumnEmbeddingConfig {
+            column: "Referer".to_string(),
+            model: "openai_embeddings".to_string(),
+            primary_keys: None,
+            chunking: Some(EmbeddingChunkConfig {
+                enabled: true,
+                target_chunk_size: 512,
+                overlap_size: 128,
+                trim_whitespace: false,
+            }),
+        }];
+
+        let app = AppBuilder::new("search_app")
+            .with_dataset(clickbench_dataset_no_chunking)
+            .with_dataset(clickbench_dataset_chunking)
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .build();
+        run_search(
+            app,
+            vec![
+                SearchTestCase {
+                    name: "openai_casing_no_chunking",
+                    body: json!({
+                        "text": "go.mail",
+                        "limit": 2,
+                        "datasets": ["clickbench_no_chunking"],
+                    }),
+                },
+                SearchTestCase {
+                    name: "openai_casing_chunking",
+                    body: json!({
+                        "text": "go.mail",
+                        "limit": 2,
+                        "datasets": ["clickbench_chunking"],
+                    }),
+                },
+            ],
+        )
+        .await
     }
 }
 
@@ -744,7 +681,10 @@ async fn get_openai_chat_model(
         .map_err(anyhow::Error::from)
 }
 
-fn get_openai_embeddings(model: Option<impl Into<String>>, name: impl Into<String>) -> Embeddings {
+pub(crate) fn get_openai_embeddings(
+    model: Option<impl Into<String>>,
+    name: impl Into<String>,
+) -> Embeddings {
     let mut embedding = match model {
         Some(model) => Embeddings::new(format!("openai:{}", model.into()), name),
         None => Embeddings::new("openai", name),

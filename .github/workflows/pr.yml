@@ -11,6 +11,15 @@ on:
       - release/*
       - feature-*
   workflow_dispatch:
+    inputs:
+      profile_option:
+        description: "Which Rust build profile to use? (Default is release)"
+        required: false
+        type: choice
+        options:
+          - "release"
+          - "release-lto"
+        default: "release"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -18,6 +27,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -208,5 +218,6 @@ jobs:
           push: false
           build-args: |
             CARGO_FEATURES=odbc
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci

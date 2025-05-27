@@ -321,21 +321,6 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
-    pub fn set_results_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
-        if let Ok(mut a) = self.caching.results.write() {
-            *a = Some(Arc::new(cache_provider));
-        }
-    }
-
-    pub fn set_logical_plan_cache_provider(
-        &self,
-        cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
-    ) {
-        if let Ok(mut a) = self.caching.plans.write() {
-            *a = Some(cache_provider);
-        }
-    }
-
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
         let table_name = table_reference.table();
 
@@ -1064,21 +1049,13 @@ impl DataFusion {
     }
 
     pub fn results_cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
-        let Ok(provider) = self.caching.results.read() else {
-            return None;
-        };
-
-        provider.clone()
+        self.caching.results.clone()
     }
 
     pub fn plans_cache_provider(
         &self,
     ) -> Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>> {
-        let Ok(provider) = self.caching.plans.read() else {
-            return None;
-        };
-
-        provider.clone()
+        self.caching.plans.clone()
     }
 
     async fn register_accelerated_table(
@@ -1706,7 +1683,9 @@ mod tests {
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_plans_cache_provider(plan_cache_provider)
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
             .build(),
         );
 
