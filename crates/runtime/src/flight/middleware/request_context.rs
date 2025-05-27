@@ -98,9 +98,9 @@ where
                 Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
             );
 
-        Box::pin(async move {
+        Box::pin(Arc::clone(&request_context).scope(async move {
             request_context.load_extensions().await;
-            request_context.scope(inner.call(req)).await
-        })
+            inner.call(req).await
+        }))
     }
 }

@@ -152,6 +152,10 @@ pub enum RunnerType {
     SelfHosted,
     #[serde(rename = "spiceai-large-runners")]
     LargeSelfHosted,
+    #[serde(rename = "spiceai-dev-runners")]
+    Dev,
+    #[serde(rename = "spiceai-dev-large-runners")]
+    DevLarge,
 }
 
 /// Payload sent to the GitHub Actions workflow request for HTTP consistency tests

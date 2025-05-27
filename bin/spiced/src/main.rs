@@ -81,7 +81,7 @@ fn main() {
     }
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        spiced::in_tracing_context(|| {
+        runtime::in_tracing_context(|| {
             tracing::error!("{err}");
         });
     }
@@ -93,7 +93,7 @@ fn main() {
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    spiced::in_tracing_context(|| {
+    runtime::in_tracing_context(|| {
         if let Some(allocator_name) = get_allocator_name() {
             tracing::info!(
                 "Starting runtime {version} (allocator: {allocator_name})",

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
-use super::is_default;
+use super::{is_default, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,10 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
+    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub results_cache: ResultsCache,
+    pub caching: Caching,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
@@ -112,6 +114,50 @@ pub enum HashingAlgorithm {
     Ahash,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Caching {
+    #[serde(skip_serializing_if = "is_default")]
+    pub sql_results: SQLResultsCacheConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct CacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub max_size: Option<String>,
+    pub item_ttl: Option<String>,
+    pub eviction_policy: Option<String>,
+    #[serde(default)]
+    pub hashing_algorithm: HashingAlgorithm,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: None,
+            item_ttl: None,
+            eviction_policy: None,
+            hashing_algorithm: HashingAlgorithm::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct SQLResultsCacheConfig {
+    #[serde(flatten)]
+    pub inner: CacheConfig,
+    #[serde(default)]
+    pub cache_key_type: CacheKeyType,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ResultsCache {
@@ -126,10 +172,6 @@ pub struct ResultsCache {
     pub hashing_algorithm: HashingAlgorithm,
 }
 
-const fn default_true() -> bool {
-    true
-}
-
 impl Default for ResultsCache {
     fn default() -> Self {
         Self {
@@ -139,6 +181,21 @@ impl Default for ResultsCache {
             eviction_policy: None,
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+        }
+    }
+}
+
+impl From<ResultsCache> for SQLResultsCacheConfig {
+    fn from(val: ResultsCache) -> Self {
+        SQLResultsCacheConfig {
+            inner: CacheConfig {
+                enabled: val.enabled,
+                max_size: val.cache_max_size,
+                item_ttl: val.item_ttl,
+                eviction_policy: val.eviction_policy,
+                hashing_algorithm: val.hashing_algorithm,
+            },
+            cache_key_type: val.cache_key_type,
         }
     }
 }

@@ -49,6 +49,7 @@ pub(crate) struct SpiceTestQueryWorker {
     name: String,
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
+    scale_factor: f64,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -100,7 +101,13 @@ impl SpiceTestQueryWorker {
             name,
             progress_bar: None,
             validate: false,
+            scale_factor: 1.0,
         }
+    }
+
+    pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
+        self.scale_factor = scale_factor;
+        self
     }
 
     pub fn with_validate(mut self, validate: bool) -> Self {
@@ -215,9 +222,13 @@ impl SpiceTestQueryWorker {
 
                         if self.explain_plan_snapshot && self.id == 0 {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
-                            if let Err(e) =
-                                record_explain_plan(&self.flight_client, self.name.as_str(), query)
-                                    .await
+                            if let Err(e) = record_explain_plan(
+                                &self.flight_client,
+                                self.name.as_str(),
+                                query,
+                                self.scale_factor,
+                            )
+                            .await
                             {
                                 println!(
                                     "Worker {} - Query '{}' explain plan failed: {}",
@@ -459,6 +470,12 @@ impl SpiceTestQueryWorker {
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
 
+            let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
+                format!("{name}_{query_name}")
+            } else {
+                format!("{name}_{query_name}_sf{}", self.scale_factor)
+            };
+
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
@@ -466,7 +483,7 @@ impl SpiceTestQueryWorker {
                     omit_expression => true,
                     snapshot_path => "../../snapshot/snapshots/results"
                 }, {
-                    insta::assert_snapshot!(format!("{name}_{query_name}"), records_pretty);
+                    insta::assert_snapshot!(snapshot_name, records_pretty);
                 });
             });
 
