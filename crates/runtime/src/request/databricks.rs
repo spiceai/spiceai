@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 use crate::datafusion::DataFusion;
 
+const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
+
 #[derive(Clone)]
 pub struct DatabricksAuthExtension {
     app: Option<Arc<App>>,
@@ -52,7 +54,7 @@ impl DatabricksAuthExtension {
         df: &Option<Arc<DataFusion>>,
         headers: &HeaderMap,
     ) -> Option<Self> {
-        let databricks_headers = headers.get_all("Spice-Databricks-Auth");
+        let databricks_headers = headers.get_all(SPICE_DATABRICKS_HEADER);
         let values = databricks_headers.iter();
 
         let mut auth_map = HashMap::new();
