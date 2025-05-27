@@ -223,7 +223,7 @@ impl VectorSearch {
 
         match vector_search_result {
             Ok(result) => {
-                // tracing::info!(target: "task_history", captured_output = ?result);
+                tracing::info!(target: "task_history", captured_output = ?result);
                 Ok(result)
             }
             Err(e) => {

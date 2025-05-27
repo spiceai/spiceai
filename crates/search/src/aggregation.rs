@@ -89,10 +89,19 @@ pub struct AggregationResult {
     pub primary_key: Vec<String>,
 
     /// Additional columns names in `data`.
+    /// Note: This does not include the [`SEARCH_SCORE_COLUMN_NAME`] column.
     pub data_columns: Vec<String>,
 
     /// Map of underlying table column (which may not be in `data_columns`, but the underlying table)
     /// to all the columns in `data` that derived from it.
+    ///
+    /// Example
+    /// ```
+    /// {
+    ///   "body": ["body_fts", "body_similarity"]
+    /// }
+    /// ```
+    /// Note: `"body"` need not be in `data_columns`.
     pub matches: HashMap<String, Vec<String>>,
 }
 

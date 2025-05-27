@@ -326,7 +326,7 @@ pub async fn to_matches(
     Ok(output)
 }
 
-/// Convert a map of column name -> column values, to a per-row representation.
+/// Convert a map of {column name -> column values}, to a per-row representation.
 fn transpose_and_convert(
     column_format: HashMap<String, Vec<Vec<Value>>>,
 ) -> Vec<HashMap<String, MatchType>> {
