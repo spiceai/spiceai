@@ -22,6 +22,8 @@ use arrow_schema::{ArrowError, DataType, Field};
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::schema;
+
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
 /// Note: Operations do not preserve all original data, and as such, should be used for human display purposes only.
@@ -258,7 +260,7 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     )
 }
 
-/// Creates a visual representation of record batches using markdown document format.
+/// Creates a visual representation of record batches using markdown document format with additional header fields.
 ///
 /// # Errors
 ///
@@ -266,19 +268,23 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
 pub fn to_markdown_documents(
     results: &[RecordBatch],
     content_column: &str,
+    content_alias: Option<&str>,
+    header_fields: &[String],
 ) -> Result<String, ArrowError> {
     let options: FormatOptions = FormatOptions::default();
     let mut buffer = Vec::new();
 
     for batch in results {
+        let schema = batch.schema();
         let formatters = batch
             .columns()
             .iter()
             .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
             .collect::<Result<Vec<_>, ArrowError>>()?;
 
-        let Some(idx_content) = batch
-            .schema()
+        let header_indices = column_indices(batch, header_fields)?;
+
+        let Some(idx_content) = schema
             .fields()
             .iter()
             .position(|f| f.name() == content_column)
@@ -291,13 +297,18 @@ pub fn to_markdown_documents(
         for row in 0..batch.num_rows() {
             // write document header / attributes
             writeln!(&mut buffer, "---")?;
-            for (i, (field, formatter)) in
-                batch.schema().fields().iter().zip(&formatters).enumerate()
-            {
-                if i != idx_content {
+            for i in header_indices.as_slice() {
+                let field = schema.field(*i);
+                if let Some(formatter) = formatters.get(*i) {
                     writeln!(buffer, "{}: {}", field.name(), formatter.value(row))?;
                 }
             }
+
+            if let Some(column_name) = content_alias {
+                // Write content alias as column name in header
+                writeln!(buffer, "column: {column_name}")?;
+            }
+
             writeln!(&mut buffer, "---")?;
 
             // write main document content
@@ -309,6 +320,19 @@ pub fn to_markdown_documents(
         ArrowError::from_external_error(format!("Failed to convert byte array to utf8: {e}").into())
     })
 }
+
+fn column_indices(batch: &RecordBatch, column_names: &[String]) -> Result<Vec<usize>, ArrowError> {
+    column_names
+        .iter()
+        .map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .map_err(|_| ArrowError::InvalidArgumentError(format!("Column '{name}' not found")))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::array::{Float32Array, RecordBatch, StringArray};
@@ -351,9 +375,14 @@ Cras venenatis euismod malesuada.",
             vec![Arc::new(content_chunk), Arc::new(location), Arc::new(dist)],
         )?;
 
-        let formatted = to_markdown_documents(&[batch], "content_chunk")
-            .expect("format record batch")
-            .to_string();
+        let formatted = to_markdown_documents(
+            &[batch],
+            "content_chunk",
+            None,
+            &["location".to_string(), "dist".to_string()],
+        )
+        .expect("format record batch")
+        .to_string();
 
         insta::assert_snapshot!(formatted);
 

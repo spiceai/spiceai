@@ -40,135 +40,6 @@ use super::{CandidateAggregationSnafu, Error, FormattingSnafu, RecordProcessingS
 
 pub type ModelKey = String;
 
-#[derive(Debug, Default)]
-pub struct VectorSearchTableResult {
-    pub data: Vec<RecordBatch>,
-
-    pub primary_keys: Vec<String>,
-    pub additional_columns: Vec<String>,
-}
-
-impl VectorSearchTableResult {
-    /// Return the underlying [`RecordBatch`]s as a pretty formatted table.
-    pub fn to_pretty(&self) -> Result<impl Display, ArrowError> {
-        to_markdown_documents(&self.data, SEARCH_VALUE_COLUMN_NAME)
-    }
-
-    /// Return the primary keys of the [`VectorSearch::individual_search`] as an array of JSON objects.
-    ///
-    /// Each element is a mapping of the primary key column to its value.
-    pub fn primary_keys_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
-        let primary_key_projection = get_projection(&self.schema(), &self.primary_keys);
-        let primary_keys_records = self
-            .data
-            .iter()
-            .map(|s| s.project(&primary_key_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-
-        if primary_keys_records
-            .first()
-            .is_some_and(|p| p.num_rows() > 0)
-        {
-            let pk_str = write_to_json_string(&primary_keys_records).context(FormattingSnafu)?;
-            serde_json::from_str(&pk_str)
-                .boxed()
-                .context(FormattingSnafu)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    /// Return the additional columns of the [`VectorSearch::individual_search`] as an array of JSON objects.
-    ///
-    /// Each element is a mapping of the additional column name to its value.
-    pub fn addition_columns_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
-        let additional_columns_projection =
-            get_projection(&self.schema(), &self.additional_columns);
-        let additional_columns_records = self
-            .data
-            .iter()
-            .map(|s| s.project(&additional_columns_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-
-        if additional_columns_records
-            .first()
-            .is_some_and(|p| p.num_rows() > 0)
-        {
-            let additional_str =
-                write_to_json_string(&additional_columns_records).context(FormattingSnafu)?;
-            serde_json::from_str(additional_str.as_str())
-                .boxed()
-                .context(FormattingSnafu)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    /// Return the distance of each search result.
-    pub fn score_values(&self) -> Result<Vec<f64>> {
-        let Some(scores) = self
-            .data
-            .iter()
-            .map(|s| s.column_by_name(SEARCH_SCORE_COLUMN_NAME).cloned())
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Err(Error::EmbeddingError {
-                source: "No distances returned".into(),
-            });
-        };
-
-        let scores: Option<Vec<_>> = scores
-            .iter()
-            .flat_map(|v| {
-                if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                    col.iter().collect::<Vec<Option<f64>>>()
-                } else {
-                    vec![]
-                }
-            })
-            .collect();
-        let Some(scores) = scores else {
-            return Err(Error::EmbeddingError {
-                source: "Empty embedding scores returned unexpectedly".into(),
-            });
-        };
-
-        Ok(scores)
-    }
-
-    /// Return the input column that was embedded.
-    pub fn embedding_columns_list(&self) -> Result<Vec<String>> {
-        let embedding_projection =
-            get_projection(&self.schema(), &[SEARCH_VALUE_COLUMN_NAME.to_string()]);
-        let embedding_records = self
-            .data
-            .iter()
-            .map(|s| s.project(&embedding_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-
-        let result = embedding_records
-            .iter()
-            .flat_map(|v| {
-                convert_string_arrow_to_iterator!(v.column(0))
-                    .map(|v| v.map(|vv| vv.unwrap_or_default().to_string()).collect_vec())
-                    .unwrap_or_default()
-            })
-            .collect();
-
-        Ok(result)
-    }
-
-    /// Retuns the Schema of the full underlying data.
-    pub fn schema(&self) -> SchemaRef {
-        self.data
-            .first()
-            .map_or(Schema::empty().into(), RecordBatch::schema)
-    }
-}
-
 pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,14 +107,39 @@ impl Match {
 
 pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowError> {
     let columns: Vec<_> = agg.matches.values().flatten().collect();
+
+    // Add primary keys, 'score' & additional data columns to the document header.
+    let header_fields = [
+        vec![SEARCH_SCORE_COLUMN_NAME],
+        agg.primary_key.clone(),
+        agg.data_columns.clone(),
+    ]
+    .concat();
     let rb = collect_batches(agg.data).await?;
-    if let Some(frst) = columns.first() {
-        to_markdown_documents(rb.as_slice(), frst.as_str())
-    } else {
-        Err(ArrowError::SchemaError(format!(
-            "TODO: Currently we only support 1 column for this tool. We have {columns:?}"
-        )))
-    }
+
+    // For each record batch, create markdown documents for each column in `agg.matches`.
+    let doc_sets: Vec<String> = agg
+        .matches
+        .iter()
+        .map(|(derived_from, highlight_columns)| {
+            highlight_columns
+                .iter()
+                .map(|col| {
+                    to_markdown_documents(
+                        rb.as_slice(),
+                        col,
+                        &derived_from,
+                        header_fields.as_slice(),
+                    )
+                })
+                .collect::<Result<Vec<_>>, _>()
+        })
+        .collect::<Result<Vec<Vec<_>>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()?;
+
+    Ok(doc_sets.join("\n"))
 }
 
 pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Result<Vec<Match>> {

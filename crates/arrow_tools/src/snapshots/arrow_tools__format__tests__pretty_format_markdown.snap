@@ -1,6 +1,7 @@
 ---
 source: crates/arrow_tools/src/format.rs
 expression: formatted
+snapshot_kind: text
 ---
 ---
 location: path/to/folder/file_12345.txt
