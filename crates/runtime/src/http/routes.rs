@@ -263,6 +263,7 @@ async fn track_metrics(
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Http)
             .with_app_opt(app_lock.as_ref().map(Arc::clone))
+            .with_df_opt(Some(Arc::clone(&df)))
             .from_headers(&headers)
             .build(),
     );

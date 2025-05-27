@@ -258,7 +258,9 @@ mod tests {
 
     use futures::TryStreamExt;
 
-    use cache::{CacheKey, QueryResultsCacheProvider, QueryResultsCacheStatus, SimpleCache};
+    use cache::{
+        CacheKey, Caching, QueryResultsCacheProvider, QueryResultsCacheStatus, SimpleCache,
+    };
     use spicepod::component::runtime::{HashingAlgorithm, ResultsCache};
 
     use crate::{
@@ -313,8 +315,11 @@ mod tests {
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_results_cache_provider(Arc::new(cache_provider))
-            .with_plans_cache_provider(plan_cache_provider)
+            .with_caching(Arc::new(
+                Caching::new()
+                    .with_results_cache(Arc::new(cache_provider))
+                    .with_plans_cache(plan_cache_provider),
+            ))
             .build(),
         );
 
@@ -442,8 +447,11 @@ mod tests {
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_results_cache_provider(Arc::new(cache_provider))
-            .with_plans_cache_provider(plan_cache_provider)
+            .with_caching(Arc::new(
+                Caching::new()
+                    .with_results_cache(Arc::new(cache_provider))
+                    .with_plans_cache(plan_cache_provider),
+            ))
             .build(),
         );
 
@@ -510,8 +518,11 @@ mod tests {
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
             )
-            .with_results_cache_provider(Arc::new(cache_provider))
-            .with_plans_cache_provider(plan_cache_provider)
+            .with_caching(Arc::new(
+                Caching::new()
+                    .with_results_cache(Arc::new(cache_provider))
+                    .with_plans_cache(plan_cache_provider),
+            ))
             .build(),
         );
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Code needed to initialize the runtime
 
+pub(crate) mod caching;
 pub(crate) mod catalog;
 pub(crate) mod dataset;
 pub(crate) mod embedding;
@@ -26,7 +27,6 @@ pub(crate) mod llm;
 pub(crate) mod metrics;
 pub(crate) mod model;
 pub(crate) mod pods_watcher;
-pub(crate) mod results_cache;
 pub(crate) mod task_history;
 pub(crate) mod tool;
 pub(crate) mod view;

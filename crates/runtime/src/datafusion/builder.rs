@@ -23,7 +23,7 @@ use std::{
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry, object_store_registry::SpiceObjectStoreRegistry,
 };
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider};
+use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -32,7 +32,6 @@ use datafusion::{
         memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
-    logical_expr::LogicalPlan,
     optimizer::{
         AnalyzerRule,
         analyzer::{
@@ -57,13 +56,12 @@ use super::{
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
-    results_cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    plans_cache_provider: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    caching: Option<Arc<Caching>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -110,13 +108,12 @@ impl DataFusionBuilder {
         Self {
             config: df_config,
             status,
-            results_cache_provider: None,
-            plans_cache_provider: None,
             accelerator_engine_registry,
             memory_limit: None,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
+            caching: None,
         }
     }
 
@@ -127,20 +124,8 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn with_results_cache_provider(
-        mut self,
-        cache_provider: Arc<QueryResultsCacheProvider>,
-    ) -> Self {
-        self.results_cache_provider = Some(cache_provider);
-        self
-    }
-
-    #[must_use]
-    pub fn with_plans_cache_provider(
-        mut self,
-        cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
-    ) -> Self {
-        self.plans_cache_provider = Some(cache_provider);
+    pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
+        self.caching = Some(caching);
         self
     }
 
@@ -237,24 +222,13 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
-        let caching = Caching::new();
-        let caching = if let Some(cache_provider) = self.plans_cache_provider {
-            caching.with_plans_cache(cache_provider)
-        } else {
-            caching
-        };
-
-        let caching = if let Some(cache_provider) = self.results_cache_provider {
-            caching.with_results_cache(cache_provider)
-        } else {
-            caching
-        };
+        let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            caching: Arc::new(caching),
+            caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
