@@ -205,7 +205,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
-        self.runtime.results_cache = results_cache;
+        self.runtime.results_cache = Some(results_cache);
         self
     }
 
