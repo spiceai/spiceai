@@ -68,24 +68,34 @@ struct SearchResponse {
         (status = 200, description = "Search completed successfully", content((
             SearchResponse = "application/json",
                 example = json!({
-                    "matches": [
+                    "results": [
                         {
-                            "value": "I booked use some tickets",
+                            "matches": { 
+                                "message": "I booked use some tickets"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
-                            "metadata": { "timestamp": 1_724_716_542 }
+                            "data": { "timestamp": 1_724_716_542 },
+                            "score": 0.914321
                         },
                         {
-                            "value": "direct to Narata",
+                            "matches": { 
+                                "message": "direct to Narata"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b" },
-                            "metadata": { "timestamp": 1_724_715_881 }
+                            "data": { "timestamp": 1_724_715_881 },
+                            "score": 0.83221
                         },
                         {
-                            "value": "Yes, we're sitting together",
+                            "matches": { 
+                                "message": "Yes, we're sitting together"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
-                            "metadata": { "timestamp": 1_724_716_123 }
+                            "data": { "timestamp": 1_724_716_123 },
+                            "score": 0.787654321
+
                         }
                     ],
                     "duration_ms": 42
