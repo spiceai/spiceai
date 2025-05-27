@@ -231,6 +231,7 @@ impl SchemaProvider for GlueSchemaProvider {
 }
 
 // copy from iceberg-catalog-glue internals
+// https://github.com/apache/iceberg-rust/blob/main/crates/catalog/glue/src/utils.rs#L256
 fn get_metadata_location(
     parameters: Option<&HashMap<String, String>>,
     table: &str,
