@@ -146,91 +146,86 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        if let Some(table) = self
+        let Some(table) = self
             .inner
             .databases
             .get(&self.schema)
             .and_then(|tables| tables.iter().find(|t| t.name() == name))
-        {
-            match TableType::from(table) {
-                TableType::HiveParquet => {
-                    tracing::warn!("Hive Parquet files not supported yet");
-                    Ok(None)
-                }
-                TableType::Iceberg => {
-                    let mut props = Vec::new();
-                    if let Some(provider) = self.inner.config.credentials_provider() {
-                        let creds = provider
-                            .provide_credentials()
-                            .await
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        props.push((S3_ACCESS_KEY_ID, creds.access_key_id().to_string()));
-                        props.push((S3_SECRET_ACCESS_KEY, creds.secret_access_key().to_string()));
-                    }
-
-                    let file_io =
-                        FileIOBuilder::new("s3")
-                            .with_props(props)
-                            .build()
-                            .map_err(|e| {
-                                DataFusionError::External(Box::new(Error::BuildFileIO {
-                                    source: e,
-                                }))
-                            })?;
-
-                    let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                    let input_file = file_io.new_input(&metadata_location).map_err(|e| {
-                        DataFusionError::External(Box::new(Error::CreateFileInput {
-                            source: e,
-                            location: metadata_location.clone(),
-                        }))
-                    })?;
-
-                    let metadata_content = input_file.read().await.map_err(|e| {
-                        DataFusionError::External(Box::new(Error::ReadMetadata {
-                            source: e,
-                            location: metadata_location.clone(),
-                        }))
-                    })?;
-
-                    let metadata = serde_json::from_slice::<TableMetadata>(&metadata_content)
-                        .map_err(|e| {
-                            DataFusionError::External(Box::new(Error::DeserializeMetadata {
-                                source: e,
-                            }))
-                        })?;
-
-                    let identifier =
-                        TableIdent::new(NamespaceIdent::new(self.schema.clone()), name.to_string());
-
-                    let table = IcebergTable::builder()
-                        .file_io(file_io)
-                        .metadata(metadata)
-                        .identifier(identifier)
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::External(Box::new(Error::BuildIcebergTable {
-                                source: e,
-                            }))
-                        })?;
-
-                    let table_provider = IcebergTableProvider::try_new_from_table(table)
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::External(Box::new(Error::CreateIcebergTableProvider {
-                                source: e,
-                            }))
-                        })?;
-
-                    Ok(Some(Arc::new(table_provider)))
-                }
-                TableType::Unsupported => Ok(None),
-            }
-        } else {
+        else {
             tracing::error!("Glue schema name not in databases");
-            Ok(None)
+            return Ok(None);
+        };
+
+        match TableType::from(table) {
+            TableType::HiveParquet => {
+                tracing::warn!("Hive Parquet files not supported yet");
+                Ok(None)
+            }
+            TableType::Iceberg => {
+                let mut props = Vec::new();
+                if let Some(provider) = self.inner.config.credentials_provider() {
+                    let creds = provider
+                        .provide_credentials()
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    props.push((S3_ACCESS_KEY_ID, creds.access_key_id().to_string()));
+                    props.push((S3_SECRET_ACCESS_KEY, creds.secret_access_key().to_string()));
+                }
+
+                let file_io = FileIOBuilder::new("s3")
+                    .with_props(props)
+                    .build()
+                    .map_err(|e| {
+                        DataFusionError::External(Box::new(Error::BuildFileIO { source: e }))
+                    })?;
+
+                let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                let input_file = file_io.new_input(&metadata_location).map_err(|e| {
+                    DataFusionError::External(Box::new(Error::CreateFileInput {
+                        source: e,
+                        location: metadata_location.clone(),
+                    }))
+                })?;
+
+                let metadata_content = input_file.read().await.map_err(|e| {
+                    DataFusionError::External(Box::new(Error::ReadMetadata {
+                        source: e,
+                        location: metadata_location.clone(),
+                    }))
+                })?;
+
+                let metadata =
+                    serde_json::from_slice::<TableMetadata>(&metadata_content).map_err(|e| {
+                        DataFusionError::External(Box::new(Error::DeserializeMetadata {
+                            source: e,
+                        }))
+                    })?;
+
+                let identifier =
+                    TableIdent::new(NamespaceIdent::new(self.schema.clone()), name.to_string());
+
+                let table = IcebergTable::builder()
+                    .file_io(file_io)
+                    .metadata(metadata)
+                    .identifier(identifier)
+                    .build()
+                    .map_err(|e| {
+                        DataFusionError::External(Box::new(Error::BuildIcebergTable { source: e }))
+                    })?;
+
+                let table_provider = IcebergTableProvider::try_new_from_table(table)
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::External(Box::new(Error::CreateIcebergTableProvider {
+                            source: e,
+                        }))
+                    })?;
+
+                Ok(Some(Arc::new(table_provider)))
+            }
+            TableType::Unsupported => Ok(None),
         }
     }
 }
