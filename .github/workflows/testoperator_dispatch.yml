@@ -70,7 +70,7 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
-      - name: Dispatch Testoperator - Scheduled Bench - TPCH
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
         env:
@@ -89,6 +89,14 @@ jobs:
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -124,7 +132,7 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 \
             --workflow ${{ github.event.inputs.workflow_type }} \
@@ -147,6 +155,17 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - ClickBench
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
