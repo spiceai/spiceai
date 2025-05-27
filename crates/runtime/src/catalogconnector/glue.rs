@@ -442,7 +442,7 @@ impl CatalogProvider for GlueCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for GlueCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // TODO
+        // TODO: #6012
         Ok(())
     }
 }
