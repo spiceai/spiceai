@@ -5,14 +5,14 @@ description: "Query: tpch_q16"
 +----------+--------------------------+--------+--------------+
 | p_brand  | p_type                   | p_size | supplier_cnt |
 +----------+--------------------------+--------+--------------+
-| Brand#41 | MEDIUM BRUSHED TIN       | 3      | 28           |
-| Brand#54 | STANDARD BRUSHED COPPER  | 14     | 27           |
-| Brand#11 | STANDARD BRUSHED TIN     | 23     | 24           |
-| Brand#11 | STANDARD BURNISHED BRASS | 36     | 24           |
-| Brand#15 | MEDIUM ANODIZED NICKEL   | 3      | 24           |
-| Brand#15 | SMALL ANODIZED BRASS     | 45     | 24           |
-| Brand#15 | SMALL BURNISHED NICKEL   | 19     | 24           |
-| Brand#21 | MEDIUM ANODIZED COPPER   | 3      | 24           |
-| Brand#22 | SMALL BRUSHED NICKEL     | 3      | 24           |
-| Brand#22 | SMALL BURNISHED BRASS    | 19     | 24           |
+| Brand#14 | SMALL BRUSHED BRASS      | 45     | 596          |
+| Brand#34 | ECONOMY BURNISHED STEEL  | 23     | 592          |
+| Brand#44 | PROMO POLISHED NICKEL    | 49     | 592          |
+| Brand#54 | LARGE BURNISHED STEEL    | 36     | 584          |
+| Brand#14 | ECONOMY BRUSHED COPPER   | 19     | 580          |
+| Brand#13 | STANDARD BRUSHED BRASS   | 45     | 579          |
+| Brand#21 | PROMO POLISHED TIN       | 36     | 579          |
+| Brand#12 | STANDARD BRUSHED TIN     | 9      | 576          |
+| Brand#32 | STANDARD ANODIZED COPPER | 14     | 576          |
+| Brand#32 | STANDARD BURNISHED STEEL | 36     | 576          |
 +----------+--------------------------+--------+--------------+
