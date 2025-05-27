@@ -98,7 +98,7 @@ type DatabaseName = String;
 
 /// A catalog provider for AWS Glue, managing database schemas and tables.
 pub struct GlueCatalogProvider {
-    inner: Arc<Inner>,
+    inner: Arc<GlueCatalogState>,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -108,7 +108,7 @@ impl fmt::Debug for GlueCatalogProvider {
     }
 }
 
-struct Inner {
+struct GlueCatalogState {
     databases: HashMap<DatabaseName, Vec<Table>>,
     config: SdkConfig,
 }
@@ -116,7 +116,7 @@ struct Inner {
 /// A schema provider for a specific Glue database, providing table metadata.
 pub struct GlueSchemaProvider {
     schema: String,
-    inner: Arc<Inner>,
+    inner: Arc<GlueCatalogState>,
 }
 
 impl fmt::Debug for GlueSchemaProvider {
@@ -291,7 +291,7 @@ impl GlueCatalogProvider {
             }
         }
 
-        let inner = Arc::new(Inner { databases, config });
+        let inner = Arc::new(GlueCatalogState { databases, config });
 
         Ok(Self { inner })
     }
