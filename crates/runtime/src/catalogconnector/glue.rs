@@ -96,7 +96,7 @@ pub struct GlueCatalog {
 
 type DatabaseName = String;
 
-/// A catalog provider for AWS Glue, managing database schemas and tables.
+/// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
     inner: Arc<GlueCatalogState>,
 }
@@ -115,14 +115,14 @@ struct GlueCatalogState {
 
 /// A schema provider for a specific Glue database, providing table metadata.
 pub struct GlueSchemaProvider {
-    schema: String,
+    database: String,
     inner: Arc<GlueCatalogState>,
 }
 
 impl fmt::Debug for GlueSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GlueSchemaProvider")
-            .field("schema", &self.schema)
+            .field("database", &self.database)
             .finish_non_exhaustive()
     }
 }
@@ -136,7 +136,7 @@ impl SchemaProvider for GlueSchemaProvider {
     fn table_names(&self) -> Vec<String> {
         self.inner
             .databases
-            .get(&self.schema)
+            .get(&self.database)
             .map(|tables| tables.iter().map(|t| t.name.clone()).collect())
             .unwrap_or_default()
     }
@@ -149,10 +149,13 @@ impl SchemaProvider for GlueSchemaProvider {
         let Some(table) = self
             .inner
             .databases
-            .get(&self.schema)
+            .get(&self.database)
             .and_then(|tables| tables.iter().find(|t| t.name() == name))
         else {
-            tracing::error!("Glue schema name not in databases");
+            tracing::error!(
+                "Glue table name `{name}` not found in database `{}`",
+                self.database
+            );
             return Ok(None);
         };
 
@@ -204,7 +207,7 @@ impl SchemaProvider for GlueSchemaProvider {
                     })?;
 
                 let identifier =
-                    TableIdent::new(NamespaceIdent::new(self.schema.clone()), name.to_string());
+                    TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
 
                 let table = IcebergTable::builder()
                     .file_io(file_io)
@@ -261,7 +264,7 @@ impl GlueCatalogProvider {
 
         let mut databases = HashMap::new();
         for db in get_databases_output.database_list {
-            if !schema_might_match(&db.name, &catalog.orig_include) {
+            if !database_might_match(&db.name, &catalog.orig_include) {
                 tracing::debug!("skipping database {}", &db.name);
                 continue;
             }
@@ -293,10 +296,10 @@ impl GlueCatalogProvider {
     }
 }
 
-fn schema_might_match(schema: &str, patterns: &[String]) -> bool {
+fn database_might_match(database: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
-        pattern == schema
-            || pattern.starts_with(&format!("{schema}."))
+        pattern == database
+            || pattern.starts_with(&format!("{database}."))
             || pattern.starts_with("*.")
             || pattern == "*.*"
     })
@@ -359,11 +362,11 @@ impl TableType {
     }
 }
 
-fn is_included(include: Option<&GlobSet>, schema: &str, table: &str) -> bool {
-    let schema_with_table = format!("{schema}.{table}");
+fn is_included(include: Option<&GlobSet>, database: &str, table: &str) -> bool {
+    let database_with_table = format!("{database}.{table}");
     if let Some(include) = include {
-        if !include.is_match(&schema_with_table) {
-            tracing::debug!("skipping table {schema_with_table}");
+        if !include.is_match(&database_with_table) {
+            tracing::debug!("skipping table {database_with_table}");
             return false;
         }
     }
@@ -429,7 +432,7 @@ impl CatalogProvider for GlueCatalogProvider {
     fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
         if self.inner.databases.contains_key(name) {
             let schema_provider = GlueSchemaProvider {
-                schema: name.to_string(),
+                database: name.to_string(),
                 inner: Arc::clone(&self.inner),
             };
             Some(Arc::new(schema_provider))
