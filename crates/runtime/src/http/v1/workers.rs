@@ -78,23 +78,25 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
                 "object": "list",
                 "data": [
                     {
-                        "from": "models:gpt-4o",
-                        "name": "gpt-4o-researcher",
-                        "role": "researcher"
+                        "name": "round-robin",
+                        "description": "Distributes requests between foo and bar models in a round-robin fashion.\n",
+                        "type": "load_balance",
+                        "is_llm": true
                     },
                     {
-                        "from": "models:gpt-4o",
-                        "name": "gpt-4o-writer",
-                        "role": "writer"
+                        "name": "fallback",
+                        "description": "Attempts bar first, then foo, then baz if previous models fail.\n",
+                        "type": "load_balance",
+                        "is_llm": true
                     }
                 ]
             })
         ), (
             String = "text/csv",
             example = "
-from,name,role
-models:gpt-4o,gpt-4o-researcher,researcher
-models:gpt-4o,gpt-4o-writer,writer
+name,description,type,is_llm
+round-robin,\"Distributes requests between foo and bar models in a round-robin fashion.\",load_balance,true
+fallback,\"Attempts bar first, then foo, then baz if previous models fail.\",load_balance,true
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing workers", content((
