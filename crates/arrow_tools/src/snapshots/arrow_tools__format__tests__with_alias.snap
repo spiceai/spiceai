@@ -1,0 +1,23 @@
+---
+source: crates/arrow_tools/src/format.rs
+expression: formatted
+snapshot_kind: text
+---
+---
+location: path/to/folder/file_12345.txt
+dist: 0.376276
+column: content
+---
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+
+Sed do eiusmod tempor aliqua. 
+
+reprehenderit nulla pariatur.
+
+---
+location: path/to/folder/file_67890.txt
+dist: 0.123456
+column: content
+---
+Lorem ipsum dolor adipiscing elit. 
+Cras venenatis euismod malesuada.
