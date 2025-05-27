@@ -51,6 +51,7 @@ jobs:
               - 'crates/**'
               - 'bin/**'
               - 'test/**'
+              - 'tools/**'
               - 'install/**'
               - '.github/workflows/**'
               - 'Cargo.toml'
