@@ -163,13 +163,17 @@ impl RuntimeBuilder {
             .as_ref()
             .is_none_or(|app| app.runtime.task_history.enabled);
 
+        let caching =
+            Runtime::init_caching(self.app.as_ref().map(|app| &app.runtime.results_cache));
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
         )
         .memory_limit(memory_limit)
         .temp_directory(temp_directory)
-        .with_task_history(task_history);
+        .with_task_history(task_history)
+        .with_caching(caching);
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);

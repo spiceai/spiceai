@@ -1,3 +1,4 @@
+# Default optimization level (used when RUST_PROFILE or DEV is not set)
 OPT_LEVEL = --release
 SPICED_NON_DEFAULT_FEATURES_WITH_FLAG := $(if $(SPICED_NON_DEFAULT_FEATURES),--features $(SPICED_NON_DEFAULT_FEATURES),)
 SPICED_FEATURES := $(SPICED_NON_DEFAULT_FEATURES_WITH_FLAG)
@@ -7,8 +8,13 @@ ifdef REL_VERSION
 endif
 
 ifdef DEV
-	SPICED_FEATURES := --features dev $(SPICED_NON_DEFAULT_FEATURES_WITH_FLAG)
-	OPT_LEVEL = --profile dev
+    SPICED_FEATURES := --features dev $(SPICED_NON_DEFAULT_FEATURES_WITH_FLAG)
+    OPT_LEVEL = --profile dev
+endif
+
+# Override OPT_LEVEL with RUST_PROFILE if set
+ifdef RUST_PROFILE
+    OPT_LEVEL = --profile $(RUST_PROFILE)
 endif
 
 ifdef SPICED_TARGET_DIR

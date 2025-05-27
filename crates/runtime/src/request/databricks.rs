@@ -26,14 +26,14 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::{
-    datafusion::request_context_extension::DataFusionContextExtension,
-    request::{AsyncMarker, RequestContext},
-};
+use crate::datafusion::DataFusion;
+
+const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 
 #[derive(Clone)]
 pub struct DatabricksAuthExtension {
     app: Option<Arc<App>>,
+    df: Option<Arc<DataFusion>>,
     tokens: Arc<HashMap<String, SecretString>>,
 }
 
@@ -41,6 +41,7 @@ impl Default for DatabricksAuthExtension {
     fn default() -> Self {
         Self {
             app: None,
+            df: None,
             tokens: Arc::new(HashMap::new()),
         }
     }
@@ -48,8 +49,12 @@ impl Default for DatabricksAuthExtension {
 
 impl DatabricksAuthExtension {
     #[must_use]
-    pub fn from_headers(app: &Option<Arc<App>>, headers: &HeaderMap) -> Option<Self> {
-        let databricks_headers = headers.get_all("Spice-Databricks-Auth");
+    pub fn from_headers(
+        app: &Option<Arc<App>>,
+        df: &Option<Arc<DataFusion>>,
+        headers: &HeaderMap,
+    ) -> Option<Self> {
+        let databricks_headers = headers.get_all(SPICE_DATABRICKS_HEADER);
         let values = databricks_headers.iter();
 
         let mut auth_map = HashMap::new();
@@ -73,6 +78,7 @@ impl DatabricksAuthExtension {
         } else {
             Some(Self {
                 app: app.as_ref().map(Arc::clone),
+                df: df.as_ref().map(Arc::clone),
                 tokens: Arc::new(auth_map),
             })
         }
@@ -84,12 +90,7 @@ impl DatabricksAuthExtension {
     }
 
     pub async fn load_u2m_components(&self) {
-        let context = RequestContext::current(AsyncMarker::new().await);
-        if let (Some(app), Some(df)) = (
-            self.app.clone(),
-            context.extension::<DataFusionContextExtension>(),
-        ) {
-            let df = df.datafusion();
+        if let (Some(app), Some(df)) = (self.app.clone(), self.df.clone()) {
             let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
             let databricks_u2m_datasets: Vec<Dataset> = app
                 .datasets

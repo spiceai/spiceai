@@ -16,24 +16,25 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use cache::{CacheProvider, QueryResultsCacheProvider, SimpleCache};
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache};
 use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::runtime::HashingAlgorithm;
+use spicepod::component::runtime::{HashingAlgorithm, ResultsCache};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
 const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
 
 impl Runtime {
-    pub async fn init_results_cache(&self) {
-        let app = self.app.read().await;
-        let Some(app) = app.as_ref() else { return };
-
-        let cache_config = &app.runtime.results_cache;
+    pub fn init_caching(cache_config: Option<&ResultsCache>) -> Arc<Caching> {
+        let Some(cache_config) = cache_config else {
+            return Arc::new(Caching::new());
+        };
 
         if !cache_config.enabled {
-            return;
+            return Arc::new(Caching::new());
         }
+
+        let mut caching = Caching::new();
 
         match QueryResultsCacheProvider::try_new(
             cache_config,
@@ -41,7 +42,7 @@ impl Runtime {
         ) {
             Ok(cache_provider) => {
                 tracing::info!("Initialized results cache; {cache_provider}");
-                self.datafusion().set_results_cache_provider(cache_provider);
+                caching = caching.with_results_cache(Arc::new(cache_provider));
             }
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
@@ -63,7 +64,8 @@ impl Runtime {
                 )),
             };
 
-        self.datafusion()
-            .set_logical_plan_cache_provider(plan_cache_provider);
+        caching = caching.with_plans_cache(plan_cache_provider);
+
+        Arc::new(caching)
     }
 }

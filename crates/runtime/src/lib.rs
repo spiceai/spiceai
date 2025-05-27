@@ -94,6 +94,7 @@ mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
 pub mod request;
+mod scheduling;
 pub mod search;
 pub mod secrets;
 pub mod spice_metrics;
@@ -688,13 +689,6 @@ impl Runtime {
             }
         });
 
-        let results_cache = tokio::spawn({
-            let self_clone = Arc::clone(&self);
-            async move {
-                self_clone.init_results_cache().await;
-            }
-        });
-
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -748,13 +742,7 @@ impl Runtime {
             }
         });
 
-        let components = vec![
-            task_history,
-            results_cache,
-            datasets,
-            catalogs,
-            models_and_evals,
-        ];
+        let components = vec![task_history, datasets, catalogs, models_and_evals];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded
         let cancel_loading = CancellationToken::new();

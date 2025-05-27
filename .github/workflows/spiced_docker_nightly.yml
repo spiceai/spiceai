@@ -18,6 +18,14 @@ on:
         required: false
         type: boolean
         default: false
+      profile_option:
+        description: "Which Rust build profile to use? (Default is release)"
+        required: false
+        type: choice
+        options:
+          - "release"
+          - "release-lto"
+        default: "release"
 jobs:
   check_commits:
     runs-on: ubuntu-latest
@@ -71,6 +79,8 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
     runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
       - uses: actions/checkout@v4
       - name: Add nightly postfix to version in Cargo.toml
@@ -122,6 +132,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
@@ -138,6 +149,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
@@ -154,6 +166,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
@@ -170,6 +183,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -179,6 +193,8 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
     runs-on: spiceai-runners
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
       - uses: actions/checkout@v4
       - name: Add nightly postfix to version in Cargo.toml
@@ -215,6 +231,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
@@ -231,6 +248,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
@@ -247,6 +265,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
@@ -263,6 +282,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
         with:

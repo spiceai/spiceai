@@ -136,7 +136,7 @@ jobs:
               },
             ];
 
-            const model_option = context.payload.inputs.model_option;
+            const model_option = context.payload.inputs?.model_option || 'all';
             let filtered = matrix;
 
             if (model_option !== 'all') {
