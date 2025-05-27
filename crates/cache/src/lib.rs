@@ -51,7 +51,6 @@ mod simple_cache;
 mod utils;
 
 pub use simple_cache::SimpleCache;
-use std::sync::RwLock;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -102,8 +101,8 @@ pub trait TableInvalidator {
 
 #[derive(Default)]
 pub struct Caching {
-    pub results: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
-    pub plans: RwLock<Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>>,
+    pub results: Option<Arc<QueryResultsCacheProvider>>,
+    pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Caching {
@@ -123,7 +122,7 @@ impl Caching {
 
     #[must_use]
     pub fn with_results_cache(mut self, results: Arc<QueryResultsCacheProvider>) -> Self {
-        self.results = RwLock::new(Some(results));
+        self.results = Some(results);
         self
     }
 
@@ -132,7 +131,24 @@ impl Caching {
         mut self,
         plans: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
     ) -> Self {
-        self.plans = RwLock::new(Some(plans));
+        self.plans = Some(plans);
+        self
+    }
+
+    #[must_use]
+    pub fn with_results_cache_opt(
+        mut self,
+        results: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> Self {
+        self.results = results;
+        self
+    }
+    #[must_use]
+    pub fn with_plans_cache_opt(
+        mut self,
+        plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
+    ) -> Self {
+        self.plans = plans;
         self
     }
 }

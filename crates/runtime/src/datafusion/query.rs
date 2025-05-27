@@ -427,7 +427,7 @@ pub fn write_to_json_string(
 
 #[cfg(test)]
 mod tests {
-    use ::cache::{QueryResultsCacheProvider, QueryResultsCacheStatus};
+    use ::cache::{Caching, QueryResultsCacheProvider, QueryResultsCacheStatus};
     use arrow::array::Int64Array;
     use serde_json::json;
     use spicepod::component::runtime::ResultsCache;
@@ -452,7 +452,7 @@ mod tests {
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
             )
-            .with_results_cache_provider(cache_provider)
+            .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
             .build(),
         );
 
