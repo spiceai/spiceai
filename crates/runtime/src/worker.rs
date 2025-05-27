@@ -14,49 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, str::FromStr, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
-use serde::{Deserialize, Serialize};
-use spicepod::component::worker::Worker as WorkerComponent;
+use spicepod::component::worker::{Worker as WorkerComponent, WorkerType};
 use workers::RouterModel;
 
-use crate::Runtime;
+use crate::{Result, Runtime};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum WorkerType {
-    #[default]
-    LoadBalance,
-}
+pub fn try_construct_worker(
+    worker_type: &WorkerType,
+    worker: &WorkerComponent,
+    rt: &Runtime,
+) -> Result<Arc<dyn Worker>> {
+    match worker_type {
+        WorkerType::LoadBalance => {
+            let Some(load_balance) = &worker.load_balance else {
+                return Err(crate::Error::UnableToLoadWorker {
+                    source: Box::from(format!(
+                        "Worker '{}' is of 'type: {}', but has no 'load_balance' configuration",
+                        worker.name, worker.r#type
+                    )),
+                });
+            };
 
-impl WorkerType {
-    pub fn construct_worker(&self, worker: &WorkerComponent, rt: &Runtime) -> Arc<dyn Worker> {
-        match self {
-            WorkerType::LoadBalance => {
-                let model = RouterModel::new(
-                    worker.name.clone(),
-                    worker.models.clone(),
-                    Arc::clone(&rt.llms),
-                );
-                Arc::new(LoadBalanceWorker::new(
-                    Arc::new(model),
-                    worker.description.clone(),
-                ))
-            }
-        }
-    }
-}
-
-impl FromStr for WorkerType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "load_balance" => Ok(WorkerType::LoadBalance),
-            _ => Err(format!("Unknown worker type: {s}")),
+            let model = RouterModel::new(
+                worker.name.clone(),
+                load_balance.routing.as_slice(),
+                Arc::clone(&rt.llms),
+            );
+            Ok(Arc::new(LoadBalanceWorker::new(
+                Arc::new(model),
+                worker.description.clone(),
+            )))
         }
     }
 }

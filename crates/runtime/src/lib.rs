@@ -270,6 +270,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to load worker: {source}"))]
+    UnableToLoadWorker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
     DataConnectorDoesntSupportCatalogs { dataconnector: String },
 

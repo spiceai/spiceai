@@ -25,9 +25,8 @@ use csv::Writer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::worker::{Worker, WorkerType};
-
 use super::Format;
+use crate::worker::Worker;
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
@@ -51,7 +50,7 @@ pub(crate) struct WorkerResponse {
 pub(crate) struct WorkerResponseItem {
     name: String,
     description: Option<String>,
-    r#type: WorkerType,
+    r#type: String,
     is_llm: bool,
 }
 
@@ -59,7 +58,7 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
     WorkerResponseItem {
         name: worker.name().to_string(),
         description: worker.description().map(|d| d.to_string()),
-        r#type: worker.role(),
+        r#type: worker.role().to_string(),
         is_llm: Arc::clone(worker).as_model().is_some(),
     }
 }

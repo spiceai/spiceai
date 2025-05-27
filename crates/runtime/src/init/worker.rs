@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
-use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::WorkerType};
+use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 
@@ -44,23 +44,15 @@ impl Runtime {
 
         tracing::info!("Loading worker [{}]...", cfg.name);
 
-        let Ok(worker_type) = cfg
-            .r#type
-            .as_ref()
-            .map(|t| WorkerType::from_str(t.as_str()))
-            .transpose()
-        else {
-            tracing::warn!(
-                "Failed to load worker [{}], invalid type: '{}'",
-                cfg.name,
-                cfg.r#type.clone().unwrap_or_default()
-            );
-            self.status
-                .update_worker(&cfg.name, status::ComponentStatus::Error);
-            return;
+        let worker = match try_construct_worker(&cfg.r#type, cfg, self) {
+            Ok(worker) => worker,
+            Err(e) => {
+                tracing::error!("Failed to load worker [{}]: {}", cfg.name, e);
+                self.status
+                    .update_worker(&cfg.name, status::ComponentStatus::Error);
+                return;
+            }
         };
-
-        let worker = worker_type.unwrap_or_default().construct_worker(cfg, self);
 
         if let Some(model) = Arc::clone(&worker).as_model() {
             let mut llm_registry = self.llms.write().await;
