@@ -70,16 +70,16 @@ struct SearchResponse {
                 example = json!({
                     "results": [
                         {
-                            "matches": { 
+                            "matches": {
                                 "message": "I booked use some tickets"
                             },
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
                             "data": { "timestamp": 1_724_716_542 },
-                            "score": 0.914321
+                            "score": 0.914_321
                         },
                         {
-                            "matches": { 
+                            "matches": {
                                 "message": "direct to Narata"
                             },
                             "dataset": "app_messages",
@@ -88,13 +88,13 @@ struct SearchResponse {
                             "score": 0.83221
                         },
                         {
-                            "matches": { 
+                            "matches": {
                                 "message": "Yes, we're sitting together"
                             },
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
                             "data": { "timestamp": 1_724_716_123 },
-                            "score": 0.787654321
+                            "score": 0.787_654_321
 
                         }
                     ],
