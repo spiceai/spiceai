@@ -86,6 +86,7 @@ where
         let request_context = Arc::new(
             RequestContext::builder(Protocol::Flight)
                 .with_app_opt(self.app.clone())
+                .with_df_opt(Some(Arc::clone(&self.df)))
                 .from_headers(headers)
                 .build(),
         );
