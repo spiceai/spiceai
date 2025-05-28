@@ -19,7 +19,7 @@ pub mod search;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
-    // The request was not eligible for caching, and thus the results cache was not checked.
+    // The request was not eligible for caching, and thus the cache was not checked.
     CacheDisabled,
     // The request asked to bypass the cache, i.e. via `Cache-Control: no-cache`.
     CacheBypass,

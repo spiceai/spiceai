@@ -1,4 +1,3 @@
-use cache::key::SearchKey;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -14,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use cache::key::SearchKey;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins, Value};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
