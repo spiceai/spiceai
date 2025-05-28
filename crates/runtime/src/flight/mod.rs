@@ -188,13 +188,7 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
-    ) -> Result<
-        (
-            BoxStream<'static, Result<FlightData, Status>>,
-            CacheStatus,
-        ),
-        Status,
-    > {
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
 
         let query = match parameters {

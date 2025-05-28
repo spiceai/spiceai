@@ -255,9 +255,7 @@ fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderVa
     }
 }
 
-fn status_to_results_cache_value(
-    results_cache_status: CacheStatus,
-) -> Option<HeaderValue> {
+fn status_to_results_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
         CacheStatus::CacheHit => "HIT".parse().ok(),
         CacheStatus::CacheMiss => "MISS".parse().ok(),
