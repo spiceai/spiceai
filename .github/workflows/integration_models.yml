@@ -13,24 +13,24 @@ on:
       - release/*
       - feature-*
     paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
-      - 'bin/spice/**'
+      - "**/*.md"
+      - "docs/**"
+      - "README.md"
+      - "Makefile"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "LICENSE"
+      - ".github/**"
+      - "version.txt"
+      - ".schema/**"
+      - ".vscode/**"
+      - "deploy/**"
+      - "install/**"
+      - "media/**"
+      - "monitoring/**"
+      - "acknowledgements.md"
+      - "Dockerfile*"
+      - "bin/spice/**"
 
   workflow_dispatch:
 
@@ -42,19 +42,19 @@ concurrency:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'darwin'
+          os: "darwin"
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
         run: |
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features models,metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features models,metal,flightsql --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./ai_integration_test
 
       # Upload the test binary as an artifact
@@ -69,7 +69,7 @@ jobs:
     name: Test OpenAI Models
     needs: build
     permissions: read-all
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v4
 
