@@ -1,16 +1,20 @@
 ---
-source: crates/runtime/tests/models/mod.rs
+source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(response)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "matches": [
+  "results": [
     {
       "dataset": "catalog_page_with_chunking",
+      "matches": {
+        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+      },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "value": "In general basic characters welcome. Clearly lively friends con"
+      "score": 0.689
     }
   ]
 }

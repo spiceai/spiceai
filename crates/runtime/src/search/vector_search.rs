@@ -19,17 +19,14 @@ use std::{collections::HashMap, sync::Arc};
 use super::request::SearchRequest;
 use super::util::{get_embedding_table, user_tables_with_embeddings};
 use super::{CandidateAggregationSnafu, Error, Result};
-use crate::search::DataFusionSnafu;
 use crate::search::candidate::vector::VectorGeneration;
-use crate::search::types::{VectorSearchGenerationTableResult, VectorSearchTableResult};
 use crate::search::util::{embedding_columns_from_table, get_primary_keys_with_overrides};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, Ident};
 use itertools::Itertools;
 use search::aggregation::CandidateAggregation;
-use search::collect_batches;
+use search::{VectorSearchGenerationResult, VectorSearchGenerationTableResult};
 use search::{aggregation::reciprocal_rank::ReciprocalRankFusion, generation::CandidateGeneration};
 use snafu::ResultExt;
 use tokio::sync::RwLock;
@@ -73,7 +70,7 @@ impl VectorSearch {
         where_cond: Option<&Expr>,
         keywords: Vec<String>,
         limit: usize,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<VectorSearchGenerationResult> {
         tracing::debug!("Running vector search for table {:#?}", tbl);
 
         let table_provider = self
@@ -138,7 +135,7 @@ impl VectorSearch {
             embedding_table.is_chunked(embedding_column),
         );
 
-        generator
+        let data = generator
             .search(
                 query.to_string(),
                 filter_refs.as_slice(),
@@ -146,7 +143,12 @@ impl VectorSearch {
                 limit,
             )
             .await
-            .map_err(|e| Error::CandidateGenerationError { source: e })
+            .map_err(|e| Error::CandidateGenerationError { source: e })?;
+
+        Ok(VectorSearchGenerationResult {
+            data,
+            derived_from: embedding_column.to_string(),
+        })
 
         // TODO: Filter results after the fact for filters that aren't supported by [`CandidateGeneration::supports_filter_pushdown`]. https://github.com/spiceai/spiceai/issues/5849
 
@@ -193,7 +195,7 @@ impl VectorSearch {
 
                 async move {
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
-                    let mut results: Vec<SendableRecordBatchStream> = Vec::with_capacity(embedding_columns.len());
+                    let mut results: Vec<VectorSearchGenerationResult> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {
                         results.insert(i, self.individual_vector_search(
@@ -214,7 +216,7 @@ impl VectorSearch {
                 }
             }).collect::<Vec<_>>()).await?.into_iter().collect();
 
-            self.aggregate_per_table(response, ReciprocalRankFusion, additional_columns.as_slice(), *limit).await
+            self.aggregate_per_table(response, ReciprocalRankFusion, *limit).await
 
         }.instrument(span.clone()).await;
 
@@ -235,7 +237,6 @@ impl VectorSearch {
         &self,
         generation_results: HashMap<TableReference, VectorSearchGenerationTableResult>,
         aggregation: impl CandidateAggregation,
-        additional_columns: &[String],
         limit: usize,
     ) -> Result<VectorSearchResult> {
         let mut result: VectorSearchResult = HashMap::with_capacity(generation_results.len());
@@ -252,20 +253,7 @@ impl VectorSearch {
                 .aggregate(data, primary_keys.clone(), limit)
                 .await
                 .context(CandidateAggregationSnafu)?;
-
-            let data = collect_batches(aggregated)
-                .await
-                .boxed()
-                .context(DataFusionSnafu)?;
-
-            result.insert(
-                tbl,
-                VectorSearchTableResult {
-                    data,
-                    primary_keys: primary_keys.clone(),
-                    additional_columns: additional_columns.to_vec(),
-                },
-            );
+            result.insert(tbl, aggregated);
         }
 
         Ok(result)

@@ -35,3 +35,17 @@ pub async fn collect_batches(
 
     Ok(batches)
 }
+
+/// The results of [`CandidateGeneration::search`]'s on a single table.
+///
+/// Rows from different [`SendableRecordBatchStream`]s with an equal `primary_key` are considered the same row.
+pub struct VectorSearchGenerationTableResult {
+    pub data: Vec<VectorSearchGenerationResult>,
+    pub primary_keys: Vec<String>,
+}
+
+/// The results of a single [`CandidateGeneration::search`].
+pub struct VectorSearchGenerationResult {
+    pub data: SendableRecordBatchStream,
+    pub derived_from: String,
+}

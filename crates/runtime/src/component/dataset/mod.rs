@@ -95,6 +95,11 @@ pub enum Error {
         dataset: String,
         missing_component: String,
     },
+
+    #[snafu(display(
+        "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified for a given dataset.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+    ))]
+    MultipleRefreshExpressionSpecified,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -401,6 +406,14 @@ impl Dataset {
     pub fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_check_interval;
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn refresh_cron(&self) -> Option<Arc<str>> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_cron.clone();
         }
         None
     }

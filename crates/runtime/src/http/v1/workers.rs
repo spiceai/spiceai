@@ -15,7 +15,6 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use app::App;
 use axum::{
     Extension,
     extract::Query,
@@ -24,11 +23,9 @@ use axum::{
 };
 use csv::Writer;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-
-use crate::Runtime;
 
 use super::Format;
+use crate::worker::{Worker, WorkerRegistry};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
@@ -43,37 +40,25 @@ pub struct WorkersQueryParams {
 #[serde(rename_all = "snake_case")]
 pub(crate) struct WorkerResponse {
     object: String,
-    data: Vec<Worker>,
+    data: Vec<WorkerResponseItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct Worker {
+pub(crate) struct WorkerResponseItem {
     name: String,
     description: Option<String>,
-
-    /// Use generic to avoid using `utoipa::ToSchema` in `spicepod` crate.
-    models: Vec<serde_json::Value>,
+    r#type: String,
+    is_llm: bool,
 }
 
-impl From<&spicepod::component::worker::Worker> for Worker {
-    fn from(value: &spicepod::component::worker::Worker) -> Self {
-        let spicepod::component::worker::Worker {
-            name,
-            description,
-            models,
-            ..
-        } = value;
-
-        Worker {
-            name: name.clone(),
-            description: description.clone(),
-            models: models
-                .iter()
-                .filter_map(|m| serde_json::to_value(m).ok()) // '.to_value' cannot fail as `.models` came from a serialized form (i.e. in spicepod.yaml).
-                .collect(),
-        }
+fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
+    WorkerResponseItem {
+        name: worker.name().to_string(),
+        description: worker.description().map(|d| d.to_string()),
+        r#type: worker.role().to_string(),
+        is_llm: Arc::clone(worker).as_model().is_some(),
     }
 }
 
@@ -92,23 +77,25 @@ impl From<&spicepod::component::worker::Worker> for Worker {
                 "object": "list",
                 "data": [
                     {
-                        "from": "models:gpt-4o",
-                        "name": "gpt-4o-researcher",
-                        "role": "researcher"
+                        "name": "round-robin",
+                        "description": "Distributes requests between foo and bar models in a round-robin fashion.\n",
+                        "type": "load_balance",
+                        "is_llm": true
                     },
                     {
-                        "from": "models:gpt-4o",
-                        "name": "gpt-4o-writer",
-                        "role": "writer"
+                        "name": "fallback",
+                        "description": "Attempts bar first, then foo, then baz if previous models fail.\n",
+                        "type": "load_balance",
+                        "is_llm": true
                     }
                 ]
             })
         ), (
             String = "text/csv",
             example = "
-from,name,role
-models:gpt-4o,gpt-4o-researcher,researcher
-models:gpt-4o,gpt-4o-writer,writer
+name,description,type,is_llm
+round-robin,\"Distributes requests between foo and bar models in a round-robin fashion.\",load_balance,true
+fallback,\"Attempts bar first, then foo, then baz if previous models fail.\",load_balance,true
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing workers", content((
@@ -119,33 +106,27 @@ models:gpt-4o,gpt-4o-writer,writer
         )))
     )
 ))]
-
 pub(crate) async fn get(
-    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(_rt): Extension<Arc<Runtime>>,
+    Extension(workers): Extension<WorkerRegistry>,
     Query(params): Query<WorkersQueryParams>,
 ) -> Response {
-    let workers = match app.read().await.as_ref() {
-        Some(a) => a.workers.iter().map(Into::into).collect::<Vec<Worker>>(),
-        None => {
-            return (
-                status::StatusCode::INTERNAL_SERVER_ERROR,
-                "App not initialized",
-            )
-                .into_response();
-        }
-    };
+    let result = &*workers
+        .read()
+        .await
+        .values()
+        .map(worker_details)
+        .collect::<Vec<_>>();
 
     match params.format {
         Format::Json => (
             status::StatusCode::OK,
             Json(WorkerResponse {
                 object: "list".to_string(),
-                data: workers,
+                data: result.to_vec(),
             }),
         )
             .into_response(),
-        Format::Csv => match convert_details_to_csv(&workers) {
+        Format::Csv => match convert_details_to_csv(result) {
             Ok(csv) => (status::StatusCode::OK, csv).into_response(),
             Err(e) => {
                 tracing::error!("Error converting to CSV: {e}");
@@ -155,7 +136,9 @@ pub(crate) async fn get(
     }
 }
 
-fn convert_details_to_csv(workers: &[Worker]) -> Result<String, Box<dyn std::error::Error>> {
+fn convert_details_to_csv(
+    workers: &[WorkerResponseItem],
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for worker in workers {
         let _ = w.serialize(worker);

@@ -60,24 +60,8 @@ impl ScalarUDFImpl for ScalarUDFAlias {
         self.scalar_udf.return_type(arg_types)
     }
 
-    #[expect(deprecated)]
-    fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        self.scalar_udf.invoke(args)
-    }
-
     fn display_name(&self, _args: &[Expr]) -> DataFusionResult<String> {
         Ok(self.alias.to_string())
-    }
-
-    #[expect(deprecated)]
-    fn return_type_from_exprs(
-        &self,
-        args: &[Expr],
-        schema: &dyn ExprSchema,
-        arg_types: &[DataType],
-    ) -> DataFusionResult<DataType> {
-        self.scalar_udf
-            .return_type_from_exprs(args, schema, arg_types)
     }
 
     fn return_type_from_args(&self, args: ReturnTypeArgs) -> DataFusionResult<ReturnInfo> {
@@ -89,21 +73,8 @@ impl ScalarUDFImpl for ScalarUDFAlias {
         self.scalar_udf.is_nullable(args, schema)
     }
 
-    fn invoke_batch(
-        &self,
-        args: &[ColumnarValue],
-        number_rows: usize,
-    ) -> DataFusionResult<ColumnarValue> {
-        self.scalar_udf.invoke_batch(args, number_rows)
-    }
-
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         self.scalar_udf.invoke_with_args(args)
-    }
-
-    #[expect(deprecated)]
-    fn invoke_no_args(&self, number_rows: usize) -> DataFusionResult<ColumnarValue> {
-        self.scalar_udf.invoke_no_args(number_rows)
     }
 
     fn aliases(&self) -> &[String] {

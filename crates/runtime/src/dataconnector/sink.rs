@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
@@ -27,10 +28,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, dml::InsertOp},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan,
-        empty::EmptyExec,
-        insert::{DataSink, DataSinkExec},
-        metrics::MetricsSet,
+        DisplayAs, DisplayFormatType, ExecutionPlan, empty::EmptyExec, metrics::MetricsSet,
     },
 };
 use futures::Future;

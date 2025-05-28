@@ -1,0 +1,43 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "multi_column_search",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      },
+      "score": 0.032
+    },
+    {
+      "dataset": "multi_column_search",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Earlier different differences get just to a methods; masses inclu"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 3
+      },
+      "score": 0.032
+    },
+    {
+      "dataset": "multi_column_search",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Narrowly great dogs carry only by the events. Successful, able legs would no"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 5
+      },
+      "score": 0.031
+    }
+  ]
+}

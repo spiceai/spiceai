@@ -53,4 +53,7 @@ pub trait CandidateGeneration: Sync + Send {
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
     fn supports_columns(&self, projection: &[&Expr]) -> Result<Vec<bool>>;
+
+    /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
+    fn value_derived_from(&self) -> String;
 }

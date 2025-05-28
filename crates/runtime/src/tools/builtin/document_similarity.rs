@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
@@ -24,6 +23,7 @@ use crate::{
     Runtime,
     search::{
         request::{SearchRequest, SearchRequestAIJson},
+        types::to_pretty,
         util::parse_explicit_primary_keys,
         vector_search::VectorSearch,
     },
@@ -78,15 +78,11 @@ impl SpiceModelTool for DocumentSimilarityTool {
             let search_request = SearchRequest::try_from(req)?;
 
             let result = vs.search(&search_request).await.boxed()?;
-            let formatted = result
-                .iter()
-                .map(|(tbl, result)| {
-                    let displayed = result.to_pretty()?;
-                    Ok((tbl.to_string(), Value::String(displayed.to_string())))
-                })
-                .collect::<Result<serde_json::Map<String, Value>, ArrowError>>()
-                .boxed()?;
-
+            let mut formatted = serde_json::Map::with_capacity(result.len());
+            for (tbl, result) in result {
+                let displayed = to_pretty(result).await?;
+                formatted.insert(tbl.to_string(), Value::String(displayed.to_string()));
+            }
             Ok(Value::Object(formatted))
         }
         .instrument(span.clone())

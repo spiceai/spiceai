@@ -40,11 +40,17 @@ pub enum Error {
         source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
     #[snafu(display(
-        "Failed to parse cron expression.\n{source}\nValidate the cron expression is valid, and try again."
+        "The names of the schedules must be unique, but the name '{name}' is already in use"
+    ))]
+    DuplicateScheduleName { name: String },
+    #[snafu(display("No schedules were specified for the scheduler '{name}'"))]
+    NoSchedulesSpecified { name: String },
+    #[snafu(display(
+        "Failed to parse cron expression.\n{source}\nConfirm the cron expression is valid, and try again."
     ))]
     FailedToParseCron { source: croner::errors::CronError },
     #[snafu(display(
-        "Failed to determine next cron expression run time.\n{source}\nValidate the cron expression is valid, and try again."
+        "Failed to determine next cron expression run time.\n{source}\nConfirm the cron expression is valid, and try again."
     ))]
     FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
 }

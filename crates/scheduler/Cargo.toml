@@ -18,7 +18,6 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true
 tracing.workspace = true
-uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
