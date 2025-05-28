@@ -14,51 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use scheduler::{schedule::Schedule, scheduler::SchedulerBuilder};
+use scheduler::{
+    schedule::Schedule,
+    scheduler::{Running, Scheduler, SchedulerBuilder},
+};
 use snafu::ResultExt;
+use tokio::sync::RwLock;
 
 use crate::{Result, Runtime, component::dataset::Dataset, scheduling::DatasetRefreshTask};
 
 const REFRESH_SCHEDULER_NAME: &str = "refresh_scheduler";
 
+pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Running>>>>;
+
 impl Runtime {
-    pub async fn create_dataset_scheduler_if_required(
-        self: Arc<Self>,
-        dataset: Arc<Dataset>,
-    ) -> Result<()> {
+    pub async fn create_dataset_schedule(self: Arc<Self>, dataset: Arc<Dataset>) -> Result<()> {
         // TODO: Actually schedule the refresh task for cron - https://github.com/spiceai/spiceai/issues/6015
-        let Some(_refresh_cron) = dataset.refresh_cron() else {
+        if dataset.refresh_cron().is_none() {
             return Ok(());
-        };
+        }
 
         tracing::debug!("Creating dataset scheduler for dataset: {}", dataset.name);
         let scheduler_lock = Arc::clone(&self.schedulers);
         let mut schedulers = scheduler_lock.write().await;
         let dataset_name = dataset.name.to_string().into();
-        for scheduler in schedulers.iter() {
-            if scheduler
-                .schedules()
-                .await
-                .iter()
-                .any(|schedule| schedule.name() == dataset_name)
-            {
-                // Schedule already exists for this dataset
-                return Ok(());
-            }
-        }
 
         let refresh_task = Arc::new(DatasetRefreshTask::from(Arc::clone(&dataset)));
         let schedule = Arc::new(Schedule::new(Arc::clone(&dataset_name), refresh_task));
 
         // a `refresh_scheduler` exists but does not contain this dataset's schedule
-        if let Some(scheduler) = schedulers
-            .iter()
-            .find(|s| s.name() == REFRESH_SCHEDULER_NAME.into())
-        {
+        if let Some(scheduler) = schedulers.get(REFRESH_SCHEDULER_NAME) {
             tracing::debug!(
-                "Adding schedule to existing refresh scheduler for dataset: {}",
+                "Adding dataset schedule to existing refresh scheduler for dataset: {}",
                 dataset.name
             );
             scheduler
@@ -73,7 +62,7 @@ impl Runtime {
 
         // no `refresh_scheduler` exists, create a new one
         tracing::debug!(
-            "Creating new refresh scheduler for dataset: {}",
+            "Creating new refresh scheduler for dataset schedule: {}",
             dataset.name
         );
         let scheduler = Arc::new(
@@ -85,7 +74,8 @@ impl Runtime {
                 .await
                 .context(crate::FailedToStartSchedulerSnafu)?,
         );
-        schedulers.push(scheduler);
+
+        schedulers.insert(REFRESH_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
 
         Ok(())
     }

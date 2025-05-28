@@ -46,11 +46,11 @@ pub enum Error {
     #[snafu(display("No schedules were specified for the scheduler '{name}'"))]
     NoSchedulesSpecified { name: String },
     #[snafu(display(
-        "Failed to parse cron expression.\n{source}\nValidate the cron expression is valid, and try again."
+        "Failed to parse cron expression.\n{source}\nConfirm the cron expression is valid, and try again."
     ))]
     FailedToParseCron { source: croner::errors::CronError },
     #[snafu(display(
-        "Failed to determine next cron expression run time.\n{source}\nValidate the cron expression is valid, and try again."
+        "Failed to determine next cron expression run time.\n{source}\nConfirm the cron expression is valid, and try again."
     ))]
     FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
 }

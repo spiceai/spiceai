@@ -692,7 +692,7 @@ impl Runtime {
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
                 if let Ok(()) = is_ready.await {
-                    if let Err(e) = runtime.create_dataset_scheduler_if_required(ds).await {
+                    if let Err(e) = runtime.create_dataset_schedule(ds).await {
                         tracing::error!(
                             "Failed to create dataset schedule for '{}': {e}",
                             dataset_name

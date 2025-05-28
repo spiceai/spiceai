@@ -97,7 +97,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified at a time.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified for a given dataset.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     ))]
     MultipleRefreshExpressionSpecified,
 }

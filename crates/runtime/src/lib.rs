@@ -18,7 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
-use scheduler::scheduler::{Running, Scheduler};
+use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -405,7 +405,7 @@ pub struct Runtime {
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 
-    schedulers: Arc<RwLock<Vec<Arc<Scheduler<Running>>>>>,
+    schedulers: Arc<ScheduleRegistry>,
 }
 
 impl Runtime {
