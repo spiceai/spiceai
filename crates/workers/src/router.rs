@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 pub struct RouterModel {
-    router_name: String,
+    pub router_name: String,
     models_cfg: Vec<worker::RouterConfig>,
     state: RouterState,
     models: Arc<RwLock<HashMap<String, Arc<dyn Chat>>>>,
@@ -53,7 +53,7 @@ impl RouterModel {
     /// Assumes all `models_cfg` to be of same enum type.
     pub fn new(
         router_name: String,
-        models_cfg: Vec<worker::RouterConfig>,
+        models_cfg: &[worker::RouterConfig],
         models: Arc<RwLock<HashMap<String, Arc<dyn Chat>>>>,
     ) -> Self {
         let initial_state = match models_cfg.first() {
@@ -65,7 +65,7 @@ impl RouterModel {
 
         Self {
             router_name,
-            models_cfg,
+            models_cfg: models_cfg.to_vec(),
             models,
             state: initial_state,
         }

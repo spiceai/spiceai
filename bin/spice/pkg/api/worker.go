@@ -17,9 +17,10 @@ limitations under the License.
 package api
 
 type Worker struct {
-	Name        string           `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	Description string           `json:"description,omitempty" csv:"description" yaml:"description,omitempty"`
-	Models      []map[string]any `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
+	Name        string `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Description string `json:"description,omitempty" csv:"description" yaml:"description,omitempty"`
+	Type        string `json:"type,omitempty" csv:"type" yaml:"type,omitempty"`
+	IsLlm       bool   `json:"is_llm,omitempty" csv:"is_llm" yaml:"is_llm,omitempty"`
 }
 
 type WorkerResponse struct {

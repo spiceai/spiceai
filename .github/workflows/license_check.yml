@@ -43,13 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up make
-        uses: ./.github/actions/setup-make
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
         with:
           os: macos
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny
+
       - name: Check Rust Licenses
-        run: make dep-licenses 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
+        run: cargo deny check licenses
 
   license-check-go:
     name: Check Golang Licenses

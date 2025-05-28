@@ -29,6 +29,7 @@ use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use tracing::subscriber;
 use util::force_shutdown_signal;
+use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -110,6 +111,7 @@ pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod view;
+mod worker;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -270,6 +272,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to load worker: {source}"))]
+    UnableToLoadWorker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
     DataConnectorDoesntSupportCatalogs { dataconnector: String },
 
@@ -385,6 +392,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
