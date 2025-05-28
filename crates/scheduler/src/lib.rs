@@ -35,7 +35,7 @@ pub enum Error {
         "The names of the schedules must be unique, but the name '{name}' is already in use"
     ))]
     DuplicateScheduleName { name: String },
-    #[snafu(display("Not schedules were specified for the scheduler '{name}'"))]
+    #[snafu(display("No schedules were specified for the scheduler '{name}'"))]
     NoSchedulesSpecified { name: String },
 }
 
