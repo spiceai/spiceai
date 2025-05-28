@@ -31,6 +31,12 @@ pub enum Error {
     ChannelSendError {
         source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
+    #[snafu(display(
+        "The names of the schedules must be unique, but the name '{name}' is already in use"
+    ))]
+    DuplicateScheduleName { name: String },
+    #[snafu(display("Not schedules were specified for the scheduler '{name}'"))]
+    NoSchedulesSpecified { name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
