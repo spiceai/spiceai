@@ -5,14 +5,14 @@ description: "Query: tpch_q20"
 +--------------------+--------------------------------------+
 | s_name             | s_address                            |
 +--------------------+--------------------------------------+
-| Supplier#000000091 | YV45D7TkfdQanOOZ7q9QxkyGUapU1oOWU6q3 |
-| Supplier#000000157 | ,mEGorBfVIm                          |
-| Supplier#000000197 | YC2Acon6kjY3zj3Fbxs2k4Vdf7X0cd2F     |
-| Supplier#000000205 | rF uV8d0JNEk                         |
-| Supplier#000000287 | 7a9SP7qW5Yku5PvSg                    |
-| Supplier#000000354 | w8fOo5W,aS                           |
-| Supplier#000000361 | f8IUYRmdVXhQC9qJQjWknCXmzhe38vCbk6   |
-| Supplier#000000402 | i9Sw4DoyMhzhKXCH9By,AYSgmD           |
-| Supplier#000000555 | TfB,a5bfl3Ah 3Z 74GqnNs6zKVGM        |
-| Supplier#000000640 | mvvtlQKsTOsJj5Ihk7,cq                |
+| Supplier#000000020 | JtPqm19E7tF 152Rl1wQZ8j0H            |
+| Supplier#000000091 | 35WVnU7GLNbQDcc2TARavGtk6RB6ZCd46UAY |
+| Supplier#000000205 | Alrx5TN,hdnG                         |
+| Supplier#000000285 | q TMZEDyZtv vUiFKBhT3NJlnIxpL        |
+| Supplier#000000287 | UQR8bUA4V2HxVbw9K                    |
+| Supplier#000000354 | wSLcCW40Q8                           |
+| Supplier#000000378 | mLPJtpu4wOc cSFzBR                   |
+| Supplier#000000402 | JR8vWoCteJtJg3okRpt0r28KEo           |
+| Supplier#000000530 | 0BvoewCPg2scOEfuL93FRKqSxHmdhw1      |
+| Supplier#000000555 | 8Lp0QWPLFXrJrX1sTWkAEdzUsh5ke        |
 +--------------------+--------------------------------------+

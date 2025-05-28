@@ -5,14 +5,14 @@ description: "Query: tpch_q21"
 +--------------------+---------+
 | s_name             | numwait |
 +--------------------+---------+
-| Supplier#000747754 | 26      |
-| Supplier#000458746 | 25      |
-| Supplier#000571158 | 25      |
-| Supplier#000107007 | 24      |
-| Supplier#000410726 | 24      |
-| Supplier#000084585 | 23      |
-| Supplier#000112694 | 23      |
-| Supplier#000142113 | 23      |
-| Supplier#000152064 | 23      |
-| Supplier#000209763 | 23      |
+| Supplier#000002829 | 20      |
+| Supplier#000005808 | 18      |
+| Supplier#000000262 | 17      |
+| Supplier#000000496 | 17      |
+| Supplier#000002160 | 17      |
+| Supplier#000002301 | 17      |
+| Supplier#000002540 | 17      |
+| Supplier#000003063 | 17      |
+| Supplier#000005178 | 17      |
+| Supplier#000008331 | 17      |
 +--------------------+---------+
