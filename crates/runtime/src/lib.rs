@@ -27,7 +27,7 @@ use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
-use worker::Worker;
+use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -371,7 +371,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
-    workers: Arc<RwLock<HashMap<String, Arc<dyn Worker>>>>,
+    workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,

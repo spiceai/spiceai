@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Extension,
@@ -23,10 +23,9 @@ use axum::{
 };
 use csv::Writer;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
 use super::Format;
-use crate::worker::Worker;
+use crate::worker::{Worker, WorkerRegistry};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
@@ -109,7 +108,7 @@ fallback,\"Attempts bar first, then foo, then baz if previous models fail.\",loa
 ))]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn get(
-    Extension(workers): Extension<Arc<RwLock<HashMap<String, Arc<dyn Worker>>>>>,
+    Extension(workers): Extension<WorkerRegistry>,
     Query(params): Query<WorkersQueryParams>,
 ) -> Response {
     let result = &*workers

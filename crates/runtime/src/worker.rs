@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
 use spicepod::component::worker::{Worker as WorkerComponent, WorkerType};
+use tokio::sync::RwLock;
 use workers::RouterModel;
 
 use crate::{Result, Runtime};
+
+pub type WorkerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Worker>>>>;
 
 pub fn try_construct_worker(
     worker_type: &WorkerType,

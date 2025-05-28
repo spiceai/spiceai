@@ -47,7 +47,7 @@ impl Runtime {
         let worker = match try_construct_worker(&cfg.r#type, cfg, self) {
             Ok(worker) => worker,
             Err(e) => {
-                tracing::error!("Failed to load worker [{}]: {}", cfg.name, e);
+                tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
                 self.status
                     .update_worker(&cfg.name, status::ComponentStatus::Error);
                 return;
