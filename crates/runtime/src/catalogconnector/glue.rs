@@ -116,7 +116,7 @@ struct GlueCatalogState {
 /// A schema provider for a specific Glue database, providing table metadata.
 pub struct GlueSchemaProvider {
     database: String,
-    inner: Arc<GlueCatalogState>,
+    state: Arc<GlueCatalogState>,
 }
 
 impl fmt::Debug for GlueSchemaProvider {
@@ -134,7 +134,7 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.inner
+        self.state
             .databases
             .get(&self.database)
             .map(|tables| tables.iter().map(|t| t.name.clone()).collect())
@@ -142,12 +142,12 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.inner.databases.contains_key(name)
+        self.state.databases.contains_key(name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let Some(table) = self
-            .inner
+            .state
             .databases
             .get(&self.database)
             .and_then(|tables| tables.iter().find(|t| t.name() == name))
@@ -166,7 +166,7 @@ impl SchemaProvider for GlueSchemaProvider {
             }
             TableType::Iceberg => {
                 let mut props = Vec::new();
-                if let Some(provider) = self.inner.config.credentials_provider() {
+                if let Some(provider) = self.state.config.credentials_provider() {
                     let creds = provider
                         .provide_credentials()
                         .await
@@ -433,7 +433,7 @@ impl CatalogProvider for GlueCatalogProvider {
         if self.inner.databases.contains_key(name) {
             let schema_provider = GlueSchemaProvider {
                 database: name.to_string(),
-                inner: Arc::clone(&self.inner),
+                state: Arc::clone(&self.inner),
             };
             Some(Arc::new(schema_provider))
         } else {
