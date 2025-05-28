@@ -62,7 +62,7 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "05d8f0fd8cf85812fb4349198865c1716d22317e", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "3044f8188176f050d930a0930f68c6c893f04362", features = [
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
