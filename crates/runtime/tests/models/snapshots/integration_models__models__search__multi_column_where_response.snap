@@ -5,7 +5,7 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "matches": [
+  "results": [
     {
       "dataset": "multi_column_search",
       "matches": {
@@ -15,7 +15,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032
+      "score": 0.032787
     },
     {
       "dataset": "multi_column_search",
@@ -26,7 +26,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.032
+      "score": 0.032258
     },
     {
       "dataset": "multi_column_search",
@@ -37,7 +37,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.031
+      "score": 0.031746
     }
   ]
 }

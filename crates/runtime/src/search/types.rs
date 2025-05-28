@@ -67,9 +67,10 @@ pub enum MatchType {
 impl From<Vec<Value>> for MatchType {
     fn from(mut value: Vec<Value>) -> Self {
         if value.len() == 1 {
-            if let Some(v) = value.pop() {
-                return MatchType::Single(v);
-            }
+            let Some(v) = value.pop() else {
+                unreachable!("The value array must have one element");
+            };
+            return MatchType::Single(v);
         }
         MatchType::Multiple(value)
     }

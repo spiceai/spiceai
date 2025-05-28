@@ -32,7 +32,7 @@ use std::{sync::Arc, time::Instant};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct SearchResponse {
     /// List of matches that were found in the datasets
-    pub matches: Vec<Match>,
+    pub results: Vec<Match>,
 
     /// Total time taken to execute the search, in milliseconds
     pub duration_ms: u128,
@@ -151,7 +151,7 @@ pub(crate) async fn post(
             Ok(m) => (
                 StatusCode::OK,
                 Json(SearchResponse {
-                    matches: m,
+                    results: m,
                     duration_ms: start_time.elapsed().as_millis(),
                 }),
             )
