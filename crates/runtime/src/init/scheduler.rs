@@ -46,6 +46,19 @@ impl Runtime {
 
         // a `refresh_scheduler` exists but does not contain this dataset's schedule
         if let Some(scheduler) = schedulers.get(REFRESH_SCHEDULER_NAME) {
+            if scheduler
+                .schedules()
+                .await
+                .iter()
+                .any(|s| s.name() == schedule.name())
+            {
+                tracing::debug!(
+                    "Dataset schedule already exists in refresh scheduler for dataset: {}",
+                    dataset.name
+                );
+                return Ok(());
+            }
+
             tracing::debug!(
                 "Adding dataset schedule to existing refresh scheduler for dataset: {}",
                 dataset.name
