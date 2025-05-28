@@ -263,15 +263,15 @@ mod tests {
             .await
             .expect("Should receive another task request");
         let next_now = Local::now();
-        let elapsed = next_now.signed_duration_since(now).num_seconds();
-        let original_elapsed = next_now.signed_duration_since(last_now).num_seconds();
+        let elapsed = next_now.signed_duration_since(now).num_milliseconds();
+        let original_elapsed = next_now.signed_duration_since(last_now).num_milliseconds();
         assert!(
-            elapsed == 3 || elapsed == 2,
+            (2950..=3050).contains(&elapsed),
             "The next request should be sent after 2  or 3 seconds"
         );
-        assert_eq!(
-            original_elapsed, 5,
-            "The next request should be sent after 5 seconds from the last request"
+        assert!(
+            (4950..=5050).contains(&original_elapsed),
+            "The next request should be sent after 5 seconds"
         );
         assert!(
             next_now.second() % 5 == 0,
