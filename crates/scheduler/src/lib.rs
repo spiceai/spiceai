@@ -21,16 +21,32 @@ use task::TaskRequest;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("A cancellation token is required"))]
+    #[snafu(display(
+        "A cancellation token is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     CancellationTokenRequired,
-    #[snafu(display("A notification channel is required"))]
+    #[snafu(display(
+        "A notification channel is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     NotificationChannelRequired,
-    #[snafu(display("A submission channel is required"))]
+    #[snafu(display(
+        "A submission channel is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     SubmissionChannelRequired,
-    #[snafu(display("A channel send error occurred: {source}"))]
+    #[snafu(display(
+        "A channel send error occurred.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     ChannelSendError {
         source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
+    #[snafu(display(
+        "Failed to parse cron expression.\n{source}\nValidate the cron expression is valid, and try again."
+    ))]
+    FailedToParseCron { source: croner::errors::CronError },
+    #[snafu(display(
+        "Failed to determine next cron expression run time.\n{source}\nValidate the cron expression is valid, and try again."
+    ))]
+    FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
