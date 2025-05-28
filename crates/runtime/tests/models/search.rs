@@ -20,9 +20,14 @@ use http::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::header::HeaderMap;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
+use runtime::config::Config;
 use serde_json::{Value, json};
+use spicepod::acceleration::Acceleration;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
+use spicepod::param::Params;
+use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::models::hf::get_huggingface_embeddings;
@@ -135,6 +140,30 @@ pub(crate) fn catalog_page_tpch_dataset_w_embeddings(
     ds_tpcds_cp
 }
 
+async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    let api_config = create_api_bindings_config();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let _ = init_tracing_with_task_history(None, &rt);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    let api_config_clone = api_config.clone();
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config_clone, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    Ok(api_config)
+}
+
 pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
@@ -143,25 +172,8 @@ pub(crate) async fn run_search(
 
     test_request_context()
         .scope(async {
-            let api_config = create_api_bindings_config();
+            let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            let _ = init_tracing_with_task_history(None, &rt);
-
-            let rt_ref_copy = Arc::clone(&rt);
-            tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                }
-                () = Arc::clone(&rt).load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
             for ts in test_cases {
                 run_search_test(http_base_url.as_str(), &ts).await?;
             }
@@ -235,13 +247,13 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
         .await
         .map_err(anyhow::Error::msg)?;
-    let mut chunked = catalog_page_tpch_dataset_w_embeddings(
+    let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_embedding_models",
         "openai_embeddings",
         Some(vec!["cp_catalog_page_sk".to_string()]),
         None,
     );
-    chunked.embeddings.push(ColumnEmbeddingConfig {
+    ds.embeddings.push(ColumnEmbeddingConfig {
         column: "cp_department".to_string(),
         model: "hf_minilm".to_string(),
         primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -249,7 +261,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     });
 
     let app = AppBuilder::new("search_app")
-        .with_dataset(chunked)
+        .with_dataset(ds)
         .with_embedding(get_huggingface_embeddings(
             "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
@@ -320,6 +332,101 @@ async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
                 "datasets": ["mulit_column_no_pks"]
             }),
         }],
+    )
+    .await
+}
+
+#[cfg(feature = "flightsql")]
+#[tokio::test]
+async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
+    let api_config = start_app(
+        AppBuilder::new("search_app")
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "single_column",
+                "hf_minilm",
+                Some(vec!["cp_catalog_page_sk".to_string()]),
+                None,
+            ))
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .build(),
+    )
+    .await?;
+
+    // Make a new dataset where one embedding column is prexisting (from 'single_column'),
+    // and another is made in this dataset.
+    let mut ds = Dataset::new("flightsql:single_column", "multiple_columns");
+    let mut params = HashMap::new();
+    params.insert(
+        "flightsql_endpoint".to_string(),
+        format!("http://{}", api_config.flight_bind_address),
+    );
+    ds.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    ds.params = Some(Params::from_string_map(params));
+    ds.columns = vec![
+        Column {
+            name: "cp_description".to_string(),
+            description: Some(
+                "This column has an embedding in the underlying spice instance".to_string(),
+            ),
+            embeddings: vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+                chunking: None,
+            }],
+        },
+        Column {
+            name: "cp_department".to_string(),
+            description: Some("This column is newly embedded in this spice app".to_string()),
+            embeddings: vec![ColumnLevelEmbeddingConfig {
+                model: "hf_minilm".to_string(),
+                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+                chunking: None,
+            }],
+        },
+    ];
+    let app2 = AppBuilder::new("search_app2")
+        .with_dataset(ds)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .build();
+
+    run_search(
+        app2,
+        vec![
+            SearchTestCase {
+                name: "multi_embedding_parent_child_basic",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                    "datasets": ["multiple_columns"]
+                }),
+            },
+            SearchTestCase {
+                name: "multi_embedding_parent_child_additional",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                    "datasets": ["multiple_columns"],
+                    "additional_columns": ["cp_catalog_number"],
+                }),
+            },
+            SearchTestCase {
+                name: "multi_embedding_parent_child_where",
+                body: json!({
+                    "text": "new patient",
+                    "datasets": ["multiple_columns"],
+                    "where": "cp_catalog_page_sk % 2 = 0"
+                }),
+            },
+        ],
     )
     .await
 }
