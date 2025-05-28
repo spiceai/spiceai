@@ -17,7 +17,7 @@ limitations under the License.
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
 use spicepod::{acceleration as spicepod_acceleration, param::Params};
-use std::{collections::HashMap, fmt::Display, time::Duration};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -250,6 +250,8 @@ pub struct Acceleration {
 
     pub refresh_check_interval: Option<Duration>,
 
+    pub refresh_cron: Option<Arc<str>>,
+
     pub refresh_sql: Option<String>,
 
     pub refresh_data_window: Option<String>,
@@ -365,6 +367,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             acceleration.refresh_check_interval,
         )?;
 
+        let refresh_cron = acceleration.refresh_cron.map(Into::into);
+        if refresh_cron.is_some() && refresh_check_interval.is_some() {
+            return Err(crate::Error::InvalidSpicepodDataset {
+                source: super::Error::MultipleRefreshExpressionSpecified,
+            });
+        }
+
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
@@ -375,6 +384,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
             refresh_append_overlap: try_parse_duration(
@@ -409,6 +419,7 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
             refresh_append_overlap: None,
