@@ -27,6 +27,7 @@ pub(crate) mod llm;
 pub(crate) mod metrics;
 pub(crate) mod model;
 pub(crate) mod pods_watcher;
+pub(crate) mod scheduler;
 pub(crate) mod task_history;
 pub(crate) mod tool;
 pub(crate) mod view;

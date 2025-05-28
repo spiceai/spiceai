@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -341,6 +342,25 @@ pub enum Error {
         "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
     AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
+
+    #[snafu(display(
+        "Failed to start scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToStartScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to build scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToBuildScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to add schedule '{name}' to the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToAddSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -384,6 +404,8 @@ pub struct Runtime {
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+
+    schedulers: Arc<ScheduleRegistry>,
 }
 
 impl Runtime {

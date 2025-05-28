@@ -249,6 +249,7 @@ impl RuntimeBuilder {
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
+            schedulers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
