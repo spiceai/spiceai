@@ -5,7 +5,7 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "matches": [
+  "results": [
     {
       "dataset": "catalog_page_with_chunking",
       "matches": {

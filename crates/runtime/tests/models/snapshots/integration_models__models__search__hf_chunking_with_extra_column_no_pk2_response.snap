@@ -5,7 +5,7 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "matches": [
+  "results": [
     {
       "data": {
         "cp_catalog_page_sk": 1,

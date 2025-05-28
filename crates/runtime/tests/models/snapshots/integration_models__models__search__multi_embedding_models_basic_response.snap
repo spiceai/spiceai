@@ -15,7 +15,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032787
+      "score": 0.032
     },
     {
       "dataset": "multi_embedding_models",
@@ -26,7 +26,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "score": 0.032258
+      "score": 0.032
     }
   ]
 }
