@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{cell::LazyCell, sync::Arc};
 
-use ::cache::{QueryResult, get_logical_plan_input_tables};
+use ::cache::{get_logical_plan_input_tables, result::query::QueryResult};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -427,10 +427,10 @@ pub fn write_to_json_string(
 
 #[cfg(test)]
 mod tests {
-    use ::cache::{Caching, QueryResultsCacheProvider, QueryResultsCacheStatus};
+    use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
     use arrow::array::Int64Array;
     use serde_json::json;
-    use spicepod::component::runtime::SQLResultsCacheConfig;
+    use spicepod::component::caching::SQLResultsCacheConfig;
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -474,10 +474,7 @@ mod tests {
             assert_eq!(id_value, 42);
         }
 
-        assert_eq!(
-            query.results_cache_status,
-            QueryResultsCacheStatus::CacheMiss
-        );
+        assert_eq!(query.cache_status, CacheStatus::CacheMiss);
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
             .parameters(parameters)
@@ -485,10 +482,7 @@ mod tests {
             .run()
             .await
             .expect("Query::run");
-        assert_eq!(
-            query.results_cache_status,
-            QueryResultsCacheStatus::CacheHit
-        );
+        assert_eq!(query.cache_status, CacheStatus::CacheHit);
 
         // Need to consume the stream to cache the result
         while let Some(Ok(batch)) = query.data.next().await {
@@ -521,10 +515,7 @@ mod tests {
             assert_eq!(id_value, 2);
         }
 
-        assert_eq!(
-            query.results_cache_status,
-            QueryResultsCacheStatus::CacheMiss
-        );
+        assert_eq!(query.cache_status, CacheStatus::CacheMiss);
     }
 
     #[tokio::test]

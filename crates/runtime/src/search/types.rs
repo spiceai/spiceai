@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
 use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::format::to_markdown_documents;
+use cache::result::search::SearchTableResult;
 use datafusion::common::utils::quote_identifier;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
@@ -41,6 +43,26 @@ pub struct VectorSearchTableResult {
 
     pub primary_keys: Vec<String>,
     pub additional_columns: Vec<String>,
+}
+
+impl From<VectorSearchTableResult> for SearchTableResult {
+    fn from(result: VectorSearchTableResult) -> Self {
+        SearchTableResult::new(
+            Arc::new(result.data.clone()),
+            result
+                .primary_keys
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            result
+                .additional_columns
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+    }
 }
 
 impl VectorSearchTableResult {

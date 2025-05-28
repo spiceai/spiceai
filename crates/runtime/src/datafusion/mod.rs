@@ -45,7 +45,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, RawCacheKey};
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -1659,7 +1659,7 @@ async fn wait_until_dependent_tables_are_ready(
 
 #[cfg(test)]
 mod tests {
-    use cache::{CacheKey, SimpleCache};
+    use cache::{SimpleCache, key::CacheKey};
 
     use crate::builder::RuntimeBuilder;
 

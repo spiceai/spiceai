@@ -1,3 +1,4 @@
+use cache::key::SearchKey;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -122,6 +123,20 @@ pub struct SearchRequest {
 
     /// Keywords to perform a lexical search and pre-filter the embedding column.
     pub keywords: Vec<String>,
+}
+
+impl From<SearchRequest> for SearchKey {
+    fn from(req: SearchRequest) -> Self {
+        SearchKey::new(
+            req.text.into(),
+            req.datasets
+                .map(|d| d.into_iter().map(Into::into).collect()),
+            req.limit,
+            req.where_cond,
+            Some(req.additional_columns.into_iter().map(Into::into).collect()),
+            req.keywords.into_iter().map(Into::into).collect(),
+        )
+    }
 }
 
 #[must_use]

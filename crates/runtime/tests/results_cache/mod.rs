@@ -18,12 +18,12 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use cache::QueryResultsCacheStatus;
+use cache::result::CacheStatus;
 use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
-    component::{dataset::Dataset, runtime::ResultsCache},
+    component::{caching::ResultsCache, dataset::Dataset},
     param::Params,
 };
 
@@ -73,7 +73,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
                 execute_query_and_check_cache_status(
                     &rt,
                     "show tables",
-                    QueryResultsCacheStatus::CacheDisabled
+                    CacheStatus::CacheDisabled
                 )
                 .await
                 .is_ok()
@@ -82,7 +82,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
                 execute_query_and_check_cache_status(
                     &rt,
                     "describe customer",
-                    QueryResultsCacheStatus::CacheDisabled
+                    CacheStatus::CacheDisabled
                 )
                 .await
                 .is_ok()
@@ -96,7 +96,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
 async fn execute_query_and_check_cache_status(
     rt: &Runtime,
     query: &str,
-    expected_cache_status: QueryResultsCacheStatus,
+    expected_cache_status: CacheStatus,
 ) -> Result<Vec<RecordBatch>, String> {
     let query = QueryBuilder::new(query, rt.datafusion()).build();
 
@@ -111,7 +111,7 @@ async fn execute_query_and_check_cache_status(
         .await
         .map_err(|e| format!("Failed to collect query results: {e}"))?;
 
-    assert_eq!(query_result.results_cache_status, expected_cache_status);
+    assert_eq!(query_result.cache_status, expected_cache_status);
 
     Ok(records)
 }
