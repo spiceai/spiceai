@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
@@ -22,6 +23,67 @@ use schemars::JsonSchema;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum WorkerType {
+    #[default]
+    LoadBalance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Worker {
+    pub name: String,
+
+    pub r#type: WorkerType,
+
+    pub description: Option<String>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balance: Option<LoadBalanceParams>,
+}
+
+impl FromStr for WorkerType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "load_balance" => Ok(WorkerType::LoadBalance),
+            _ => Err(format!("Unknown worker type: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerType::LoadBalance => write!(f, "load_balance"),
+        }
+    }
+}
+
+impl Nameable for Worker {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl WithDependsOn<Worker> for Worker {
+    fn depends_on(&self, _depends_on: &[String]) -> Worker {
+        Worker {
+            name: self.name.clone(),
+            r#type: self.r#type.clone(),
+            description: self.description.clone(),
+            params: self.params.clone(),
+            load_balance: self.load_balance.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -64,37 +126,13 @@ impl From<&RouterConfig> for RoutingStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct Worker {
-    pub name: String,
-
-    pub description: Option<String>,
-
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, Value>,
-
+pub struct LoadBalanceParams {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_router_configs"
     )]
-    pub models: Vec<RouterConfig>,
-}
-
-impl Nameable for Worker {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl WithDependsOn<Worker> for Worker {
-    fn depends_on(&self, _depends_on: &[String]) -> Worker {
-        Worker {
-            name: self.name.clone(),
-            description: self.description.clone(),
-            params: self.params.clone(),
-            models: self.models.clone(),
-        }
-    }
+    pub routing: Vec<RouterConfig>,
 }
 
 fn deserialize_router_configs<'de, D>(deserializer: D) -> Result<Vec<RouterConfig>, D::Error>
