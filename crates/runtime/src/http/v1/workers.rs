@@ -106,7 +106,6 @@ fallback,\"Attempts bar first, then foo, then baz if previous models fail.\",loa
         )))
     )
 ))]
-#[allow(clippy::type_complexity)]
 pub(crate) async fn get(
     Extension(workers): Extension<WorkerRegistry>,
     Query(params): Query<WorkersQueryParams>,
