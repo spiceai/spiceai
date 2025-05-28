@@ -36,14 +36,13 @@ use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
-use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
+use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory, in_tracing_context};
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use tracing::subscriber;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -444,14 +443,4 @@ fn apply_override(
     }
 
     Ok(())
-}
-
-pub fn in_tracing_context<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
 }

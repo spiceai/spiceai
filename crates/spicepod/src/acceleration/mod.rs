@@ -149,6 +149,9 @@ pub struct Acceleration {
     pub refresh_check_interval: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_cron: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_sql: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +223,7 @@ impl Default for Acceleration {
             engine: None,
             refresh_mode: None,
             refresh_check_interval: None,
+            refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
             refresh_append_overlap: None,

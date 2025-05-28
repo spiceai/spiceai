@@ -405,13 +405,18 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn register_table(&self, dataset: Arc<Dataset>, table: Table) -> Result<()> {
+    // Returns a oneshot::Receiver if the table supports notifying the runtime when the table is ready.
+    pub async fn register_table(
+        &self,
+        dataset: Arc<Dataset>,
+        table: Table,
+    ) -> Result<Option<oneshot::Receiver<()>>> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_mode = dataset.mode();
         let dataset_table_ref = dataset.name.clone();
 
-        match table {
+        let is_ready = match table {
             Table::Accelerated {
                 source,
                 federated_read_table,
@@ -430,6 +435,7 @@ impl DataFusion {
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
+                    None
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
@@ -441,9 +447,17 @@ impl DataFusion {
                             dataset: Arc::clone(&dataset),
                             secrets: Arc::clone(&secrets),
                         });
+                    None
                 } else {
-                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                        .await?;
+                    Some(
+                        self.register_accelerated_table(
+                            dataset,
+                            source,
+                            federated_read_table,
+                            secrets,
+                        )
+                        .await?,
+                    )
                 }
             }
             Table::Federated {
@@ -467,8 +481,10 @@ impl DataFusion {
                     self.register_federated_table(&dataset, data_connector, federated_read_table)
                         .await?;
                 }
+
+                None
             }
-        }
+        };
 
         if matches!(dataset_mode, Mode::ReadWrite) {
             self.data_writers
@@ -477,7 +493,7 @@ impl DataFusion {
                 .insert(dataset_table_ref.clone());
         }
 
-        Ok(())
+        Ok(is_ready)
     }
 
     #[must_use]
@@ -1064,8 +1080,8 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<()> {
-        let (mut accelerated_table, _) = self
+    ) -> Result<oneshot::Receiver<()>> {
+        let (mut accelerated_table, is_ready) = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
 
@@ -1090,7 +1106,7 @@ impl DataFusion {
             .await
             .insert(dataset.name.clone());
 
-        Ok(())
+        Ok(is_ready)
     }
 
     pub async fn refresh_table(

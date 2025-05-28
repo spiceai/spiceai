@@ -17,7 +17,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use tokio::sync::{Notify, RwLock};
-use uuid::Uuid;
 
 use crate::{
     channel::TaskRequestChannel,
@@ -26,21 +25,21 @@ use crate::{
 };
 
 pub struct Schedule {
-    id: Arc<str>,
+    name: Arc<str>,
     triggers: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
     task: Arc<dyn ScheduledTask>,
 }
 
 impl Schedule {
     #[must_use]
-    pub fn id(&self) -> Arc<str> {
-        Arc::clone(&self.id)
+    pub fn name(&self) -> Arc<str> {
+        Arc::clone(&self.name)
     }
 
     #[must_use]
-    pub fn new(task: Arc<dyn ScheduledTask>) -> Self {
+    pub fn new(name: Arc<str>, task: Arc<dyn ScheduledTask>) -> Self {
         Self {
-            id: Uuid::new_v4().to_string().into(),
+            name,
             triggers: Vec::new(),
             task,
         }
@@ -94,11 +93,11 @@ impl Schedule {
         notification_channels: Arc<NotificationChannels>,
         cancellation_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> tokio::task::JoinHandle<crate::Result<()>> {
-        let schedule_id = self.id();
+        let schedule_name = self.name();
         tokio::spawn(async move {
             let rx_lock = {
                 let channels = request_channels.read().await;
-                channels.get(&schedule_id).cloned()
+                channels.get(&schedule_name).cloned()
             };
 
             if let Some(rx_lock) = rx_lock {

@@ -253,22 +253,27 @@ impl Runtime {
     }
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
-    async fn load_dataset(&self, ds: Arc<Dataset>) {
+    async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
+        let runtime = Arc::clone(&self);
         let _ = retry(retry_strategy, || async {
-            let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
+            let connector = match Arc::clone(&runtime)
+                .load_dataset_connector(Arc::clone(&ds))
+                .await
+            {
                 Ok(connector) => connector,
                 Err(err) => {
-                    if self.status.is_shutdown() {
+                    if runtime.status.is_shutdown() {
                         // should not retry or trace error if runtime is shutting down
                         return Err(RetryError::permanent(err));
                     }
 
                     let ds_name = &ds.name;
-                    self.status
+                    runtime
+                        .status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
@@ -276,11 +281,11 @@ impl Runtime {
                 }
             };
 
-            if let Err(err) = self
+            if let Err(err) = Arc::clone(&runtime)
                 .register_loaded_dataset(Arc::clone(&ds), connector, None)
                 .await
             {
-                if self.status.is_shutdown() {
+                if runtime.status.is_shutdown() {
                     // should not retry if runtime is shutting down
                     return Err(RetryError::permanent(err));
                 }
@@ -294,7 +299,7 @@ impl Runtime {
 
     #[allow(clippy::too_many_lines)]
     async fn register_loaded_dataset(
-        &self,
+        self: Arc<Self>,
         ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<AcceleratedTable>,
@@ -349,7 +354,7 @@ impl Runtime {
             }
         };
 
-        match self
+        match Arc::clone(&self)
             .register_dataset(
                 Arc::clone(&ds),
                 RegisterDatasetContext {
@@ -446,7 +451,7 @@ impl Runtime {
         metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
     }
 
-    async fn update_dataset(&self, ds: Arc<Dataset>) {
+    async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
 
@@ -454,12 +459,15 @@ impl Runtime {
         // obsolete, so we remove them
         self.df.clear_cached_plans();
 
-        match self.load_dataset_connector(Arc::clone(&ds)).await {
+        match Arc::clone(&self)
+            .load_dataset_connector(Arc::clone(&ds))
+            .await
+        {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Updating accelerated dataset {}...", &ds.name);
-                    if let Ok(()) = &self
+                    if let Ok(()) = Arc::clone(&self)
                         .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
                     {
@@ -476,7 +484,7 @@ impl Runtime {
                 self.remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if self
+                if Arc::clone(&self)
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
                     .await
                     .is_err()
@@ -523,7 +531,7 @@ impl Runtime {
     }
 
     async fn reload_accelerated_dataset(
-        &self,
+        self: Arc<Self>,
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
@@ -603,7 +611,7 @@ impl Runtime {
     }
 
     async fn register_dataset(
-        &self,
+        self: Arc<Self>,
         ds: Arc<Dataset>,
         register_dataset_ctx: RegisterDatasetContext,
     ) -> Result<()> {
@@ -660,7 +668,8 @@ impl Runtime {
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        self.df
+        let is_ready = self
+            .df
             .register_table(
                 Arc::clone(&ds),
                 crate::datafusion::Table::Accelerated {
@@ -674,7 +683,26 @@ impl Runtime {
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
                 connector_component: ConnectorComponent::from(&ds),
-            })
+            })?;
+
+        if let Some(is_ready) = is_ready {
+            // spawn a background task to wait for the accelerated table to be ready before creating schedules
+            let runtime = Arc::clone(&self);
+            let ds = Arc::clone(&ds);
+            let dataset_name = ds.name.to_string();
+            tokio::task::spawn(async move {
+                if let Ok(()) = is_ready.await {
+                    if let Err(e) = runtime.create_dataset_schedule(ds).await {
+                        tracing::error!(
+                            "Failed to create dataset schedule for '{}': {e}",
+                            dataset_name
+                        );
+                    }
+                }
+            });
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn apply_dataset_diff(
@@ -689,12 +717,12 @@ impl Runtime {
         for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
                 if ds != *current_ds {
-                    self.update_dataset(ds).await;
+                    Arc::clone(&self).update_dataset(ds).await;
                 }
             } else {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                self.load_dataset(ds).await;
+                Arc::clone(&self).load_dataset(ds).await;
             }
         }
 

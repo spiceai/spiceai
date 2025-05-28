@@ -14,19 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use scheduler::Result;
 use scheduler::task::ScheduledTask;
 use tonic::async_trait;
 
 use crate::component::dataset::Dataset;
 
+pub struct DatasetRefreshTask(Arc<Dataset>);
+
+impl From<Arc<Dataset>> for DatasetRefreshTask {
+    fn from(dataset: Arc<Dataset>) -> Self {
+        Self(dataset)
+    }
+}
+
 #[async_trait]
-impl ScheduledTask for Dataset {
+impl ScheduledTask for DatasetRefreshTask {
     async fn execute(&self) -> Result<()> {
-        match self
+        let dataset = Arc::clone(&self.0);
+        match dataset
             .runtime()
             .datafusion()
-            .refresh_table(&self.name, None)
+            .refresh_table(&dataset.name, None)
             .await
         {
             Ok(()) => {

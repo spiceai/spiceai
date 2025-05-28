@@ -18,40 +18,43 @@ use std::{sync::Arc, time::Duration};
 
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache};
 use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::runtime::{HashingAlgorithm, ResultsCache};
+use spicepod::component::runtime::{Caching as CachingConfig, HashingAlgorithm};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
 const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
 
 impl Runtime {
-    pub fn init_caching(cache_config: Option<&ResultsCache>) -> Arc<Caching> {
+    #[must_use]
+    pub fn init_caching(cache_config: Option<&CachingConfig>) -> Arc<Caching> {
         let Some(cache_config) = cache_config else {
             return Arc::new(Caching::new());
         };
 
-        if !cache_config.enabled {
-            return Arc::new(Caching::new());
-        }
-
         let mut caching = Caching::new();
 
-        match QueryResultsCacheProvider::try_new(
-            cache_config,
-            Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
-        ) {
-            Ok(cache_provider) => {
-                tracing::info!("Initialized results cache; {cache_provider}");
-                caching = caching.with_results_cache(Arc::new(cache_provider));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize results cache: {e}");
+        if cache_config.sql_results.inner.enabled {
+            match QueryResultsCacheProvider::try_new(
+                &cache_config.sql_results,
+                Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
+            ) {
+                Ok(cache_provider) => {
+                    crate::in_tracing_context(|| {
+                        tracing::info!("Initialized results cache; {cache_provider}");
+                    });
+                    caching = caching.with_results_cache(Arc::new(cache_provider));
+                }
+                Err(e) => {
+                    crate::in_tracing_context(|| {
+                        tracing::error!("Failed to initialize results cache: {e}");
+                    });
+                }
             }
         }
 
         // TODO: logical plan cache needs its own configuration?
         let plan_cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync> =
-            match cache_config.hashing_algorithm {
+            match cache_config.sql_results.inner.hashing_algorithm {
                 HashingAlgorithm::Siphash => Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
