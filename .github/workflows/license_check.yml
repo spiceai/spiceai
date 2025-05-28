@@ -49,7 +49,7 @@ jobs:
           os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny
+        run: cargo install cargo-deny || true
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
