@@ -34,7 +34,7 @@ on:
 
 env:
   FORBIDDEN_LICENSE_CHECK: |
-    grep -v 'Apache-2.0' | grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
+    grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
 
 jobs:
   license-check-rust:
@@ -43,13 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up make
-        uses: ./.github/actions/setup-make
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
         with:
           os: macos
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny
+
       - name: Check Rust Licenses
-        run: make dep-licenses 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
+        run: cargo deny check licenses
 
   license-check-go:
     name: Check Golang Licenses
