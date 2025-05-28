@@ -43,7 +43,6 @@ use futures::task::{Context, Poll};
 use lru_cache::LruCache;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::HashingAlgorithm;
-use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
 mod metrics;
@@ -51,6 +50,7 @@ mod simple_cache;
 mod utils;
 
 pub use simple_cache::SimpleCache;
+use spicepod::component::runtime::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -324,21 +324,24 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
-    pub fn try_new(config: &ResultsCache, ignore_schemas: Box<[Box<str>]>) -> Result<Self> {
-        let cache_max_size: u64 = match &config.cache_max_size {
+    pub fn try_new(
+        config: &SQLResultsCacheConfig,
+        ignore_schemas: Box<[Box<str>]>,
+    ) -> Result<Self> {
+        let cache_max_size: u64 = match &config.inner.max_size {
             Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
                 .context(FailedToParseCacheMaxSizeSnafu)?
                 .as_u64(),
             None => 128 * 1024 * 1024, // 128 MiB
         };
 
-        let ttl = match &config.item_ttl {
+        let ttl = match &config.inner.item_ttl {
             Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
             None => std::time::Duration::from_secs(1),
         };
 
         let cache_provider = QueryResultsCacheProvider {
-            cache: match config.hashing_algorithm {
+            cache: match config.inner.hashing_algorithm {
                 HashingAlgorithm::Ahash => Arc::new(LruCache::new(
                     cache_max_size,
                     ttl,
@@ -503,7 +506,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider =
-            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
         assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
@@ -515,7 +518,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider = QueryResultsCacheProvider::try_new(
-            &ResultsCache::default(),
+            &SQLResultsCacheConfig::default(),
             Box::new(["information_schema".into()]),
         )
         .expect("valid cache provider");
@@ -529,7 +532,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider =
-            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
         assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));

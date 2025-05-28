@@ -66,6 +66,7 @@ pub struct NotStarted {
     parallel_count: usize,
     validate: bool,
     disable_caching: bool,
+    scale_factor: f64,
 }
 
 impl NotStarted {
@@ -102,6 +103,12 @@ impl NotStarted {
     #[must_use]
     pub fn with_validate(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
+        self.scale_factor = scale_factor;
         self
     }
 }
@@ -183,7 +190,8 @@ impl SpiceTest<NotStarted> {
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
                 .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate(self.state.validate);
+                .with_validate(self.state.validate)
+                .with_scale_factor(self.state.scale_factor);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
