@@ -40,9 +40,11 @@ pub struct Match {
     /// The matches for this result
     matches: HashMap<String, MatchType>,
 
+    /// Addditional data from the `dataset` requested by the user.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     data: HashMap<String, Value>,
 
+    /// Primary key(s) identifying the matched item in the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     primary_key: HashMap<String, Value>,
 
