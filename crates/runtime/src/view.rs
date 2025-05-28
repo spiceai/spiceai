@@ -96,7 +96,7 @@ pub(crate) async fn create_view_table(
     view: impl Into<String>,
 ) -> Result<ViewTable> {
     let plan = ctx.state().statement_to_plan(statement.clone()).await?;
-    ViewTable::try_new(plan, Some(view.into()))
+    Ok(ViewTable::new(plan, Some(view.into())))
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::TimeZone;
@@ -43,16 +43,32 @@ pub enum Error {
     InvalidToken,
 }
 
+#[derive(Debug)]
+struct GitHubClientConfig {
+    org: String,
+    repo: String,
+    rev: String,
+    token: Option<String>,
+}
+
+impl GitHubClientConfig {
+    fn new(org: impl Display, repo: impl Display, rev: impl Display, token: Option<&str>) -> Self {
+        Self {
+            org: org.to_string(),
+            repo: repo.to_string(),
+            rev: rev.to_string(),
+            token: token.map(ToString::to_string),
+        }
+    }
+}
+
 /// An implementation of the `ObjectStore` trait for raw.githubusercontent.com
 ///
 /// This is logically a small wrapper on the existing HTTP Object Store, but just constrained to specific GitHub URLs
 #[derive(Debug)]
 pub struct GitHubRawObjectStore {
     http_store: HttpStore,
-    org: String,
-    repo: String,
-    rev: String,
-    token: Option<String>,
+    config: Arc<GitHubClientConfig>,
 }
 
 impl GitHubRawObjectStore {
@@ -79,10 +95,7 @@ impl GitHubRawObjectStore {
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self {
             http_store,
-            org: org.to_string(),
-            repo: repo.to_string(),
-            rev: rev.to_string(),
-            token: token.map(ToString::to_string),
+            config: Arc::new(GitHubClientConfig::new(&org, &repo, &rev, token)),
         })
     }
 }
@@ -127,7 +140,7 @@ impl ObjectStore for GitHubRawObjectStore {
     fn list(
         &self,
         prefix: Option<&Path>,
-    ) -> BoxStream<'_, Result<ObjectMeta, object_store::Error>> {
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         // Github raw content endpoint does not support listing files in a directory, so we need to use the GitHub API
         // to get the list of files and then create the ObjectMeta objects from the response.
 
@@ -140,9 +153,11 @@ impl ObjectStore for GitHubRawObjectStore {
             }
         });
 
+        let config = Arc::clone(&self.config);
+
         Box::pin(async_stream::stream! {
-            let gh_rest_api = GithubRestClient::new(self.token.as_deref());
-            let git_tree = match gh_rest_api.fetch_git_tree(&self.org, &self.repo, &self.rev).await {
+            let gh_rest_api = GithubRestClient::new(config.token.as_deref());
+            let git_tree = match gh_rest_api.fetch_git_tree(&config.org, &config.repo, &config.rev).await {
                 Ok(tree) => tree,
                 Err(e) => {
                     yield Err(object_store::Error::Generic {
@@ -165,7 +180,7 @@ impl ObjectStore for GitHubRawObjectStore {
                 let metadata = ObjectMeta {
                     location: path.clone(),
                     last_modified: chrono::Utc.timestamp_nanos(0),
-                    size: usize::try_from(file.size.unwrap_or(0)).unwrap_or_default(),
+                    size: u64::try_from(file.size.unwrap_or(0)).unwrap_or_default(),
                     e_tag: None,
                     version: None,
                 };

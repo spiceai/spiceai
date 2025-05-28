@@ -430,7 +430,7 @@ mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, QueryResultsCacheStatus};
     use arrow::array::Int64Array;
     use serde_json::json;
-    use spicepod::component::runtime::ResultsCache;
+    use spicepod::component::runtime::SQLResultsCacheConfig;
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -443,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn parameterized_query() {
         let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
-        let config = ResultsCache::default();
+        let config = SQLResultsCacheConfig::default();
         let cache_provider = Arc::new(
             QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
         );

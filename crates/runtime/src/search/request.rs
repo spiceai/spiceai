@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use datafusion::sql::sqlparser;
-use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins, Value};
+use datafusion::sql::sqlparser::ast::{
+    Expr, SelectItem, TableFactor, TableWithJoins, Value, ValueWithSpan,
+};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -288,8 +290,13 @@ impl SearchRequest {
             });
         };
 
-        if let (Expr::Identifier(id), Expr::Value(Value::SingleQuotedString(v))) =
-            (*expr.clone(), *pattern.clone())
+        if let (
+            Expr::Identifier(id),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(v),
+                ..
+            }),
+        ) = (*expr.clone(), *pattern.clone())
         {
             if id.value.to_lowercase() != target_column {
                 tracing::trace!(

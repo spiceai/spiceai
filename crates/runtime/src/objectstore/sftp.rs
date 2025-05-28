@@ -18,6 +18,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     net::TcpStream,
     ops::Range,
+    sync::Arc,
     time::Duration,
 };
 
@@ -33,7 +34,7 @@ use object_store::{
 use ssh2::Session;
 
 #[derive(Debug)]
-pub struct SFTPObjectStore {
+struct SFTPClient {
     user: String,
     password: String,
     host: String,
@@ -41,15 +42,8 @@ pub struct SFTPObjectStore {
     timeout: Option<Duration>,
 }
 
-impl std::fmt::Display for SFTPObjectStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SFTP")
-    }
-}
-
-impl SFTPObjectStore {
-    #[must_use]
-    pub fn new(
+impl SFTPClient {
+    fn new(
         user: String,
         password: String,
         host: String,
@@ -92,6 +86,32 @@ impl SFTPObjectStore {
     }
 }
 
+#[derive(Debug)]
+pub struct SFTPObjectStore {
+    client: Arc<SFTPClient>,
+}
+
+impl std::fmt::Display for SFTPObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SFTP")
+    }
+}
+
+impl SFTPObjectStore {
+    #[must_use]
+    pub fn new(
+        user: String,
+        password: String,
+        host: String,
+        port: String,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            client: Arc::new(SFTPClient::new(user, password, host, port, timeout)),
+        }
+    }
+}
+
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
 ) -> object_store::Error {
@@ -125,7 +145,7 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.get_client()?;
+        let client = self.client.get_client()?;
         let mut file = client
             .sftp()
             .map_err(handle_error)?
@@ -134,13 +154,12 @@ impl ObjectStore for SFTPObjectStore {
 
         let object_meta = ObjectMeta {
             location: location.clone(),
-            size: usize::try_from(file.stat().map_err(handle_error)?.size.ok_or_else(|| {
+            size: file.stat().map_err(handle_error)?.size.ok_or_else(|| {
                 object_store::Error::Generic {
                     store: "SFTP",
                     source: "No size found for file".into(),
                 }
-            })?)
-            .map_err(handle_error)?,
+            })?,
 
             #[allow(clippy::cast_possible_wrap)]
             last_modified: DateTime::from_timestamp(
@@ -172,7 +191,7 @@ impl ObjectStore for SFTPObjectStore {
         }
 
         let stream = stream! {
-            file.seek(SeekFrom::Start(start as u64)).map_err(handle_error)?;
+            file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
 
             let mut total = 0;
             let mut buf = vec![0; 4096];
@@ -182,7 +201,7 @@ impl ObjectStore for SFTPObjectStore {
                 }
                 let mut n = file
                     .read(&mut buf)
-                    .map_err(handle_error)?;
+                    .map_err(handle_error)? as u64;
 
                 total += n;
                 if n == 0 {
@@ -192,7 +211,7 @@ impl ObjectStore for SFTPObjectStore {
                     n -= total - data_to_read;
                 }
 
-                yield Ok(Bytes::copy_from_slice(&buf[..n]))
+                yield Ok(Bytes::copy_from_slice(&buf[..usize::try_from(n).map_err(handle_error)?]));
             }
         };
 
@@ -215,18 +234,23 @@ impl ObjectStore for SFTPObjectStore {
         unimplemented!()
     }
 
-    fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        location: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let location = location
             .map(ToOwned::to_owned)
             .map_or("/".to_string(), |x| x.to_string());
 
+        let client = Arc::clone(&self.client);
+
         let stream = stream! {
-            let client = self.get_client()?;
+            let session = client.get_client()?;
 
             let mut queue = vec![location];
 
             while let Some(item) = queue.pop() {
-                let list = client
+                let list = session
                     .sftp()
                     .map_err(handle_error)?
                     .readdir(std::path::Path::new(&item))
@@ -242,10 +266,10 @@ impl ObjectStore for SFTPObjectStore {
                             store: "SFTP",
                             source: "Failed to convert path".into(),
                         })?),
-                        size: usize::try_from(entry.1.size.ok_or_else(|| object_store::Error::Generic {
+                        size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
                             store: "SFTP",
                             source: "No size found for file".into(),
-                        })?).map_err(handle_error)?,
+                        })?,
                         #[allow(clippy::cast_possible_wrap)]
                         last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
                                 store: "SFTP",
@@ -269,7 +293,7 @@ impl ObjectStore for SFTPObjectStore {
         &self,
         _: Option<&Path>,
         _: &Path,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         unimplemented!()
     }
 

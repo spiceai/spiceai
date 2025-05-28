@@ -230,23 +230,26 @@ impl RuntimeStatus {
     /// Keys are the `model_name`, not the format from [`RuntimeStatus::get_all_statuses`] (i.e. `model:<model_name>`).
     #[must_use]
     pub fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
-        let statuses = match self.statuses.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        statuses
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("model:")
-                    .map(|model_name| (model_name.to_string(), *v))
-            })
-            .collect()
+        self.get_statuses_of_prefix("model:")
     }
 
     /// Returns the status of all registered datasets.
     #[must_use]
     pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        self.get_statuses_of_prefix("dataset:")
+    }
+
+    /// Returns the status of all registered workers.
+    #[must_use]
+    pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
+        self.get_statuses_of_prefix("worker:")
+    }
+
+    #[must_use]
+    fn get_statuses_of_prefix<S>(&self, prefix: &'static str) -> HashMap<S, ComponentStatus>
+    where
+        S: for<'a> From<&'a str> + Eq + std::hash::Hash,
+    {
         let statuses = match self.statuses.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -254,7 +257,7 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix("dataset:").map(|name| (name.into(), *v)))
+            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), *v)))
             .collect()
     }
 

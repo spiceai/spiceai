@@ -22,6 +22,7 @@ use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::scalar::ScalarValue;
@@ -39,7 +40,6 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
@@ -267,7 +267,9 @@ impl Debug for MemSink {
 impl DisplayAs for MemSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let partition_count = self.batches.len();
                 write!(f, "MemoryTable (partitions={partition_count})")
             }

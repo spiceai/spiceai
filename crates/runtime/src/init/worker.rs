@@ -16,8 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Runtime, metrics, status, timing::TimeMeasurement};
-use ::workers::RouterModel;
+use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 
@@ -45,12 +44,24 @@ impl Runtime {
 
         tracing::info!("Loading worker [{}]...", cfg.name);
 
-        // Currently, only worker paradigm is [`RouterModel`].
-        let worker = RouterModel::new(cfg.name.clone(), cfg.models.clone(), Arc::clone(&self.llms));
+        let worker = match try_construct_worker(&cfg.r#type, cfg, self) {
+            Ok(worker) => worker,
+            Err(e) => {
+                tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
+                self.status
+                    .update_worker(&cfg.name, status::ComponentStatus::Error);
+                return;
+            }
+        };
 
-        let mut llm_registry = self.llms.write().await;
-        llm_registry.insert(cfg.name.clone(), Arc::new(worker));
-        drop(llm_registry);
+        if let Some(model) = Arc::clone(&worker).as_model() {
+            let mut llm_registry = self.llms.write().await;
+            llm_registry.insert(cfg.name.clone(), model);
+            drop(llm_registry);
+        }
+
+        let mut worker_registry = self.workers.write().await;
+        worker_registry.insert(cfg.name.clone(), worker);
 
         tracing::info!("Worker [{}] loaded, ready for use", cfg.name);
         metrics::workers::COUNT.add(1, &[KeyValue::new("worker", cfg.name.clone())]);

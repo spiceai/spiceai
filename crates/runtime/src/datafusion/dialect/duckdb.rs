@@ -17,7 +17,6 @@ limitations under the License.
 use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
-use datafusion::sql::sqlparser::tokenizer::Span;
 use itertools::Itertools;
 
 /// Converts the `cosine_distance` UDF into `DuckDB` `array_cosine_distance` function:
@@ -64,11 +63,9 @@ pub(crate) fn cosine_distance_to_sql(
         .try_collect()?;
 
     let ast_fn = ast::Expr::Function(Function {
-        name: ObjectName(vec![Ident {
-            value: "array_cosine_distance".to_string(),
-            quote_style: None,
-            span: Span::empty(),
-        }]),
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            "array_cosine_distance",
+        ))]),
         args: ast::FunctionArguments::List(ast::FunctionArgumentList {
             duplicate_treatment: None,
             args: ast_args

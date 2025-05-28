@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Result;
 use crate::task::TaskRequest;
 
+pub mod cron;
 pub mod interval;
 pub mod manual;
 

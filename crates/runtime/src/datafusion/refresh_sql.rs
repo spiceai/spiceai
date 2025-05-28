@@ -166,7 +166,7 @@ pub fn validate_refresh_sql(
                                 let table_name_with_schema = name
                                     .0
                                     .iter()
-                                    .map(|x| x.value.as_str())
+                                    .map(ToString::to_string)
                                     .collect::<Vec<_>>()
                                     .join(".");
                                 ensure!(

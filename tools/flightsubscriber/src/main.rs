@@ -76,7 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream = stream.into_inner();
 
-    let mut flight_decoder = FlightDataDecoder::new(stream.map(|r| r.map_err(FlightError::Tonic)));
+    let mut flight_decoder = FlightDataDecoder::new(
+        stream.map(|r| r.map_err(|status| FlightError::Tonic(Box::new(status)))),
+    );
 
     loop {
         let msg = flight_decoder.next().await;

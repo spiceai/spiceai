@@ -261,7 +261,7 @@ mod tests {
     use cache::{
         CacheKey, Caching, QueryResultsCacheProvider, QueryResultsCacheStatus, SimpleCache,
     };
-    use spicepod::component::runtime::{HashingAlgorithm, ResultsCache};
+    use spicepod::component::runtime::{CacheConfig, SQLResultsCacheConfig};
 
     use crate::{
         builder::RuntimeBuilder,
@@ -292,13 +292,12 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
-        let results_cache_config = ResultsCache {
-            enabled: true,
-            cache_max_size: None,
-            item_ttl: Some("10m".to_string()),
-            eviction_policy: None,
+        let results_cache_config = SQLResultsCacheConfig {
+            inner: CacheConfig {
+                item_ttl: Some("10m".to_string()),
+                ..Default::default()
+            },
             cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
-            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
@@ -424,13 +423,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_plan_or_cached_sql_cached_prepared_statements() {
-        let results_cache_config = ResultsCache {
-            enabled: true,
-            cache_max_size: None,
-            item_ttl: Some("10m".to_string()),
-            eviction_policy: None,
+        let results_cache_config = SQLResultsCacheConfig {
+            inner: CacheConfig {
+                item_ttl: Some("10m".to_string()),
+                ..Default::default()
+            },
             cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
-            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
@@ -495,13 +493,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_plan_or_cached_plan_cached_prepared_statements() {
-        let results_cache_config = ResultsCache {
-            enabled: true,
-            cache_max_size: None,
-            item_ttl: Some("10m".to_string()),
-            eviction_policy: None,
+        let results_cache_config = SQLResultsCacheConfig {
+            inner: CacheConfig {
+                item_ttl: Some("10m".to_string()),
+                ..Default::default()
+            },
             cache_key_type: spicepod::component::runtime::CacheKeyType::Plan,
-            hashing_algorithm: HashingAlgorithm::default(),
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))

@@ -212,7 +212,7 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
     let temp_dir = tempdir()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?
-        .into_path();
+        .keep();
 
     for (name, file) in files {
         let Ok(abs_path) = path::absolute(&file) else {

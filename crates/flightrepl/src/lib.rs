@@ -339,7 +339,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
-                last_error = Some(status);
+                last_error = Some(*status);
             }
             Err(e) => {
                 println!(
@@ -378,10 +378,10 @@ pub async fn get_records(
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
-        return Err(FlightError::Tonic(Status::internal("No endpoint")));
+        return Err(FlightError::Tonic(Status::internal("No endpoint").into()));
     };
     let Some(ticket) = endpoint.ticket else {
-        return Err(FlightError::Tonic(Status::internal("No ticket")));
+        return Err(FlightError::Tonic(Status::internal("No ticket").into()));
     };
     let mut request = add_api_key(ticket.into_request(), api_key);
 
@@ -410,8 +410,9 @@ pub async fn get_records(
 
     let stream = response.into_inner();
 
-    let mut stream =
-        FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
+    let mut stream = FlightRecordBatchStream::new_from_flight_data(
+        stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+    );
     let mut records = vec![];
     let mut total_rows = 0_usize;
     while let Some(data) = stream.next().await {

@@ -444,7 +444,7 @@ impl FlightClient {
                 .into_parts();
 
             return Ok(FlightRecordBatchStream::new_from_flight_data(
-                response_stream.map_err(FlightError::Tonic),
+                response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
             )
             .with_headers(md));
         }
@@ -494,7 +494,7 @@ impl FlightClient {
             .into_parts();
 
         Ok(FlightDataDecoder::new(
-            response_stream.map(|r| r.map_err(FlightError::Tonic)),
+            response_stream.map_err(|status| FlightError::Tonic(Box::new(status))),
         ))
     }
 

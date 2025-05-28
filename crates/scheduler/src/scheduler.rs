@@ -17,12 +17,15 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
-    sync::{Notify, RwLock, mpsc::Receiver},
+    sync::{
+        Notify, RwLock,
+        mpsc::{Receiver, Sender},
+    },
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Result, schedule::Schedule, task::TaskRequest};
+use crate::{Result, channel::TaskRequestChannel, schedule::Schedule, task::TaskRequest};
 
 pub struct NotStarted {
     schedules: Vec<Arc<Schedule>>,
@@ -36,16 +39,70 @@ pub struct NotificationChannels {
 type TaskRequestHandles = Arc<RwLock<HashMap<Arc<str>, Vec<JoinHandle<Result<()>>>>>>;
 pub(crate) type TaskRequestChannels =
     Arc<RwLock<HashMap<Arc<str>, Arc<RwLock<Receiver<Arc<TaskRequest>>>>>>>;
+pub(crate) type TaskSubmissionChannels =
+    Arc<RwLock<HashMap<Arc<str>, Arc<Sender<Arc<TaskRequest>>>>>>;
 
 type SchedulerHandles = Arc<RwLock<HashMap<Arc<str>, Vec<JoinHandle<Result<()>>>>>>;
 
 pub struct Running {
-    schedules: Vec<Arc<Schedule>>,
+    schedules: Arc<RwLock<Vec<Arc<Schedule>>>>,
     request_handles: TaskRequestHandles,
     request_channels: TaskRequestChannels,
+    submission_channels: TaskSubmissionChannels,
     cancellation_token: Arc<CancellationToken>,
     notification_channels: Arc<NotificationChannels>,
     scheduler_handles: SchedulerHandles,
+}
+
+pub struct SchedulerBuilder {
+    name: Arc<str>,
+    schedules: Vec<Arc<Schedule>>,
+}
+
+impl SchedulerBuilder {
+    #[must_use]
+    pub fn new(name: Arc<str>) -> Self {
+        Self {
+            name,
+            schedules: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn add_schedule(mut self, schedule: Arc<Schedule>) -> Self {
+        self.schedules.push(schedule);
+        self
+    }
+
+    /// Builds a new scheduler that has not yet started.
+    ///
+    /// # Errors
+    ///
+    /// - If no schedules are specified, or if there are duplicate schedule names.
+    pub fn build(self) -> Result<Scheduler<NotStarted>> {
+        if self.schedules.is_empty() {
+            return Err(crate::Error::NoSchedulesSpecified {
+                name: self.name.to_string(),
+            });
+        }
+
+        self.schedules.iter().try_for_each(|schedule| {
+            if self
+                .schedules
+                .iter()
+                .filter(|s| s.name() == schedule.name())
+                .count()
+                > 1
+            {
+                return Err(crate::Error::DuplicateScheduleName {
+                    name: schedule.name().to_string(),
+                });
+            }
+            Ok(())
+        })?;
+
+        Ok(Scheduler::<NotStarted>::new(self.name, self.schedules))
+    }
 }
 
 pub struct Scheduler<T> {
@@ -55,7 +112,7 @@ pub struct Scheduler<T> {
 
 impl Scheduler<NotStarted> {
     #[must_use]
-    pub fn new(name: Arc<str>, schedules: Vec<Arc<Schedule>>) -> Self {
+    pub(crate) fn new(name: Arc<str>, schedules: Vec<Arc<Schedule>>) -> Self {
         Self {
             state: Arc::new(NotStarted { schedules }),
             name,
@@ -70,59 +127,43 @@ impl Scheduler<NotStarted> {
     pub async fn start(self) -> Result<Scheduler<Running>> {
         let cancellation_token = Arc::new(CancellationToken::new());
 
-        let schedules = self.state.schedules.clone();
-        let mut request_handles = HashMap::new();
-        let mut request_channels = HashMap::new();
-
         let notification_channels = Arc::new(NotificationChannels {
             completion: Arc::new(Notify::default()),
             reset: Arc::new(Notify::default()),
         });
 
-        for schedule in &schedules {
-            // Initialize the request channels for each schedule
-            let (tx, rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(5);
-            let tx = Arc::new(tx);
-            let schedule_id = schedule.id();
-
-            for channel_lock in schedule.triggers() {
-                let mut channel = channel_lock.write().await;
-                channel.set_task_completion_notification(Arc::clone(
-                    &notification_channels.completion,
-                ));
-                channel.set_cancellation_token(Arc::clone(&cancellation_token));
-                channel.set_reset_notification(Arc::clone(&notification_channels.reset));
-                channel.set_submission_channel(Arc::clone(&tx));
-                let handle = channel.start()?;
-                let entry = request_handles
-                    .entry(Arc::clone(&schedule_id))
-                    .or_insert(Vec::new());
-                entry.push(handle);
-            }
-
-            request_channels.insert(Arc::clone(&schedule_id), Arc::new(RwLock::new(rx)));
-        }
-
-        let request_handles = Arc::new(RwLock::new(request_handles));
-        let request_channels = Arc::new(RwLock::new(request_channels));
-
-        Ok(Scheduler {
+        let scheduler = Scheduler {
             state: Arc::new(Running {
-                schedules: self.state.schedules.clone(),
-                cancellation_token,
-                request_handles,
-                request_channels,
+                schedules: Arc::new(RwLock::new(Vec::new())),
+                cancellation_token: Arc::clone(&cancellation_token),
+                request_handles: Arc::new(RwLock::new(HashMap::new())),
+                request_channels: Arc::new(RwLock::new(HashMap::new())),
+                submission_channels: Arc::new(RwLock::new(HashMap::new())),
                 notification_channels: Arc::clone(&notification_channels),
                 scheduler_handles: Arc::new(RwLock::new(HashMap::new())),
             }),
             name: self.name,
+        };
+
+        for schedule in &self.state.schedules.clone() {
+            scheduler.add_schedule(Arc::clone(schedule)).await?;
         }
-        .start()
-        .await)
+
+        Ok(scheduler)
     }
 }
 
 impl Scheduler<Running> {
+    #[must_use]
+    pub fn name(&self) -> Arc<str> {
+        Arc::clone(&self.name)
+    }
+
+    #[must_use]
+    pub async fn schedules(&self) -> Vec<Arc<Schedule>> {
+        self.state.schedules.read().await.clone()
+    }
+
     pub async fn stop(self) {
         let cancellation_token = Arc::clone(&self.state.cancellation_token);
         cancellation_token.cancel();
@@ -173,32 +214,120 @@ impl Scheduler<Running> {
         scheduler_handles.clear();
     }
 
-    pub async fn start(self) -> Self {
-        let state = Arc::clone(&self.state);
-        let cancellation_token = Arc::clone(&self.state.cancellation_token);
-        let schedules = self.state.schedules.clone();
+    /// Adds another trigger to an existing schedule, and starts up the request channel.
+    ///
+    /// # Errors
+    ///
+    /// - If the schedule with the specified name does not exist.
+    /// - If the request channel fails to start.
+    /// - If a submission channel is not found for the schedule.
+    pub async fn add_trigger_for_schedule(
+        &self,
+        schedule_name: Arc<str>,
+        request_channel: Arc<RwLock<dyn TaskRequestChannel>>,
+    ) -> Result<()> {
+        self.schedules()
+            .await
+            .iter()
+            .find(|s| s.name() == schedule_name)
+            .ok_or_else(|| crate::Error::DuplicateScheduleName {
+                name: schedule_name.to_string(),
+            })?;
 
-        // For each schedule, spawn a task that listens for task requests and executes them
-        let scheduler_handles = Arc::clone(&self.state.scheduler_handles);
-        let mut scheduler_handles = scheduler_handles.write().await;
-        for schedule in &schedules {
-            let schedule = Arc::clone(schedule);
-            let schedule_id = schedule.id();
+        let mut channel = request_channel.write().await;
+        channel.set_task_completion_notification(Arc::clone(
+            &self.state.notification_channels.completion,
+        ));
+        channel.set_cancellation_token(Arc::clone(&self.state.cancellation_token));
+        channel.set_reset_notification(Arc::clone(&self.state.notification_channels.reset));
 
-            let handle = schedule.start(
-                Arc::clone(&state.request_channels),
-                Arc::clone(&state.notification_channels),
-                Arc::clone(&cancellation_token),
-            );
+        let submission_channels_lock = Arc::clone(&self.state.submission_channels);
+        let submission_channels = submission_channels_lock.read().await;
+        let submission_channel = submission_channels
+            .get(&schedule_name)
+            .ok_or(crate::Error::SubmissionChannelRequired)?;
 
-            scheduler_handles
-                .entry(schedule_id)
-                .or_insert_with(Vec::new)
-                .push(handle);
+        channel.set_submission_channel(Arc::clone(submission_channel));
+        let handle = channel.start()?;
+        let mut request_handles = self.state.request_handles.write().await;
+        let entry = request_handles
+            .entry(schedule_name)
+            .or_insert_with(Vec::new);
+        entry.push(handle);
+        Ok(())
+    }
+
+    /// Adds a new schedule to the running scheduler.
+    ///
+    /// # Errors
+    ///
+    /// - If a schedule with the same name already exists.
+    pub async fn add_schedule(&self, schedule: Arc<Schedule>) -> Result<()> {
+        let schedule_name = schedule.name();
+        if self
+            .schedules()
+            .await
+            .iter()
+            .any(|s| s.name() == schedule_name)
+        {
+            return Err(crate::Error::DuplicateScheduleName {
+                name: schedule_name.to_string(),
+            });
         }
 
-        drop(scheduler_handles);
-        self
+        let mut schedules = self.state.schedules.write().await;
+        schedules.push(Arc::clone(&schedule));
+        drop(schedules);
+
+        // Create the submission and request channels for the new schedule
+        let (tx, rx) = tokio::sync::mpsc::channel::<Arc<TaskRequest>>(5);
+        let tx = Arc::new(tx);
+        let schedule_name = schedule.name();
+        self.state
+            .submission_channels
+            .write()
+            .await
+            .insert(Arc::clone(&schedule_name), Arc::clone(&tx));
+        let rx_lock = Arc::new(RwLock::new(rx));
+        self.state
+            .request_channels
+            .write()
+            .await
+            .insert(Arc::clone(&schedule_name), Arc::clone(&rx_lock));
+
+        // Start the request channels for the new schedule
+        let cancellation_token = Arc::clone(&self.state.cancellation_token);
+        let notification_channels = Arc::clone(&self.state.notification_channels);
+
+        for trigger_lock in schedule.triggers() {
+            let mut trigger = trigger_lock.write().await;
+            trigger.set_task_completion_notification(Arc::clone(&notification_channels.completion));
+            trigger.set_cancellation_token(Arc::clone(&cancellation_token));
+            trigger.set_reset_notification(Arc::clone(&notification_channels.reset));
+
+            trigger.set_submission_channel(Arc::clone(&tx));
+            let handle = trigger.start()?;
+            let mut request_handles = self.state.request_handles.write().await;
+            let entry = request_handles
+                .entry(Arc::clone(&schedule_name))
+                .or_insert_with(Vec::new);
+            entry.push(handle);
+        }
+
+        // With request channels set up, we can now start the schedule
+        let scheduler_handles = Arc::clone(&self.state.scheduler_handles);
+        let mut scheduler_handles = scheduler_handles.write().await;
+        let handle = schedule.start(
+            Arc::clone(&self.state.request_channels),
+            Arc::clone(&self.state.notification_channels),
+            Arc::clone(&cancellation_token),
+        );
+        scheduler_handles
+            .entry(schedule_name)
+            .or_insert_with(Vec::new)
+            .push(handle);
+
+        Ok(())
     }
 }
 
@@ -240,6 +369,15 @@ mod test {
         map.insert(Arc::from("test_manual_interrupts"), 0);
         map.insert(Arc::from("test_manual_queued_with_interrupt"), 0);
         map.insert(Arc::from("test_manual_queue_clears_after_immediate"), 0);
+        map.insert(
+            Arc::from("test_adding_schedule_while_running_starts_existing"),
+            0,
+        );
+        map.insert(
+            Arc::from("test_adding_schedule_while_running_starts_new"),
+            0,
+        );
+        map.insert(Arc::from("test_adding_trigger_to_existing_schedule"), 0);
 
         RwLock::new(map)
     });
@@ -304,9 +442,12 @@ mod test {
 
     #[tokio::test]
     async fn test_scheduler() {
-        let schedule = Schedule::new(Arc::new(TestComponent {
-            name: Arc::from("test_scheduler"),
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_scheduler"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_scheduler"),
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler =
             Scheduler::<NotStarted>::new("test_scheduler".into(), vec![Arc::new(schedule)]);
@@ -326,9 +467,12 @@ mod test {
     #[tokio::test]
     async fn test_scheduler_timing() {
         init_tracing(None);
-        let schedule = Schedule::new(Arc::new(TimedComponent {
-            name: "test_scheduler_timing".into(),
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_scheduler_timing"),
+            Arc::new(TimedComponent {
+                name: "test_scheduler_timing".into(),
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::new("test_scheduler_timing".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
@@ -357,13 +501,19 @@ mod test {
 
     #[tokio::test]
     async fn test_multi_schedule() {
-        let schedule_one = Schedule::new(Arc::new(TestComponent {
-            name: Arc::from("test_multi_schedule"),
-        }))
+        let schedule_one = Schedule::new(
+            Arc::from("test_multi_schedule_one"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_multi_schedule"),
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
-        let schedule_two = Schedule::new(Arc::new(TestComponent {
-            name: Arc::from("test_multi_schedule"),
-        }))
+        let schedule_two = Schedule::new(
+            Arc::from("test_multi_schedule_two"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_multi_schedule"),
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler = Scheduler::<NotStarted>::new(
             "test_multi_schedule".into(),
@@ -387,9 +537,12 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new(Arc::new(TestComponent {
-            name: "test_multi_evaluator".into(),
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_multi_evaluator"),
+            Arc::new(TestComponent {
+                name: "test_multi_evaluator".into(),
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new("test_multi_evaluator".into(), vec![Arc::new(schedule)]);
@@ -415,9 +568,12 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new(Arc::new(TestComponent {
-            name: "test_manual_interrupts".into(),
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_manual_interrupts"),
+            Arc::new(TestComponent {
+                name: "test_manual_interrupts".into(),
+            }),
+        )
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new("test_manual_interrupts".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
@@ -443,9 +599,12 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new(Arc::new(TestComponent {
-            name: "test_manual_queued_with_interrupt".into(),
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_manual_queued_with_interrupt"),
+            Arc::new(TestComponent {
+                name: "test_manual_queued_with_interrupt".into(),
+            }),
+        )
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new(
             "test_manual_queued_with_interrupt".into(),
@@ -474,10 +633,13 @@ mod test {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
-        let schedule = Schedule::new(Arc::new(LongComponent {
-            name: "test_manual_queue_clears_after_immediate".into(),
-            wait: 5,
-        }))
+        let schedule = Schedule::new(
+            Arc::from("test_manual_queue_clears_after_immediate"),
+            Arc::new(LongComponent {
+                name: "test_manual_queue_clears_after_immediate".into(),
+                wait: 5,
+            }),
+        )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new(
@@ -498,6 +660,102 @@ mod test {
         assert!(
             *count == 1,
             "Test component should have executed 1 times, but got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adding_schedule_while_running_starts() {
+        let schedule = Schedule::new(
+            Arc::from("test_adding_schedule_while_running_starts_existing"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_adding_schedule_while_running_starts_existing"),
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let scheduler = Scheduler::<NotStarted>::new(
+            "test_adding_schedule_while_running_starts".into(),
+            vec![Arc::new(schedule)],
+        );
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // add a new schedule while the scheduler has been running for some time
+        let new_schedule = Schedule::new(
+            Arc::from("test_adding_schedule_while_running_starts_new"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_adding_schedule_while_running_starts_new"),
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+
+        scheduler
+            .add_schedule(Arc::new(new_schedule))
+            .await
+            .expect("To add new schedule");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        scheduler.stop().await;
+        let map_lock = TEST_EXECUTION_COUNT.read().await;
+        let count = map_lock
+            .get("test_adding_schedule_while_running_starts_existing")
+            .expect("To get test execution count");
+        assert!(
+            *count == 9 || *count == 10,
+            "Test component should have executed 9 or 10 times, but got {count}"
+        );
+        let count = map_lock
+            .get("test_adding_schedule_while_running_starts_new")
+            .expect("To get test execution count");
+        assert!(
+            *count == 4 || *count == 5,
+            "Test component should have executed 4 or 5 times, but got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adding_trigger_to_existing_schedule() {
+        let schedule = Schedule::new(
+            Arc::from("test_adding_trigger_to_existing_schedule"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_adding_trigger_to_existing_schedule"),
+            }),
+        );
+        let scheduler = Scheduler::<NotStarted>::new(
+            "test_adding_trigger_to_existing_schedule".into(),
+            vec![Arc::new(schedule)],
+        );
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let map_lock = TEST_EXECUTION_COUNT.read().await;
+        let count = map_lock
+            .get("test_adding_trigger_to_existing_schedule")
+            .expect("To get test execution count");
+        assert!(
+            *count == 0,
+            "Test component should have executed 0 times, but got {count}"
+        );
+        drop(map_lock);
+
+        // add a new trigger to the existing schedule
+        let new_trigger = Arc::new(RwLock::new(IntervalRequestChannel::new(1)));
+        scheduler
+            .add_trigger_for_schedule(
+                Arc::from("test_adding_trigger_to_existing_schedule"),
+                new_trigger,
+            )
+            .await
+            .expect("To add new trigger");
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        scheduler.stop().await;
+        let map_lock = TEST_EXECUTION_COUNT.read().await;
+        let count = map_lock
+            .get("test_adding_trigger_to_existing_schedule")
+            .expect("To get test execution count");
+        assert!(
+            *count == 4 || *count == 5,
+            "Test component should have executed 4 or 5 times, but got {count}"
         );
     }
 }
