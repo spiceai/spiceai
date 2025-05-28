@@ -144,11 +144,7 @@ impl Read for FlightSQLFactory {
             ),
         };
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
         Ok(table_provider)
     }

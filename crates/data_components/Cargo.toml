@@ -26,7 +26,6 @@ chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
-datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }

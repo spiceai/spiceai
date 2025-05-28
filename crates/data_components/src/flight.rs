@@ -37,7 +37,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
-use datafusion_federation::table_reference::MultiPartTableReference;
+use datafusion_federation::sql::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -155,11 +155,7 @@ impl FlightFactory {
             ),
         };
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
         Ok(table_provider)
     }
