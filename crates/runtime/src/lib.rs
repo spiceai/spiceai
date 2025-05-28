@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -26,7 +27,9 @@ use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
+use tracing::subscriber;
 use util::force_shutdown_signal;
+use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -94,6 +97,7 @@ mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
 pub mod request;
+mod scheduling;
 pub mod search;
 pub mod secrets;
 pub mod spice_metrics;
@@ -107,6 +111,7 @@ pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod view;
+mod worker;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -267,6 +272,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to load worker: {source}"))]
+    UnableToLoadWorker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("The data connector {dataconnector} doesn't support catalogs."))]
     DataConnectorDoesntSupportCatalogs { dataconnector: String },
 
@@ -339,6 +349,25 @@ pub enum Error {
         "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
     AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
+
+    #[snafu(display(
+        "Failed to start scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToStartScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to build scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToBuildScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to add schedule '{name}' to the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToAddSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -363,6 +392,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
@@ -382,6 +412,8 @@ pub struct Runtime {
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+
+    schedulers: Arc<ScheduleRegistry>,
 }
 
 impl Runtime {
@@ -978,4 +1010,14 @@ pub fn spice_data_base_path() -> String {
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
+}
+
+pub fn in_tracing_context<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_ansi(true)
+        .finish();
+    subscriber::with_default(subscriber, f)
 }

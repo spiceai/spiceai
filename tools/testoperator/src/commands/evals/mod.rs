@@ -68,10 +68,10 @@ pub struct EvalMetrics {
 
 impl EvalMetrics {
     pub fn from_record_batch(batch: &[RecordBatch]) -> anyhow::Result<Self> {
-        if batch.is_empty() || batch[0].num_rows() == 0 {
-            return Err(anyhow::anyhow!("No evaluation metrics found"));
-        }
-        let record = &batch[0];
+        let record = batch
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .ok_or_else(|| anyhow::anyhow!("No evaluation metrics found"))?;
 
         let status_str = record
             .column_by_name("status")

@@ -122,6 +122,7 @@ runtime-auth = { path = "../runtime-auth" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+scheduler = { path = "../scheduler" }
 schemars = "0.8.22"
 search = { path = "../search" }
 secrecy.workspace = true

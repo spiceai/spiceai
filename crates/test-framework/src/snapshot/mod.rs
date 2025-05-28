@@ -28,6 +28,7 @@ pub async fn record_explain_plan(
     client: &FlightClient,
     name: &str,
     query: &Query,
+    scale_factor: f64,
 ) -> anyhow::Result<()> {
     // Check the plan
     let sql = Arc::clone(&query.sql);
@@ -62,8 +63,14 @@ pub async fn record_explain_plan(
             (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
         ],
     }, {
+        let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
+            format!("{name}_{query_name}_explain")
+        } else {
+            format!("{name}_{query_name}_explain_sf{scale_factor}")
+        };
+
         let result = panic::catch_unwind(|| {
-            insta::assert_snapshot!(format!("{name}_{query_name}_explain"), explain_plan);
+            insta::assert_snapshot!(snapshot_name, explain_plan);
         });
         if result.is_err() {
             assertion_err = Some(format!("Snapshot assertion failed for {name}, {query_name}"));

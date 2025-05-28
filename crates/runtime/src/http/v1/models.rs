@@ -50,7 +50,7 @@ pub(crate) struct OpenAIModelResponse {
     data: Vec<OpenAIModel>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct OpenAIModel {
@@ -154,6 +154,28 @@ pub(crate) async fn get(
                 .into_response();
         }
     };
+
+    let worker_statuses = if params.status {
+        rt.status.get_worker_statuses()
+    } else {
+        HashMap::default()
+    };
+    let worker_registry = rt.workers.read().await;
+    let workers = worker_registry
+        .iter()
+        .filter_map(|(name, worker)| {
+            Arc::clone(worker).as_model()?;
+            Some(OpenAIModel {
+                id: name.clone(),
+                object: "model".to_string(),
+                owned_by: "spiceai".to_string(),
+                datasets: None,
+                status: worker_statuses.get(name).copied(),
+            })
+        })
+        .collect::<Vec<OpenAIModel>>();
+
+    let models = [workers, models].concat().clone();
 
     match params.format {
         Format::Json => (

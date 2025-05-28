@@ -1,0 +1,59 @@
+[graph]
+# Cargo deny will check dependencies via `--all-features`
+all-features = true
+
+[advisories]
+ignore = [
+]
+yanked = "deny"
+
+[bans]
+allow-wildcard-paths = false
+multiple-versions    = "allow"
+
+[licenses]
+
+allow = [
+  "Apache-2.0 WITH LLVM-exception",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "BlueOak-1.0.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+  "OpenSSL",
+  "0BSD"
+]
+private = { ignore = false }
+unused-allowed-license = "deny"
+
+[sources]
+unknown-git      = "deny"
+unknown-registry = "deny"
+
+# text-embeddings-* have empty license but belongs to the text-embeddings-inference / Apache-2.0 license
+[[licenses.clarify]]
+name = "text-embeddings-core"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "text-embeddings-backend"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "text-embeddings-backend-core"
+expression = "Apache-2.0"
+license-files = []
+
+[[licenses.clarify]]
+name = "text-embeddings-backend-candle"
+expression = "Apache-2.0"
+license-files = []
+
