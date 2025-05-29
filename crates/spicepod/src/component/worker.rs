@@ -46,6 +46,9 @@ pub struct Worker {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balance: Option<LoadBalanceParams>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cron: Option<String>,
 }
 
 impl FromStr for WorkerType {
@@ -81,6 +84,7 @@ impl WithDependsOn<Worker> for Worker {
             description: self.description.clone(),
             params: self.params.clone(),
             load_balance: self.load_balance.clone(),
+            start_cron: self.start_cron.clone(),
         }
     }
 }
