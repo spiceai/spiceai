@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use cache::key::SearchKey;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{
     Expr, SelectItem, TableFactor, TableWithJoins, Value, ValueWithSpan,
@@ -124,6 +125,20 @@ pub struct SearchRequest {
 
     /// Keywords to perform a lexical search and pre-filter the embedding column.
     pub keywords: Vec<String>,
+}
+
+impl From<SearchRequest> for SearchKey {
+    fn from(req: SearchRequest) -> Self {
+        SearchKey::new(
+            req.text.into(),
+            req.datasets
+                .map(|d| d.into_iter().map(Into::into).collect()),
+            req.limit,
+            req.where_cond,
+            Some(req.additional_columns.into_iter().map(Into::into).collect()),
+            req.keywords.into_iter().map(Into::into).collect(),
+        )
+    }
 }
 
 #[must_use]

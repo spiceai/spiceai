@@ -45,7 +45,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, RawCacheKey};
+use cache::result::search::CachedSearchResult;
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -1074,6 +1075,12 @@ impl DataFusion {
         self.caching.plans.clone()
     }
 
+    pub fn search_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>> {
+        self.caching.search.clone()
+    }
+
     async fn register_accelerated_table(
         &self,
         dataset: Arc<Dataset>,
@@ -1675,7 +1682,7 @@ async fn wait_until_dependent_tables_are_ready(
 
 #[cfg(test)]
 mod tests {
-    use cache::{CacheKey, SimpleCache};
+    use cache::{SimpleCache, key::CacheKey};
 
     use crate::builder::RuntimeBuilder;
 

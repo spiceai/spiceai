@@ -23,12 +23,13 @@ pub use spicepod;
 use spicepod::{
     Spicepod,
     component::{
+        caching::ResultsCache,
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
         eval::Eval,
         model::Model,
-        runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
+        runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
         tool::Tool,
         view::View,

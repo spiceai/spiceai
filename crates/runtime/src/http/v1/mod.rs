@@ -46,7 +46,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
-use cache::QueryResultsCacheStatus;
+use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
@@ -192,7 +192,7 @@ pub async fn run_sql(
     df: Arc<DataFusion>,
     sql: &str,
     parameters: Option<ParamValues>,
-) -> Result<(Vec<RecordBatch>, QueryResultsCacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
     let builder = QueryBuilder::new(sql, df);
     let builder = if let Some(parameters) = parameters {
         builder.parameters(parameters)
@@ -202,14 +202,14 @@ pub async fn run_sql(
     let query_res = builder.build().run().await?;
     Ok((
         query_res.data.try_collect::<Vec<RecordBatch>>().await?,
-        query_res.results_cache_status,
+        query_res.cache_status,
     ))
 }
 
 // Converts query result to HTTP response (as JSON).
 pub async fn to_http_response(
     data: Vec<RecordBatch>,
-    cache_status: QueryResultsCacheStatus,
+    cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
 ) -> Response {
@@ -236,7 +236,7 @@ pub async fn to_http_response(
     (StatusCode::OK, headers, body).into_response()
 }
 
-fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: QueryResultsCacheStatus) {
+fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: CacheStatus) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
     }
@@ -247,22 +247,20 @@ fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: QueryResu
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
-fn status_to_x_cache_value(results_cache_status: QueryResultsCacheStatus) -> Option<HeaderValue> {
+fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        QueryResultsCacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
-        QueryResultsCacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
-        QueryResultsCacheStatus::CacheDisabled | QueryResultsCacheStatus::CacheBypass => None,
+        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
+        CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
 }
 
-fn status_to_results_cache_value(
-    results_cache_status: QueryResultsCacheStatus,
-) -> Option<HeaderValue> {
+fn status_to_results_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        QueryResultsCacheStatus::CacheHit => "HIT".parse().ok(),
-        QueryResultsCacheStatus::CacheMiss => "MISS".parse().ok(),
-        QueryResultsCacheStatus::CacheBypass => "BYPASS".parse().ok(),
-        QueryResultsCacheStatus::CacheDisabled => None,
+        CacheStatus::CacheHit => "HIT".parse().ok(),
+        CacheStatus::CacheMiss => "MISS".parse().ok(),
+        CacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        CacheStatus::CacheDisabled => None,
     }
 }
 

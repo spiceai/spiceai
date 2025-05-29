@@ -26,6 +26,7 @@ use serde_value::Value;
 use snafu::prelude::*;
 
 use crate::reader;
+pub mod caching;
 pub mod catalog;
 pub mod dataset;
 pub mod embeddings;
@@ -176,4 +177,8 @@ pub(super) fn is_default_or_none<T: Default + PartialEq>(value: &Option<T>) -> b
         Some(v) => is_default(v),
         None => true,
     }
+}
+
+pub(super) const fn default_true() -> bool {
+    true
 }
