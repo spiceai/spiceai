@@ -1,8 +1,3 @@
-use std::{collections::HashMap, sync::Arc};
-
-use arrow::{array::RecordBatch, datatypes::Schema, error::ArrowError};
-use arrow_json::reader::Decoder;
-use async_stream::stream;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +10,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::{collections::HashMap, sync::Arc};
+
 use crate::SEARCH_SCORE_COLUMN_NAME;
+use arrow::error::ArrowError;
+use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
+    sql::sqlparser::ast::Ident,
 };
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
@@ -32,8 +32,7 @@ use tantivy::{
 };
 
 use super::{
-    CandidateGeneration, InternalSnafu, Result as GenerationResult,
-    TextSearchSnafu as GenerationTextSearchSnafu,
+    CandidateGeneration, Result as GenerationResult, TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -41,10 +40,18 @@ pub enum Error {
     #[snafu(display(""))]
     TextSearchError { source: TantivyError },
 
-    #[snafu(display(""))]
+    #[snafu(display("User provided query '{query}' is invalid: {source}"))]
     InvalidTextSearchQueryError {
         source: QueryParserError,
         query: String,
+    },
+
+    #[snafu(display(
+        "Search index is missing the column `{missing}`. The index has the following columns: {}", index_columns.join(", ")
+    ))]
+    TextSearchIndexMissingColummn {
+        missing: String,
+        index_columns: Vec<String>,
     },
 
     #[snafu(display("Failed to infer an Arrow schema from JSON format. Error: {source}"))]
@@ -53,23 +60,74 @@ pub enum Error {
     #[snafu(display("Failed to convert JSON values to Arrow format. Error: {source}"))]
     ArrowConversionError { source: ArrowError },
 
-    #[snafu(display(""))]
-    SerdeJsonError { source: serde_json::Error },
+    #[snafu(display("Failed to convert underlying search data into JSON format. Error: {source}"))]
+    SerdeJsonConversionError { source: serde_json::Error },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidTextSearchQueryError { .. } | Error::TextSearchIndexMissingColummn { .. }
+        )
+    }
+}
 
 pub struct FullTextSearch {
     idx: Arc<Index>,
     field: String,
+    primary_key: Vec<String>,
 }
 
 impl FullTextSearch {
-    pub fn new(index: Arc<Index>, field: String) -> Self {
-        Self { idx: index, field }
+    pub fn try_new(index: Arc<Index>, field: String, primary_key: Vec<String>) -> Result<Self> {
+        let fts = Self {
+            idx: index,
+            field,
+            primary_key,
+        };
+
+        // Ensure that the index has the required primary key columns.
+        let cols = fts.all_columns();
+        for pk in &fts.primary_key {
+            if !cols.contains(pk) {
+                return Err(Error::TextSearchIndexMissingColummn {
+                    missing: pk.clone(),
+                    index_columns: cols.clone(),
+                });
+            }
+        }
+
+        // Ensure that the index has the field to search on.
+        if !cols.contains(&fts.field) {
+            return Err(Error::TextSearchIndexMissingColummn {
+                missing: fts.field.clone(),
+                index_columns: cols,
+            });
+        }
+
+        Ok(fts)
     }
-}
 
-impl FullTextSearch {
+    #[must_use]
+    pub fn additional_columns(&self) -> Vec<String> {
+        self.all_columns()
+            .into_iter()
+            .filter(|name| *name != self.field && !self.primary_key.contains(name))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn all_columns(&self) -> Vec<String> {
+        self.idx
+            .schema()
+            .fields()
+            .map(|(_, f)| f.name().to_string())
+            .collect()
+    }
+
     fn index_searcher(&self) -> Result<Searcher> {
         Ok(self
             .idx
@@ -111,8 +169,10 @@ impl FullTextSearch {
                     .map(|(f, v)| (schema.get_field_name(f), v))
                     .collect::<HashMap<_, _>>();
 
-                let mut v = serde_json::to_value(&doc_w_col_names).context(SerdeJsonSnafu)?;
-                if let Some(num) = Number::from_f64(score as f64) {
+                let mut v =
+                    serde_json::to_value(&doc_w_col_names).context(SerdeJsonConversionSnafu)?;
+
+                if let Some(num) = Number::from_f64(f64::from(score)) {
                     v[SEARCH_SCORE_COLUMN_NAME] = Value::Number(num);
                 }
                 Ok(v)
@@ -167,17 +227,30 @@ impl CandidateGeneration for FullTextSearch {
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        Ok(vec![])
+        Ok((0..filters.len()).map(|_| false).collect::<Vec<_>>())
     }
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
     fn supports_columns(&self, projection: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        Ok(vec![])
+        let columns = self.all_columns();
+
+        let cols_found = projection
+            .iter()
+            .map(|expr| {
+                if let Expr::Identifier(Ident { value, .. }) = expr {
+                    columns.contains(value) || value == SEARCH_SCORE_COLUMN_NAME
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        Ok(cols_found)
     }
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
     fn value_derived_from(&self) -> String {
-        String::new()
+        self.field.clone()
     }
 }
 
@@ -239,10 +312,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let result = FullTextSearch::new(Arc::new(create_basic_index()), "body".to_string())
-            .search("fish".into(), &[], &[], 3)
-            .await
-            .expect("Search was unsuccessful");
+        let result =
+            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
+                .expect("failed to create FullTextSearch")
+                .search("fish".into(), &[], &[], 3)
+                .await
+                .expect("Search was unsuccessful");
 
         let rbs = collect(result)
             .await

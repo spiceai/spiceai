@@ -31,6 +31,16 @@ pub enum Error {
     TextSearchError { source: text_search::Error },
 }
 
+impl Error {
+    #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Error::TextSearchError { source } if source.is_user_error()
+        )
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Standard interface to generate search candidates from a given table/dataset/source for subsequent aggregation in a hybrid search system.
