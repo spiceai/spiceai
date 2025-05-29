@@ -30,10 +30,10 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(""))]
+    #[snafu(display("Error occurred retrieving candidate search results: {source}"))]
     CandidateGenerationError { source: generation::Error },
 
-    #[snafu(display(""))]
+    #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display("An invalid keyword was specified: {keyword}"))]
@@ -72,6 +72,9 @@ impl SearchPipeline {
         let generation_results: Vec<VectorSearchGenerationResult> =
             futures::future::try_join_all(self.generators.iter().map(|g| async {
                 let content_col = g.value_derived_from();
+
+                // The column name for each `.generator` will be different, and therefore the
+                // keyword filter [`Expr`] must be made differently.
                 let filters = [
                     prepare_keywords(&keywords.clone(), &content_col)?,
                     opt_filters.clone(),
@@ -105,6 +108,9 @@ impl SearchPipeline {
     }
 }
 
+/// Convert each keyword into an `ILIKE %keyword%` [`Expr`].
+///
+/// Also validates keywords against being SQL injections.
 fn prepare_keywords(keywords: &[String], column: &str) -> Result<Vec<Expr>, Error> {
     keywords
         .iter()

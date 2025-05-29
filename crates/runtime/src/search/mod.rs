@@ -45,12 +45,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Error occurred retrieving candidate search results: {source}"))]
-    CandidateGenerationError { source: search::generation::Error },
-
-    #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
-    CandidateAggregationError { source: search::aggregation::Error },
-
     #[snafu(display("Error occurred in search pipeline: {source}"))]
     SearchPipelineError { source: search::pipeline::Error },
 
