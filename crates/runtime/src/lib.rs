@@ -376,6 +376,15 @@ pub enum Error {
         cron: String,
         source: scheduler::Error,
     },
+
+    #[snafu(display(
+        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToRemoveSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
 }
 
 const HTTP_SERVER: &str = "http_server";

@@ -83,6 +83,13 @@ impl Runtime {
         let mut llm_registry = self.llms.write().await;
         llm_registry.remove(&cfg.name);
 
+        if let Err(e) = Arc::clone(&self).remove_worker_schedule(cfg.clone()).await {
+            tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
+            self.status
+                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            return;
+        }
+
         tracing::info!("Worker [{}] has been unloaded", cfg.name);
         metrics::workers::COUNT.add(-1, &[KeyValue::new("worker", cfg.name.clone())]);
     }

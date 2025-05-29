@@ -204,4 +204,36 @@ impl Runtime {
 
         Ok(())
     }
+
+    pub async fn remove_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
+        let scheduler_lock = Arc::clone(&self.schedulers);
+        let schedulers = scheduler_lock.read().await;
+        let worker_name = worker.name.to_string().into();
+
+        if let Some(scheduler) = schedulers.get(WORKER_SCHEDULER_NAME) {
+            if scheduler
+                .schedules()
+                .await
+                .iter()
+                .any(|s| s.name() == worker_name)
+            {
+                tracing::debug!("Removing worker schedule for worker: {worker_name}",);
+                scheduler
+                    .remove_schedule(Arc::clone(&worker_name))
+                    .await
+                    .context(crate::FailedToRemoveScheduleSnafu {
+                        name: worker_name.to_string(),
+                        scheduler: WORKER_SCHEDULER_NAME.to_string(),
+                    })?;
+            } else {
+                tracing::debug!("No worker schedule found for worker: {worker_name}",);
+            }
+        } else {
+            tracing::debug!(
+                "No worker scheduler found, cannot remove schedule for worker: {worker_name}",
+            );
+        }
+
+        Ok(())
+    }
 }
