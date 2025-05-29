@@ -91,6 +91,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Update HTTP sources to HTTPS
+        uses: ./.github/actions/update-http-sources
+
       - name: Select environment secrets
         id: select-env-secrets
         run: |

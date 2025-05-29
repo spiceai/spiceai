@@ -51,6 +51,9 @@ jobs:
         with:
           ref: ${{ matrix.branch }}
 
+      - name: Update HTTP sources to HTTPS
+        uses: ./.github/actions/update-http-sources
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -161,7 +164,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
-
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
