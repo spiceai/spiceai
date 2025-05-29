@@ -21,7 +21,7 @@ use crate::{
     UnableToLoadCatalogConnectorSnafu,
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::{Catalog, CatalogBuilder},
-    dataconnector::ConnectorParamsBuilder,
+    dataconnector::parameters::ConnectorParamsBuilder,
     metrics, status, warn_spaced,
 };
 use app::App;

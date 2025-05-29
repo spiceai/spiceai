@@ -17,8 +17,15 @@ limitations under the License.
 use super::{CatalogConnector, ParameterSpec, Parameters};
 use crate::{
     Runtime,
-    component::catalog::Catalog,
-    dataconnector::{ConnectorComponent, ConnectorParams},
+    component::{catalog::Catalog, dataset::builder::DatasetBuilder},
+    dataconnector::{
+        ConnectorComponent, DataConnectorFactory as _,
+        parameters::{
+            self, ConnectorParams,
+            aws::{AuthValidator, RegionValidator, Validator},
+        },
+        s3::{self, S3Factory},
+    },
 };
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
@@ -44,8 +51,11 @@ use iceberg::{
 };
 use iceberg_datafusion::IcebergTableProvider;
 use snafu::prelude::*;
-use std::fmt;
 use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{fmt, sync::LazyLock};
+
+static VALIDATORS: LazyLock<Vec<Box<dyn Validator + Send + Sync + 'static>>> =
+    LazyLock::new(|| vec![Box::new(RegionValidator), Box::new(AuthValidator)]);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -84,6 +94,12 @@ pub enum Error {
 
     #[snafu(display("No 'parameters' set on table"))]
     MissingParameters,
+
+    #[snafu(display("Parameter validation failed: {source}",))]
+    ParameterValidation {
+        #[snafu(source)]
+        source: parameters::aws::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -91,7 +107,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A catalog connector for AWS Glue, providing access to database and table metadata.
 #[derive(Clone)]
 pub struct GlueCatalog {
-    params: Parameters,
+    params: ConnectorParams,
 }
 
 type DatabaseName = String;
@@ -111,6 +127,8 @@ impl fmt::Debug for GlueCatalogProvider {
 struct GlueCatalogState {
     databases: HashMap<DatabaseName, Vec<Table>>,
     config: SdkConfig,
+    parameters: ConnectorParams,
+    runtime: Arc<Runtime>,
 }
 
 /// A schema provider for a specific Glue database, providing table metadata.
@@ -153,7 +171,7 @@ impl SchemaProvider for GlueSchemaProvider {
             .and_then(|tables| tables.iter().find(|t| t.name() == name))
         else {
             tracing::error!(
-                "Glue table name `{name}` not found in database `{}`",
+                "Glue table `{name}` not found in database `{}`",
                 self.database
             );
             return Ok(None);
@@ -161,8 +179,55 @@ impl SchemaProvider for GlueSchemaProvider {
 
         match TableType::from(table) {
             TableType::HiveParquet => {
-                tracing::warn!("Hive Parquet files not supported yet");
-                Ok(None)
+                let Some(storage_descriptor) = table.storage_descriptor() else {
+                    return Err(DataFusionError::External(
+                        format!("table `{name}` does not have a storage descriptor").into(),
+                    ));
+                };
+
+                let Some(mut from) = storage_descriptor.location().map(String::from) else {
+                    return Err(DataFusionError::External(
+                        format!("table `{name}` does not have a location").into(),
+                    ));
+                };
+
+                // trailing slash in S3 endpoint is required
+                if !from.ends_with('/') {
+                    from.push_str("/");
+                }
+
+                let mut params = self.state.parameters.clone();
+                params
+                    .parameters
+                    .insert("endpoint".into(), from.clone().into());
+                params.parameters.prefix = "s3";
+
+                let s3 = S3Factory::new()
+                    .create(self.state.parameters.clone())
+                    .await
+                    .unwrap();
+
+                let app = self
+                    .state
+                    .parameters
+                    .app
+                    .as_ref()
+                    .map(|a| Arc::clone(a))
+                    .unwrap();
+
+                let dataset = DatasetBuilder::try_new(from, name)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .with_runtime(Arc::clone(&self.state.runtime))
+                    .with_app(app)
+                    .build()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                let provider = s3
+                    .read_provider(&dataset)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                Ok(Some(provider))
             }
             TableType::Iceberg => {
                 let mut props = Vec::new();
@@ -233,6 +298,54 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 }
 
+async fn create_hive_style_parquet_provider(
+    name: &str,
+    table: &Table,
+    state: &GlueCatalogState,
+) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    let Some(storage_descriptor) = table.storage_descriptor() else {
+        return Err(DataFusionError::External(
+            format!("table `{name}` does not have a storage descriptor").into(),
+        ));
+    };
+
+    let Some(mut from) = storage_descriptor.location().map(String::from) else {
+        return Err(DataFusionError::External(
+            format!("table `{name}` does not have a location").into(),
+        ));
+    };
+
+    // trailing slash in S3 endpoint is required
+    if !from.ends_with('/') {
+        from.push_str("/");
+    }
+
+    let mut parameters = state.parameters.clone();
+
+    parameters
+        .parameters
+        .insert("endpoint".into(), from.clone().into());
+    parameters.parameters.prefix = "s3";
+
+    let s3 = S3Factory::new().create(parameters.clone()).await.unwrap();
+
+    let app = parameters.app.as_ref().map(|a| Arc::clone(a)).unwrap();
+
+    let dataset = DatasetBuilder::try_new(from, name)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_runtime(Arc::clone(&state.runtime))
+        .with_app(app)
+        .build()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let provider = s3
+        .read_provider(&dataset)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    Ok(Some(provider))
+}
+
 // copy from iceberg-catalog-glue internals
 // https://github.com/apache/iceberg-rust/blob/main/crates/catalog/glue/src/utils.rs#L256
 fn get_metadata_location(
@@ -252,8 +365,26 @@ fn get_metadata_location(
 }
 
 impl GlueCatalogProvider {
-    pub async fn new(params: &Parameters, catalog: &Catalog) -> Result<Self> {
-        let config = load_config(params).await;
+    pub async fn new(
+        mut parameters: ConnectorParams,
+        catalog: &Catalog,
+        runtime: Arc<Runtime>,
+    ) -> Result<Self> {
+        for validator in VALIDATORS.iter() {
+            validator
+                .validate(&mut parameters)
+                .await
+                .context(ParameterValidationSnafu)?;
+        }
+
+        parameters
+            .parameters
+            .insert("hive_partitioning_enabled".to_string(), "true".into());
+        parameters
+            .parameters
+            .insert("file_format".to_string(), "parquet".into());
+
+        let config = load_config(&parameters.parameters).await;
         let glue = Client::new(&config);
 
         let get_databases_output = glue
@@ -281,7 +412,8 @@ impl GlueCatalogProvider {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|t| {
-                    is_supported(t) && is_included(catalog.include.as_ref(), &db.name, t.name())
+                    !matches!(TableType::from(t), TableType::Unsupported)
+                        && is_included(catalog.include.as_ref(), &db.name, t.name())
                 })
                 .collect::<Vec<_>>();
 
@@ -290,7 +422,12 @@ impl GlueCatalogProvider {
             }
         }
 
-        let inner = Arc::new(GlueCatalogState { databases, config });
+        let inner = Arc::new(GlueCatalogState {
+            databases,
+            config,
+            parameters,
+            runtime,
+        });
 
         Ok(Self { inner })
     }
@@ -303,30 +440,6 @@ fn database_might_match(database: &str, patterns: &[String]) -> bool {
             || pattern.starts_with("*.")
             || pattern == "*.*"
     })
-}
-
-fn is_supported(table: &Table) -> bool {
-    if table
-        .parameters
-        .as_ref()
-        .and_then(|params| params.get("table_type"))
-        .is_some_and(|value| value.to_lowercase() == "iceberg")
-    {
-        return true; // Iceberg is supported
-    }
-
-    if table
-        .storage_descriptor
-        .as_ref()
-        .and_then(|sd| sd.input_format.as_ref())
-        .is_some_and(|input_format| {
-            input_format == "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-        })
-    {
-        return true; // Hive-style parquet is supported
-    }
-
-    false
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -376,26 +489,29 @@ fn is_included(include: Option<&GlobSet>, database: &str, table: &str) -> bool {
 impl GlueCatalog {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
-        Arc::new(Self {
-            params: params.parameters,
-        })
+        Arc::new(Self { params })
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("aws_region")
-        .description("The AWS region to use for Glue.")
-        .secret(),
-    ParameterSpec::component("aws_access_key_id")
-        .description("The AWS access key ID to use for Glue.")
-        .secret(),
-    ParameterSpec::component("aws_secret_access_key")
-        .description("The AWS secret access key to use for Glue.")
-        .secret(),
-    ParameterSpec::component("aws_session_token")
-        .description("The AWS session token to use for Glue.")
-        .secret(),
-];
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+        ParameterSpec::component("region")
+            .description("The AWS region to use for Glue.")
+            .secret(),
+        ParameterSpec::component("key")
+            .description("The AWS access key ID to use for Glue.")
+            .secret(),
+        ParameterSpec::component("secret")
+            .description("The AWS secret access key to use for Glue.")
+            .secret(),
+        ParameterSpec::component("session_token")
+            .description("The AWS session token to use for Glue.")
+            .secret(),
+    ]);
+    all_parameters.extend_from_slice(&s3::PARAMETERS);
+    all_parameters
+});
 
 #[async_trait]
 impl CatalogConnector for GlueCatalog {
@@ -405,11 +521,11 @@ impl CatalogConnector for GlueCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        _runtime: Arc<Runtime>,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         Ok(Arc::new(
-            GlueCatalogProvider::new(&self.params, catalog)
+            GlueCatalogProvider::new(self.params.clone(), catalog, runtime)
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: "glue".to_string(),
@@ -453,7 +569,7 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
 async fn load_config(params: &Parameters) -> SdkConfig {
     // Get and own all parameter values upfront
     let region = params
-        .get("aws_region")
+        .get("region")
         .expose()
         .ok()
         .unwrap_or_else(|| {
@@ -463,20 +579,12 @@ async fn load_config(params: &Parameters) -> SdkConfig {
         })
         .to_string();
 
-    let access_key_id = params
-        .get("aws_access_key_id")
-        .expose()
-        .ok()
-        .map(ToString::to_string);
+    let access_key_id = params.get("key").expose().ok().map(ToString::to_string);
 
-    let secret_access_key = params
-        .get("aws_secret_access_key")
-        .expose()
-        .ok()
-        .map(ToString::to_string);
+    let secret_access_key = params.get("secret").expose().ok().map(ToString::to_string);
 
     let session_token = params
-        .get("aws_session_token")
+        .get("session_token")
         .expose()
         .ok()
         .map(ToString::to_string);
