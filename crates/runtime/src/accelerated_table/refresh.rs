@@ -36,8 +36,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 
@@ -428,6 +428,7 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
+    notifier: Option<Arc<Notify>>,
 }
 
 impl Refresher {
@@ -454,6 +455,7 @@ impl Refresher {
             initial_load_completed: Arc::new(AtomicBool::new(false)),
             disable_federation: false,
             semaphore: None,
+            notifier: None,
         }
     }
 
@@ -495,6 +497,16 @@ impl Refresher {
         self
     }
 
+    pub fn with_notifier(&mut self, notifier: Arc<Notify>) -> &mut Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    #[must_use]
+    pub fn notifier(&self) -> Option<Arc<Notify>> {
+        self.notifier.clone()
+    }
+
     pub fn set_initial_load_completed(&self, initial_load_completed: bool) {
         self.initial_load_completed
             .store(initial_load_completed, Ordering::Relaxed);
@@ -524,7 +536,6 @@ impl Refresher {
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
-        ready_sender: oneshot::Sender<()>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let dataset_name = self.dataset_name.clone();
         let time_column = self.refresh.read().await.time_column.clone();
@@ -561,10 +572,10 @@ impl Refresher {
             (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
             | (AccelerationRefreshMode::Full(receiver), _) => receiver,
             (AccelerationRefreshMode::Append(_), _) => {
-                return Some(self.start_streaming_append(ready_sender));
+                return Some(self.start_streaming_append());
             }
             (AccelerationRefreshMode::Changes(stream), _) => {
-                return Some(self.start_changes_stream(stream, ready_sender));
+                return Some(self.start_changes_stream(stream));
             }
         };
 
@@ -587,7 +598,7 @@ impl Refresher {
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
         self.refresh_task_runner = Some(refresh_task_runner);
 
-        let mut ready_sender = Some(ready_sender);
+        let notifier = self.notifier.clone();
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
@@ -648,7 +659,7 @@ impl Refresher {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
                         if let Ok(()) = res {
-                            notify_refresh_done(&dataset_name, &refresh, &mut ready_sender).await;
+                            notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
                             if let Some(cache_provider) = &cache_provider {
@@ -711,10 +722,7 @@ impl Refresher {
         }
     }
 
-    fn start_streaming_append(
-        &mut self,
-        ready_sender: oneshot::Sender<()>,
-    ) -> tokio::task::JoinHandle<()> {
+    fn start_streaming_append(&mut self) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(
             RefreshTask::builder(
                 Arc::clone(&self.runtime_status),
@@ -732,11 +740,12 @@ impl Refresher {
         let cache_provider = self.cache_provider.clone();
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
+        let notifier = self.notifier.clone();
         tokio::spawn(async move {
             if let Err(err) = refresh_task
                 .start_streaming_append(
                     cache_provider,
-                    Some(ready_sender),
+                    notifier,
                     refresh_defaults,
                     initial_load_completed,
                 )
@@ -750,7 +759,6 @@ impl Refresher {
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
-        ready_sender: oneshot::Sender<()>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(
             RefreshTask::builder(
@@ -768,13 +776,14 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
+        let notifier = self.notifier.clone();
         tokio::spawn(async move {
             if let Err(err) = refresh_task
                 .start_changes_stream(
                     refresh,
                     changes_stream,
                     cache_provider,
-                    Some(ready_sender),
+                    notifier,
                     initial_load_completed,
                 )
                 .await
@@ -802,10 +811,10 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 async fn notify_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
-    ready_sender: &mut Option<oneshot::Sender<()>>,
+    ready_sender: Option<Arc<Notify>>,
 ) {
-    if let Some(sender) = ready_sender.take() {
-        sender.send(()).ok();
+    if let Some(sender) = ready_sender.as_ref() {
+        sender.notify_waiters();
     }
 
     let now = SystemTime::now()
@@ -913,6 +922,7 @@ mod tests {
 
         let refresh = Refresh::new(RefreshMode::Full);
 
+        let notifier = Arc::new(Notify::new());
         let mut refresher = Refresher::new(
             status,
             TableReference::bare("test"),
@@ -922,12 +932,11 @@ mod tests {
             Arc::clone(&accelerator),
         );
 
+        refresher.with_notifier(Arc::clone(&notifier));
+
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-        let (ready_sender, is_ready) = oneshot::channel::<()>();
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = refresher
-            .start(acceleration_refresh_mode, ready_sender)
-            .await;
+        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
         trigger
             .send(None)
@@ -935,7 +944,7 @@ mod tests {
             .expect("trigger sent correctly to refresh");
 
         timeout(Duration::from_secs(2), async move {
-            is_ready.await.expect("data is received");
+            notifier.notified().await.expect("notification is received");
         })
         .await
         .expect("finish before the timeout");
@@ -1121,6 +1130,7 @@ mod tests {
                 .time_column("time_in_string".to_string())
                 .time_format(TimeFormat::ISO8601);
 
+            let notifier = Arc::new(Notify::new());
             let mut refresher = Refresher::new(
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
@@ -1130,12 +1140,12 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
+            refresher.with_notifier(Arc::clone(&notifier));
+
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
+            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
             trigger
                 .send(None)
@@ -1143,7 +1153,7 @@ mod tests {
                 .expect("trigger sent correctly to refresh");
 
             timeout(Duration::from_secs(2), async move {
-                is_ready.await.expect("data is received");
+                notifier.notified().await.expect("notification is received");
             })
             .await
             .expect("finish before the timeout");
@@ -1274,6 +1284,7 @@ mod tests {
                 refresh = refresh.append_overlap(append_overlap);
             }
 
+            let notifier = Arc::new(Notify::new());
             let mut refresher = Refresher::new(
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
@@ -1283,12 +1294,12 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
+            refresher.with_notifier(Arc::clone(&notifier));
+
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
+            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
             trigger
                 .send(None)
@@ -1296,7 +1307,7 @@ mod tests {
                 .expect("trigger sent correctly to refresh");
 
             timeout(Duration::from_secs(2), async move {
-                is_ready.await.expect("data is received");
+                notifier.notified().await.expect("notification is received");
             })
             .await
             .expect("finish before the timeout");
@@ -1477,6 +1488,7 @@ mod tests {
                 refresh = refresh.append_overlap(append_overlap);
             }
 
+            let notifier = Arc::new(Notify::new());
             let mut refresher = Refresher::new(
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
@@ -1489,16 +1501,14 @@ mod tests {
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
+            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
             trigger
                 .send(None)
                 .await
                 .expect("trigger sent correctly to refresh");
 
             timeout(Duration::from_secs(2), async move {
-                is_ready.await.expect("data is received");
+                notifier.notified().await.expect("notification is received");
             })
             .await
             .expect("finish before the timeout");
