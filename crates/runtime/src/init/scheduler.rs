@@ -120,7 +120,7 @@ impl Runtime {
             }
             (_, Some(v)) => {
                 tracing::warn!(
-                    "Worker '{}' has a 'prompt' but it is not a string: {v}.\nThe worker will not be scheduled to run.\nSpecify a 'start_cron' parameter and try again.",
+                    "Worker '{}' has a 'prompt' but it is not a string: {v}.\nThe worker will not be scheduled to run.\nSpecify a valid 'prompt' parameter and try again.",
                     worker.name,
                 );
                 return Ok(());
