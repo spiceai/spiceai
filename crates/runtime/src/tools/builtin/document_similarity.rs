@@ -78,6 +78,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
             let search_request = SearchRequest::try_from(req)?;
 
             let result = vs.search(&search_request).await.boxed()?;
+
             let mut formatted = serde_json::Map::with_capacity(result.len());
             for (tbl, result) in result {
                 let displayed = to_pretty(result).await?;

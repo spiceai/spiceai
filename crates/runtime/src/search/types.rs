@@ -31,7 +31,6 @@ use snafu::ResultExt;
 use super::{CandidateAggregationSnafu, Result};
 
 pub type ModelKey = String;
-
 pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
