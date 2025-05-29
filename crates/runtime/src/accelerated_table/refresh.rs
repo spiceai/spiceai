@@ -943,9 +943,10 @@ mod tests {
             .await
             .expect("trigger sent correctly to refresh");
 
-        timeout(Duration::from_secs(2), async move {
-            notifier.notified().await.expect("notification is received");
-        })
+        timeout(
+            Duration::from_secs(2),
+            async move { notifier.notified().await },
+        )
         .await
         .expect("finish before the timeout");
 
@@ -1143,7 +1144,6 @@ mod tests {
             refresher.with_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
@@ -1152,9 +1152,10 @@ mod tests {
                 .await
                 .expect("trigger sent correctly to refresh");
 
-            timeout(Duration::from_secs(2), async move {
-                notifier.notified().await.expect("notification is received");
-            })
+            timeout(
+                Duration::from_secs(2),
+                async move { notifier.notified().await },
+            )
             .await
             .expect("finish before the timeout");
 
@@ -1297,7 +1298,6 @@ mod tests {
             refresher.with_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
 
@@ -1306,9 +1306,10 @@ mod tests {
                 .await
                 .expect("trigger sent correctly to refresh");
 
-            timeout(Duration::from_secs(2), async move {
-                notifier.notified().await.expect("notification is received");
-            })
+            timeout(
+                Duration::from_secs(2),
+                async move { notifier.notified().await },
+            )
             .await
             .expect("finish before the timeout");
 
@@ -1499,7 +1500,6 @@ mod tests {
             );
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let (ready_sender, is_ready) = oneshot::channel::<()>();
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
             trigger
@@ -1507,9 +1507,10 @@ mod tests {
                 .await
                 .expect("trigger sent correctly to refresh");
 
-            timeout(Duration::from_secs(2), async move {
-                notifier.notified().await.expect("notification is received");
-            })
+            timeout(
+                Duration::from_secs(2),
+                async move { notifier.notified().await },
+            )
             .await
             .expect("finish before the timeout");
 
