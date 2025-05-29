@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use datafusion::sql::TableReference;
 use scheduler::{
     channel::cron::CronRequestChannel,
     schedule::Schedule,
@@ -39,10 +40,13 @@ pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Runnin
 
 impl Runtime {
     pub async fn create_dataset_schedule(self: Arc<Self>, dataset: Arc<Dataset>) -> Result<()> {
-        // TODO: Actually schedule the refresh task for cron - https://github.com/spiceai/spiceai/issues/6015
-        if dataset.refresh_cron().is_none() {
+        let Some(refresh_cron) = dataset.refresh_cron().clone() else {
+            tracing::debug!(
+                "Dataset '{}' has no refresh cron specified, skipping schedule creation",
+                dataset.name
+            );
             return Ok(());
-        }
+        };
 
         tracing::debug!("Creating dataset scheduler for dataset: {}", dataset.name);
         let scheduler_lock = Arc::clone(&self.schedulers);
@@ -50,7 +54,19 @@ impl Runtime {
         let dataset_name = dataset.name.to_string().into();
 
         let refresh_task = Arc::new(DatasetRefreshTask::from(Arc::clone(&dataset)));
-        let schedule = Arc::new(Schedule::new(Arc::clone(&dataset_name), refresh_task));
+
+        let cron_request_channel = Arc::new(RwLock::new(
+            CronRequestChannel::new(&refresh_cron).context(
+                crate::FailedToCreateCronChannelSnafu {
+                    cron: refresh_cron.to_string(),
+                },
+            )?,
+        ));
+
+        let schedule = Arc::new(
+            Schedule::new(Arc::clone(&dataset_name), refresh_task)
+                .add_trigger(cron_request_channel),
+        );
 
         // a `refresh_scheduler` exists but does not contain this dataset's schedule
         if let Some(scheduler) = schedulers.get(REFRESH_SCHEDULER_NAME) {
@@ -231,6 +247,38 @@ impl Runtime {
         } else {
             tracing::debug!(
                 "No worker scheduler found, cannot remove schedule for worker: {worker_name}",
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_dataset_schedule(self: Arc<Self>, ds_name: &TableReference) -> Result<()> {
+        let scheduler_lock = Arc::clone(&self.schedulers);
+        let schedulers = scheduler_lock.read().await;
+        let dataset_name = ds_name.to_string().into();
+
+        if let Some(scheduler) = schedulers.get(REFRESH_SCHEDULER_NAME) {
+            if scheduler
+                .schedules()
+                .await
+                .iter()
+                .any(|s| s.name() == dataset_name)
+            {
+                tracing::debug!("Removing dataset schedule for dataset: {dataset_name}");
+                scheduler
+                    .remove_schedule(Arc::clone(&dataset_name))
+                    .await
+                    .context(crate::FailedToRemoveScheduleSnafu {
+                        name: dataset_name.to_string(),
+                        scheduler: REFRESH_SCHEDULER_NAME.to_string(),
+                    })?;
+            } else {
+                tracing::debug!("No dataset schedule found for dataset: {dataset_name}");
+            }
+        } else {
+            tracing::debug!(
+                "No refresh scheduler found, cannot remove schedule for dataset: {dataset_name}",
             );
         }
 
