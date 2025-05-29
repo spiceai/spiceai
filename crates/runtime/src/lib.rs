@@ -479,6 +479,11 @@ impl Runtime {
         Arc::clone(&self.token_provider_registry)
     }
 
+    #[must_use]
+    pub fn schedulers(&self) -> Arc<ScheduleRegistry> {
+        Arc::clone(&self.schedulers)
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
