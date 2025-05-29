@@ -51,6 +51,9 @@ pub enum Error {
     #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
     CandidateAggregationError { source: search::aggregation::Error },
 
+    #[snafu(display("Error occurred in search pipeline: {source}"))]
+    SearchPipelineError { source: search::pipeline::Error },
+
     #[snafu(display("Error occurred processing Arrow records: {source}"))]
     RecordProcessingError { source: ArrowError },
 
