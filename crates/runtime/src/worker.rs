@@ -18,7 +18,7 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
-use spicepod::component::worker::{Worker as WorkerComponent, WorkerType};
+use spicepod::component::worker::Worker as WorkerComponent;
 use tokio::sync::RwLock;
 use workers::RouterModel;
 
@@ -26,20 +26,37 @@ use crate::{Result, Runtime};
 
 pub type WorkerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Worker>>>>;
 
-pub fn try_construct_worker(
-    worker_type: &WorkerType,
-    worker: &WorkerComponent,
-    rt: &Runtime,
-) -> Result<Arc<dyn Worker>> {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum WorkerType {
+    #[default]
+    LoadBalance,
+}
+
+impl std::fmt::Display for WorkerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerType::LoadBalance => write!(f, "load_balance"),
+        }
+    }
+}
+
+fn infer_worker_type(worker: &WorkerComponent) -> Result<WorkerType> {
+    if worker.load_balance.is_some() {
+        Ok(WorkerType::LoadBalance)
+    } else {
+        Err(super::Error::FailedToInferWorkerType {
+            name: worker.name.clone(),
+        })
+    }
+}
+
+pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Arc<dyn Worker>> {
+    let worker_type = infer_worker_type(worker)?;
+
     match worker_type {
         WorkerType::LoadBalance => {
             let Some(load_balance) = &worker.load_balance else {
-                return Err(crate::Error::UnableToLoadWorker {
-                    source: Box::from(format!(
-                        "Worker '{}' is of 'type: {}', but has no 'load_balance' configuration",
-                        worker.name, worker.r#type
-                    )),
-                });
+                unreachable!("LoadBalance worker must have load_balance defined");
             };
 
             let model = RouterModel::new(
@@ -58,8 +75,6 @@ pub fn try_construct_worker(
 #[async_trait]
 pub trait Worker: Send + Sync {
     fn name(&self) -> Cow<'_, str>;
-
-    fn role(&self) -> WorkerType;
 
     fn description(&self) -> Option<Cow<'_, str>>;
 
@@ -80,10 +95,6 @@ impl LoadBalanceWorker {
 impl Worker for LoadBalanceWorker {
     fn name(&self) -> Cow<'_, str> {
         self.model.router_name.clone().into()
-    }
-
-    fn role(&self) -> WorkerType {
-        WorkerType::LoadBalance
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {

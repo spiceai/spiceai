@@ -385,6 +385,11 @@ pub enum Error {
         scheduler: String,
         name: String,
     },
+
+    #[snafu(display(
+        "Failed to infer the worker type for the worker '{name}'.\nEnsure the worker has a valid configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/workers"
+    ))]
+    FailedToInferWorkerType { name: String },
 }
 
 const HTTP_SERVER: &str = "http_server";

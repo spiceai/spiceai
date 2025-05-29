@@ -102,7 +102,7 @@ impl Runtime {
     }
 
     pub async fn create_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
-        let (start_cron, prompt) = match (worker.start_cron.clone(), worker.params.get("prompt")) {
+        let (start_cron, prompt) = match (worker.cron.clone(), worker.params.get("prompt")) {
             (Some(cron), Some(Value::String(prompt))) => (cron, prompt.clone()),
             (Some(_), None) => {
                 tracing::warn!(
