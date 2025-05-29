@@ -22,6 +22,7 @@ pub mod vector_search;
 use arrow_schema::ArrowError;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
+use search::aggregation;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -47,6 +48,9 @@ pub enum Error {
 
     #[snafu(display("Error occurred in search pipeline: {source}"))]
     SearchPipelineError { source: search::pipeline::Error },
+
+    #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
+    SearchAggregationError { source: aggregation::Error },
 
     #[snafu(display("Error occurred processing Arrow records: {source}"))]
     RecordProcessingError { source: ArrowError },

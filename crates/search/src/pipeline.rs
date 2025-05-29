@@ -40,6 +40,13 @@ pub enum Error {
     InvalidKeyword { keyword: String },
 }
 
+impl Error {
+    #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        matches!(self, Error::CandidateAggregationError { source } if source.is_user_error())
+    }
+}
+
 pub struct SearchPipeline {
     generators: Vec<Box<dyn CandidateGeneration>>,
     aggregator: Box<dyn CandidateAggregation>,
