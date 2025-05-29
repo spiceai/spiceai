@@ -170,7 +170,7 @@ impl VectorSearch {
                         );
                     };
 
-                    let agg_result = SearchPipeline::new(generators, Box::new(ReciprocalRankFusion)).run(
+                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
                          query.clone(),
                          where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
                           additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),

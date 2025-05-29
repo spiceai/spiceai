@@ -47,17 +47,17 @@ impl Error {
     }
 }
 
-pub struct SearchPipeline {
+pub struct SearchPipeline<A>
+where
+    A: CandidateAggregation,
+{
     generators: Vec<Box<dyn CandidateGeneration>>,
-    aggregator: Box<dyn CandidateAggregation>,
+    aggregator: A,
 }
 
-impl SearchPipeline {
+impl<A: CandidateAggregation> SearchPipeline<A> {
     #[must_use]
-    pub fn new(
-        generators: Vec<Box<dyn CandidateGeneration>>,
-        aggregator: Box<dyn CandidateAggregation>,
-    ) -> Self {
+    pub fn new(generators: Vec<Box<dyn CandidateGeneration>>, aggregator: A) -> Self {
         SearchPipeline {
             generators,
             aggregator,
@@ -125,7 +125,18 @@ fn prepare_keywords(keywords: &[String], column: &str) -> Result<Vec<Expr>, Erro
         .collect::<Result<Vec<Expr>, Error>>()
 }
 
-fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
+/// Ensure the provided keywords are valid string literal, useable as a keyword in an ILIKE expression (i.e. no SQL injection).
+pub fn valid_keywords(keywords: &[String]) -> Result<Vec<String>, Error> {
+    keywords
+        .iter()
+        .map(|k| {
+            validate_keyword_to_ilike(k.as_str(), "target_column")?; // emulate the use of the keyword in the query.
+            Ok(k.clone())
+        })
+        .collect::<Result<Vec<String>, _>>()
+}
+
+pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
     let expression = format!("{target_column} ILIKE '%{}%'", k.to_lowercase());
     let parser = Parser::new(&GenericDialect {});
     let mut parser = parser.try_with_sql(&expression).map_err(|err| {
@@ -162,7 +173,7 @@ fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error
     {
         if id.value.to_lowercase() != target_column {
             tracing::trace!(
-                "vector_search keyword parsing failed. expected 'target_column', but got {}",
+                "vector_search keyword parsing failed. expected {target_column}, but got {}",
                 id.value
             );
             return Err(Error::InvalidKeyword {
@@ -201,4 +212,31 @@ fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error
     }
 
     Ok(ilike_expr)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    #[test]
+    fn test_search_request_parse_keywords() {
+        let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
+        let result = valid_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test keyword with a space
+        let keywords = vec!["keyword 1".to_string()];
+        let result = valid_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test empty keyword
+        let keywords = vec![String::new()];
+        let result = valid_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test escaping keyword
+        let keywords = vec!["'); DROP TABLE testing;".to_string()];
+        let result = valid_keywords(&keywords);
+        assert!(result.is_err());
+    }
 }

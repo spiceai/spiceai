@@ -23,6 +23,7 @@ use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 use schemars::JsonSchema;
+use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
 
 use super::{Error, Result};
@@ -101,7 +102,7 @@ impl TryFrom<SearchRequestAIJson> for SearchRequest {
                 .transpose()?,
             SearchRequest::parse_additional_columns(&req.base.additional_columns)
                 .map_err(|e| e.to_string())?,
-            SearchRequest::parse_keywords(&req.keywords).map_err(|e| e.to_string())?,
+            valid_keywords(&req.keywords).map_err(|e| e.to_string())?,
         ))
     }
 }
@@ -355,16 +356,6 @@ impl SearchRequest {
 
         Ok(ilike_expr)
     }
-
-    pub fn parse_keywords(keywords: &[String]) -> Result<Vec<String>> {
-        keywords
-            .iter()
-            .map(|k| {
-                Self::validate_keyword_to_ilike(k.as_str(), "target_column")?; // emulate the use of the keyword in the query.
-                Ok(k.clone())
-            })
-            .collect::<Result<Vec<String>>>()
-    }
 }
 
 #[cfg(test)]
@@ -523,28 +514,6 @@ pub(crate) mod tests {
         // Test escaping column name
         let additional_columns = vec!["1; DROP TABLE testing; --".to_string()]; // would result in SELECT 1; DROP TABLE testing; -- FROM testing;
         let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_search_request_parse_keywords() {
-        let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
-        let result = SearchRequest::parse_keywords(&keywords);
-        assert!(result.is_ok());
-
-        // Test keyword with a space
-        let keywords = vec!["keyword 1".to_string()];
-        let result = SearchRequest::parse_keywords(&keywords);
-        assert!(result.is_ok());
-
-        // Test empty keyword
-        let keywords = vec![String::new()];
-        let result = SearchRequest::parse_keywords(&keywords);
-        assert!(result.is_ok());
-
-        // Test escaping keyword
-        let keywords = vec!["'); DROP TABLE testing;".to_string()];
-        let result = SearchRequest::parse_keywords(&keywords);
         assert!(result.is_err());
     }
 }
