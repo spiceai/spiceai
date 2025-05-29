@@ -70,8 +70,4 @@ impl SQLExecutor for FlightTable {
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))
     }
-
-    fn subquery_use_partial_path(&self) -> bool {
-        self.subquery_use_partial_path
-    }
 }

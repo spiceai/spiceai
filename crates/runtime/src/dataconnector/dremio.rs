@@ -170,7 +170,7 @@ impl DataConnectorFactory for DremioFactory {
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
-                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}), true);
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
     }

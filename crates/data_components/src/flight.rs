@@ -78,7 +78,6 @@ pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
-    subquery_use_partial_path: bool,
     extra_compute_context: Option<Arc<str>>,
 }
 
@@ -87,7 +86,6 @@ impl std::fmt::Debug for FlightFactory {
         f.debug_struct("FlightFactory")
             .field("name", &self.name)
             .field("client", &self.client)
-            .field("subquery_use_partial_path", &self.subquery_use_partial_path)
             .field("extra_compute_context", &self.extra_compute_context)
             .finish_non_exhaustive()
     }
@@ -95,17 +93,11 @@ impl std::fmt::Debug for FlightFactory {
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(
-        name: &'static str,
-        client: FlightClient,
-        dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
-    ) -> Self {
+    pub fn new(name: &'static str, client: FlightClient, dialect: Arc<dyn Dialect>) -> Self {
         Self {
             name,
             client,
             dialect,
-            subquery_use_partial_path,
             extra_compute_context: None,
         }
     }
@@ -139,7 +131,6 @@ impl FlightFactory {
                 table_reference,
                 schema,
                 Arc::clone(&self.dialect),
-                self.subquery_use_partial_path,
                 self.extra_compute_context.as_ref().map(Arc::clone),
             )),
             None => Arc::new(
@@ -148,7 +139,6 @@ impl FlightFactory {
                     self.client.clone(),
                     table_reference,
                     Arc::clone(&self.dialect),
-                    self.subquery_use_partial_path,
                     self.extra_compute_context.as_ref().map(Arc::clone),
                 )
                 .await?,
@@ -196,7 +186,6 @@ pub struct FlightTable {
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
     table_reference: MultiPartTableReference,
-    subquery_use_partial_path: bool,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -218,7 +207,6 @@ impl FlightTable {
         client: FlightClient,
         table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
         extra_compute_context: Option<Arc<str>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
@@ -235,7 +223,6 @@ impl FlightTable {
             table_reference,
             dialect,
             join_push_down_context,
-            subquery_use_partial_path,
         })
     }
 
@@ -245,7 +232,6 @@ impl FlightTable {
         table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
         extra_compute_context: Option<Arc<str>>,
     ) -> Self {
         let table_reference = table_reference.into();
@@ -262,7 +248,6 @@ impl FlightTable {
             table_reference,
             dialect,
             join_push_down_context,
-            subquery_use_partial_path,
         }
     }
 
