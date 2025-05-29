@@ -78,7 +78,7 @@ SELECT (now() + INTERVAL '30 days');
 
 ### `EXCEPT` and `INTERSECT` keywords are not supported
 
-**Limitation**: There is an error `Referenced table not found` or `Schema contains duplicate qualified field name` when `EXCEPT` or `INTERSECT` is used.
+**Limitation**: There is an error `Referenced table not found` or `Schema contains duplicate qualified field name` or `Duplicate alias in query` when `EXCEPT` or `INTERSECT` is used.
 
 **Solution**: Use `DISTINCT` and `IN`/`NOT IN` instead
 
