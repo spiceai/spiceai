@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q20"
+---
++--------------------+---------------------------------------+
+| s_name             | s_address                             |
++--------------------+---------------------------------------+
+| Supplier#000000091 | YV45D7TkfdQanOOZ7q9QxkyGUapU1oOWU6q3  |
+| Supplier#000000287 | 7a9SP7qW5Yku5PvSg                     |
+| Supplier#000000354 | w8fOo5W,aS                            |
+| Supplier#000000402 | i9Sw4DoyMhzhKXCH9By,AYSgmD            |
+| Supplier#000000555 | TfB,a5bfl3Ah 3Z 74GqnNs6zKVGM         |
+| Supplier#000000710 | f19YPvOyb QoYwjKC,oPycpGfieBAcwKJo    |
+| Supplier#000000736 | l6i2nMwVuovfKnuVgaSGK2rDy65DlAFLegiL7 |
+| Supplier#000000848 | tx44JAuF,Jnw1                         |
+| Supplier#000000884 | bmhEShejaS                            |
+| Supplier#000000887 | urEaTejH5POADP2ARrf                   |
++--------------------+---------------------------------------+
