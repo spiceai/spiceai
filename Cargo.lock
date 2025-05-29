@@ -11553,6 +11553,7 @@ name = "search"
 version = "1.4.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",

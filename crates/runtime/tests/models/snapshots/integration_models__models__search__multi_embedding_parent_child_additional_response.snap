@@ -1,0 +1,38 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "data": {
+        "cp_catalog_number": 1
+      },
+      "dataset": "multiple_columns",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      },
+      "score": 0.032
+    },
+    {
+      "data": {
+        "cp_catalog_number": 1
+      },
+      "dataset": "multiple_columns",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "score": 0.032
+    }
+  ]
+}

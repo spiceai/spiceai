@@ -7,18 +7,26 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
+      "dataset": "multiple_columns",
+      "matches": {
         "cp_department": "DEPARTMENT",
         "cp_description": "In general basic characters welcome. Clearly lively friends conv"
-      },
-      "dataset": "catalog_page_with_chunking",
-      "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.945
+      "score": 0.032
+    },
+    {
+      "dataset": "multiple_columns",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "score": 0.032
     }
   ]
 }

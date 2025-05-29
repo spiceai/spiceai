@@ -6,6 +6,7 @@ snapshot_kind: text
 ---
 location: path/to/folder/file_12345.txt
 dist: 0.376276
+column: content
 ---
 Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
@@ -16,6 +17,7 @@ reprehenderit nulla pariatur.
 ---
 location: path/to/folder/file_67890.txt
 dist: 0.123456
+column: content
 ---
 Lorem ipsum dolor adipiscing elit. 
 Cras venenatis euismod malesuada.
