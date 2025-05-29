@@ -45,6 +45,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
+use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
@@ -1072,6 +1073,12 @@ impl DataFusion {
         &self,
     ) -> Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>> {
         self.caching.plans.clone()
+    }
+
+    pub fn search_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>> {
+        self.caching.search.clone()
     }
 
     async fn register_accelerated_table(

@@ -14,14 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
 use arrow::error::ArrowError;
 use arrow_tools::format::to_markdown_documents;
-use cache::result::search::SearchTableResult;
-use datafusion::common::utils::quote_identifier;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;

@@ -27,10 +27,34 @@ use super::CacheStatus;
 // TODO: Move VectorSearchResult into the `search` crate to prevent circular dependency, to reuse here?
 // https://github.com/spiceai/spiceai/issues/6018
 #[derive(Clone)]
-pub struct SearchTableResult {
+pub struct CachedAggregationResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub primary_keys: Vec<Arc<str>>,
-    pub additional_columns: Vec<Arc<str>>,
+    pub data_columns: Vec<Arc<str>>,
+    pub matches: Arc<HashMap<String, Vec<String>>>,
+}
+
+impl CachedAggregationResult {
+    #[must_use]
+    pub fn new(
+        records: Arc<Vec<RecordBatch>>,
+        primary_keys: Vec<Arc<str>>,
+        data_columns: Vec<Arc<str>>,
+        matches: Arc<HashMap<String, Vec<String>>>,
+    ) -> Self {
+        Self {
+            records,
+            primary_keys,
+            data_columns,
+            matches,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedSearchResult {
+    pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+    pub cache_status: CacheStatus,
 }
 
 impl Sizeable for CachedSearchResult {
@@ -44,29 +68,15 @@ impl Sizeable for CachedSearchResult {
                     .map(arrow::array::RecordBatch::get_array_memory_size)
                     .sum::<usize>()
                     + (result.primary_keys.len() * std::mem::size_of::<Arc<str>>())
-                    + (result.additional_columns.len() * std::mem::size_of::<Arc<str>>())
+                    + (result.data_columns.len() * std::mem::size_of::<Arc<str>>())
+                    + result
+                        .matches
+                        .iter()
+                        .map(|(key, values)| {
+                            key.len() + values.iter().map(std::string::String::len).sum::<usize>()
+                        })
+                        .sum::<usize>()
             })
             .sum()
     }
-}
-
-impl SearchTableResult {
-    #[must_use]
-    pub fn new(
-        records: Arc<Vec<RecordBatch>>,
-        primary_keys: Vec<Arc<str>>,
-        additional_columns: Vec<Arc<str>>,
-    ) -> Self {
-        Self {
-            records,
-            primary_keys,
-            additional_columns,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct CachedSearchResult {
-    pub results: Arc<HashMap<TableReference, SearchTableResult>>,
-    pub cache_status: CacheStatus,
 }
