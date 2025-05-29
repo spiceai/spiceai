@@ -1,0 +1,11 @@
+name: Update HTTP to HTTPS sources
+description: 'composite action'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Use HTTPS in apt sources
+      shell: bash
+      run: |
+        sudo sed -i 's|http://|https://|g' /etc/apt/sources.list
+        sudo apt-get update
