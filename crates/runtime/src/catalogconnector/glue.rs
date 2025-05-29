@@ -215,12 +215,16 @@ impl SchemaProvider for GlueSchemaProvider {
                     .map(|a| Arc::clone(a))
                     .unwrap();
 
-                let dataset = DatasetBuilder::try_new(from, name)
+                let mut dataset = DatasetBuilder::try_new(from, name)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?
                     .with_runtime(Arc::clone(&self.state.runtime))
                     .with_app(app)
                     .build()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                dataset
+                    .params
+                    .insert("hive_partitioning_enabled".to_string(), "true".to_string());
 
                 let provider = s3
                     .read_provider(&dataset)
@@ -298,54 +302,6 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 }
 
-async fn create_hive_style_parquet_provider(
-    name: &str,
-    table: &Table,
-    state: &GlueCatalogState,
-) -> DFResult<Option<Arc<dyn TableProvider>>> {
-    let Some(storage_descriptor) = table.storage_descriptor() else {
-        return Err(DataFusionError::External(
-            format!("table `{name}` does not have a storage descriptor").into(),
-        ));
-    };
-
-    let Some(mut from) = storage_descriptor.location().map(String::from) else {
-        return Err(DataFusionError::External(
-            format!("table `{name}` does not have a location").into(),
-        ));
-    };
-
-    // trailing slash in S3 endpoint is required
-    if !from.ends_with('/') {
-        from.push_str("/");
-    }
-
-    let mut parameters = state.parameters.clone();
-
-    parameters
-        .parameters
-        .insert("endpoint".into(), from.clone().into());
-    parameters.parameters.prefix = "s3";
-
-    let s3 = S3Factory::new().create(parameters.clone()).await.unwrap();
-
-    let app = parameters.app.as_ref().map(|a| Arc::clone(a)).unwrap();
-
-    let dataset = DatasetBuilder::try_new(from, name)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?
-        .with_runtime(Arc::clone(&state.runtime))
-        .with_app(app)
-        .build()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    let provider = s3
-        .read_provider(&dataset)
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    Ok(Some(provider))
-}
-
 // copy from iceberg-catalog-glue internals
 // https://github.com/apache/iceberg-rust/blob/main/crates/catalog/glue/src/utils.rs#L256
 fn get_metadata_location(
@@ -377,9 +333,6 @@ impl GlueCatalogProvider {
                 .context(ParameterValidationSnafu)?;
         }
 
-        parameters
-            .parameters
-            .insert("hive_partitioning_enabled".to_string(), "true".into());
         parameters
             .parameters
             .insert("file_format".to_string(), "parquet".into());
