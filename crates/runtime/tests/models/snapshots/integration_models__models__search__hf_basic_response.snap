@@ -1,31 +1,38 @@
 ---
-source: crates/runtime/tests/models/mod.rs
+source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(response)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "matches": [
+  "results": [
     {
-      "dataset": "item",
-      "metadata": {
+      "data": {
         "i_color": "smoke",
         "i_item_id": "AAAAAAAADBAAAAAA"
+      },
+      "dataset": "item",
+      "matches": {
+        "i_item_desc": "Patient"
       },
       "primary_key": {
         "i_item_sk": 19
       },
-      "value": "Patient"
+      "score": 0.99
     },
     {
-      "dataset": "item",
-      "metadata": {
+      "data": {
         "i_color": "spring",
         "i_item_id": "AAAAAAAAHAAAAAAA"
+      },
+      "dataset": "item",
+      "matches": {
+        "i_item_desc": "New"
       },
       "primary_key": {
         "i_item_sk": 7
       },
-      "value": "New"
+      "score": 0.983
     }
   ]
 }

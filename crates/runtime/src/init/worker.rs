@@ -24,19 +24,21 @@ use snafu::prelude::*;
 pub enum Error {}
 
 impl Runtime {
-    pub(crate) async fn load_workers(&self) {
+    pub(crate) async fn load_workers(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 
         if let Some(app) = app_lock.as_ref() {
             for worker in &app.workers {
-                self.status
+                let runtime = Arc::clone(&self);
+                runtime
+                    .status
                     .update_worker(&worker.name, status::ComponentStatus::Initializing);
-                self.load_worker(worker).await;
+                runtime.load_worker(worker).await;
             }
         }
     }
 
-    async fn load_worker(&self, cfg: &spicepod::component::worker::Worker) {
+    async fn load_worker(self: Arc<Self>, cfg: &spicepod::component::worker::Worker) {
         let _guard = TimeMeasurement::new(
             &metrics::workers::LOAD_DURATION_MS,
             &[KeyValue::new("worker", cfg.name.clone())],
@@ -44,7 +46,7 @@ impl Runtime {
 
         tracing::info!("Loading worker [{}]...", cfg.name);
 
-        let worker = match try_construct_worker(&cfg.r#type, cfg, self) {
+        let worker = match try_construct_worker(&cfg.r#type, cfg, &self) {
             Ok(worker) => worker,
             Err(e) => {
                 tracing::error!("Failed to load worker [{}]: {e}", cfg.name);
@@ -67,34 +69,51 @@ impl Runtime {
         metrics::workers::COUNT.add(1, &[KeyValue::new("worker", cfg.name.clone())]);
         self.status
             .update_worker(&cfg.name, status::ComponentStatus::Ready);
+
+        if let Err(e) = Arc::clone(&self).create_worker_schedule(cfg.clone()).await {
+            tracing::error!("Failed to create scheduler for worker [{}]: {e}", cfg.name);
+            self.status
+                .update_worker(&cfg.name, status::ComponentStatus::Error);
+        } else {
+            tracing::info!("Scheduler for worker [{}] created successfully", cfg.name);
+        }
     }
 
-    async fn remove_worker(&self, cfg: &spicepod::component::worker::Worker) {
+    async fn remove_worker(self: Arc<Self>, cfg: &spicepod::component::worker::Worker) {
         let mut llm_registry = self.llms.write().await;
         llm_registry.remove(&cfg.name);
+
+        if let Err(e) = Arc::clone(&self).remove_worker_schedule(cfg.clone()).await {
+            tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
+            self.status
+                .update_worker(&cfg.name, status::ComponentStatus::Error);
+            return;
+        }
 
         tracing::info!("Worker [{}] has been unloaded", cfg.name);
         metrics::workers::COUNT.add(-1, &[KeyValue::new("worker", cfg.name.clone())]);
     }
 
-    async fn update_worker(&self, worker_config: &spicepod::component::worker::Worker) {
+    async fn update_worker(self: Arc<Self>, worker_config: &spicepod::component::worker::Worker) {
         self.status
             .update_worker(&worker_config.name, status::ComponentStatus::Refreshing);
-        self.remove_worker(worker_config).await;
-        self.load_worker(worker_config).await;
+        Arc::clone(&self).remove_worker(worker_config).await;
+        Arc::clone(&self).load_worker(worker_config).await;
     }
 
     pub(crate) async fn apply_worker_diff(
-        &self,
+        self: Arc<Self>,
         current_app: &Arc<app::App>,
         new_app: &Arc<app::App>,
     ) {
         // Remove workers that are no longer in the app
         for worker in &current_app.workers {
             if !new_app.workers.iter().any(|w| w.name == worker.name) {
-                self.status
+                let runtime = Arc::clone(&self);
+                runtime
+                    .status
                     .update_worker(&worker.name, status::ComponentStatus::Disabled);
-                self.remove_worker(worker).await;
+                runtime.remove_worker(worker).await;
             }
         }
 
@@ -102,12 +121,14 @@ impl Runtime {
             if let Some(current_worker) = current_app.workers.iter().find(|w| w.name == worker.name)
             {
                 if current_worker != worker {
-                    self.update_worker(worker).await;
+                    Arc::clone(&self).update_worker(worker).await;
                 }
             } else {
-                self.status
+                let runtime = Arc::clone(&self);
+                runtime
+                    .status
                     .update_worker(&worker.name, status::ComponentStatus::Initializing);
-                self.load_worker(worker).await;
+                runtime.load_worker(worker).await;
             }
         }
     }

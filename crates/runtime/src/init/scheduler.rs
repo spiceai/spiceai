@@ -17,15 +17,23 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use scheduler::{
+    channel::cron::CronRequestChannel,
     schedule::Schedule,
     scheduler::{Running, Scheduler, SchedulerBuilder},
 };
+use serde_json::Value;
 use snafu::ResultExt;
+use spicepod::component::worker::Worker;
 use tokio::sync::RwLock;
 
-use crate::{Result, Runtime, component::dataset::Dataset, scheduling::DatasetRefreshTask};
+use crate::{
+    Result, Runtime,
+    component::dataset::Dataset,
+    scheduling::{DatasetRefreshTask, WorkerPromptTask},
+};
 
 const REFRESH_SCHEDULER_NAME: &str = "refresh_scheduler";
+const WORKER_SCHEDULER_NAME: &str = "worker_scheduler";
 
 pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Running>>>>;
 
@@ -89,6 +97,142 @@ impl Runtime {
         );
 
         schedulers.insert(REFRESH_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
+
+        Ok(())
+    }
+
+    pub async fn create_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
+        let (start_cron, prompt) = match (worker.start_cron.clone(), worker.params.get("prompt")) {
+            (Some(cron), Some(Value::String(prompt))) => (cron, prompt.clone()),
+            (Some(_), None) => {
+                tracing::warn!(
+                    "Worker '{}' has a 'start_cron' but no prompt is specified.\nThe worker will not be scheduled to run.\nSpecify a 'prompt' parameter and try again.",
+                    worker.name
+                );
+                return Ok(());
+            }
+            (None, Some(Value::String(_))) => {
+                tracing::warn!(
+                    "Worker '{}' has a 'prompt' but no 'start_cron' is specified.\nThe worker will not be scheduled to run.\nSpecify a 'start_cron' parameter and try again.",
+                    worker.name
+                );
+                return Ok(());
+            }
+            (_, Some(v)) => {
+                tracing::warn!(
+                    "Worker '{}' has a 'prompt' but it is not a string: {v}.\nThe worker will not be scheduled to run.\nSpecify a valid 'prompt' parameter and try again.",
+                    worker.name,
+                );
+                return Ok(());
+            }
+            (None, None) => {
+                tracing::debug!(
+                    "Worker {} has no start cron or prompt, skipping schedule creation",
+                    worker.name
+                );
+                return Ok(());
+            }
+        };
+
+        let scheduler_lock = Arc::clone(&self.schedulers);
+        let mut schedulers = scheduler_lock.write().await;
+        let worker_name = worker.name.to_string().into();
+
+        let worker_prompt_task = Arc::new(WorkerPromptTask::new(
+            Arc::clone(&self),
+            Arc::new(worker),
+            Arc::from(prompt),
+        ));
+
+        let cron_request_channel = Arc::new(RwLock::new(
+            CronRequestChannel::new(&start_cron.clone().into()).context(
+                crate::FailedToCreateCronChannelSnafu {
+                    cron: start_cron.clone(),
+                },
+            )?,
+        ));
+
+        let schedule = Arc::new(
+            Schedule::new(Arc::clone(&worker_name), worker_prompt_task)
+                .add_trigger(cron_request_channel),
+        );
+
+        tracing::debug!("Creating worker schedule for worker: {worker_name}");
+
+        if let Some(scheduler) = schedulers.get(WORKER_SCHEDULER_NAME) {
+            if scheduler
+                .schedules()
+                .await
+                .iter()
+                .any(|s| s.name() == schedule.name())
+            {
+                tracing::debug!(
+                    "Worker schedule already exists in worker scheduler for worker: {worker_name}",
+                );
+                return Ok(());
+            }
+
+            tracing::debug!(
+                "Adding worker schedule to existing worker scheduler for worker: {worker_name}",
+            );
+            scheduler
+                .add_schedule(schedule)
+                .await
+                .context(crate::FailedToAddScheduleSnafu {
+                    name: worker_name.to_string(),
+                    scheduler: WORKER_SCHEDULER_NAME.to_string(),
+                })?;
+            return Ok(());
+        }
+
+        // create a new 'worker_scheduler' if it doesn't exist
+        tracing::debug!("Creating new worker scheduler for worker schedule: {worker_name}",);
+
+        let scheduler = Arc::new(
+            SchedulerBuilder::new(WORKER_SCHEDULER_NAME.into())
+                .add_schedule(schedule)
+                .build()
+                .context(crate::FailedToBuildSchedulerSnafu)?
+                .start()
+                .await
+                .context(crate::FailedToStartSchedulerSnafu)?,
+        );
+        schedulers.insert(WORKER_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
+        tracing::debug!(
+            "Worker scheduler created for worker '{worker_name}' with cron: {start_cron}",
+        );
+
+        Ok(())
+    }
+
+    pub async fn remove_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
+        let scheduler_lock = Arc::clone(&self.schedulers);
+        let schedulers = scheduler_lock.read().await;
+        let worker_name = worker.name.to_string().into();
+
+        if let Some(scheduler) = schedulers.get(WORKER_SCHEDULER_NAME) {
+            if scheduler
+                .schedules()
+                .await
+                .iter()
+                .any(|s| s.name() == worker_name)
+            {
+                tracing::debug!("Removing worker schedule for worker: {worker_name}",);
+                scheduler
+                    .remove_schedule(Arc::clone(&worker_name))
+                    .await
+                    .context(crate::FailedToRemoveScheduleSnafu {
+                        name: worker_name.to_string(),
+                        scheduler: WORKER_SCHEDULER_NAME.to_string(),
+                    })?;
+            } else {
+                tracing::debug!("No worker schedule found for worker: {worker_name}",);
+            }
+        } else {
+            tracing::debug!(
+                "No worker scheduler found, cannot remove schedule for worker: {worker_name}",
+            );
+        }
 
         Ok(())
     }

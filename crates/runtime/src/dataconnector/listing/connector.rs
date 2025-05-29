@@ -988,7 +988,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for TestObjectStore {
-        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             stream::iter(self.meta.clone().into_iter().map(Ok)).boxed()
         }
 
@@ -1053,7 +1056,7 @@ mod tests {
         }
     }
 
-    fn create_meta(location: &str, last_modified_secs: i64, size: usize) -> ObjectMeta {
+    fn create_meta(location: &str, last_modified_secs: i64, size: u64) -> ObjectMeta {
         ObjectMeta {
             location: Path::from(location),
             last_modified: Utc

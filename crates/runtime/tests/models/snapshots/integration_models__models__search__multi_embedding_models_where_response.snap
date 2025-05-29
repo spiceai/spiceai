@@ -1,0 +1,43 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "multi_embedding_models",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "score": 0.032
+    },
+    {
+      "dataset": "multi_embedding_models",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 6
+      },
+      "score": 0.032
+    },
+    {
+      "dataset": "multi_embedding_models",
+      "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make a"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 8
+      },
+      "score": 0.031
+    }
+  ]
+}

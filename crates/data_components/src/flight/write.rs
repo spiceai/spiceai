@@ -18,15 +18,14 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    datasource::{TableProvider, TableType},
+    datasource::{
+        TableProvider, TableType,
+        sink::{DataSink, DataSinkExec},
+    },
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, dml::InsertOp},
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan,
-        insert::{DataSink, DataSinkExec},
-        metrics::MetricsSet,
-    },
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::MetricsSet},
     sql::TableReference,
 };
 use flight_client::FlightClient;

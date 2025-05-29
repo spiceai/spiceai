@@ -146,7 +146,7 @@ fn strip_prefix<'a, 'b: 'a>(
 mod tests {
     use super::*;
 
-    fn create_test_object_meta(path: &str, size: usize) -> ObjectMeta {
+    fn create_test_object_meta(path: &str, size: u64) -> ObjectMeta {
         ObjectMeta {
             location: object_store::path::Path::from(path),
             last_modified: chrono::Utc::now(),

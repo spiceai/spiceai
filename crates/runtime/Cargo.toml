@@ -23,7 +23,9 @@ async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1.6.1", optional = true }
+aws-credential-types = "1.2"
 aws-sdk-dynamodb = { version = "1", optional = true }
+aws-sdk-glue = "1"
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true

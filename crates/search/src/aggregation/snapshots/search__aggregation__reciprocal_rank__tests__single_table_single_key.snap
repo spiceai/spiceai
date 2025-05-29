@@ -11,7 +11,7 @@ WITH bm25 AS (
 )
 SELECT
     TRUNC(coalesce(1.0/(bm25.rank + 42), 0), 6) AS score,
-    bm25.value as value,
+    bm25.value AS value_0,
     coalesce(bm25.doc_id) as doc_id
 FROM bm25
 

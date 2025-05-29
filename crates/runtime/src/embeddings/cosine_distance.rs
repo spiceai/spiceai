@@ -25,6 +25,7 @@ use datafusion::common::cast::{
     as_float32_array, as_float64_array, as_generic_list_array, as_int32_array, as_int64_array,
 };
 use datafusion::common::utils::coerced_fixed_size_list_to_list;
+use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
@@ -137,8 +138,8 @@ impl ScalarUDFImpl for CosineDistance {
         Ok(result)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
-        make_scalar_function(cosine_distance_inner)(args)
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        make_scalar_function(cosine_distance_inner)(&args.args)
     }
 }
 
