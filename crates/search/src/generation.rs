@@ -16,12 +16,27 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::sqlparser::ast::Expr;
 use snafu::Snafu;
 
+#[cfg(feature = "text_search")]
+use tantivy::TantivyError;
+use tantivy::query::QueryParserError;
+
+#[cfg(feature = "text_search")]
+pub mod text_search;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Error occured during search: {source}"))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[cfg(feature = "text_search")]
+    #[snafu(display(""))]
+    TextSearchError { source: TantivyError },
+
+    #[cfg(feature = "text_search")]
+    #[snafu(display("Error occured during search: {source}"))]
+    InvalidTextSearchQueryError { source: QueryParserError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

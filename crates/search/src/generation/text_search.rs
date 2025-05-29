@@ -1,0 +1,234 @@
+use std::{collections::HashMap, sync::Arc};
+
+use arrow::{array::RecordBatch, datatypes::Schema};
+use arrow_json::reader::Decoder;
+use async_stream::stream;
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+     https://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use crate::SEARCH_SCORE_COLUMN_NAME;
+use async_trait::async_trait;
+use datafusion::{
+    error::DataFusionError, execution::SendableRecordBatchStream,
+    logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
+};
+use futures::stream;
+use serde_json::{Number, Value};
+use snafu::ResultExt;
+use tantivy::{
+    Document, Index, ReloadPolicy, Searcher, TantivyDocument,
+    collector::TopDocs,
+    query::QueryParser,
+    query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
+    schema::{Field, OwnedValue},
+};
+
+use super::{
+    CandidateGeneration, InternalSnafu, InvalidTextSearchQuerySnafu, Result, TextSearchSnafu,
+};
+
+pub struct FullTextSearch {
+    idx: Arc<Index>,
+    field: String,
+}
+
+impl FullTextSearch {
+    pub fn new(index: Arc<Index>, field: String) -> Self {
+        Self { idx: index, field }
+    }
+}
+
+impl FullTextSearch {
+    fn index_searcher(&self) -> Result<Searcher> {
+        Ok(self
+            .idx
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .context(TextSearchSnafu)?
+            .searcher())
+    }
+
+    fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
+        // let q = QueryParser::for_index(&self.idx, vec![])
+        //     .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
+        //         UserInputLiteral {
+        //             field_name: Some(self.field.clone()),
+        //             phrase: literal.to_string(),
+        //             delimiter: Delimiter::None,
+        //             slop: 0,
+        //             prefix: false,
+        //         },
+        //     ))))
+        //     .context(InvalidTextSearchQuerySnafu)?;
+
+        let default_field = self
+            .idx
+            .schema()
+            .get_field(self.field.as_str())
+            .context(TextSearchSnafu)?;
+        let q = QueryParser::for_index(&self.idx, vec![default_field])
+            .parse_query(literal)
+            .context(InvalidTextSearchQuerySnafu)?;
+
+        let schema = self.idx.schema();
+        let searcher = self.index_searcher()?;
+        let top_docs = searcher
+            .search(&q, &TopDocs::with_limit(limit))
+            .context(TextSearchSnafu)?
+            .into_iter()
+            .map(|(score, addr)| {
+                println!("Got a doc @ {addr:?} scoring={score}");
+                let doc: HashMap<Field, OwnedValue> =
+                    searcher.doc(addr).context(TextSearchSnafu)?;
+
+                let mut v = serde_json::to_value(
+                    doc.into_iter()
+                        .map(|(f, v)| (schema.get_field_name(f), v))
+                        .collect::<HashMap<_, _>>(),
+                )
+                .boxed()
+                .context(InternalSnafu)?;
+                if let Some(num) = Number::from_f64(score as f64) {
+                    v[SEARCH_SCORE_COLUMN_NAME] = Value::Number(num);
+                }
+                Ok(v)
+            })
+            .collect::<Result<Vec<Value>>>()?;
+
+        Ok(top_docs)
+    }
+}
+
+#[async_trait]
+impl CandidateGeneration for FullTextSearch {
+    async fn search(
+        &self,
+        query: String,
+        opt_filters: &[&Expr],
+        addition_projection: &[&Expr],
+        limit: usize,
+    ) -> Result<SendableRecordBatchStream> {
+        let v = self.search_query_literal(query.as_str(), limit)?;
+
+        let schema = Arc::new(
+            arrow_json::reader::infer_json_schema_from_iterator(v.iter().map(Ok)).unwrap(),
+        );
+        let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema))
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(v.as_slice()).unwrap();
+
+        let strm = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream! {
+                match decoder.flush() {
+                    Ok(Some(rb)) => yield Ok(rb),
+                    Ok(None) => {
+                      tracing::debug!("Empty results");
+                    },
+                    Err(e) => yield Err(DataFusionError::ArrowError(e, None))
+                }
+            },
+        )) as SendableRecordBatchStream;
+
+        Ok(strm)
+    }
+
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<bool>> {
+        Ok(vec![])
+    }
+
+    /// Whether additional columns of the underlying source can also be retrieved during generation.
+    fn supports_columns(&self, projection: &[&Expr]) -> Result<Vec<bool>> {
+        Ok(vec![])
+    }
+
+    /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
+    fn value_derived_from(&self) -> String {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::physical_plan::common::collect;
+    use tantivy::{
+        Index, IndexWriter, doc,
+        schema::{STORED, Schema, TEXT},
+    };
+
+    use crate::{
+        aggregation::write_to_json_string,
+        generation::{CandidateGeneration, text_search::FullTextSearch},
+    };
+
+    fn create_basic_index() -> Index {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT | STORED);
+        let body = schema_builder.add_text_field("body", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index
+            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+            .expect("Failed to make index writer");
+        index_writer.add_document(doc!(
+            title => "The Old Man and the Sea",
+            body => "He was an old man who fished alone in a skiff in the Gulf Stream and he had gone \
+              eighty-four days now without taking a fish.",
+        )).expect("failed to add document");
+
+        index_writer.add_document(doc!(
+        title => "Of Mice and Men",
+        body => "A few miles south of Soledad, the Salinas River drops in close to the hillside \
+                bank and runs deep and green. The water is warm too, for it has slipped twinkling \
+                over the yellow sands in the sunlight before reaching the narrow pool. On one \
+                side of the river the golden foothill slopes curve up to the strong and rocky \
+                Gabilan Mountains, but on the valley side the water is lined with fish and trees—willows \
+                fresh and green with every spring, carrying in their lower leaf junctures the \
+                debris of the winter’s flooding; and sycamores with mottled, white, recumbent \
+                limbs and branches that arch over the pool."
+        )).expect("failed to add document");
+
+        index_writer.add_document(doc!(
+        title => "Frankenstein",
+        body => "You will rejoice to hear that no disaster has accompanied the commencement of an \
+                 enterprise which you have regarded with such evil forebodings.  I arrived here \
+                 yesterday, and my first task is to assure my dear sister of my welfare and \
+                 increasing confidence in the success of getting fish."
+        )).expect("failed to add document");
+
+        index_writer.commit().expect("failed to commit documents");
+
+        index
+    }
+
+    #[tokio::test]
+    async fn test_basic_index() {
+        let result = FullTextSearch::new(Arc::new(create_basic_index()), "body".to_string())
+            .search("fish".into(), &[], &[], 3)
+            .await
+            .expect("Search was unsuccessful");
+
+        let rbs = collect(result)
+            .await
+            .expect("failed to collect search results");
+
+        let rb_json =
+            write_to_json_string(rbs.as_slice()).expect("failed to write RecordBatch to JSON");
+
+        insta::assert_snapshot!(rb_json);
+    }
+}
