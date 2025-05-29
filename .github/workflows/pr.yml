@@ -74,6 +74,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Update HTTP sources to HTTPS
+        uses: ./.github/actions/update-http-sources
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/setup-go@v5
@@ -154,6 +158,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Update HTTP sources to HTTPS
+        uses: ./.github/actions/update-http-sources
+        if: needs.check_changes.outputs.relevant_changes == 'true'
 
       - name: Set up Go
         uses: actions/setup-go@v5
