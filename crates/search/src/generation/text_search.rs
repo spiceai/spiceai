@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::Schema};
+use arrow::{array::RecordBatch, datatypes::Schema, error::ArrowError};
 use arrow_json::reader::Decoder;
 use async_stream::stream;
 /*
@@ -21,20 +21,42 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
 };
-use futures::stream;
 use serde_json::{Number, Value};
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Document, Index, ReloadPolicy, Searcher, TantivyDocument,
+    Index, ReloadPolicy, Searcher, TantivyError,
     collector::TopDocs,
-    query::QueryParser,
+    query::{QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{Field, OwnedValue},
 };
 
 use super::{
-    CandidateGeneration, InternalSnafu, InvalidTextSearchQuerySnafu, Result, TextSearchSnafu,
+    CandidateGeneration, InternalSnafu, Result as GenerationResult,
+    TextSearchSnafu as GenerationTextSearchSnafu,
 };
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(""))]
+    TextSearchError { source: TantivyError },
+
+    #[snafu(display(""))]
+    InvalidTextSearchQueryError {
+        source: QueryParserError,
+        query: String,
+    },
+
+    #[snafu(display("Failed to infer an Arrow schema from JSON format. Error: {source}"))]
+    ArrowSchemaError { source: ArrowError },
+
+    #[snafu(display("Failed to convert JSON values to Arrow format. Error: {source}"))]
+    ArrowConversionError { source: ArrowError },
+
+    #[snafu(display(""))]
+    SerdeJsonError { source: serde_json::Error },
+}
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct FullTextSearch {
     idx: Arc<Index>,
@@ -59,26 +81,20 @@ impl FullTextSearch {
     }
 
     fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
-        // let q = QueryParser::for_index(&self.idx, vec![])
-        //     .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
-        //         UserInputLiteral {
-        //             field_name: Some(self.field.clone()),
-        //             phrase: literal.to_string(),
-        //             delimiter: Delimiter::None,
-        //             slop: 0,
-        //             prefix: false,
-        //         },
-        //     ))))
-        //     .context(InvalidTextSearchQuerySnafu)?;
-
-        let default_field = self
-            .idx
-            .schema()
-            .get_field(self.field.as_str())
-            .context(TextSearchSnafu)?;
-        let q = QueryParser::for_index(&self.idx, vec![default_field])
-            .parse_query(literal)
-            .context(InvalidTextSearchQuerySnafu)?;
+        // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
+        let q = QueryParser::for_index(&self.idx, vec![])
+            .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
+                UserInputLiteral {
+                    field_name: Some(self.field.clone()),
+                    phrase: literal.to_string(),
+                    delimiter: Delimiter::None,
+                    slop: 0,
+                    prefix: false,
+                },
+            ))))
+            .context(InvalidTextSearchQuerySnafu {
+                query: literal.to_string(),
+            })?;
 
         let schema = self.idx.schema();
         let searcher = self.index_searcher()?;
@@ -87,17 +103,15 @@ impl FullTextSearch {
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
-                println!("Got a doc @ {addr:?} scoring={score}");
                 let doc: HashMap<Field, OwnedValue> =
                     searcher.doc(addr).context(TextSearchSnafu)?;
 
-                let mut v = serde_json::to_value(
-                    doc.into_iter()
-                        .map(|(f, v)| (schema.get_field_name(f), v))
-                        .collect::<HashMap<_, _>>(),
-                )
-                .boxed()
-                .context(InternalSnafu)?;
+                let doc_w_col_names = doc
+                    .into_iter()
+                    .map(|(f, v)| (schema.get_field_name(f), v))
+                    .collect::<HashMap<_, _>>();
+
+                let mut v = serde_json::to_value(&doc_w_col_names).context(SerdeJsonSnafu)?;
                 if let Some(num) = Number::from_f64(score as f64) {
                     v[SEARCH_SCORE_COLUMN_NAME] = Value::Number(num);
                 }
@@ -114,28 +128,36 @@ impl CandidateGeneration for FullTextSearch {
     async fn search(
         &self,
         query: String,
-        opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
+        _opt_filters: &[&Expr],
+        _addition_projection: &[&Expr],
         limit: usize,
-    ) -> Result<SendableRecordBatchStream> {
-        let v = self.search_query_literal(query.as_str(), limit)?;
+    ) -> GenerationResult<SendableRecordBatchStream> {
+        let hits = self
+            .search_query_literal(query.as_str(), limit)
+            .context(GenerationTextSearchSnafu)?;
 
         let schema = Arc::new(
-            arrow_json::reader::infer_json_schema_from_iterator(v.iter().map(Ok)).unwrap(),
+            arrow_json::reader::infer_json_schema_from_iterator(hits.iter().map(Ok))
+                .context(ArrowSchemaSnafu)
+                .context(GenerationTextSearchSnafu)?,
         );
+
         let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema))
             .build_decoder()
-            .unwrap();
-        decoder.serialize(v.as_slice()).unwrap();
+            .context(ArrowSchemaSnafu)
+            .context(GenerationTextSearchSnafu)?;
+
+        decoder
+            .serialize(hits.as_slice())
+            .context(ArrowConversionSnafu)
+            .context(GenerationTextSearchSnafu)?;
 
         let strm = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream! {
                 match decoder.flush() {
                     Ok(Some(rb)) => yield Ok(rb),
-                    Ok(None) => {
-                      tracing::debug!("Empty results");
-                    },
+                    Ok(None) => {},
                     Err(e) => yield Err(DataFusionError::ArrowError(e, None))
                 }
             },
@@ -144,12 +166,12 @@ impl CandidateGeneration for FullTextSearch {
         Ok(strm)
     }
 
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<bool>> {
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
         Ok(vec![])
     }
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
-    fn supports_columns(&self, projection: &[&Expr]) -> Result<Vec<bool>> {
+    fn supports_columns(&self, projection: &[&Expr]) -> GenerationResult<Vec<bool>> {
         Ok(vec![])
     }
 
