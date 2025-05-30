@@ -70,7 +70,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "spiceai-runners",
+                builder: "spiceai-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
@@ -104,7 +104,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Update HTTP sources to HTTPS
-        if: matrix.target.builder == 'spiceai-runners'
+        if: matrix.target.builder == 'spiceai-dev-runners'
         uses: ./.github/actions/update-http-sources
 
       - name: Set REL_VERSION from version.txt

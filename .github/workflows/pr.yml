@@ -66,7 +66,7 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     env:
       GOVER: 1.24.2
     needs: check_changes
@@ -100,7 +100,7 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
@@ -112,7 +112,7 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
 
       - name: Install Protoc
@@ -131,8 +131,8 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
 
       - name: Show sccache stats
@@ -151,7 +151,7 @@ jobs:
 
   build:
     name: Build Go & Rust
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     env:
       GOVER: 1.24.2
     needs: check_changes
@@ -176,7 +176,7 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
@@ -188,7 +188,7 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
 
       - name: Set up make
@@ -201,8 +201,8 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
 
       - name: Show sccache stats
@@ -211,7 +211,7 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     needs: check_changes
 
     steps:
