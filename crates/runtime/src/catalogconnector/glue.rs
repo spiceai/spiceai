@@ -39,6 +39,8 @@ mod state;
 
 use provider::GlueCatalogProvider;
 
+pub static PREFIX: &str = "glue";
+
 pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     vec![
         ParameterSpec::component("region")
@@ -123,7 +125,7 @@ pub struct GlueCatalog {
 
 impl GlueCatalog {
     #[must_use]
-    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub fn new(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }
@@ -143,7 +145,7 @@ impl CatalogConnector for GlueCatalog {
             GlueCatalogProvider::new(self.params.clone(), catalog, runtime)
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                    connector: "glue".to_string(),
+                    connector: PREFIX.to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })?,
