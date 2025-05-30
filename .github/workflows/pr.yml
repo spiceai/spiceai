@@ -34,7 +34,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a sucess when skipped).
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
