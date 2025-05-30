@@ -39,24 +39,24 @@ mod state;
 
 use provider::GlueCatalogProvider;
 
-pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    let mut all_parameters = Vec::new();
-    all_parameters.extend_from_slice(&[
+pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    vec![
         ParameterSpec::component("region")
-            .description("The AWS region to use for Glue.")
+            .description("The AWS region for Glue operations")
             .secret(),
         ParameterSpec::component("key")
-            .description("The AWS access key ID to use for Glue.")
+            .description("The AWS access key ID for Glue authentication")
             .secret(),
         ParameterSpec::component("secret")
-            .description("The AWS secret access key to use for Glue.")
+            .description("The AWS secret access key for Glue authentication")
             .secret(),
         ParameterSpec::component("session_token")
-            .description("The AWS session token to use for Glue.")
+            .description("The AWS session token for Glue authentication")
             .secret(),
-    ]);
-    all_parameters.extend_from_slice(&s3::PARAMETERS);
-    all_parameters
+    ]
+    .into_iter()
+    .chain(s3::PARAMETERS.iter().cloned())
+    .collect()
 });
 
 static VALIDATORS: LazyLock<Vec<Box<dyn Validator + Send + Sync + 'static>>> =
