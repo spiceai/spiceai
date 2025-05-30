@@ -40,7 +40,7 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::FederationAnalyzerRule;
+use datafusion_federation::sql::federation_analyzer_rule;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::{embeddings, status};
@@ -244,7 +244,7 @@ impl DataFusionBuilder {
 #[must_use]
 pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
-        Arc::new(FederationAnalyzerRule::new()),
+        Arc::new(federation_analyzer_rule()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),

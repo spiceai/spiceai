@@ -19,6 +19,7 @@ use std::sync::Arc;
 use datafusion_federation::FederationProvider;
 
 #[allow(clippy::struct_field_names)]
+#[derive(Debug)]
 pub struct AcceleratedTableFederationProvider {
     enabled: bool,
     provider: Option<Arc<dyn FederationProvider>>,
