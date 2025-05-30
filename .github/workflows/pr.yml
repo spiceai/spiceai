@@ -13,14 +13,14 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: "Which Rust build profile to use? (Default is dev)"
+        description: "Which Rust build profile to use? (Default is ci)"
         required: false
         type: choice
         options:
-          - "dev"
+          - "ci"
           - "release"
           - "release-lto"
-        default: "dev"
+        default: "ci"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -28,7 +28,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'dev' }}
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'ci' }}
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -136,6 +136,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -175,6 +176,11 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+        
+      - name: Install Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Check if sccache can be set up
         run: |
@@ -199,7 +205,7 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make build-cli test
+      - run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -207,6 +213,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
