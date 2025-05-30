@@ -420,7 +420,7 @@ impl Runtime {
     }
 
     async fn remove_dataset(
-        &self,
+        self: Arc<Self>,
         ds_name: TableReference,
         ds_acceleration: Option<&Acceleration>,
     ) {
@@ -448,6 +448,13 @@ impl Runtime {
                 }
             },
         );
+
+        if ds_acceleration.is_some() {
+            if let Err(e) = Arc::clone(&self).remove_dataset_schedule(&ds_name).await {
+                tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
+            }
+        }
+
         metrics::datasets::COUNT.add(-1, &[KeyValue::new("engine", engine)]);
     }
 
@@ -481,7 +488,8 @@ impl Runtime {
                     );
                 }
 
-                self.remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                Arc::clone(&self)
+                    .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
                 if Arc::clone(&self)
@@ -544,6 +552,9 @@ impl Runtime {
         let federated_table =
             FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
 
+        // Remove the schedule if the dataset has one, to prevent scheduling while the dataset is being updated.
+        Arc::clone(&self).remove_dataset_schedule(&ds.name).await?;
+
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
@@ -557,6 +568,11 @@ impl Runtime {
         is_ready
             .await
             .context(UnableToReceiveAcceleratedTableStatusSnafu)?;
+
+        // recreate the scheduler, which also recreates with any updated parameters
+        Arc::clone(&self)
+            .create_dataset_schedule(Arc::clone(&ds))
+            .await?;
 
         tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
@@ -756,7 +772,9 @@ impl Runtime {
 
                 self.status
                     .update_dataset(&ds_name, status::ComponentStatus::Disabled);
-                self.remove_dataset(ds_name, ds_acceleration.as_ref()).await;
+                Arc::clone(&self)
+                    .remove_dataset(ds_name, ds_acceleration.as_ref())
+                    .await;
             }
         }
     }

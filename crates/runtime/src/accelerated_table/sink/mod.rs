@@ -27,6 +27,7 @@ use super::synchronized_table::SynchronizedTable;
 pub(crate) mod multi;
 pub(crate) mod table;
 
+#[derive(Debug)]
 pub enum AccelerationSink {
     Table(TableSink),
     Multi(MultiSink),

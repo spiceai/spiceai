@@ -21,6 +21,7 @@ use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 use futures::StreamExt;
 pub mod aggregation;
 pub mod generation;
+pub mod pipeline;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "value";
@@ -34,4 +35,18 @@ pub async fn collect_batches(
     }
 
     Ok(batches)
+}
+
+/// The results of [`CandidateGeneration::search`]'s on a single table.
+///
+/// Rows from different [`SendableRecordBatchStream`]s with an equal `primary_key` are considered the same row.
+pub struct VectorSearchGenerationTableResult {
+    pub data: Vec<VectorSearchGenerationResult>,
+    pub primary_keys: Vec<String>,
+}
+
+/// The results of a single [`CandidateGeneration::search`].
+pub struct VectorSearchGenerationResult {
+    pub data: SendableRecordBatchStream,
+    pub derived_from: String,
 }

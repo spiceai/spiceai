@@ -329,6 +329,94 @@ impl Scheduler<Running> {
 
         Ok(())
     }
+
+    /// Removes a running schedule from the scheduler.
+    ///
+    /// # Errors
+    ///
+    /// - If the schedule with the specified name does not exist.
+    pub async fn remove_schedule(&self, schedule_name: Arc<str>) -> Result<()> {
+        let mut schedules = self.state.schedules.write().await;
+        if let Some(index) = schedules.iter().position(|s| s.name() == schedule_name) {
+            schedules.remove(index);
+        } else {
+            return Err(crate::Error::ScheduleNotFound {
+                name: schedule_name.to_string(),
+            });
+        }
+
+        // Remove the request handles for the schedule
+        let handles = self
+            .state
+            .request_handles
+            .write()
+            .await
+            .remove(&schedule_name);
+
+        if let Some(handles) = handles {
+            for handle in handles {
+                handle.abort();
+                match handle.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("Request channel completed successfully");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Request channel execution failed: {e}");
+                    }
+                    Err(e) => {
+                        if !e.is_cancelled() {
+                            // Only log errors that are not due to cancellation
+                            // (which is expected when stopping the scheduler)
+                            tracing::error!("Request channel join error: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove the scheduler handles for the schedule
+        let handles = self
+            .state
+            .scheduler_handles
+            .write()
+            .await
+            .remove(&schedule_name);
+
+        if let Some(handles) = handles {
+            for handle in handles {
+                handle.abort();
+                match handle.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("Scheduler task completed successfully");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Scheduler task execution failed: {e}");
+                    }
+                    Err(e) => {
+                        if !e.is_cancelled() {
+                            // Only log errors that are not due to cancellation
+                            // (which is expected when stopping the scheduler)
+                            tracing::error!("Scheduler task join error: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove the request and submission channels for the schedule
+        self.state
+            .request_channels
+            .write()
+            .await
+            .remove(&schedule_name);
+        self.state
+            .submission_channels
+            .write()
+            .await
+            .remove(&schedule_name);
+
+        Ok(())
+    }
 }
 
 // ========== Tests ==========
@@ -378,6 +466,7 @@ mod test {
             0,
         );
         map.insert(Arc::from("test_adding_trigger_to_existing_schedule"), 0);
+        map.insert(Arc::from("test_remove_schedule"), 0);
 
         RwLock::new(map)
     });
@@ -692,7 +781,7 @@ mod test {
             .add_schedule(Arc::new(new_schedule))
             .await
             .expect("To add new schedule");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5250)).await;
 
         scheduler.stop().await;
         let map_lock = TEST_EXECUTION_COUNT.read().await;
@@ -701,7 +790,7 @@ mod test {
             .expect("To get test execution count");
         assert!(
             *count == 9 || *count == 10,
-            "Test component should have executed 9 or 10 times, but got {count}"
+            "Test component should have executed 9 or 10 times, but got {count}" // environment load in CI can cause this to vary
         );
         let count = map_lock
             .get("test_adding_schedule_while_running_starts_new")
@@ -752,6 +841,51 @@ mod test {
         let map_lock = TEST_EXECUTION_COUNT.read().await;
         let count = map_lock
             .get("test_adding_trigger_to_existing_schedule")
+            .expect("To get test execution count");
+        assert!(
+            *count == 4 || *count == 5,
+            "Test component should have executed 4 or 5 times, but got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_schedule() {
+        let schedule = Schedule::new(
+            Arc::from("test_remove_schedule"),
+            Arc::new(TestComponent {
+                name: Arc::from("test_remove_schedule"),
+            }),
+        )
+        .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
+        let scheduler =
+            Scheduler::<NotStarted>::new("test_remove_schedule".into(), vec![Arc::new(schedule)]);
+        let scheduler = scheduler.start().await.expect("Scheduler should start");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let map_lock = TEST_EXECUTION_COUNT.read().await;
+        let count = map_lock
+            .get("test_remove_schedule")
+            .expect("To get test execution count");
+
+        assert!(
+            *count == 4 || *count == 5,
+            "Test component should have executed 4 or 5 times, but got {count}"
+        );
+
+        drop(map_lock);
+
+        // remove the schedule
+        scheduler
+            .remove_schedule(Arc::from("test_remove_schedule"))
+            .await
+            .expect("To remove schedule");
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        scheduler.stop().await;
+        let map_lock = TEST_EXECUTION_COUNT.read().await;
+        let count = map_lock
+            .get("test_remove_schedule")
             .expect("To get test execution count");
         assert!(
             *count == 4 || *count == 5,

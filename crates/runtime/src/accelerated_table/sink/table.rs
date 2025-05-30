@@ -27,6 +27,7 @@ use crate::{
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
 
+#[derive(Debug)]
 pub(crate) struct TableSink {
     pub(super) table_provider: Arc<dyn TableProvider>,
 }

@@ -326,6 +326,10 @@ impl CandidateGeneration for VectorGeneration {
     fn supports_columns(&self, _projection: &[&Expr]) -> Result<Vec<bool>, SearchGenerationError> {
         Ok(vec![])
     }
+
+    fn value_derived_from(&self) -> String {
+        self.embedding_column.clone()
+    }
 }
 
 // Constructs a `WHERE` clause of aggregating ['Expr'] by AND conditions.

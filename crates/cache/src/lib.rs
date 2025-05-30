@@ -14,43 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::BuildHasher;
-use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::common::ParamValues;
-use datafusion::error::DataFusionError;
-use datafusion::execution::RecordBatchStream;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
-use futures::Stream;
-use futures::task::{Context, Poll};
-use lru_cache::LruCache;
+use key::CacheKey;
+use key::RawCacheKey;
+use result::query::CachedQueryResult;
+use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
-use spicepod::component::runtime::HashingAlgorithm;
+use spicepod::component::caching::HashingAlgorithm;
 
-mod lru_cache;
+pub mod lru_cache;
 mod metrics;
 mod simple_cache;
 mod utils;
 
+pub mod key;
+pub mod result;
+
+pub use lru_cache::LruCache;
 pub use simple_cache::SimpleCache;
-use spicepod::component::runtime::SQLResultsCacheConfig;
+use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -76,7 +71,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) trait Sizeable {
+pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
 }
 
@@ -103,6 +98,7 @@ pub trait TableInvalidator {
 pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
     pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
+    pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Caching {
@@ -110,6 +106,7 @@ impl std::fmt::Debug for Caching {
         f.debug_struct("Caching")
             .field("results", &self.results)
             .field("plans", &self.plans)
+            .field("search", &self.search)
             .finish_non_exhaustive()
     }
 }
@@ -136,157 +133,12 @@ impl Caching {
     }
 
     #[must_use]
-    pub fn with_results_cache_opt(
+    pub fn with_search_cache(
         mut self,
-        results: Option<Arc<QueryResultsCacheProvider>>,
+        search: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
     ) -> Self {
-        self.results = results;
+        self.search = Some(search);
         self
-    }
-    #[must_use]
-    pub fn with_plans_cache_opt(
-        mut self,
-        plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
-    ) -> Self {
-        self.plans = plans;
-        self
-    }
-}
-
-pub struct QueryResult {
-    pub data: SendableRecordBatchStream,
-    pub results_cache_status: QueryResultsCacheStatus,
-}
-
-impl std::fmt::Debug for QueryResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueryResult")
-            .field("data", &"<stream>")
-            .field("results_cache_status", &self.results_cache_status)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryResultsCacheStatus {
-    // The request was not eligible for caching, and thus the results cache was not checked.
-    CacheDisabled,
-    // The request asked to bypass the cache, i.e. via `Cache-Control: no-cache`.
-    CacheBypass,
-    // The request was a cache hit.
-    CacheHit,
-    // The request was a cache miss.
-    CacheMiss,
-}
-
-pub enum CacheKey<'a> {
-    LogicalPlan(&'a LogicalPlan),
-    Query(&'a str, Option<&'a ParamValues>),
-}
-
-impl CacheKey<'_> {
-    #[must_use]
-    pub fn as_raw_key<T: Hasher>(&self, mut hasher: T) -> RawCacheKey {
-        match self {
-            Self::LogicalPlan(logical_plan) => logical_plan.hash(&mut hasher),
-            Self::Query(sql, param_values) => {
-                sql.hash(&mut hasher);
-                if let Some(params) = param_values {
-                    match params {
-                        ParamValues::List(vec) => vec.hash(&mut hasher),
-                        ParamValues::Map(hash_map) => {
-                            // implementing Hash for HashMap
-                            let mut pairs: Vec<(&String, &ScalarValue)> = hash_map.iter().collect();
-                            pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
-
-                            for (key, value) in pairs {
-                                key.hash(&mut hasher);
-                                value.hash(&mut hasher);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        RawCacheKey(hasher.finish())
-    }
-}
-
-#[derive(Hash, Eq, PartialEq)]
-pub struct RawCacheKey(u64);
-
-impl RawCacheKey {
-    #[must_use]
-    pub fn as_u64(&self) -> u64 {
-        self.0
-    }
-}
-
-impl QueryResult {
-    #[must_use]
-    pub fn new(
-        data: SendableRecordBatchStream,
-        results_cache_status: QueryResultsCacheStatus,
-    ) -> Self {
-        QueryResult {
-            data,
-            results_cache_status,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct CachedQueryResult {
-    pub records: Arc<Vec<RecordBatch>>,
-    pub schema: Arc<Schema>,
-    pub input_tables: Arc<HashSet<TableReference>>,
-}
-
-pub struct CachedStream {
-    /// Vector of record batches
-    data: Arc<Vec<RecordBatch>>,
-    /// Schema representing the data
-    schema: SchemaRef,
-    index: usize,
-}
-
-impl CachedStream {
-    #[must_use]
-    pub fn try_new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
-        Self {
-            data,
-            schema,
-            index: 0,
-        }
-    }
-}
-
-impl Stream for CachedStream {
-    type Item = Result<RecordBatch, DataFusionError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        Poll::Ready(if self.index < self.data.len() {
-            let index = self.index;
-            let batch = self.data.get(index).cloned().map(Ok);
-            self.index += 1;
-            batch
-        } else {
-            None
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.data.len(), Some(self.data.len()))
-    }
-}
-
-impl RecordBatchStream for CachedStream {
-    /// Get the schema
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
     }
 }
 

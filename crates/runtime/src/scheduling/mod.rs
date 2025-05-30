@@ -16,10 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use scheduler::Result;
 use scheduler::task::ScheduledTask;
+use spicepod::component::worker::Worker;
 use tonic::async_trait;
+use tracing_futures::Instrument;
 
+use crate::Runtime;
 use crate::component::dataset::Dataset;
 
 pub struct DatasetRefreshTask(Arc<Dataset>);
@@ -50,5 +54,89 @@ impl ScheduledTask for DatasetRefreshTask {
         }
 
         Ok(())
+    }
+}
+
+pub struct WorkerPromptTask {
+    runtime: Arc<Runtime>,
+    worker: Arc<Worker>,
+    prompt: Arc<str>,
+}
+
+impl WorkerPromptTask {
+    pub fn new(runtime: Arc<Runtime>, worker: Arc<Worker>, prompt: Arc<str>) -> Self {
+        Self {
+            runtime,
+            worker,
+            prompt,
+        }
+    }
+}
+
+#[async_trait]
+impl ScheduledTask for WorkerPromptTask {
+    async fn execute(&self) -> Result<()> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduler::worker", input = %self.prompt, worker = %self.worker.name, prompt = %self.prompt);
+
+        async {
+            let worker = Arc::clone(&self.worker);
+            let prompt = Arc::clone(&self.prompt);
+            let runtime = Arc::clone(&self.runtime);
+
+            let workers_lock = Arc::clone(&runtime.workers);
+            let workers = workers_lock.read().await;
+            let Some(worker) = workers.get(&worker.name) else {
+                tracing::debug!("Worker not found for ScheduledTask: {}", worker.name);
+                return Ok(());
+            };
+
+            tracing::debug!(
+                "Executing worker prompt task for worker: {}, prompt: {}",
+                worker.name(),
+                prompt
+            );
+
+            let Some(model) = Arc::clone(worker).as_model() else {
+                tracing::debug!(
+                    "Worker is not a model worker, skipping prompt execution: {}",
+                    worker.name()
+                );
+                return Ok(());
+            };
+
+            let Ok(message_args) = ChatCompletionRequestUserMessageArgs::default()
+                .content(prompt.to_string())
+                .build()
+            else {
+                tracing::error!(
+                    "Failed to build chat completion request message for worker '{}'",
+                    worker.name()
+                );
+                return Ok(());
+            };
+
+            let Ok(chat_request) = CreateChatCompletionRequestArgs::default()
+                .messages(vec![message_args.into()])
+                .build()
+            else {
+                tracing::error!(
+                    "Failed to build chat completion request for worker '{}'",
+                    worker.name()
+                );
+
+                return Ok(());
+            };
+
+            if let Err(e) = model.chat_request(chat_request).await {
+                tracing::error!(
+                    "Failed to execute worker prompt task for worker '{}': {e}",
+                    worker.name(),
+                );
+            }
+
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 }

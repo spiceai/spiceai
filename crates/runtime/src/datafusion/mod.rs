@@ -45,7 +45,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, RawCacheKey};
+use cache::result::search::CachedSearchResult;
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -431,7 +432,7 @@ impl DataFusion {
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
-                            Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
+                            Arc::new(accelerated_table).table_provider(),
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -1074,6 +1075,12 @@ impl DataFusion {
         self.caching.plans.clone()
     }
 
+    pub fn search_cache_provider(
+        &self,
+    ) -> Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>> {
+        self.caching.search.clone()
+    }
+
     async fn register_accelerated_table(
         &self,
         dataset: Arc<Dataset>,
@@ -1093,7 +1100,7 @@ impl DataFusion {
         self.ctx
             .register_table(
                 dataset.name.clone(),
-                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
+                Arc::new(accelerated_table).table_provider(),
             )
             .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -1474,10 +1481,7 @@ impl DataFusion {
                 })?;
 
         self.ctx
-            .register_table(
-                table.clone(),
-                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
-            )
+            .register_table(table.clone(), Arc::new(accelerated_table).table_provider())
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to registed view: {e}"),
             })?;
@@ -1675,7 +1679,7 @@ async fn wait_until_dependent_tables_are_ready(
 
 #[cfg(test)]
 mod tests {
-    use cache::{CacheKey, SimpleCache};
+    use cache::{SimpleCache, key::CacheKey};
 
     use crate::builder::RuntimeBuilder;
 

@@ -40,8 +40,8 @@ impl CacheKeyType {
             || app.runtime.caching.sql_results.cache_key_type,
             |c| c.cache_key_type,
         ) {
-            spicepod::component::runtime::CacheKeyType::Plan => Self::Default,
-            spicepod::component::runtime::CacheKeyType::Sql => Self::Raw,
+            spicepod::component::caching::CacheKeyType::Plan => Self::Default,
+            spicepod::component::caching::CacheKeyType::Sql => Self::Raw,
         }
     }
 }
@@ -95,8 +95,8 @@ mod tests {
         // Create test App instances
         let app_with_plan = AppBuilder::new("app_with_plan")
             .with_runtime(spicepod::component::runtime::Runtime {
-                results_cache: Some(spicepod::component::runtime::ResultsCache {
-                    cache_key_type: spicepod::component::runtime::CacheKeyType::Plan,
+                results_cache: Some(spicepod::component::caching::ResultsCache {
+                    cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -105,8 +105,8 @@ mod tests {
 
         let app_with_sql = AppBuilder::new("app_with_sql")
             .with_runtime(spicepod::component::runtime::Runtime {
-                results_cache: Some(spicepod::component::runtime::ResultsCache {
-                    cache_key_type: spicepod::component::runtime::CacheKeyType::Sql,
+                results_cache: Some(spicepod::component::caching::ResultsCache {
+                    cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -22,9 +22,12 @@ use crate::Result;
 use crate::Sizeable;
 use crate::TableInvalidator;
 use async_trait::async_trait;
+use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
+use spicepod::component::caching::CacheConfig;
+use spicepod::component::caching::HashingAlgorithm;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -50,13 +53,41 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
     }
 }
 
-impl Sizeable for CachedQueryResult {
-    fn get_memory_size(&self) -> usize {
-        self.records
-            .iter()
-            .map(arrow::array::RecordBatch::get_array_memory_size)
-            .sum()
-    }
+/// Builds an LRU cache provider from the given configuration.
+///
+/// # Errors
+///
+/// - If the specified `max_size` cannot be parsed as a valid byte size.
+/// - If the specified `item_ttl` cannot be parsed as a valid duration.
+pub fn build_from_config<V: Sizeable + Clone + Send + Sync + 'static>(
+    cache_config: &CacheConfig,
+) -> Result<Arc<dyn CacheProvider<V> + Send + Sync>> {
+    let cache_max_size: u64 = match &cache_config.max_size {
+        Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
+            .context(super::FailedToParseCacheMaxSizeSnafu)?
+            .as_u64(),
+        None => 128 * 1024 * 1024, // 128 MiB
+    };
+
+    let ttl = match &cache_config.item_ttl {
+        Some(item_ttl) => {
+            fundu::parse_duration(item_ttl).context(super::FailedToParseItemTtlSnafu)?
+        }
+        None => std::time::Duration::from_secs(1),
+    };
+
+    Ok(match cache_config.hashing_algorithm {
+        HashingAlgorithm::Siphash => Arc::new(LruCache::new(
+            cache_max_size,
+            ttl,
+            std::hash::RandomState::default(),
+        )),
+        HashingAlgorithm::Ahash => Arc::new(LruCache::new(
+            cache_max_size,
+            ttl,
+            ahash::RandomState::default(),
+        )),
+    })
 }
 
 impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>

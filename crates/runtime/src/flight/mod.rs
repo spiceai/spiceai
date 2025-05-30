@@ -35,7 +35,7 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
 use bytes::Bytes;
-use cache::QueryResultsCacheStatus;
+use cache::result::CacheStatus;
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::sql::TableReference;
@@ -188,13 +188,7 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
-    ) -> Result<
-        (
-            BoxStream<'static, Result<FlightData, Status>>,
-            QueryResultsCacheStatus,
-        ),
-        Status,
-    > {
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
 
         let query = match parameters {
@@ -251,7 +245,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), query_result.results_cache_status))
+        Ok((flights_stream.boxed(), query_result.cache_status))
     }
 }
 

@@ -23,7 +23,9 @@ t3 AS (
 )
 SELECT
     TRUNC(coalesce(1.0/(t1.rank + 100), 0) + coalesce(1.0/(t2.rank + 100), 0) + coalesce(1.0/(t3.rank + 100), 0), 6) AS score,
-    t1.value as value,
+    t1.value AS value_0,
+    t2.value AS value_1,
+    t3.value AS value_2,
     coalesce(t1.doc_id, t2.doc_id, t3.doc_id) as doc_id,
     coalesce(t1.section, t2.section, t3.section) as section
 FROM t1

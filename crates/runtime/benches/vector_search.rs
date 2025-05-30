@@ -27,7 +27,7 @@ use runtime::{
     request::{Protocol, RequestContext, UserAgent},
     search::{
         request::SearchRequest,
-        types::VectorSearchResult,
+        types::{VectorSearchResult, to_matches},
         util::parse_explicit_primary_keys,
         vector_search::{self, VectorSearch},
     },
@@ -310,7 +310,7 @@ async fn run_search_queries(
                     let start = Instant::now();
                     match vsearch.search(&req).await {
                         Ok(search_res) => {
-                            scores.push((query.id.clone(), to_search_result(&search_res)?));
+                            scores.push((query.id.clone(), to_search_result(search_res).await?));
                         }
                         Err(e) => return Err(e.to_string()),
                     }
@@ -349,11 +349,11 @@ async fn run_search_queries(
     Ok(result)
 }
 
-fn to_search_result(result: &VectorSearchResult) -> Result<HashMap<String, f64>, String> {
+async fn to_search_result(result: VectorSearchResult) -> Result<HashMap<String, f64>, String> {
     let mut output = HashMap::new();
 
-    for (table_ref, value) in result {
-        match value.to_matches(table_ref) {
+    for (table_ref, agg_result) in result {
+        match to_matches(&table_ref, agg_result).await {
             Ok(matches) => {
                 for m in matches {
                     let id = m.metadata().get("_id").ok_or_else(|| {

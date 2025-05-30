@@ -47,10 +47,8 @@ use datafusion::{
     sql::unparser::dialect::{Dialect, PostgreSqlDialect},
 };
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_federation::{
-    FederatedTableProviderAdaptor, table_reference::MultiPartTableReference,
-};
-use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+use datafusion_federation::{FederatedTableProviderAdaptor, sql::MultiPartTableReference};
 use futures::{Stream, TryStreamExt};
 
 use runtime::{
@@ -188,12 +186,7 @@ impl DataConnector for SlowFederatedDataConnector {
             federation_provider,
             table_reference,
             Arc::clone(&self.schema),
-        )
-        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-            dataconnector: "SlowFederatedDataConnector".to_string(),
-            connector_component: ConnectorComponent::Dataset(Arc::new(dataset.clone())),
-            source: e.into(),
-        })?;
+        );
 
         let fallback_provider = Arc::new(DelayedNativeTableProvider {
             schema: Arc::clone(&self.schema),
