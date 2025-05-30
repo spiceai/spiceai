@@ -161,7 +161,7 @@ impl Validator for AuthValidator {
                 for param in ["key", "secret", "session_token"] {
                     if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
                         return Err(Error::InvalidAuthParameterCombination {
-                            parameter: format!("{param}"),
+                            parameter: param.to_string(),
                             auth: "key".to_string(),
                         });
                     }

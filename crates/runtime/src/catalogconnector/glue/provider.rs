@@ -256,7 +256,7 @@ impl GlueSchemaProvider {
         };
 
         if !from.ends_with('/') {
-            from.push_str("/");
+            from.push('/');
         }
 
         let mut params = self.state.parameters.clone();
@@ -268,15 +268,15 @@ impl GlueSchemaProvider {
         let s3 = S3Factory::new()
             .create(self.state.parameters.clone())
             .await
-            .unwrap();
+            .map_err(DataFusionError::External)?;
 
         let app = self
             .state
             .parameters
             .app
             .as_ref()
-            .map(|a| Arc::clone(a))
-            .unwrap();
+            .map(Arc::clone)
+            .ok_or_else(|| DataFusionError::External("Missing application".into()))?;
 
         let mut dataset = DatasetBuilder::try_new(from, name)
             .map_err(|e| DataFusionError::External(Box::new(e)))?

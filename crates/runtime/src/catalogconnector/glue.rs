@@ -126,7 +126,7 @@ pub struct GlueCatalog {
 
 impl GlueCatalog {
     #[must_use]
-    pub fn new(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self { params })
     }
 }

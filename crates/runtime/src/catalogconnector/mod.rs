@@ -144,7 +144,11 @@ pub async fn register_all() {
 
     registry.insert(
         glue::PREFIX.to_string(),
-        CatalogConnectorFactory::new(glue::GlueCatalog::new, glue::PREFIX, &glue::PARAMETERS),
+        CatalogConnectorFactory::new(
+            glue::GlueCatalog::new_connector,
+            glue::PREFIX,
+            &glue::PARAMETERS,
+        ),
     );
 
     registry.insert(
