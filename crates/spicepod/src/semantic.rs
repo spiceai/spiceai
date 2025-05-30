@@ -34,6 +34,9 @@ pub struct Column {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_search: Option<FullTextSearchConfig>,
 }
 
 impl Column {
@@ -105,6 +108,20 @@ where
             }
             other => Err(D::Error::custom(format!("Invalid format for row_id. Expected a string, or array of strings. Found {other:?}"))),
         }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct FullTextSearchConfig {
+    pub enabled: bool,
+
+    #[serde(
+        rename = "row_id",
+        default,
+        deserialize_with = "deserialize_row_ids",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub row_ids: Option<Vec<String>>,
 }
 
 #[cfg(test)]

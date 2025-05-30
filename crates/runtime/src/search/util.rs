@@ -90,18 +90,8 @@ pub async fn parse_explicit_primary_keys(
     })
 }
 
-async fn get_primary_keys(
-    df: &Arc<DataFusion>,
-    table: &TableReference,
-) -> super::Result<Vec<String>> {
-    let tbl_ref = df
-        .get_table(table)
-        .await
-        .ok_or_else(|| super::Error::DataSourcesNotFound {
-            data_source: vec![table.clone()],
-        })?;
-
-    let constraint_idx = tbl_ref
+pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> super::Result<Vec<String>> {
+    let constraint_idx = tbl
         .constraints()
         .map(|c| c.iter())
         .unwrap_or_default()
@@ -112,8 +102,7 @@ async fn get_primary_keys(
         .cloned()
         .unwrap_or(Vec::new());
 
-    tbl_ref
-        .schema()
+    tbl.schema()
         .project(&constraint_idx)
         .map(|schema_projection| {
             schema_projection
@@ -124,6 +113,20 @@ async fn get_primary_keys(
         })
         .boxed()
         .map_err(|e| super::Error::DataFusionError { source: e })
+}
+
+pub(crate) async fn get_primary_keys_from_table(
+    df: &Arc<DataFusion>,
+    table: &TableReference,
+) -> super::Result<Vec<String>> {
+    let tbl_ref = df
+        .get_table(table)
+        .await
+        .ok_or_else(|| super::Error::DataSourcesNotFound {
+            data_source: vec![table.clone()],
+        })?;
+
+    get_primary_keys(tbl_ref).await
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
@@ -143,7 +146,7 @@ pub async fn get_primary_keys_with_overrides(
             .clone()
             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
             .into();
-        let pks = get_primary_keys(df, &resolved_tbl).await?;
+        let pks = get_primary_keys_from_table(df, &resolved_tbl).await?;
         if !pks.is_empty() {
             tbl_to_pks.insert(tbl.clone(), pks);
         } else if let Some(explicit_pks) = explicit_primary_keys.get(&resolved_tbl) {

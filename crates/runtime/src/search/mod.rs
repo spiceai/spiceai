@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod candidate;
+pub mod full_text;
 pub mod request;
 pub mod types;
 pub mod util;
