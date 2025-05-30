@@ -1499,6 +1499,8 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
+            refresher.with_notifier(Arc::clone(&notifier));
+
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = refresher.start(acceleration_refresh_mode).await;
