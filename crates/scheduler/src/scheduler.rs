@@ -364,7 +364,11 @@ impl Scheduler<Running> {
                         tracing::error!("Request channel execution failed: {e}");
                     }
                     Err(e) => {
-                        tracing::error!("Request channel join error: {e}");
+                        if !e.is_cancelled() {
+                            // Only log errors that are not due to cancellation
+                            // (which is expected when stopping the scheduler)
+                            tracing::error!("Request channel join error: {e}");
+                        }
                     }
                 }
             }
@@ -389,7 +393,11 @@ impl Scheduler<Running> {
                         tracing::error!("Scheduler task execution failed: {e}");
                     }
                     Err(e) => {
-                        tracing::error!("Scheduler task join error: {e}");
+                        if !e.is_cancelled() {
+                            // Only log errors that are not due to cancellation
+                            // (which is expected when stopping the scheduler)
+                            tracing::error!("Scheduler task join error: {e}");
+                        }
                     }
                 }
             }

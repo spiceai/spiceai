@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
@@ -24,20 +23,10 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub enum WorkerType {
-    #[default]
-    LoadBalance,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Worker {
     pub name: String,
-
-    pub r#type: WorkerType,
 
     pub description: Option<String>,
 
@@ -48,26 +37,7 @@ pub struct Worker {
     pub load_balance: Option<LoadBalanceParams>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_cron: Option<String>,
-}
-
-impl FromStr for WorkerType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "load_balance" => Ok(WorkerType::LoadBalance),
-            _ => Err(format!("Unknown worker type: {s}")),
-        }
-    }
-}
-
-impl std::fmt::Display for WorkerType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkerType::LoadBalance => write!(f, "load_balance"),
-        }
-    }
+    pub cron: Option<String>,
 }
 
 impl Nameable for Worker {
@@ -80,11 +50,10 @@ impl WithDependsOn<Worker> for Worker {
     fn depends_on(&self, _depends_on: &[String]) -> Worker {
         Worker {
             name: self.name.clone(),
-            r#type: self.r#type.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
             load_balance: self.load_balance.clone(),
-            start_cron: self.start_cron.clone(),
+            cron: self.cron.clone(),
         }
     }
 }
