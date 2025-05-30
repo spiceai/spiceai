@@ -38,22 +38,27 @@ impl From<Arc<Dataset>> for DatasetRefreshTask {
 impl ScheduledTask for DatasetRefreshTask {
     async fn execute(&self) -> Result<()> {
         let dataset = Arc::clone(&self.0);
-        match dataset
-            .runtime()
-            .datafusion()
-            .refresh_table(&dataset.name, None)
-            .await
-        {
-            Ok(notifier) => {
-                if let Some(notifier) = notifier {
-                    notifier.notified().await;
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduler::refresh", input = %dataset.name.to_string());
+        async {
+            match dataset
+                .runtime()
+                .datafusion()
+                .refresh_table(&dataset.name, None)
+                .await
+            {
+                Ok(notifier) => {
+                    if let Some(notifier) = notifier {
+                        notifier.notified().await;
+                    }
+                }
+                Err(e) => {
+                    // Handle the error
+                    todo!("Handle when refresh fails: {e}");
                 }
             }
-            Err(e) => {
-                // Handle the error
-                todo!("Handle when refresh fails: {e}");
-            }
         }
+        .instrument(span)
+        .await;
 
         Ok(())
     }
