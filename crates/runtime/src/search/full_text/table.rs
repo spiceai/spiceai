@@ -32,7 +32,7 @@ use crate::search::util::get_primary_keys;
 pub struct TableWithFullText {
     base_table: Arc<dyn TableProvider>,
     search_field: String,
-    index: tantivy::Index,
+    index: Arc<tantivy::Index>,
 }
 
 #[derive(Debug, Snafu)]
@@ -75,6 +75,10 @@ impl TableWithFullText {
         })
     }
 
+    pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.base_table)
+    }
+
     async fn create_index(
         base_table: Arc<dyn TableProvider>,
         search_field: &str,
@@ -83,7 +87,7 @@ impl TableWithFullText {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
         for p in primary_key {
-            let Some((idx, field)) = schema.column_with_name(p) else {
+            let Some((_, field)) = schema.column_with_name(p) else {
                 continue;
             };
             match field.data_type() {
@@ -111,10 +115,10 @@ impl TableWithFullText {
                 }
                 dt => {
                     return Err(Error::PrimaryKeyInvalidType {
-                        data_type: dt,
+                        data_type: dt.clone(),
                         column: p.clone(),
-                    })
-                };
+                    });
+                }
             }
         }
         schema_builder.add_text_field(
@@ -122,10 +126,10 @@ impl TableWithFullText {
             tantivy::schema::STORED | tantivy::schema::TEXT,
         );
         let schema = schema_builder.build();
-        let index = tantivy::Index::create_in_ram(schema_builder.build());
-        let mut index_writer: tantivy::IndexWriter = index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .expect("Failed to make index writer");
+        let index = tantivy::Index::create_in_ram(schema);
+        // let mut index_writer: tantivy::IndexWriter = index
+        //     .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+        //     .expect("Failed to make index writer");
 
         // TODO write data.
         //
@@ -180,7 +184,7 @@ impl TableProvider for TableWithFullText {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.base_table.suppsupports_filters_pushdown(filters)
+        self.base_table.supports_filters_pushdown(filters)
     }
 
     fn statistics(&self) -> Option<Statistics> {

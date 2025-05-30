@@ -17,10 +17,13 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
-use super::util::{get_embedding_table, user_tables_with_embeddings};
+use super::util::user_tables_with_embeddings;
 use super::{CandidateAggregationSnafu, Error, Result};
+use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector::VectorGeneration;
-use crate::search::util::{embedding_columns_from_table, get_primary_keys_with_overrides};
+use crate::search::util::{
+    embedding_columns_from_table, find_concrete_table_provider, get_primary_keys_with_overrides,
+};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Expr, Ident};
@@ -81,7 +84,9 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let Some(embedding_table) = get_embedding_table(&table_provider).await else {
+        let Some(embedding_table) =
+            find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
+        else {
             return Err(Error::CannotVectorSearchDataset {
                 data_source: tbl.clone(),
             });

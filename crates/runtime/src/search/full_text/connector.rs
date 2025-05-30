@@ -47,8 +47,11 @@ impl FullTextConnector {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let search_field_opt = dataset.columns.iter().find_map(|c| {
             if c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled) {
-                let primary_key_overrides =
-                    c.full_text_search.map(|cfg| cfg.row_ids).flatten().clone();
+                let primary_key_overrides = c
+                    .full_text_search
+                    .as_ref()
+                    .map(|cfg| cfg.row_ids.clone())
+                    .flatten();
                 Some((c.name.clone(), primary_key_overrides))
             } else {
                 None

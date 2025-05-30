@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
@@ -27,31 +28,50 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 
-/// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
-/// This includes if the [`TableProvider`] is an [`AcceleratedTable`] with a [`EmbeddingTable`] underneath.
-pub(super) async fn get_embedding_table(
+use super::full_text::table::TableWithFullText;
+
+/// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
+pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
     tbl: &Arc<dyn TableProvider>,
-) -> Option<Arc<EmbeddingTable>> {
-    if let Some(embedding_table) = tbl.as_any().downcast_ref::<EmbeddingTable>() {
-        return Some(Arc::new(embedding_table.clone()));
-    }
+) -> Option<Arc<T>> {
+    let mut current_tbl = Arc::clone(tbl);
 
-    let tbl = if let Some(adaptor) = tbl.as_any().downcast_ref::<FederatedTableProviderAdaptor>() {
-        adaptor.table_provider.clone()?
-    } else {
-        Arc::clone(tbl)
-    };
-
-    if let Some(accelerated_table) = tbl.as_any().downcast_ref::<AcceleratedTable>() {
-        let federated_table = accelerated_table
-            .get_federated_table()
-            .table_provider()
-            .await;
-        if let Some(embedding_table) = federated_table.as_any().downcast_ref::<EmbeddingTable>() {
-            return Some(Arc::new(embedding_table.clone()));
+    // For the many possible wrapping [`TableProvider`], attempt to find the concrete `impl TableProvider`.
+    // Also avoids having to [`Box::pin`] for recursive `async fn`.
+    loop {
+        // Attempt to downcast the current table to the desired type.
+        if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
+            return Some(Arc::new(found_table.clone()));
         }
+
+        // Handle specific table wrapping logic.
+        if let Some(fts_table) = current_tbl.as_any().downcast_ref::<TableWithFullText>() {
+            current_tbl = fts_table.underlying_table();
+            continue;
+        }
+
+        if let Some(adaptor) = current_tbl
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            if let Some(adapted_tbl) = adaptor.table_provider.clone() {
+                current_tbl = adapted_tbl;
+                continue;
+            }
+        }
+
+        if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
+            let federated_table = accelerated_table
+                .get_federated_table()
+                .table_provider()
+                .await;
+            current_tbl = Arc::clone(&federated_table);
+            continue;
+        }
+
+        // Exit if no further wrapping is found.
+        return None;
     }
-    None
 }
 
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
@@ -168,7 +188,10 @@ pub async fn user_tables_with_embeddings(
             .await
             // we should not fail here, as we are iterating over the tables that we know exist
             .ok_or_else(|| super::Error::DataSourceNotFound { table: t.clone() })?;
-        if get_embedding_table(&table_provider).await.is_some() {
+        if find_concrete_table_provider::<EmbeddingTable>(&table_provider)
+            .await
+            .is_some()
+        {
             tables_with_embeddings.push(t);
         }
     }
@@ -189,7 +212,9 @@ pub async fn embedding_columns_from_table(
             data_source: vec![tbl.clone()],
         })?;
 
-    let Some(embedding_table) = get_embedding_table(&table_provider).await else {
+    let Some(embedding_table) =
+        find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
+    else {
         return Err(super::Error::CannotVectorSearchDataset {
             data_source: tbl.clone(),
         });
