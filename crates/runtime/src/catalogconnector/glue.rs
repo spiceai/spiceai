@@ -145,6 +145,130 @@ impl fmt::Debug for GlueSchemaProvider {
     }
 }
 
+impl GlueSchemaProvider {
+    async fn create_iceberg_provider(
+        &self,
+        name: &str,
+        table: &Table,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let mut props = Vec::new();
+        if let Some(provider) = self.state.config.credentials_provider() {
+            let creds = provider
+                .provide_credentials()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            props.push((S3_ACCESS_KEY_ID, creds.access_key_id().to_string()));
+            props.push((S3_SECRET_ACCESS_KEY, creds.secret_access_key().to_string()));
+        }
+
+        let file_io = FileIOBuilder::new("s3")
+            .with_props(props)
+            .build()
+            .map_err(|e| DataFusionError::External(Box::new(Error::BuildFileIO { source: e })))?;
+
+        let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let input_file = file_io.new_input(&metadata_location).map_err(|e| {
+            DataFusionError::External(Box::new(Error::CreateFileInput {
+                source: e,
+                location: metadata_location.clone(),
+            }))
+        })?;
+
+        let metadata_content = input_file.read().await.map_err(|e| {
+            DataFusionError::External(Box::new(Error::ReadMetadata {
+                source: e,
+                location: metadata_location.clone(),
+            }))
+        })?;
+
+        let metadata = serde_json::from_slice::<TableMetadata>(&metadata_content).map_err(|e| {
+            DataFusionError::External(Box::new(Error::DeserializeMetadata { source: e }))
+        })?;
+
+        let identifier =
+            TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
+
+        let table = IcebergTable::builder()
+            .file_io(file_io)
+            .metadata(metadata)
+            .identifier(identifier)
+            .build()
+            .map_err(|e| {
+                DataFusionError::External(Box::new(Error::BuildIcebergTable { source: e }))
+            })?;
+
+        let table_provider = IcebergTableProvider::try_new_from_table(table)
+            .await
+            .map_err(|e| {
+                DataFusionError::External(Box::new(Error::CreateIcebergTableProvider { source: e }))
+            })?;
+
+        Ok(Some(Arc::new(table_provider)))
+    }
+
+    async fn create_hive_parquet_provider(
+        &self,
+        name: &str,
+        table: &Table,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let Some(storage_descriptor) = table.storage_descriptor() else {
+            return Err(DataFusionError::External(
+                format!("table `{name}` does not have a storage descriptor").into(),
+            ));
+        };
+
+        let Some(mut from) = storage_descriptor.location().map(String::from) else {
+            return Err(DataFusionError::External(
+                format!("table `{name}` does not have a location").into(),
+            ));
+        };
+
+        // trailing slash in S3 endpoint is required
+        if !from.ends_with('/') {
+            from.push_str("/");
+        }
+
+        let mut params = self.state.parameters.clone();
+        params
+            .parameters
+            .insert("endpoint".into(), from.clone().into());
+        params.parameters.prefix = "s3";
+
+        let s3 = S3Factory::new()
+            .create(self.state.parameters.clone())
+            .await
+            .unwrap();
+
+        let app = self
+            .state
+            .parameters
+            .app
+            .as_ref()
+            .map(|a| Arc::clone(a))
+            .unwrap();
+
+        let mut dataset = DatasetBuilder::try_new(from, name)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .with_runtime(Arc::clone(&self.state.runtime))
+            .with_app(app)
+            .build()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        dataset
+            .params
+            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+
+        let provider = s3
+            .read_provider(&dataset)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(Some(provider))
+    }
+}
+
 #[async_trait]
 impl SchemaProvider for GlueSchemaProvider {
     fn as_any(&self) -> &dyn Any {
@@ -178,125 +302,8 @@ impl SchemaProvider for GlueSchemaProvider {
         };
 
         match TableType::from(table) {
-            TableType::HiveParquet => {
-                let Some(storage_descriptor) = table.storage_descriptor() else {
-                    return Err(DataFusionError::External(
-                        format!("table `{name}` does not have a storage descriptor").into(),
-                    ));
-                };
-
-                let Some(mut from) = storage_descriptor.location().map(String::from) else {
-                    return Err(DataFusionError::External(
-                        format!("table `{name}` does not have a location").into(),
-                    ));
-                };
-
-                // trailing slash in S3 endpoint is required
-                if !from.ends_with('/') {
-                    from.push_str("/");
-                }
-
-                let mut params = self.state.parameters.clone();
-                params
-                    .parameters
-                    .insert("endpoint".into(), from.clone().into());
-                params.parameters.prefix = "s3";
-
-                let s3 = S3Factory::new()
-                    .create(self.state.parameters.clone())
-                    .await
-                    .unwrap();
-
-                let app = self
-                    .state
-                    .parameters
-                    .app
-                    .as_ref()
-                    .map(|a| Arc::clone(a))
-                    .unwrap();
-
-                let mut dataset = DatasetBuilder::try_new(from, name)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    .with_runtime(Arc::clone(&self.state.runtime))
-                    .with_app(app)
-                    .build()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                dataset
-                    .params
-                    .insert("hive_partitioning_enabled".to_string(), "true".to_string());
-
-                let provider = s3
-                    .read_provider(&dataset)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                Ok(Some(provider))
-            }
-            TableType::Iceberg => {
-                let mut props = Vec::new();
-                if let Some(provider) = self.state.config.credentials_provider() {
-                    let creds = provider
-                        .provide_credentials()
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    props.push((S3_ACCESS_KEY_ID, creds.access_key_id().to_string()));
-                    props.push((S3_SECRET_ACCESS_KEY, creds.secret_access_key().to_string()));
-                }
-
-                let file_io = FileIOBuilder::new("s3")
-                    .with_props(props)
-                    .build()
-                    .map_err(|e| {
-                        DataFusionError::External(Box::new(Error::BuildFileIO { source: e }))
-                    })?;
-
-                let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let input_file = file_io.new_input(&metadata_location).map_err(|e| {
-                    DataFusionError::External(Box::new(Error::CreateFileInput {
-                        source: e,
-                        location: metadata_location.clone(),
-                    }))
-                })?;
-
-                let metadata_content = input_file.read().await.map_err(|e| {
-                    DataFusionError::External(Box::new(Error::ReadMetadata {
-                        source: e,
-                        location: metadata_location.clone(),
-                    }))
-                })?;
-
-                let metadata =
-                    serde_json::from_slice::<TableMetadata>(&metadata_content).map_err(|e| {
-                        DataFusionError::External(Box::new(Error::DeserializeMetadata {
-                            source: e,
-                        }))
-                    })?;
-
-                let identifier =
-                    TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
-
-                let table = IcebergTable::builder()
-                    .file_io(file_io)
-                    .metadata(metadata)
-                    .identifier(identifier)
-                    .build()
-                    .map_err(|e| {
-                        DataFusionError::External(Box::new(Error::BuildIcebergTable { source: e }))
-                    })?;
-
-                let table_provider = IcebergTableProvider::try_new_from_table(table)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::External(Box::new(Error::CreateIcebergTableProvider {
-                            source: e,
-                        }))
-                    })?;
-
-                Ok(Some(Arc::new(table_provider)))
-            }
+            TableType::HiveParquet => self.create_hive_parquet_provider(name, table).await,
+            TableType::Iceberg => self.create_iceberg_provider(name, table).await,
             TableType::Unsupported => Ok(None),
         }
     }
