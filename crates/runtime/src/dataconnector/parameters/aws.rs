@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_credential_types::Credentials;
 use snafu::prelude::*;
 use tonic::async_trait;
 
-use crate::parameters::ParamLookup;
+use crate::parameters::{ParamLookup, Parameters};
 
 use super::ConnectorParams;
 
@@ -183,4 +185,58 @@ impl Validator for AuthValidator {
         }
         Ok(())
     }
+}
+
+pub async fn load_config(
+    provider_name: &'static str,
+    region_name: &'static str,
+    key_name: &'static str,
+    secret_name: &'static str,
+    token_name: &'static str,
+    params: &Parameters,
+) -> Result<SdkConfig, String> {
+    let region = params
+        .get(region_name)
+        .expose()
+        .ok_or_else(|_| format!("{region_name} is required"))?
+        .to_string();
+
+    let access_key_id = params.get(key_name).expose().ok().map(ToString::to_string);
+
+    let secret_access_key = params
+        .get(secret_name)
+        .expose()
+        .ok()
+        .map(ToString::to_string);
+
+    let session_token = params
+        .get(token_name)
+        .expose()
+        .ok()
+        .map(ToString::to_string);
+
+    Ok(match (access_key_id, secret_access_key) {
+        (Some(access_key_id), Some(secret_access_key)) => {
+            let credentials = Credentials::new(
+                access_key_id,
+                secret_access_key,
+                session_token,
+                None,
+                provider_name,
+            );
+
+            aws_config::defaults(BehaviorVersion::v2025_01_17())
+                .region(Region::new(region))
+                .credentials_provider(credentials)
+                .load()
+                .await
+        }
+        _ => {
+            // This will automatically load AWS credentials from the environment, via IAM roles if configured.
+            aws_config::defaults(BehaviorVersion::v2025_01_17())
+                .region(Region::new(region))
+                .load()
+                .await
+        }
+    })
 }

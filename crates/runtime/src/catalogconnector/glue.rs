@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{CatalogConnector, ParameterSpec, Parameters};
+use super::{CatalogConnector, ParameterSpec};
 use crate::{
     Runtime,
     component::catalog::Catalog,
@@ -28,8 +28,6 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_sdk_sts::config::Credentials;
 use snafu::prelude::*;
 use std::sync::{Arc, LazyLock};
 use std::{any::Any, collections::HashMap};
@@ -113,6 +111,9 @@ pub enum Error {
         #[snafu(source)]
         source: parameters::aws::Error,
     },
+
+    #[snafu(display("Configuration loading failed: {message}"))]
+    ConfigurationLoadingFailed { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -221,53 +222,6 @@ fn get_metadata_location(
             }),
         },
         None => Err(Error::MissingParameters),
-    }
-}
-
-async fn load_config(params: &Parameters) -> SdkConfig {
-    let region = params
-        .get("region")
-        .expose()
-        .ok()
-        .unwrap_or_else(|| {
-            let region = "us-east-1";
-            tracing::warn!("no AWS region specified, defaulting to {region}");
-            region
-        })
-        .to_string();
-
-    let access_key_id = params.get("key").expose().ok().map(ToString::to_string);
-
-    let secret_access_key = params.get("secret").expose().ok().map(ToString::to_string);
-
-    let session_token = params
-        .get("session_token")
-        .expose()
-        .ok()
-        .map(ToString::to_string);
-
-    match (access_key_id, secret_access_key) {
-        (Some(access_key_id), Some(secret_access_key)) => {
-            let credentials = Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
-                None,
-                "GlueCatalogProvider",
-            );
-
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .credentials_provider(credentials)
-                .load()
-                .await
-        }
-        _ => {
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .load()
-                .await
-        }
     }
 }
 

@@ -17,6 +17,7 @@ limitations under the License.
 use super::state::GlueCatalogState;
 use super::{Result, TableType, get_metadata_location};
 use crate::dataconnector::DataConnectorFactory as _;
+use crate::dataconnector::parameters::aws::load_config;
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
@@ -85,7 +86,16 @@ impl GlueCatalogProvider {
             .parameters
             .insert("file_format".to_string(), "parquet".into());
 
-        let config = super::load_config(&parameters.parameters).await;
+        let config = load_config(
+            "GlueCatalogConnector",
+            "region",
+            "key",
+            "secret",
+            "session_token",
+            &parameters.parameters,
+        )
+        .await
+        .map_err(|message| super::Error::ConfigurationLoadingFailed { message })?;
         let glue = Client::new(&config);
 
         let get_databases_output = glue
