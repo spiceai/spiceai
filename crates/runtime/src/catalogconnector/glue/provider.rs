@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::state::GlueCatalogState;
-use super::{Result, TableType, get_metadata_location};
+use super::{Error, Result, TableType};
 use crate::dataconnector::DataConnectorFactory as _;
 use crate::dataconnector::parameters::aws::load_config;
 use crate::{
@@ -106,7 +106,7 @@ impl GlueCatalogProvider {
 
         let mut databases = HashMap::new();
         for db in get_databases_output.database_list {
-            if !super::database_might_match(&db.name, &catalog.orig_include) {
+            if !database_might_match(&db.name, &catalog.orig_include) {
                 tracing::debug!("skipping database {}", &db.name);
                 continue;
             }
@@ -124,7 +124,7 @@ impl GlueCatalogProvider {
                 .into_iter()
                 .filter(|t| {
                     !matches!(TableType::from(t), TableType::Unsupported)
-                        && super::is_included(catalog.include.as_ref(), &db.name, t.name())
+                        && is_included(catalog.include.as_ref(), &db.name, t.name())
                 })
                 .collect::<Vec<_>>();
 
@@ -335,5 +335,54 @@ impl SchemaProvider for GlueSchemaProvider {
             TableType::Iceberg => self.create_iceberg_provider(name, table).await,
             TableType::Unsupported => Ok(None),
         }
+    }
+}
+
+fn database_might_match(database: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        pattern == database
+            || pattern.starts_with(&format!("{database}."))
+            || pattern.starts_with("*.")
+            || pattern == "*.*"
+    })
+}
+
+fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
+    let database_with_table = format!("{database}.{table}");
+    if let Some(include) = include {
+        if !include.is_match(&database_with_table) {
+            tracing::debug!("skipping table {database_with_table}");
+            return false;
+        }
+    }
+    true
+}
+
+fn get_metadata_location(
+    parameters: Option<&HashMap<String, String>>,
+    table: &str,
+) -> Result<String> {
+    const METADATA_LOCATION: &str = "metadata_location";
+    match parameters {
+        Some(properties) => match properties.get(METADATA_LOCATION) {
+            Some(location) => Ok(location.to_string()),
+            None => Err(Error::MissingMetadataLocation {
+                table: table.to_string(),
+            }),
+        },
+        None => Err(Error::MissingParameters),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_get_metadata_location_missing() {
+        let params: Option<&HashMap<String, String>> = None;
+        let result = get_metadata_location(params, "test_table");
+        assert!(matches!(result, Err(Error::MissingParameters)));
     }
 }

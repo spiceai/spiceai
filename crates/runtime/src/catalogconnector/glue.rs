@@ -29,8 +29,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use snafu::prelude::*;
+use std::any::Any;
 use std::sync::{Arc, LazyLock};
-use std::{any::Any, collections::HashMap};
 
 mod provider;
 mod state;
@@ -186,54 +186,5 @@ impl TableType {
         }
 
         Self::Unsupported
-    }
-}
-
-fn database_might_match(database: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        pattern == database
-            || pattern.starts_with(&format!("{database}."))
-            || pattern.starts_with("*.")
-            || pattern == "*.*"
-    })
-}
-
-fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
-    let database_with_table = format!("{database}.{table}");
-    if let Some(include) = include {
-        if !include.is_match(&database_with_table) {
-            tracing::debug!("skipping table {database_with_table}");
-            return false;
-        }
-    }
-    true
-}
-
-fn get_metadata_location(
-    parameters: Option<&HashMap<String, String>>,
-    table: &str,
-) -> Result<String> {
-    const METADATA_LOCATION: &str = "metadata_location";
-    match parameters {
-        Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
-            None => Err(Error::MissingMetadataLocation {
-                table: table.to_string(),
-            }),
-        },
-        None => Err(Error::MissingParameters),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn test_get_metadata_location_missing() {
-        let params: Option<&HashMap<String, String>> = None;
-        let result = get_metadata_location(params, "test_table");
-        assert!(matches!(result, Err(Error::MissingParameters)));
     }
 }
