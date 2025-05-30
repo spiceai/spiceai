@@ -35,7 +35,7 @@ test:
 
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all
+	@cargo nextest run --all --lib
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
