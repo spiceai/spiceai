@@ -13,13 +13,14 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: "Which Rust build profile to use? (Default is release)"
+        description: "Which Rust build profile to use? (Default is dev)"
         required: false
         type: choice
         options:
+          - "dev"
           - "release"
           - "release-lto"
-        default: "release"
+        default: "dev"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -27,7 +28,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'dev' }}
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -97,7 +98,7 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
-
+      
       - name: Check if sccache can be set up
         run: |
           if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
@@ -134,6 +135,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -197,13 +199,14 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make ci test
+      - run: make build-cli test
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
