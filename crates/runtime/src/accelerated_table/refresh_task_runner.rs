@@ -111,6 +111,7 @@ impl RefreshTaskRunnerBuilder {
 /// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
 /// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
 /// refreshing an `accelerator`.
+#[derive(Debug)]
 pub struct RefreshTaskRunner {
     dataset_name: TableReference,
     refresh: Arc<RwLock<Refresh>>,

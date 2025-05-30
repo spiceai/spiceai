@@ -2,15 +2,15 @@
 source: crates/runtime/tests/ready_state/mod.rs
 expression: explain_str
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                                                                        |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                                                                                                          |
-|               |   Federated                                                                                                                                                                                                                                 |
-|               |  Projection: native_on_registration_duckdb.id                                                                                                                                                                                               |
-|               |   TableScan: native_on_registration_duckdb projection=[id]                                                                                                                                                                                  |
-| physical_plan | BytesProcessedExec                                                                                                                                                                                                                          |
-|               |   SchemaCastScanExec                                                                                                                                                                                                                        |
-|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: sql=SELECT native_on_registration_duckdb.id FROM native_on_registration_duckdb rewritten_sql=SELECT "native_on_registration_duckdb"."id" FROM "native_on_registration_duckdb" |
-|               |                                                                                                                                                                                                                                             |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                       |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                         |
+|               |   Federated                                                                                                                                                |
+|               |  Projection: native_on_registration_duckdb.id                                                                                                              |
+|               |   TableScan: native_on_registration_duckdb projection=[id]                                                                                                 |
+| physical_plan | BytesProcessedExec                                                                                                                                         |
+|               |   SchemaCastScanExec                                                                                                                                       |
+|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "native_on_registration_duckdb"."id" FROM "native_on_registration_duckdb" |
+|               |                                                                                                                                                            |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+

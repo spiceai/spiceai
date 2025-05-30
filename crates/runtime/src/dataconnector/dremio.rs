@@ -30,7 +30,7 @@ use datafusion::sql::sqlparser::ast::WindowFrameBound;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
-use datafusion_federation::table_reference::parse_multi_part_table_reference;
+use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
@@ -170,7 +170,7 @@ impl DataConnectorFactory for DremioFactory {
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
-                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}), true);
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
@@ -194,7 +194,16 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let table_reference = parse_multi_part_table_reference(dataset.path());
+        let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
+            Ok(table_reference) => table_reference.table_ref,
+            Err(e) => {
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "dremio".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                });
+            }
+        };
         match FlightFactory::table_provider(&self.flight_factory, table_reference, dataset.schema())
             .await
         {

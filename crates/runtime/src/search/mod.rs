@@ -23,6 +23,7 @@ pub mod vector_search;
 use arrow_schema::ArrowError;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
+use search::aggregation;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -46,11 +47,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Error occurred retrieving candidate search results: {source}"))]
-    CandidateGenerationError { source: search::generation::Error },
+    #[snafu(display("Error occurred in search pipeline: {source}"))]
+    SearchPipelineError { source: search::pipeline::Error },
 
     #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
-    CandidateAggregationError { source: search::aggregation::Error },
+    SearchAggregationError { source: aggregation::Error },
 
     #[snafu(display("Error occurred processing Arrow records: {source}"))]
     RecordProcessingError { source: ArrowError },
