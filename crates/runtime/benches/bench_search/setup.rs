@@ -30,9 +30,9 @@ use app::AppBuilder;
 use spicepod::{
     acceleration::Acceleration,
     component::{
+        caching::{CacheKeyType, HashingAlgorithm, ResultsCache},
         dataset::{Dataset, Mode, replication::Replication},
         embeddings::{EmbeddingChunkConfig, Embeddings},
-        runtime::{CacheKeyType, HashingAlgorithm, ResultsCache},
     },
 };
 

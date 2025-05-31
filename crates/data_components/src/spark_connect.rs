@@ -113,11 +113,7 @@ impl Read for SparkConnect {
             self.join_push_down_context.clone(),
         )
         .await?;
-        let provider = Arc::new(
-            provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let provider = Arc::new(provider.create_federated_table_provider());
         Ok(provider)
     }
 }

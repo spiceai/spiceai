@@ -53,6 +53,10 @@ pub enum Error {
         "Failed to determine next cron expression run time.\n{source}\nConfirm the cron expression is valid, and try again."
     ))]
     FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
+    #[snafu(display(
+        "The specified schedule '{name}' does not exist in the scheduler.\nEnsure the schedule is defined, and try again."
+    ))]
+    ScheduleNotFound { name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

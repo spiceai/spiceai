@@ -16,9 +16,9 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache};
+use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache, lru_cache};
 use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::runtime::{Caching as CachingConfig, HashingAlgorithm};
+use spicepod::component::caching::{Caching as CachingConfig, HashingAlgorithm};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
@@ -68,6 +68,23 @@ impl Runtime {
             };
 
         caching = caching.with_plans_cache(plan_cache_provider);
+
+        if cache_config.search_results.enabled {
+            let config = &cache_config.search_results;
+            match lru_cache::build_from_config(config) {
+                Ok(cache_provider) => {
+                    crate::in_tracing_context(|| {
+                        tracing::info!("Initialized search results cache;"); // TODO: update to include max size and ttl. https://github.com/spiceai/spiceai/issues/6019
+                    });
+                    caching = caching.with_search_cache(cache_provider);
+                }
+                Err(e) => {
+                    crate::in_tracing_context(|| {
+                        tracing::error!("Failed to initialize search results cache: {e}");
+                    });
+                }
+            }
+        }
 
         Arc::new(caching)
     }

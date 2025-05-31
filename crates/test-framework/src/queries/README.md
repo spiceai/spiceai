@@ -25,10 +25,10 @@ where p_partkey = ps_partkey
 Has a correlated subquery in the WHERE clause that is rewritten to contain a correlated subquery in the JOIN filter clause:
 
 ```sql
-SELECT 
+SELECT
     "tpch"."supplier"."s_name",
     "tpch"."part"."p_partkey"
-FROM 
+FROM
     "tpch"."part"
     JOIN "tpch"."supplier" ON true
     JOIN "tpch"."partsupp" ON (
@@ -78,7 +78,8 @@ SELECT (now() + INTERVAL '30 days');
 
 ### `EXCEPT` and `INTERSECT` keywords are not supported
 
-**Limitation**: There is an error `syntax error at or near "ANTI"` when `EXCEPT` is used, and a `syntax error at or near "SEMI"` in the case of `INTERSECT`
+**Limitation**: There is an error `Referenced table not found` or `Schema contains duplicate qualified field name` or `Duplicate alias in query` when `EXCEPT` or `INTERSECT` is used.
+
 **Solution**: Use `DISTINCT` and `IN`/`NOT IN` instead
 
 ```sql

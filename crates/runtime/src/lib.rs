@@ -368,6 +368,28 @@ pub enum Error {
         scheduler: String,
         name: String,
     },
+
+    #[snafu(display(
+        "Failed to create a cron schedule from the provided expression: '{cron}'\n{source}\nEnsure the cron expression is valid and try again."
+    ))]
+    FailedToCreateCronChannel {
+        cron: String,
+        source: scheduler::Error,
+    },
+
+    #[snafu(display(
+        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToRemoveSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
+
+    #[snafu(display(
+        "Failed to infer the worker type for the worker '{name}'.\nEnsure the worker has a valid configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/workers"
+    ))]
+    FailedToInferWorkerType { name: String },
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -460,6 +482,11 @@ impl Runtime {
     #[must_use]
     pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
         Arc::clone(&self.token_provider_registry)
+    }
+
+    #[must_use]
+    pub fn schedulers(&self) -> Arc<ScheduleRegistry> {
+        Arc::clone(&self.schedulers)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -755,7 +782,7 @@ impl Runtime {
 
                 #[cfg(feature = "models")]
                 {
-                    self_clone.load_workers().await;
+                    Arc::clone(&self_clone).load_workers().await;
                     self_clone.load_eval_scorer().await;
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());

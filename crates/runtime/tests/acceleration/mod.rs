@@ -25,6 +25,8 @@ mod checkpoint_duckdb;
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
+#[cfg(feature = "duckdb")]
+mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]

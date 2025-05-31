@@ -49,7 +49,6 @@ pub(crate) struct WorkerResponse {
 pub(crate) struct WorkerResponseItem {
     name: String,
     description: Option<String>,
-    r#type: String,
     is_llm: bool,
 }
 
@@ -57,7 +56,6 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
     WorkerResponseItem {
         name: worker.name().to_string(),
         description: worker.description().map(|d| d.to_string()),
-        r#type: worker.role().to_string(),
         is_llm: Arc::clone(worker).as_model().is_some(),
     }
 }
@@ -79,13 +77,11 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
                     {
                         "name": "round-robin",
                         "description": "Distributes requests between foo and bar models in a round-robin fashion.\n",
-                        "type": "load_balance",
                         "is_llm": true
                     },
                     {
                         "name": "fallback",
                         "description": "Attempts bar first, then foo, then baz if previous models fail.\n",
-                        "type": "load_balance",
                         "is_llm": true
                     }
                 ]
