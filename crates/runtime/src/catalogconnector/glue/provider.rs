@@ -377,12 +377,99 @@ fn get_metadata_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use globset::{Glob, GlobSetBuilder};
     use std::collections::HashMap;
 
+    #[test]
+    fn database_might_match_exact_match() {
+        let patterns = vec!["mydb".to_string()];
+        assert!(database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn database_might_match_prefix_match() {
+        let patterns = vec!["mydb.table1".to_string()];
+        assert!(database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn database_might_match_wildcard_prefix() {
+        let patterns = vec!["*.table1".to_string()];
+        assert!(database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn database_might_match_wildcard_all() {
+        let patterns = vec!["*.*".to_string()];
+        assert!(database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn database_might_match_no_match() {
+        let patterns = vec!["otherdb".to_string(), "otherdb.table1".to_string()];
+        assert!(!database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn database_might_match_empty_patterns() {
+        let patterns: Vec<String> = vec![];
+        assert!(!database_might_match("mydb", &patterns));
+    }
+
+    #[test]
+    fn is_included_no_globset() {
+        assert!(is_included(None, "mydb", "table1"));
+    }
+
+    #[test]
+    fn is_included_matching_glob() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("mydb.table1").expect("builder add"));
+        let globset = builder.build().expect("builder build");
+        assert!(is_included(Some(&globset), "mydb", "table1"));
+    }
+
+    #[test]
+    fn is_included_non_matching_glob() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("otherdb.table1").expect("builder add"));
+        let globset = builder.build().expect("builder build");
+        assert!(!is_included(Some(&globset), "mydb", "table1"));
+    }
+
+    #[test]
+    fn is_included_wildcard_glob() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("*.table1").expect("builder add"));
+        let globset = builder.build().expect("builder build");
+        assert!(is_included(Some(&globset), "mydb", "table1"));
+    }
+
+    #[test]
+    fn get_metadata_location_success() {
+        let mut params = HashMap::new();
+        params.insert(
+            "metadata_location".to_string(),
+            "s3://bucket/path".to_string(),
+        );
+        let result = get_metadata_location(Some(&params), "table").expect("metadata");
+        assert_eq!(result, "s3://bucket/path");
+    }
+
+    #[test]
+    fn get_metadata_location_missing_location() {
+        let params = HashMap::new();
+        let result = get_metadata_location(Some(&params), "table");
+        assert!(matches!(result, Err(Error::MissingMetadataLocation { .. })));
+        if let Err(Error::MissingMetadataLocation { table }) = result {
+            assert_eq!(table, "table");
+        }
+    }
+
     #[tokio::test]
-    async fn test_get_metadata_location_missing() {
+    async fn get_metadata_location_missing() {
         let params: Option<&HashMap<String, String>> = None;
-        let result = get_metadata_location(params, "test_table");
+        let result = get_metadata_location(params, "table");
         assert!(matches!(result, Err(Error::MissingParameters)));
     }
 }
