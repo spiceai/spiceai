@@ -166,7 +166,7 @@ fn create_response_stream(
     first_message: &FlightData,
 ) -> impl futures::Stream<Item = Result<PutResult, Status>> + use<> {
     let dictionaries_by_id = Arc::new(HashMap::new());
-    tracing::debug!("Starting writing data to path: {path}");
+    tracing::debug!("Starting writing data into dataset: {path}");
 
     // Sometimes the first message only contains the schema and no data
     let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
@@ -248,7 +248,7 @@ fn create_response_stream(
             }
         };
 
-        tracing::debug!("Finished writing data to path: {path}");
+        tracing::debug!("Finished writing data into dataset: {path}");
     }
 }
 
