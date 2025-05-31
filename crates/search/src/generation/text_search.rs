@@ -37,7 +37,7 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(""))]
+    #[snafu(display("Error occurred during text search: {source}"))]
     TextSearchError { source: TantivyError },
 
     #[snafu(display("User provided query '{query}' is invalid: {source}"))]
