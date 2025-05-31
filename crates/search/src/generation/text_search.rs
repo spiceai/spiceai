@@ -62,6 +62,12 @@ pub enum Error {
 
     #[snafu(display("Failed to convert underlying search data into JSON format. Error: {source}"))]
     SerdeJsonConversionError { source: serde_json::Error },
+
+    #[snafu(display("Full text search does not support filters."))]
+    UnsupportedFiltersError,
+
+    #[snafu(display("Full text search does not support retrieving additional columns."))]
+    UnsupportedAdditionalColumnsError,
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -188,10 +194,19 @@ impl CandidateGeneration for FullTextSearch {
     async fn search(
         &self,
         query: String,
-        _opt_filters: &[&Expr],
-        _addition_projection: &[&Expr],
+        opt_filters: &[&Expr],
+        addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
+        if !opt_filters.is_empty() {
+            return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
+        }
+
+        if !addition_projection.is_empty() {
+            return Err(Error::UnsupportedAdditionalColumnsError)
+                .context(GenerationTextSearchSnafu)?;
+        }
+
         let hits = self
             .search_query_literal(query.as_str(), limit)
             .context(GenerationTextSearchSnafu)?;
