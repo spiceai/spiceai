@@ -374,6 +374,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             description: Some(
                 "This column has an embedding in the underlying spice instance".to_string(),
             ),
+            full_text_search: None,
             embeddings: vec![ColumnLevelEmbeddingConfig {
                 model: "hf_minilm".to_string(),
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -383,6 +384,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
         Column {
             name: "cp_department".to_string(),
             description: Some("This column is newly embedded in this spice app".to_string()),
+            full_text_search: None,
             embeddings: vec![ColumnLevelEmbeddingConfig {
                 model: "hf_minilm".to_string(),
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),

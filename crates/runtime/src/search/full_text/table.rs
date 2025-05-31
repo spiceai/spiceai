@@ -75,7 +75,7 @@ impl TableWithFullText {
         })
     }
 
-    pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
+    #[must_use] pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
     }
 

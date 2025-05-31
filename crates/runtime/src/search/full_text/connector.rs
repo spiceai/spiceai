@@ -50,8 +50,7 @@ impl FullTextConnector {
                 let primary_key_overrides = c
                     .full_text_search
                     .as_ref()
-                    .map(|cfg| cfg.row_ids.clone())
-                    .flatten();
+                    .and_then(|cfg| cfg.row_ids.clone());
                 Some((c.name.clone(), primary_key_overrides))
             } else {
                 None
