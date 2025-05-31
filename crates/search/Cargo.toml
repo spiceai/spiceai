@@ -28,5 +28,5 @@ default = [
 text_search = ["dep:tantivy"]
 
 [dev-dependencies]
-insta.workspace = true
+insta = {workspace = true, features = ["json"] }
 tokio.workspace = true

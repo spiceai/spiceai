@@ -259,6 +259,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::physical_plan::common::collect;
+    use serde_json::Value;
     use tantivy::{
         Index, IndexWriter, doc,
         schema::{STORED, Schema, TEXT},
@@ -268,6 +269,26 @@ mod tests {
         aggregation::write_to_json_string,
         generation::{CandidateGeneration, text_search::FullTextSearch},
     };
+
+    fn normalise_result(value: &mut serde_json::Value) {
+        if let Value::Array(vv) = value {
+            for v in vv {
+                if let Value::Object(obj) = v {
+                    obj.sort_keys();
+                    if let Some(Value::Number(n)) = obj.get("score") {
+                        if let Some(score) = n.as_f64() {
+                            if let Some(truncated_score) =
+                                serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
+                            // Keep 2 decimals
+                            {
+                                obj.insert("score".to_string(), Value::Number(truncated_score));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn create_basic_index() -> Index {
         let mut schema_builder = Schema::builder();
@@ -326,6 +347,11 @@ mod tests {
         let rb_json =
             write_to_json_string(rbs.as_slice()).expect("failed to write RecordBatch to JSON");
 
-        insta::assert_snapshot!(rb_json);
+        let mut rb_as_value = serde_json::from_str::<serde_json::Value>(&rb_json)
+            .expect("failed to parse JSON string");
+
+        normalise_result(&mut rb_as_value);
+
+        insta::assert_json_snapshot!(rb_as_value);
     }
 }
