@@ -19,14 +19,17 @@ use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DataFusionResult;
+use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::Expr;
-use snafu::Snafu;
+use datafusion::prelude::{Expr, SessionContext};
+use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
+use tantivy::{TantivyDocument, TantivyError};
 
+use crate::datafusion::query::write_to_json_string;
 use crate::search::util::get_primary_keys;
 
 pub struct TableWithFullText {
@@ -46,6 +49,9 @@ pub enum Error {
 
     #[snafu(display("",))]
     PrimaryKeyInvalidType { column: String, data_type: DataType },
+
+    #[snafu(display("Failed to create a full text search index: {source}.",))]
+    IndexCreationError { source: TantivyError },
 }
 
 impl TableWithFullText {
@@ -75,7 +81,8 @@ impl TableWithFullText {
         })
     }
 
-    #[must_use] pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
+    #[must_use]
+    pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
     }
 
@@ -87,6 +94,10 @@ impl TableWithFullText {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
         for p in primary_key {
+            if p == search_field {
+                // Added below, tokenized.
+                continue;
+            }
             let Some((_, field)) = schema.column_with_name(p) else {
                 continue;
             };
@@ -121,18 +132,43 @@ impl TableWithFullText {
                 }
             }
         }
+
         schema_builder.add_text_field(
             search_field,
             tantivy::schema::STORED | tantivy::schema::TEXT,
         );
         let schema = schema_builder.build();
-        let index = tantivy::Index::create_in_ram(schema);
-        // let mut index_writer: tantivy::IndexWriter = index
-        //     .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-        //     .expect("Failed to make index writer");
+        Self::create_and_init_index(base_table, schema)
+    }
 
-        // TODO write data.
-        //
+    async fn create_and_init_index(
+        table: Arc<dyn TableProvider>,
+        schema: tantivy::schema::Schema,
+    ) -> Result<Arc<tantivy::Index>, Error> {
+        let index = tantivy::Index::create_in_ram(schema);
+        let mut index_writer: tantivy::IndexWriter = index
+            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+            .context(IndexCreationSnafu)?;
+
+        let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
+
+        let ctx = SessionContext::new();
+        let _ = ctx.register_table("temp_table", table)?;
+
+        let rbs = ctx
+            .sql(format!("SELECT {} FROM temp_table", cols.join(", ")).as_str())
+            .await?
+            .collect()
+            .await?;
+
+        let doc_json = write_to_json_string(rbs.as_slice())?;
+        let docs = parse_json_array(&schema, doc_json.as_str())?;
+
+        for doc in docs {
+            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        }
+        index_writer.commit()?;
+
         Ok(Arc::new(index))
     }
 }
@@ -199,4 +235,16 @@ impl TableProvider for TableWithFullText {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
     }
+}
+
+/// An implementation of [`TantivyDocument::parse_json`] that can parse a JSON array of JSON
+/// objects that will deserialize to [`TantivyDocument`].
+fn parse_json_array(schema: &Schema, doc_json: &str) -> Result<Vec<TantivyDocument>, TantivyError> {
+    let json_obj: Vec<Map<String, serde_json::Value>> =
+        serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
+
+    json_obj
+        .into_iter()
+        .map(|obj| TantivyDocument::parse_json_object(schema, &obj))
+        .collect::<Result<Vec<_>, _>>()
 }
