@@ -63,7 +63,8 @@ pub struct DataFusionBuilder {
     caching: Option<Arc<Caching>>,
 }
 
-pub(crate) fn get_df_default_config() -> SessionConfig {
+#[must_use]
+pub fn get_df_default_config() -> SessionConfig {
     let mut df_config = SessionConfig::new();
 
     // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.

@@ -22,28 +22,39 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use datafusion::{arrow::array::RecordBatch, datasource::TableProvider};
-use futures::TryStreamExt;
+use datafusion::{
+    arrow::array::RecordBatch,
+    datasource::{DefaultTableSource, TableProvider},
+    execution::SessionStateBuilder,
+    logical_expr::LogicalPlanBuilder,
+    prelude::{DataFrame, SessionContext},
+    sql::TableReference,
+};
 use snafu::{ResultExt, prelude::*};
 
+use datafusion::logical_expr::{col, lit};
 use runtime::{
     Runtime,
     accelerated_table::AcceleratedTableBuilderError,
     component::dataset::{Mode, builder::DatasetBuilder},
     dataaccelerator::{self},
     dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
-    datafusion::DataFusion,
+    datafusion::{
+        DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config,
+        error::find_datafusion_root,
+    },
     dataupdate::{DataUpdate, UpdateType},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     secrets::Secrets,
+    task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
-const TASK_HISTORY_SINK_TABLE: &str = "runtime.scp_task_history_sink";
+const TASK_HISTORY_SINK_TABLE: &str = "runtime.task_history_scp";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
-const DEFAULT_EXPORT_LATER_ARRIVED_RECORDS_SECS: u64 = 30;
+const DEFAULT_EXPORT_LATER_ARRIVED_RECORDS_SECS: u64 = 5;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -121,12 +132,15 @@ impl ScpManagementExtension {
     }
 
     async fn export_task_history_records(df: &Arc<DataFusion>, since: SystemTime) -> bool {
-        // We fetch records and then insert them into the sink table separatly as
-        // Insert Into is not allowed via runtime settings, so we can't do 'INSERT INTO .. SELECT * FROM ..'
-        let data = match get_task_history_records(df, since).await {
+        let data = match get_task_history_records(df, since)
+            .await
+            .map_err(find_datafusion_root)
+            .boxed()
+            .context(UnableToExportTaskHistoryDataSnafu)
+        {
             Ok(records) => records,
             Err(e) => {
-                tracing::warn!("{e}");
+                tracing::warn!("{e}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds");
                 return false;
             }
         };
@@ -137,17 +151,14 @@ impl ScpManagementExtension {
         }
 
         if let Err(e) = write_task_history_records_to_remote(df, data).await {
-            tracing::warn!(
-                "Error exporting task history records: {e}. Retrying in {} seconds",
-                DEFAULT_EXPORT_INTERVAL_SECS
-            );
+            tracing::warn!("{e}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds");
             return false;
         }
 
         true
     }
 
-    async fn start_task_history_replication(&self, runtime: Arc<Runtime>) -> Result<()> {
+    async fn start_task_history_export(&self, runtime: Arc<Runtime>) -> Result<()> {
         let app_ref = runtime.app();
         let app_lock = app_ref.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -264,7 +275,7 @@ impl Extension for ScpManagementExtension {
     }
 
     async fn on_start(&self, runtime: Arc<Runtime>) -> Result<()> {
-        self.start_task_history_replication(runtime).await?;
+        self.start_task_history_export(runtime).await?;
         tracing::info!("Initialized Spice Cloud management");
         Ok(())
     }
@@ -370,24 +381,37 @@ async fn write_task_history_records_to_remote(
 async fn get_task_history_records(
     df: &Arc<DataFusion>,
     since: SystemTime,
-) -> Result<Vec<RecordBatch>, Error> {
-    let sql = format!(
-        "SELECT * FROM runtime.task_history WHERE end_time >= '{}'",
-        Into::<DateTime<Utc>>::into(since).to_rfc3339()
-    );
+) -> Result<Vec<RecordBatch>, datafusion::error::DataFusionError> {
+    let state = SessionStateBuilder::new()
+        .with_config(get_df_default_config())
+        .build();
 
-    let result = df
-        .query_builder(&sql)
-        .build()
-        .run()
-        .await
-        .boxed()
-        .context(UnableToExportTaskHistoryDataSnafu)?;
+    let ctx = SessionContext::new_with_state(state);
 
-    result
-        .data
-        .try_collect::<Vec<RecordBatch>>()
+    let Ok(table_provider) = df
+        .get_accelerated_table_provider("runtime.task_history")
         .await
-        .boxed()
-        .context(UnableToExportTaskHistoryDataSnafu)
+    else {
+        // If the table provider is not available, it means task history is not registered or ready yet
+        tracing::debug!("Task history table is not registered or ready yet.");
+        return Ok(vec![]);
+    };
+
+    // Build filter expression: end_time >= since
+    let since_dt = Into::<DateTime<Utc>>::into(since).to_rfc3339();
+    let filter_expr = col("end_time").gt_eq(lit(since_dt));
+
+    let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
+
+    let logical_plan = LogicalPlanBuilder::scan(
+        TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+        table_source,
+        None,
+    )?
+    .filter(filter_expr)?
+    .build()?;
+
+    let df = DataFrame::new(ctx.state(), logical_plan);
+
+    df.collect().await
 }
