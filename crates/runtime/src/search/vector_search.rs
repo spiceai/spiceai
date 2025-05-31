@@ -20,6 +20,7 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
+use crate::search::util::search_table;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,

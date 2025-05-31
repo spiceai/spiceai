@@ -18,20 +18,22 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
+use logos::Source;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
+use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
 
 use crate::datafusion::query::write_to_json_string;
 use crate::search::util::get_primary_keys;
 
+#[derive(Clone)]
 pub struct TableWithFullText {
     base_table: Arc<dyn TableProvider>,
     search_field: String,
@@ -52,6 +54,20 @@ pub enum Error {
 
     #[snafu(display("Failed to create a full text search index: {source}.",))]
     IndexCreationError { source: TantivyError },
+
+    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
+    FailedToRetrieveDataFromSource { source: DataFusionError },
+
+    #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
+    FailedToInsertDataIntoIndex { source: TantivyError },
+
+    #[snafu(display(
+        "Failed to create the full text search index. Context: {context}. Error: {source}.",
+    ))]
+    InvalidIndexingError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        context: String,
+    },
 }
 
 impl TableWithFullText {
@@ -138,36 +154,45 @@ impl TableWithFullText {
             tantivy::schema::STORED | tantivy::schema::TEXT,
         );
         let schema = schema_builder.build();
-        Self::create_and_init_index(base_table, schema)
+        Self::create_and_init_index(base_table, schema).await
     }
 
     async fn create_and_init_index(
         table: Arc<dyn TableProvider>,
         schema: tantivy::schema::Schema,
     ) -> Result<Arc<tantivy::Index>, Error> {
+        let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
+
+        let ctx = SessionContext::new();
+        let _ = ctx
+            .register_table("temp_table", table)
+            .context(FailedToRetrieveDataFromSourceSnafu)?;
+
+        let rbs = ctx
+            .sql(format!("SELECT {} FROM temp_table", cols.join(", ")).as_str())
+            .await
+            .context(FailedToRetrieveDataFromSourceSnafu)?
+            .collect()
+            .await
+            .context(FailedToRetrieveDataFromSourceSnafu)?;
+
+        let doc_json = write_to_json_string(rbs.as_slice()).context(InvalidIndexingSnafu {
+            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
+        })?;
+        let docs = parse_json_array(&schema, doc_json.as_str())
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
         let index = tantivy::Index::create_in_ram(schema);
         let mut index_writer: tantivy::IndexWriter = index
             .writer(15_000_000) // cannot be less than 15_000_000 for in memory
             .context(IndexCreationSnafu)?;
 
-        let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
-
-        let ctx = SessionContext::new();
-        let _ = ctx.register_table("temp_table", table)?;
-
-        let rbs = ctx
-            .sql(format!("SELECT {} FROM temp_table", cols.join(", ")).as_str())
-            .await?
-            .collect()
-            .await?;
-
-        let doc_json = write_to_json_string(rbs.as_slice())?;
-        let docs = parse_json_array(&schema, doc_json.as_str())?;
-
         for doc in docs {
             index_writer.add_document(doc).context(IndexCreationSnafu)?;
         }
-        index_writer.commit()?;
+        index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu)?;
 
         Ok(Arc::new(index))
     }
@@ -239,12 +264,19 @@ impl TableProvider for TableWithFullText {
 
 /// An implementation of [`TantivyDocument::parse_json`] that can parse a JSON array of JSON
 /// objects that will deserialize to [`TantivyDocument`].
-fn parse_json_array(schema: &Schema, doc_json: &str) -> Result<Vec<TantivyDocument>, TantivyError> {
-    let json_obj: Vec<Map<String, serde_json::Value>> =
-        serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
+fn parse_json_array(
+    schema: &tantivy::schema::Schema,
+    doc_json: &str,
+) -> Result<Vec<TantivyDocument>, TantivyError> {
+    let json_obj: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(doc_json)
+        .map_err(|_| {
+            Into::<TantivyError>::into(DocParsingError::InvalidJson(
+                doc_json.slice(0..20).unwrap_or_default().to_string(),
+            ))
+        })?;
 
-    json_obj
+    Ok(json_obj
         .into_iter()
-        .map(|obj| TantivyDocument::parse_json_object(schema, &obj))
-        .collect::<Result<Vec<_>, _>>()
+        .map(|obj| TantivyDocument::from_json_object(schema, obj))
+        .collect::<Result<Vec<_>, _>>()?)
 }
