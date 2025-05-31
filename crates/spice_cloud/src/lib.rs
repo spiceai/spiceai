@@ -14,34 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use chrono::{DateTime, Utc};
+use datafusion::{arrow::array::RecordBatch, datasource::TableProvider};
+use futures::TryStreamExt;
 use snafu::{ResultExt, prelude::*};
 
 use runtime::{
     Runtime,
-    accelerated_table::{
-        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
-    },
-    component::dataset::{
-        Mode, TimeFormat,
-        acceleration::{Acceleration, RefreshMode},
-        builder::DatasetBuilder,
-        replication::Replication,
-    },
-    dataaccelerator::{self, AcceleratorEngineRegistry},
+    accelerated_table::AcceleratedTableBuilderError,
+    component::dataset::{Mode, builder::DatasetBuilder},
+    dataaccelerator::{self},
     dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
+    datafusion::DataFusion,
+    dataupdate::{DataUpdate, UpdateType},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    federated_table::FederatedTable,
-    secrets::{ExposeSecret, Secrets},
-    spice_metrics::get_metrics_table_reference,
-    status,
+    secrets::Secrets,
 };
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
+const TASK_HISTORY_SINK_TABLE: &str = "runtime.scp_task_history_sink";
+const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
+const DEFAULT_EXPORT_LATER_ARRIVED_RECORDS_SECS: u64 = 30;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -66,126 +68,159 @@ pub enum Error {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
-    #[snafu(display("Spice Cloud secret not found"))]
-    SpiceSecretNotFound {},
-
     #[snafu(display("Spice Cloud api_key not provided"))]
     SpiceApiKeyNotFound {},
-
-    #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
-    UnableToConnectToSpiceCloud { source: reqwest::Error },
 
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
     },
+
+    #[snafu(display("Error exporting task_history records: {source}"))]
+    UnableToExportTaskHistoryData {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
-pub struct SpiceExtension {
+pub struct ScpManagementExtension {
     manifest: ExtensionManifest,
     api_key: String,
 }
 
-impl SpiceExtension {
+impl ScpManagementExtension {
     #[must_use]
     pub fn new(manifest: ExtensionManifest) -> Self {
-        SpiceExtension {
+        ScpManagementExtension {
             manifest,
             api_key: String::new(),
         }
     }
 
-    fn metrics_enabled(&self) -> bool {
-        if !self.manifest.enabled {
-            return false;
-        }
-
+    fn get_flight_url(&self) -> String {
         self.manifest
             .params
-            .get("metrics")
-            .map_or_else(|| false, |v| v.eq_ignore_ascii_case("true"))
-    }
-
-    fn spice_http_url(&self) -> String {
-        self.manifest
-            .params
-            .get("endpoint")
-            .unwrap_or(&"https://data.spiceai.io".to_string())
+            .get("flight_endpoint")
+            .unwrap_or(&"https://flight.spiceai.io".to_string())
             .to_string()
     }
 
-    async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        let secret = runtime.secrets();
-        let secret = secret.read().await;
-        let api_key = secret
-            .get_secret("spiceai_api_key")
-            .await
-            .context(UnableToGetSpiceSecretSnafu)?
-            .ok_or(Error::SpiceApiKeyNotFound {})?;
-
-        Ok(api_key.expose_secret().to_string())
+    fn get_api_key(&self, _runtime: &Runtime) -> Result<String, Error> {
+        self.manifest
+            .params
+            .get("api_key")
+            .ok_or(Error::SpiceApiKeyNotFound {})
+            .cloned()
     }
 
-    async fn connect(&self) -> Result<SpiceCloudConnectResponse, Error> {
-        self.post_json("/v1/connect", json!({})).await
+    fn calculate_export_since_time(last_exported_time: SystemTime) -> SystemTime {
+        last_exported_time
+            .checked_sub(Duration::from_secs(
+                DEFAULT_EXPORT_LATER_ARRIVED_RECORDS_SECS,
+            ))
+            .unwrap_or(last_exported_time)
     }
 
-    async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: Req,
-    ) -> Result<Resp, Error> {
-        let client = reqwest::Client::new();
-        let response = client
-            .post(format!("{}{path}", self.spice_http_url()))
-            .json(&body)
-            .header("Content-Type", "application/json")
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
+    async fn export_task_history_records(df: &Arc<DataFusion>, since: SystemTime) -> bool {
+        // We fetch records and then insert them into the sink table separatly as
+        // Insert Into is not allowed via runtime settings, so we can't do 'INSERT INTO .. SELECT * FROM ..'
+        let data = match get_task_history_records(df, since).await {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!("{e}");
+                return false;
+            }
+        };
 
-        let response: Resp = response
-            .json()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
+        if data.is_empty() {
+            tracing::trace!("No new task history records to export");
+            return true;
+        }
 
-        Ok(response)
+        if let Err(e) = write_task_history_records_to_remote(df, data).await {
+            tracing::warn!(
+                "Error exporting task history records: {e}. Retrying in {} seconds",
+                DEFAULT_EXPORT_INTERVAL_SECS
+            );
+            return false;
+        }
+
+        true
     }
 
-    async fn register_runtime_metrics_table(
-        &self,
-        runtime: Arc<Runtime>,
-        from: String,
-    ) -> Result<()> {
-        let retention = Retention::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            None,
-            None,
-            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-            Some(Duration::from_secs(300)),  // run retention every 5 minutes
-            true,
-        );
+    async fn start_task_history_replication(&self, runtime: Arc<Runtime>) -> Result<()> {
+        let app_ref = runtime.app();
+        let app_lock = app_ref.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            if !app.runtime.task_history.enabled {
+                tracing::debug!("Task history is disabled via configuration.");
+                return Ok(());
+            }
+        }
+        drop(app_lock);
 
-        let refresh = Refresh::new(RefreshMode::Full)
-            .time_column("timestamp".to_string())
-            .time_format(TimeFormat::UnixSeconds)
-            .check_interval(Duration::from_secs(10))
-            .period(Duration::from_secs(1800)); // sync only last 30 minutes from cloud
+        self.init_task_history_sink_table(&runtime).await?;
 
-        let metrics_table_reference = get_metrics_table_reference();
+        let cancellation_token = CancellationToken::new();
+        let df = runtime.datafusion();
 
-        let table = create_synced_internal_accelerated_table(
-            runtime.accelerator_engine_registry(),
-            runtime.status(),
-            metrics_table_reference.clone(),
-            from.as_str(),
-            Acceleration::default(),
-            refresh,
-            retention,
+        let _task = runtime
+            .start_runtime_task(
+                "task_history_export",
+                Some(cancellation_token.clone()),
+                async move {
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(DEFAULT_EXPORT_INTERVAL_SECS));
+
+                    let mut last_exported_time = SystemTime::now();
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                            }
+                            () = cancellation_token.cancelled() => {
+                                // Runtime shutdown requested, write latest available data and stop exporting
+                                let since = Self::calculate_export_since_time(last_exported_time);
+                                let _= Self::export_task_history_records(&df, since).await;
+                                tracing::debug!("Task history data export stopped");
+                                break;
+                            }
+                        };
+
+                        // new candidate time for last export, as retrieving and exporting records is not atomic and can take time,
+                        // we calcualte new time candidate before fetching records, not after we retrieved or send them
+                        let last_exported_time_new = SystemTime::now();
+
+                        // export only records added after last export (plus additional buffer for late arrivals)
+                        let since = Self::calculate_export_since_time(last_exported_time);
+
+                        if !Self::export_task_history_records(&df, since).await {
+                            continue;
+                        }
+
+                        last_exported_time = last_exported_time_new;
+                    }
+
+                    Ok(())
+                },
+            )
+            .await;
+
+        tracing::debug!("Enabled task history data export to Spice Cloud");
+
+        Ok(())
+    }
+
+    async fn init_task_history_sink_table(&self, runtime: &Arc<Runtime>) -> Result<()> {
+        let mut params = HashMap::new();
+        params.insert("spiceai_endpoint".to_string(), self.get_flight_url());
+        params.insert("spiceai_api_key".to_string(), self.api_key.to_string());
+
+        let sink = get_spiceai_table_provider(
+            TASK_HISTORY_SINK_TABLE,
+            TASK_HISTORY_SINK_REMOTE_TABLE,
             runtime.secrets(),
-            Arc::clone(&runtime),
+            params,
+            Arc::clone(runtime),
         )
         .await
         .boxed()
@@ -193,48 +228,24 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+            .register_table_as_writable_and_with_schema(TASK_HISTORY_SINK_TABLE.into(), sink)
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-        Ok(())
-    }
-
-    async fn start_metrics(&self, runtime: Arc<Runtime>) -> Result<()> {
-        if !self.metrics_enabled() {
-            return Ok(());
-        }
-
-        let connection = self
-            .connect()
-            .await
-            .boxed()
-            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-        let spiceai_metrics_dataset_path = format!(
-            "spice.ai/{}/{}/{}",
-            connection.org_name, connection.app_name, connection.metrics_dataset_name
-        );
-
-        let from = spiceai_metrics_dataset_path.to_string();
-        self.register_runtime_metrics_table(runtime, from.clone())
-            .await?;
-        tracing::info!("Enabled metrics sync from runtime.metrics to {from}");
 
         Ok(())
     }
 }
 
-impl Default for SpiceExtension {
+impl Default for ScpManagementExtension {
     fn default() -> Self {
-        SpiceExtension::new(ExtensionManifest::default())
+        ScpManagementExtension::new(ExtensionManifest::default())
     }
 }
 
 #[async_trait]
-impl Extension for SpiceExtension {
+impl Extension for ScpManagementExtension {
     fn name(&self) -> &'static str {
-        "spice_cloud"
+        "management"
     }
 
     async fn initialize(&mut self, runtime: &Runtime) -> Result<()> {
@@ -243,18 +254,18 @@ impl Extension for SpiceExtension {
         }
 
         let api_key = self
-            .get_spice_api_key(runtime)
-            .await
+            .get_api_key(runtime)
             .boxed()
             .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?;
+
         self.api_key = api_key;
 
         Ok(())
     }
 
     async fn on_start(&self, runtime: Arc<Runtime>) -> Result<()> {
-        self.start_metrics(runtime).await?;
-
+        self.start_task_history_replication(runtime).await?;
+        tracing::info!("Initialized Spice Cloud management");
         Ok(())
     }
 }
@@ -273,7 +284,7 @@ impl SpiceExtensionFactory {
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {
+        Box::new(ScpManagementExtension {
             manifest: self.manifest.clone(),
             api_key: String::new(),
         })
@@ -284,6 +295,7 @@ async fn get_spiceai_table_provider(
     name: &str,
     cloud_dataset_path: &str,
     secrets: Arc<RwLock<Secrets>>,
+    params: HashMap<String, String>,
     runtime: Arc<Runtime>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     let app_ref = runtime.app();
@@ -294,19 +306,19 @@ async fn get_spiceai_table_provider(
         });
     };
 
-    let mut dataset = DatasetBuilder::try_new(cloud_dataset_path.to_string(), name)
+    let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?
         .with_app(Arc::clone(app))
         .with_runtime(runtime)
         .build()
         .boxed()
-        .context(UnableToCreateDataConnectorSnafu)?;
+        .context(UnableToCreateDataConnectorSnafu)?
+        .with_params(params);
 
     dataset.mode = Mode::ReadWrite;
-    dataset.replication = Some(Replication { enabled: true });
 
-    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
         .build(secrets)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
@@ -325,63 +337,57 @@ async fn get_spiceai_table_provider(
     Ok(source_table_provider)
 }
 
-/// Create a new accelerated table that is synced with the cloud dataset
-///
-/// # Errors
-///
-/// This function will return an error if the accelerated table provider cannot be created
-#[allow(clippy::too_many_arguments)]
-pub async fn create_synced_internal_accelerated_table(
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
-    runtime_status: Arc<status::RuntimeStatus>,
-    table_reference: TableReference,
-    from: &str,
-    acceleration: Acceleration,
-    refresh: Refresh,
-    retention: Option<Retention>,
-    secrets: Arc<RwLock<Secrets>>,
-    runtime: Arc<Runtime>,
-) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
-            .await?;
-    let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
+async fn write_task_history_records_to_remote(
+    df: &Arc<DataFusion>,
+    data: Vec<RecordBatch>,
+) -> Result<(), Error> {
+    let Some(schema) = data.first().map(RecordBatch::schema) else {
+        tracing::trace!("No records to export for task history");
+        return Ok(());
+    };
 
-    let accelerated_table_provider = accelerator_engine_registry
-        .create_accelerator_table(
-            table_reference.clone(),
-            federated_table.schema(),
-            None,
-            &acceleration,
-            secrets,
-            None,
-        )
+    let num_records: usize = data
+        .iter()
+        .map(datafusion::arrow::array::RecordBatch::num_rows)
+        .sum();
+
+    let data_update = DataUpdate {
+        schema,
+        data,
+        update_type: UpdateType::Append,
+    };
+
+    df.write_data(&TASK_HISTORY_SINK_TABLE.into(), data_update)
         .await
-        .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+        .boxed()
+        .context(UnableToExportTaskHistoryDataSnafu)?;
 
-    let mut builder = AcceleratedTable::builder(
-        runtime_status,
-        table_reference.clone(),
-        federated_table,
-        "spice.ai".to_string(),
-        accelerated_table_provider,
-        refresh,
-    );
+    tracing::debug!("Exported {num_records} task history records");
 
-    builder.retention(retention);
-
-    let (accelerated_table, _) = builder
-        .build()
-        .await
-        .context(UnableToBuildAcceleratedTableSnafu)?;
-
-    Ok(Arc::new(accelerated_table))
+    Ok(())
 }
 
-#[derive(Deserialize, Debug)]
-#[allow(clippy::struct_field_names)]
-struct SpiceCloudConnectResponse {
-    org_name: String,
-    app_name: String,
-    metrics_dataset_name: String,
+async fn get_task_history_records(
+    df: &Arc<DataFusion>,
+    since: SystemTime,
+) -> Result<Vec<RecordBatch>, Error> {
+    let sql = format!(
+        "SELECT * FROM runtime.task_history WHERE end_time >= '{}'",
+        Into::<DateTime<Utc>>::into(since).to_rfc3339()
+    );
+
+    let result = df
+        .query_builder(&sql)
+        .build()
+        .run()
+        .await
+        .boxed()
+        .context(UnableToExportTaskHistoryDataSnafu)?;
+
+    result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .boxed()
+        .context(UnableToExportTaskHistoryDataSnafu)
 }

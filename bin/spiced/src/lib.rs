@@ -185,7 +185,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {
-        if let Some(manifest) = app.extensions.get("spice_cloud") {
+        if let Some(manifest) = app.extensions.get("management") {
             let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
             extension_factories.push(Box::new(spice_extension_factory));
         }
@@ -208,7 +208,7 @@ pub async fn run(args: Args) -> Result<()> {
         .with_extensions(extension_factories)
         // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
         .with_autoload_extensions(HashMap::from([(
-            "spice_cloud".to_string(),
+            "management".to_string(),
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
         .with_datasets_health_monitor()

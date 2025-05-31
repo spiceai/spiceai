@@ -934,7 +934,7 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    async fn start_runtime_task<F>(
+    pub async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,

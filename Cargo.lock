@@ -12123,6 +12123,7 @@ name = "spice-cloud"
 version = "1.4.0-unstable"
 dependencies = [
  "async-trait",
+ "chrono",
  "datafusion",
  "futures",
  "globset",
@@ -12132,6 +12133,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
