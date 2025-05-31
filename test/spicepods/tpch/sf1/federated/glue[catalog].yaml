@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: glue[catalog]-federated
+catalogs:
+  - from: glue
+    name: tpch
+    include:
+      - 'tpch.*'
+    params:
+      glue_auth: key
+      glue_region: ${secret:GLUE_AWS_REGION}
+      glue_key: ${secret:GLUE_AWS_KEY}
+      glue_secret: ${secret:GLUE_AWS_SECRET}
+
