@@ -11669,6 +11669,8 @@ dependencies = [
  "insta",
  "serde_json",
  "snafu",
+ "tantivy",
+ "tokio",
  "tracing",
 ]
 

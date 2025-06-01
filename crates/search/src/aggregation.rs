@@ -221,7 +221,7 @@ impl AggregationResult {
     }
 }
 
-fn write_to_json_string(
+pub(crate) fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();
