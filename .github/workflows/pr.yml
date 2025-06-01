@@ -13,14 +13,14 @@ on:
   workflow_dispatch:
     inputs:
       profile_option:
-        description: "Which Rust build profile to use? (Default is ci)"
+        description: "Which Rust build profile to use? (Default is lint)"
         required: false
         type: choice
         options:
-          - "ci"
+          - "lint"
           - "release"
           - "release-lto"
-        default: "ci"
+        default: "lint"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -28,7 +28,7 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
-  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'ci' }}
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via

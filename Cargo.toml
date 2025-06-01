@@ -175,7 +175,7 @@ x509-certificate = "0.23.1"
 inherits = "release"
 lto = true
 
-[profile.ci]
+[profile.lint]
 inherits = "dev"
 debug = "line-tables-only"
 incremental = false
