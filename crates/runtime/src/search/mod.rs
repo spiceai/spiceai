@@ -50,6 +50,9 @@ pub enum Error {
     #[snafu(display("Error occurred in search pipeline: {source}"))]
     SearchPipelineError { source: search::pipeline::Error },
 
+    #[snafu(display("Error occurred generating search candidates: {source}"))]
+    SearchGenerationError { source: search::generation::Error },
+
     #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
     SearchAggregationError { source: aggregation::Error },
 

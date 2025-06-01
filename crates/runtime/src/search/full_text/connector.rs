@@ -1,5 +1,3 @@
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::metrics::MetricsProvider;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -15,16 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::component::ComponentInitialization;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorResult;
+use crate::accelerated_table::AcceleratedTable;
+use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
+use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 
 use super::table::TableWithFullText;
 

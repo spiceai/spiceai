@@ -20,6 +20,7 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
+use crate::search::SearchGenerationSnafu;
 use crate::search::util::search_table;
 use crate::search::{
     SearchPipelineSnafu,
@@ -176,13 +177,18 @@ impl VectorSearch {
                         );
                     };
 
+                    if let Some(fts) = search_table(&self.df, &tbl).await {
+                        let genn = fts.as_search_generator().context(SearchGenerationSnafu)?;
+                        generators.push(Box::new(genn));
+                    }
+
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
-                         query.clone(),
-                         where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                          additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),
-                          primary_keys.to_vec(),
-                          keywords,
-                          *limit
+                        query.clone(),
+                        where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
+                        additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),
+                        primary_keys.to_vec(),
+                        keywords,
+                        *limit
                     ).await.context(SearchPipelineSnafu)?;
 
                     Ok((tbl.clone(), agg_result))

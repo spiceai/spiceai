@@ -24,6 +24,8 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use logos::Source;
+use search::generation::CandidateGeneration;
+use search::generation::text_search::FullTextSearch;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
@@ -37,6 +39,7 @@ use crate::search::util::get_primary_keys;
 pub struct TableWithFullText {
     base_table: Arc<dyn TableProvider>,
     search_field: String,
+    primary_key: Vec<String>,
     index: Arc<tantivy::Index>,
 }
 
@@ -94,6 +97,7 @@ impl TableWithFullText {
             base_table: inner,
             search_field,
             index,
+            primary_key: pks,
         })
     }
 
@@ -151,7 +155,7 @@ impl TableWithFullText {
 
         schema_builder.add_text_field(
             search_field,
-            tantivy::schema::STORED | tantivy::schema::TEXT,
+            tantivy::schema::TEXT | tantivy::schema::STORED,
         );
         let schema = schema_builder.build();
         Self::create_and_init_index(base_table, schema).await
@@ -162,7 +166,6 @@ impl TableWithFullText {
         schema: tantivy::schema::Schema,
     ) -> Result<Arc<tantivy::Index>, Error> {
         let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
-
         let ctx = SessionContext::new();
         let _ = ctx
             .register_table("temp_table", table)
@@ -195,6 +198,17 @@ impl TableWithFullText {
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
         Ok(Arc::new(index))
+    }
+
+    pub fn as_search_generator(
+        &self,
+    ) -> std::result::Result<FullTextSearch, search::generation::Error> {
+        FullTextSearch::try_new(
+            Arc::clone(&self.index),
+            self.search_field.clone(),
+            self.primary_key.clone(),
+        )
+        .map_err(|source| search::generation::Error::TextSearchError { source })
     }
 }
 

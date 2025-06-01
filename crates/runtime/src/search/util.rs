@@ -222,7 +222,10 @@ pub async fn embedding_columns_from_table(
     Ok(embedding_table.get_embedding_columns())
 }
 
-pub async fn search_table(df: &Arc<DataFusion>, tbl: &TableReference) -> Option<TableWithFullText> {
+pub async fn search_table(
+    df: &Arc<DataFusion>,
+    tbl: &TableReference,
+) -> Option<Arc<TableWithFullText>> {
     let table_provider = df.get_table(tbl).await?;
 
     find_concrete_table_provider::<TableWithFullText>(&table_provider).await
