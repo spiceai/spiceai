@@ -3,16 +3,16 @@ tests:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/mysql.yaml
     query_set: tpch
     query_overrides: mysql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/mysql.yaml
     query_set: tpch
     query_overrides: mysql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   load:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/mysql.yaml
     query_set: tpch
     query_overrides: mysql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     duration: 28800

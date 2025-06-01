@@ -3,15 +3,15 @@ tests:
     spicepod_path: ./test/spicepods/tpcds/sf1/federated/duckdb.yaml
     query_set: tpcds
     query_overrides: duckdb
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   throughput:
     spicepod_path: ./test/spicepods/tpcds/sf1/federated/duckdb.yaml
     query_set: tpcds
     query_overrides: duckdb
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   load:
     spicepod_path: ./test/spicepods/tpcds/sf1/federated/duckdb.yaml
     query_set: tpcds
     query_overrides: duckdb
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     duration: 28800
