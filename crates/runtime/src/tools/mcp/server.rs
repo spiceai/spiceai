@@ -50,7 +50,7 @@ impl ServerHandler for RuntimeServer {
             instructions: None,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "Spice OSS".to_string(),
+                name: "Spice.ai Open Source".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             protocol_version: ProtocolVersion::LATEST,
