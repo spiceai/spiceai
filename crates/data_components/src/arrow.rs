@@ -19,9 +19,10 @@ use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
     datasource::TableProvider,
-    error::Result as DataFusionResult,
+    error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::sync::Arc;
 
 use crate::delete::DeletionTableProviderAdapter;
@@ -55,9 +56,18 @@ impl TableProviderFactory for ArrowFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
-        let mem_table = MemTable::try_new(schema, vec![])?
+        let mut mem_table = MemTable::try_new(schema, vec![])?
             .try_with_constraints(cmd.constraints.clone())
             .await?;
+
+        if let Some(on_conflict_str) = cmd.options.get("on_conflict") {
+            mem_table = mem_table.with_on_conflict(
+                OnConflict::try_from(on_conflict_str.as_str()).map_err(|e| {
+                    DataFusionError::External(format!("Error parsing on_conflict: {e}").into())
+                })?,
+            );
+        }
+
         let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }
