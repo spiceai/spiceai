@@ -564,7 +564,7 @@ impl Runtime {
                 dataset: ds.name.clone(),
             })?;
 
-        let notifier = accelerated_table.refresher().notifier();
+        let notifier = accelerated_table.refresher().on_complete_notification();
 
         // wait for accelerated table to be ready
         if let Some(notifier) = notifier {

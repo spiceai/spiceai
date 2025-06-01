@@ -428,7 +428,7 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
-    notifier: Option<Arc<Notify>>,
+    on_complete_notification: Option<Arc<Notify>>,
 }
 
 impl Refresher {
@@ -455,7 +455,7 @@ impl Refresher {
             initial_load_completed: Arc::new(AtomicBool::new(false)),
             disable_federation: false,
             semaphore: None,
-            notifier: None,
+            on_complete_notification: None,
         }
     }
 
@@ -497,14 +497,14 @@ impl Refresher {
         self
     }
 
-    pub fn with_notifier(&mut self, notifier: Arc<Notify>) -> &mut Self {
-        self.notifier = Some(notifier);
+    pub fn with_completion_notifier(&mut self, on_complete_notification: Arc<Notify>) -> &mut Self {
+        self.on_complete_notification = Some(on_complete_notification);
         self
     }
 
     #[must_use]
-    pub fn notifier(&self) -> Option<Arc<Notify>> {
-        self.notifier.clone()
+    pub fn on_complete_notification(&self) -> Option<Arc<Notify>> {
+        self.on_complete_notification.clone()
     }
 
     pub fn set_initial_load_completed(&self, initial_load_completed: bool) {
@@ -598,7 +598,7 @@ impl Refresher {
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
         self.refresh_task_runner = Some(refresh_task_runner);
 
-        let notifier = self.notifier.clone();
+        let notifier = self.on_complete_notification.clone();
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
@@ -740,7 +740,7 @@ impl Refresher {
         let cache_provider = self.cache_provider.clone();
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
-        let notifier = self.notifier.clone();
+        let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
             if let Err(err) = refresh_task
                 .start_streaming_append(
@@ -776,7 +776,7 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
-        let notifier = self.notifier.clone();
+        let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
             if let Err(err) = refresh_task
                 .start_changes_stream(
@@ -932,7 +932,7 @@ mod tests {
             Arc::clone(&accelerator),
         );
 
-        refresher.with_notifier(Arc::clone(&notifier));
+        refresher.with_completion_notifier(Arc::clone(&notifier));
 
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
@@ -1141,7 +1141,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            refresher.with_notifier(Arc::clone(&notifier));
+            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
@@ -1295,7 +1295,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            refresher.with_notifier(Arc::clone(&notifier));
+            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
@@ -1499,7 +1499,7 @@ mod tests {
                 Arc::clone(&accelerator),
             );
 
-            refresher.with_notifier(Arc::clone(&notifier));
+            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));

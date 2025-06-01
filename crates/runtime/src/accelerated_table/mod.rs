@@ -391,7 +391,7 @@ impl Builder {
 
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
-        let notify_ready = Arc::new(Notify::new());
+        let on_complete_notification = Arc::new(Notify::new());
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
@@ -448,7 +448,7 @@ impl Builder {
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_notifier(Arc::clone(&notify_ready));
+        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }

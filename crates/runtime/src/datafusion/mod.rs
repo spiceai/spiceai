@@ -428,7 +428,7 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
-                    let notifier = accelerated_table.refresher().notifier();
+                    let notifier = accelerated_table.refresher().on_complete_notification();
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
@@ -1084,7 +1084,7 @@ impl DataFusion {
         let mut accelerated_table = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
-        let notifier = accelerated_table.refresher().notifier();
+        let notifier = accelerated_table.refresher().on_complete_notification();
 
         source
             .on_accelerated_table_registration(&dataset, &mut accelerated_table)
@@ -1119,7 +1119,7 @@ impl DataFusion {
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
-            let notifier = accelerated_table.refresher().notifier();
+            let notifier = accelerated_table.refresher().on_complete_notification();
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
