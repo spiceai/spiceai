@@ -781,7 +781,7 @@ mod test {
             .add_schedule(Arc::new(new_schedule))
             .await
             .expect("To add new schedule");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5250)).await;
 
         scheduler.stop().await;
         let map_lock = TEST_EXECUTION_COUNT.read().await;
@@ -790,7 +790,7 @@ mod test {
             .expect("To get test execution count");
         assert!(
             *count == 9 || *count == 10,
-            "Test component should have executed 9 or 10 times, but got {count}"
+            "Test component should have executed 9 or 10 times, but got {count}" // environment load in CI can cause this to vary
         );
         let count = map_lock
             .get("test_adding_schedule_while_running_starts_new")

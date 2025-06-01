@@ -430,6 +430,18 @@ pub struct Refresher {
     semaphore: Option<Arc<Semaphore>>,
 }
 
+impl std::fmt::Debug for Refresher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refresher")
+            .field("dataset_name", &self.dataset_name)
+            .field("federated", &self.federated)
+            .field("federated_source", &self.federated_source)
+            .field("refresh", &self.refresh)
+            .field("accelerator", &self.accelerator)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Refresher {
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,

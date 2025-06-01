@@ -146,6 +146,7 @@ impl RefreshTaskBuilder {
     }
 }
 
+#[derive(Debug)]
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,

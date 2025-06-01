@@ -2,16 +2,16 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q6"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                        |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                                                          |
-|               |   Federated                                                                                                                                                                                 |
-|               |  Projection: count(DISTINCT hits.SearchPhrase)                                                                                                                                              |
-|               |   Aggregate: groupBy=[[]], aggr=[[count(DISTINCT hits.SearchPhrase)]]                                                                                                                       |
-|               |     TableScan: hits projection=[SearchPhrase]                                                                                                                                               |
-| physical_plan | BytesProcessedExec                                                                                                                                                                          |
-|               |   SchemaCastScanExec                                                                                                                                                                        |
-|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: sql=SELECT count(DISTINCT hits.SearchPhrase) FROM hits rewritten_sql=SELECT count(DISTINCT "hits"."SearchPhrase") FROM "hits" |
-|               |                                                                                                                                                                                             |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                               |
++---------------+------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                 |
+|               |   Federated                                                                                                                        |
+|               |  Projection: count(DISTINCT hits.SearchPhrase)                                                                                     |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(DISTINCT hits.SearchPhrase)]]                                                              |
+|               |     TableScan: hits projection=[SearchPhrase]                                                                                      |
+| physical_plan | BytesProcessedExec                                                                                                                 |
+|               |   SchemaCastScanExec                                                                                                               |
+|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT count(DISTINCT "hits"."SearchPhrase") FROM "hits" |
+|               |                                                                                                                                    |
++---------------+------------------------------------------------------------------------------------------------------------------------------------+
