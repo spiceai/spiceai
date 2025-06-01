@@ -1,5 +1,3 @@
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::metrics::MetricsProvider;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -15,8 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::accelerated_table::AcceleratedTable;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
