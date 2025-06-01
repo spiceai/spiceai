@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use datafusion::{
     arrow::array::RecordBatch,
     datasource::{DefaultTableSource, TableProvider},
+    error::DataFusionError,
     execution::SessionStateBuilder,
     logical_expr::LogicalPlanBuilder,
     prelude::{DataFrame, SessionContext},
@@ -40,8 +41,7 @@ use runtime::{
     dataaccelerator::{self},
     dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
     datafusion::{
-        DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config,
-        error::find_datafusion_root,
+        DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
     dataupdate::{DataUpdate, UpdateType},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
@@ -131,23 +131,29 @@ impl ScpManagementExtension {
             .unwrap_or(last_exported_time)
     }
 
+    // Export task history records to Spice Cloud, returning true if any records were exported
     async fn export_task_history_records(df: &Arc<DataFusion>, since: SystemTime) -> bool {
-        let data = match get_task_history_records(df, since)
-            .await
-            .map_err(find_datafusion_root)
-            .boxed()
-            .context(UnableToExportTaskHistoryDataSnafu)
-        {
+        let data = match get_task_history_records(df, since).await {
             Ok(records) => records,
             Err(e) => {
-                tracing::warn!("{e}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds");
+                if is_table_not_ready_error(&e) {
+                    tracing::debug!("Task history table is not ready yet, retrying later");
+                    return false;
+                }
+
+                tracing::warn!(
+                    "{}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds",
+                    Error::UnableToExportTaskHistoryData {
+                        source: Box::new(e)
+                    }
+                );
                 return false;
             }
         };
 
         if data.is_empty() {
-            tracing::trace!("No new task history records to export");
-            return true;
+            tracing::trace!("No task history records to export");
+            return false;
         }
 
         if let Err(e) = write_task_history_records_to_remote(df, data).await {
@@ -414,4 +420,16 @@ async fn get_task_history_records(
     let df = DataFrame::new(ctx.state(), logical_plan);
 
     df.collect().await
+}
+
+fn is_table_not_ready_error(e: &DataFusionError) -> bool {
+    if let DataFusionError::External(e) = e {
+        if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
+            match e {
+                SpiceExternalError::AccelerationNotReady { .. } => return true,
+            }
+        }
+    }
+
+    false
 }
