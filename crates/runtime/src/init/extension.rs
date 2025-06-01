@@ -22,7 +22,7 @@ impl Runtime {
         let mut extensions = self.extensions.write().await;
         for (name, extension) in extensions.iter_mut() {
             if let Err(err) = extension.on_start(Arc::clone(&self)).await {
-                tracing::warn!("Failed to start extension {name}: {err}");
+                tracing::warn!("Failed to start extension '{name}': {err}");
             }
         }
     }

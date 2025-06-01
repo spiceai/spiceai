@@ -45,7 +45,8 @@ use runtime::{
     },
     dataupdate::{DataUpdate, UpdateType},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    secrets::Secrets,
+    get_params_with_secrets,
+    secrets::{ExposeSecret, Secrets},
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
 use tokio::sync::RwLock;
@@ -115,12 +116,14 @@ impl ScpManagementExtension {
             .to_string()
     }
 
-    fn get_api_key(&self, _runtime: &Runtime) -> Result<String, Error> {
-        self.manifest
-            .params
+    async fn get_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
+        let extension_params =
+            get_params_with_secrets(runtime.secrets(), &self.manifest.params).await;
+
+        extension_params
             .get("api_key")
+            .map(|api_key| api_key.expose_secret().to_string())
             .ok_or(Error::SpiceApiKeyNotFound {})
-            .cloned()
     }
 
     fn calculate_export_since_time(last_exported_time: SystemTime) -> SystemTime {
@@ -272,6 +275,7 @@ impl Extension for ScpManagementExtension {
 
         let api_key = self
             .get_api_key(runtime)
+            .await
             .boxed()
             .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?;
 
