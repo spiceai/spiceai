@@ -75,6 +75,9 @@ impl GlueCatalogProvider {
                 .context(super::ParameterValidationSnafu)?;
         }
 
+        // `file_format` is required early for ListingConnector which the S3
+        // connector uses. We can change the file format when we create
+        // TableProviders if we need to.
         parameters
             .parameters
             .insert("file_format".to_string(), "parquet".into());
