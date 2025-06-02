@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+use component::management::Management;
 use extension::Extension;
 use reader::ReadableYaml;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,8 @@ pub struct Spicepod {
     pub workers: Vec<Worker>,
 
     pub runtime: Runtime,
+
+    pub management: Option<Management>,
 }
 
 fn detect_duplicate_component_names(
@@ -266,5 +269,6 @@ fn from_definition(
         workers,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
+        management: spicepod_definition.management,
     }
 }
