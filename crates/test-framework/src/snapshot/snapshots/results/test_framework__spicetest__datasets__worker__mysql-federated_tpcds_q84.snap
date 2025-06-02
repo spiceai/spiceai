@@ -6,13 +6,13 @@ description: "Query: tpcds_q84"
 | customer_id      | customername |
 +------------------+--------------+
 | AAAAAAAAAENGBAAA | 0            |
-| AAAAAAAABLEPAAAA | 0            |
-| AAAAAAAADLECBAAA | 0            |
 | AAAAAAAAEFEBBAAA | 0            |
-| AAAAAAAAEFPDBAAA | 0            |
 | AAAAAAAAEGPDAAAA | 0            |
-| AAAAAAAAFFOGBAAA | 0            |
-| AAAAAAAAGLFBAAAA | 0            |
-| AAAAAAAAIEPNAAAA | 0            |
-| AAAAAAAAIGBPAAAA | 0            |
+| AAAAAAAAHJHBAAAA | 0            |
+| AAAAAAAAHNFDAAAA | 0            |
+| AAAAAAAAIIHCAAAA | 0            |
+| AAAAAAAAIJMGAAAA | 0            |
+| AAAAAAAAJHACAAAA | 0            |
+| AAAAAAAAJNHAAAAA | 0            |
+| AAAAAAAAKBGDAAAA | 0            |
 +------------------+--------------+
