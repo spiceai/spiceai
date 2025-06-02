@@ -19,6 +19,7 @@ use crate::{Runtime, dataconnector::parameters::ConnectorParams};
 use aws_config::SdkConfig;
 use aws_sdk_glue::types::Table;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 pub struct GlueCatalogState {
@@ -41,5 +42,13 @@ impl GlueCatalogState {
             parameters,
             runtime,
         }
+    }
+}
+
+impl fmt::Debug for GlueCatalogState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GlueCatalogState")
+            .field("databases", &self.databases)
+            .finish_non_exhaustive()
     }
 }

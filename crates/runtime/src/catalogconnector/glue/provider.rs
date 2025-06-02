@@ -56,17 +56,10 @@ impl fmt::Debug for GlueCatalogProvider {
 }
 
 /// A schema provider for a specific Glue database, providing table metadata.
+#[derive(Debug)]
 pub struct GlueSchemaProvider {
     database: String,
     state: Arc<GlueCatalogState>,
-}
-
-impl fmt::Debug for GlueSchemaProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GlueSchemaProvider")
-            .field("database", &self.database)
-            .finish_non_exhaustive()
-    }
 }
 
 impl GlueCatalogProvider {
