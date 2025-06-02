@@ -51,7 +51,7 @@ runs:
         mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
         mkdir ./sf0_01
         cd ./sf0_01
-        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/* ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
     
     - name: Download File Connector ClickBench Data
       shell: bash
