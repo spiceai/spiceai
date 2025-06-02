@@ -121,9 +121,7 @@ impl GlueCatalogProvider {
                 })
                 .collect::<Vec<_>>();
 
-            if !table_names.is_empty() {
-                databases.insert(db.name, table_names);
-            }
+            databases.insert(db.name, table_names);
         }
 
         let inner = Arc::new(GlueCatalogState::new(
