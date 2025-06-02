@@ -56,7 +56,7 @@ impl ScheduledTask for DatasetRefreshTask {
             }
         }
         .instrument(span)
-        .await?
+        .await
     }
 }
 
