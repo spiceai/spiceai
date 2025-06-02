@@ -261,7 +261,7 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
         let expected_fields = if is_tz { 3 } else { 2 };
         if struct_array.columns().len() < expected_fields {
             return UnableToCastSnowflakeTimestampSnafu {
-                reason: format!("struct has fewer than {} columns", expected_fields),
+                reason: format!("struct has fewer than {expected_fields} columns"),
             }
             .fail();
         }
@@ -468,6 +468,28 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::util::display;
     use std::sync::Arc;
+
+    #[test]
+    fn test_cast_sf_timestamp_ntz_seconds_precision_to_arrow_timestamp() {
+        let mut builder = Int64Builder::new();
+        builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
+        let timestamp_ntz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            Some(1_714_647_301_000_000_000),
+        ];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert_eq!(result.value(1), expected_timestamps[1].unwrap_or_default());
+    }
 
     #[test]
     fn test_cast_sf_timestamp_ntz_to_arrow_timestamp() {
