@@ -146,7 +146,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
 
     // Extract metrics from the evaluation result. If the evaluation run was not successful (EvalStatus::Failed),
-    // we will return an error at the end after prining statistics and cleaning up.
+    // we will return an error at the end after printing statistics and cleaning up.
     let metrics = EvalMetrics::from_record_batch(&eval_result)?;
 
     let tasks_calls = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
