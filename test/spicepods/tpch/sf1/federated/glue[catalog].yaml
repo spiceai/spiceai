@@ -3,7 +3,7 @@ kind: Spicepod
 name: glue[catalog]-federated
 catalogs:
   - from: glue
-    name: tpch
+    name: glue
     include:
       - 'tpch.*'
     params:
