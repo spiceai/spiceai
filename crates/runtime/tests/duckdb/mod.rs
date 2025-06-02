@@ -17,12 +17,16 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::configure_test_datafusion;
-use crate::{RecordBatch, init_tracing, utils::test_request_context};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{runtime_ready_check, test_request_context},
+};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use scopeguard::defer;
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
@@ -30,6 +34,23 @@ fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset 
         format!("duckdb:read_{fn_name}({path_str})"),
         fn_name.to_string(),
     );
+    dataset.name = ds_name.to_string();
+    dataset
+}
+
+fn make_duckdb_acceleration_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        format!("duckdb:read_{fn_name}({path_str})"),
+        fn_name.to_string(),
+    );
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        refresh_sql: None,
+        ..Acceleration::default()
+    });
     dataset.name = ds_name.to_string();
     dataset
 }
@@ -159,7 +180,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
             }
 
             let app = AppBuilder::new("duckdb_order_by_test")
-                .with_dataset(make_duckdb_dataset(
+                .with_dataset(make_duckdb_acceleration_dataset(
                     "csv_test",
                     "csv",
                     &format!("'{}'", sample_csv_path.display()),
@@ -180,6 +201,8 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             // Test ORDER BY NULL
             let order_by_null_query = "SELECT \"VendorID\" FROM csv_test ORDER BY NULL LIMIT 5";
