@@ -18,7 +18,15 @@ datafusion.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+tantivy = { version = "0.24.1", optional = true }
 tracing.workspace = true
 
+[features]
+default = [
+    "text_search"
+]
+text_search = ["dep:tantivy"]
+
 [dev-dependencies]
-insta.workspace = true
+insta = {workspace = true, features = ["json"] }
+tokio.workspace = true
