@@ -41,6 +41,8 @@ use std::error::Error as StdError;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::Channel;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 pub mod tls;
 
@@ -387,6 +389,24 @@ impl FlightClient {
     ///
     /// Returns an error if the query fails.
     pub async fn query(&self, query: &str) -> Result<FlightRecordBatchStream> {
+        // Server may configured with a http2_max_requests limit
+        // Which can causes transient error due to connection being closed and reopened.
+        // Use a retry strategy with exponential backoff to handle transient errors.
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
+
+        retry(retry_strategy, || async {
+            match self.query_internal(query).await {
+                Ok(stream) => Ok(stream),
+                Err(e) => Err(RetryError::transient(e)),
+            }
+        })
+        .await
+        .map_err(|e| Error::UnableToQuery {
+            source: Box::new(e),
+        })
+    }
+
+    async fn query_internal(&self, query: &str) -> Result<FlightRecordBatchStream> {
         let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
