@@ -18,7 +18,10 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
     listing::{self, ListingTableConnector},
-    parameters::aws::{AuthValidator, EndpointValidator, RegionValidator, Validator},
+    parameters::{
+        self, Validator,
+        aws::{AuthValidator, EndpointValidator, RegionValidator},
+    },
 };
 
 use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
@@ -34,14 +37,15 @@ use url::Url;
 
 static PREFIX: &str = "s3";
 
-static VALIDATORS: LazyLock<Vec<Box<dyn Validator + Send + Sync + 'static>>> =
-    LazyLock::new(|| {
-        vec![
-            Box::new(EndpointValidator),
-            Box::new(RegionValidator),
-            Box::new(AuthValidator),
-        ]
-    });
+static VALIDATORS: LazyLock<
+    Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
+> = LazyLock::new(|| {
+    vec![
+        Box::new(EndpointValidator),
+        Box::new(RegionValidator),
+        Box::new(AuthValidator),
+    ]
+});
 
 #[derive(Debug, Snafu)]
 pub enum Error {

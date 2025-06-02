@@ -21,8 +21,8 @@ use crate::{
     dataconnector::{
         ConnectorComponent,
         parameters::{
-            self, ConnectorParams,
-            aws::{AuthValidator, RegionValidator, Validator},
+            self, ConnectorParams, Validator,
+            aws::{AuthValidator, RegionValidator},
         },
         s3,
     },
@@ -59,8 +59,9 @@ pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     .collect()
 });
 
-static VALIDATORS: LazyLock<Vec<Box<dyn Validator + Send + Sync + 'static>>> =
-    LazyLock::new(|| vec![Box::new(RegionValidator), Box::new(AuthValidator)]);
+static VALIDATORS: LazyLock<
+    Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
+> = LazyLock::new(|| vec![Box::new(RegionValidator), Box::new(AuthValidator)]);
 
 #[derive(Debug, Snafu)]
 pub enum Error {

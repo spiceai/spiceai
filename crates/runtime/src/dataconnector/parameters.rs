@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
+use async_trait::async_trait;
 use datafusion_table_providers::UnsupportedTypeAction;
 use tokio::sync::RwLock;
 
@@ -30,6 +31,14 @@ use super::{
 };
 
 pub(crate) mod aws;
+
+#[async_trait]
+pub(crate) trait Validator {
+    type Error;
+
+    /// Parameters may be changed while validating.
+    async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Self::Error>;
+}
 
 #[derive(Clone)]
 pub struct ConnectorParams {

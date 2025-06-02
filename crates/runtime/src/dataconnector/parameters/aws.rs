@@ -21,7 +21,7 @@ use tonic::async_trait;
 
 use crate::parameters::{ParamLookup, Parameters};
 
-use super::ConnectorParams;
+use super::{ConnectorParams, Validator};
 
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
 pub const AWS_REGIONS: [&str; 32] = [
@@ -88,15 +88,12 @@ pub enum Error {
     UnsupportedAuthenticationMethod { method: String },
 }
 
-#[async_trait]
-pub(crate) trait Validator {
-    async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error>;
-}
-
 pub(crate) struct EndpointValidator;
 
 #[async_trait]
 impl Validator for EndpointValidator {
+    type Error = Error;
+
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
             let endpoint = endpoint.to_string();
@@ -124,6 +121,8 @@ pub(crate) struct RegionValidator;
 
 #[async_trait]
 impl Validator for RegionValidator {
+    type Error = Error;
+
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
         if let Some(region) = params.parameters.get("region").expose().ok() {
             if AWS_REGIONS.contains(&region.to_lowercase().as_str())
@@ -155,6 +154,8 @@ pub(crate) struct AuthValidator;
 
 #[async_trait]
 impl Validator for AuthValidator {
+    type Error = Error;
+
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
         match params.parameters.get("auth").expose().ok() {
             None | Some("public" | "iam_role") => {
