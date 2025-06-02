@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 mod embedding;
 mod hf;
 mod local;
-mod openai;
+pub(crate) mod openai;
 mod search;
 mod tools;
 
@@ -189,7 +189,7 @@ fn get_small_clickbench_dataset(name: &str) -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(
+pub fn get_tpcds_dataset(
     ds_name: &str,
     spice_name: Option<&str>,
     refresh_sql: Option<&str>,

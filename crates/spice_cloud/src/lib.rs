@@ -370,7 +370,7 @@ pub async fn create_synced_internal_accelerated_table(
 
     builder.retention(retention);
 
-    let (accelerated_table, _) = builder
+    let accelerated_table = builder
         .build()
         .await
         .context(UnableToBuildAcceleratedTableSnafu)?;
