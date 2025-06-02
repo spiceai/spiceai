@@ -46,7 +46,6 @@ pub struct ConnectorParams {
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
     pub(crate) app: Option<Arc<App>>,
-    #[allow(dead_code)] // will be utilized in https://github.com/spiceai/spiceai/pull/5542
     pub(crate) runtime: Option<Arc<Runtime>>,
 }
 
