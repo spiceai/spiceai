@@ -51,10 +51,7 @@ impl ScheduledTask for DatasetRefreshTask {
                         notifier.notified().await;
                     }
                 }
-                Err(e) => {
-                    // Handle the error
-                    todo!("Handle when refresh fails: {e}");
-                }
+                Err(e) => Err(scheduler::Error::RefreshTaskFailure { source: e.into() }),
             }
         }
         .instrument(span)
