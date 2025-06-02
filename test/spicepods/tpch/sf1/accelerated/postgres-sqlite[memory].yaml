@@ -9,7 +9,7 @@ datasets:
       pg_port: 5432
       pg_user: postgres
       pg_pass: ${secrets:POSTGRES_PASSWORD}
-      pg_db: tpch
+      pg_db: tpch_sf1
       pg_sslmode: disable
     acceleration: &acceleration
       enabled: true

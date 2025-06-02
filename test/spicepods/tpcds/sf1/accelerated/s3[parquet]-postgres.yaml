@@ -18,7 +18,7 @@ datasets:
         pg_host: ${secrets:PG_BENCHMARK_PG_HOST}
         pg_user: ${secrets:PG_BENCHMARK_PG_USER}
         pg_pass: ${secrets:PG_BENCHMARK_PG_PASS}
-        pg_db: ${secrets:PG_BENCHMARK_ACC_PG_DBNAME}
+        pg_db: tpcds_sf1_accelerated
         pg_port: ${secrets:PG_BENCHMARK_PG_PORT}
         pg_sslmode: ${secrets:PG_BENCHMARK_PG_SSLMODE}
   - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
