@@ -137,7 +137,7 @@ impl AppBuilder {
         self.runtime = spicepod.runtime.clone();
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
-        self.management = spicepod.management.clone();
+        self.management.clone_from(&spicepod.management);
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());

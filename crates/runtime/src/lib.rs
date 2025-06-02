@@ -88,6 +88,7 @@ pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
+mod management;
 mod metrics;
 mod metrics_server;
 pub mod model;
@@ -799,6 +800,18 @@ impl Runtime {
                 }
             }
         });
+
+        if let Some(cfg) = self
+            .app
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.management.as_ref())
+        {
+            if let Err(err) = management::init_cloud_management(Arc::clone(&self), cfg).await {
+                tracing::error!("Failed to initialize Spice Cloud management: {err}");
+            }
+        }
 
         let components = vec![task_history, datasets, catalogs, models_and_evals];
 
