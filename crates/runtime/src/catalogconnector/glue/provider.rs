@@ -124,9 +124,7 @@ impl GlueCatalogProvider {
             databases.insert(db.name, table_names);
         }
 
-        let inner = Arc::new(GlueCatalogState::new(
-            databases, config, parameters, runtime,
-        ));
+        let inner = Arc::new(GlueCatalogState::new(databases, parameters, runtime));
 
         Ok(Self { inner })
     }

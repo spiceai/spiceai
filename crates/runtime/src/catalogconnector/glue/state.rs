@@ -16,7 +16,6 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::{Runtime, dataconnector::parameters::ConnectorParams};
-use aws_config::SdkConfig;
 use aws_sdk_glue::types::Table;
 use std::collections::HashMap;
 use std::fmt;
@@ -24,7 +23,6 @@ use std::sync::Arc;
 
 pub struct GlueCatalogState {
     pub(super) databases: HashMap<DatabaseName, Vec<Table>>,
-    pub(super) config: SdkConfig,
     pub(super) parameters: ConnectorParams,
     pub(super) runtime: Arc<Runtime>,
 }
@@ -32,13 +30,11 @@ pub struct GlueCatalogState {
 impl GlueCatalogState {
     pub(super) fn new(
         databases: HashMap<DatabaseName, Vec<Table>>,
-        config: SdkConfig,
         parameters: ConnectorParams,
         runtime: Arc<Runtime>,
     ) -> Self {
         Self {
             databases,
-            config,
             parameters,
             runtime,
         }
