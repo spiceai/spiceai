@@ -292,7 +292,7 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
             } else {
                 let epoch = epoch_array.value(idx);
                 let fraction = i64::from(fraction_array.value(idx));
-                let timestamp = epoch * 1_000_000_000 + fraction;
+                let timestamp = epoch * NANOSECONDS + fraction;
                 builder.append_value(timestamp);
             }
         }
@@ -476,6 +476,28 @@ mod tests {
         let timestamp_ntz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
 
         let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            Some(1_714_647_301_000_000_000),
+        ];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert_eq!(result.value(1), expected_timestamps[1].unwrap_or_default());
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_tz_seconds_precision_to_arrow_timestamp() {
+        let mut builder = Int64Builder::new();
+        builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
+        let timestamp_tz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true)
             .expect("Should cast Snowflake timestamp to Arrow timestamp");
         let result = result
             .as_any()
