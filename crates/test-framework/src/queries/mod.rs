@@ -392,6 +392,7 @@ pub enum QueryOverrides {
     Snowflake,
     IcebergSF1,
     SpicecloudCatalog,
+    GlueCatalog,
     Spicecloud,
 }
 

@@ -80,6 +80,8 @@ pub enum QueryOverridesArg {
     IcebergSF1,
     #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
+    #[serde(rename = "glue-catalog")]
+    GlueCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
 }
@@ -111,6 +113,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
             QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
+            QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
         }
     }
 }
