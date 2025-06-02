@@ -20,7 +20,7 @@ use super::{
     listing::{self, ListingTableConnector},
     parameters::{
         self, Validator,
-        aws::{AuthValidator, EndpointValidator, RegionValidator},
+        aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
 
@@ -41,7 +41,7 @@ static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
 > = LazyLock::new(|| {
     vec![
-        Box::new(EndpointValidator),
+        Box::new(S3EndpointValidator),
         Box::new(RegionValidator),
         Box::new(AuthValidator),
     ]

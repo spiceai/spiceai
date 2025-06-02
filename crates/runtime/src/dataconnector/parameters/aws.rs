@@ -88,10 +88,10 @@ pub enum Error {
     UnsupportedAuthenticationMethod { method: String },
 }
 
-pub(crate) struct EndpointValidator;
+pub(crate) struct S3EndpointValidator;
 
 #[async_trait]
-impl Validator for EndpointValidator {
+impl Validator for S3EndpointValidator {
     type Error = Error;
 
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
