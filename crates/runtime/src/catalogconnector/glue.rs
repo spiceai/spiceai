@@ -28,6 +28,11 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+use aws_sdk_glue::{
+    error::SdkError,
+    operation::{get_databases::GetDatabasesError, get_tables::GetTablesError},
+    types::Table,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::{Arc, LazyLock};
@@ -66,16 +71,10 @@ static VALIDATORS: LazyLock<
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to get Glue databases: {source}"))]
-    GetDatabases {
-        source: aws_sdk_glue::error::SdkError<
-            aws_sdk_glue::operation::get_databases::GetDatabasesError,
-        >,
-    },
+    GetDatabases { source: SdkError<GetDatabasesError> },
 
     #[snafu(display("Failed to get Glue tables: {source}"))]
-    GetTables {
-        source: aws_sdk_glue::error::SdkError<aws_sdk_glue::operation::get_tables::GetTablesError>,
-    },
+    GetTables { source: SdkError<GetTablesError> },
 
     #[snafu(display("Failed to build FileIO: {source}"))]
     BuildFileIO { source: iceberg::Error },
@@ -165,7 +164,7 @@ enum TableType {
 }
 
 impl TableType {
-    fn from(table: &aws_sdk_glue::types::Table) -> TableType {
+    fn from(table: &Table) -> TableType {
         if table
             .parameters
             .as_ref()
