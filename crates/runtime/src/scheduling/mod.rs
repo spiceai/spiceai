@@ -50,14 +50,13 @@ impl ScheduledTask for DatasetRefreshTask {
                     if let Some(notifier) = notifier {
                         notifier.notified().await;
                     }
+                    Ok(())
                 }
                 Err(e) => Err(scheduler::Error::RefreshTaskFailure { source: e.into() }),
             }
         }
         .instrument(span)
-        .await;
-
-        Ok(())
+        .await?
     }
 }
 
