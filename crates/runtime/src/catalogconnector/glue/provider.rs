@@ -25,7 +25,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_sts::config::ProvideCredentials as _;
 use data_components::RefreshableCatalogProvider;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
@@ -33,9 +32,7 @@ use datafusion::{
     error::DataFusionError,
 };
 use iceberg::{
-    NamespaceIdent, TableIdent,
-    io::{FileIOBuilder, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY},
-    spec::TableMetadata,
+    NamespaceIdent, TableIdent, io::FileIOBuilder, spec::TableMetadata,
     table::Table as IcebergTable,
 };
 use iceberg_datafusion::IcebergTableProvider;
@@ -173,22 +170,9 @@ impl GlueSchemaProvider {
         name: &str,
         table: &Table,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let mut props = Vec::new();
-        if let Some(provider) = self.state.config.credentials_provider() {
-            let creds = provider
-                .provide_credentials()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            props.push((S3_ACCESS_KEY_ID, creds.access_key_id().to_string()));
-            props.push((S3_SECRET_ACCESS_KEY, creds.secret_access_key().to_string()));
-        }
-
-        let file_io = FileIOBuilder::new("s3")
-            .with_props(props)
-            .build()
-            .map_err(|e| {
-                DataFusionError::External(Box::new(super::Error::BuildFileIO { source: e }))
-            })?;
+        let file_io = FileIOBuilder::new("s3").build().map_err(|e| {
+            DataFusionError::External(Box::new(super::Error::BuildFileIO { source: e }))
+        })?;
 
         let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
