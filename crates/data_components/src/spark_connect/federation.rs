@@ -25,8 +25,8 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::unparser::dialect::{CustomDialectBuilder, Dialect},
 };
+use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::Stream;
 
 use crate::spark_connect::map_error_to_datafusion_err;
@@ -34,32 +34,24 @@ use crate::spark_connect::map_error_to_datafusion_err;
 use super::SparkConnectTableProvider;
 
 impl SparkConnectTableProvider {
-    fn create_federated_table_source(
-        self: Arc<Self>,
-    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
-        let table_name = self.table_reference.to_quoted_string();
+    fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
+        let table_name = self.table_reference.clone();
         tracing::trace!(
-            table_name,
             %self.table_reference,
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
-        Ok(Arc::new(SQLTableSource::new_with_schema(
+        Arc::new(SQLTableSource::new_with_schema(
             fed_provider,
             table_name,
             schema,
-        )?))
+        ))
     }
 
-    pub fn create_federated_table_provider(
-        self: Arc<Self>,
-    ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
-        Ok(FederatedTableProviderAdaptor::new_with_provider(
-            table_source,
-            self,
-        ))
+    pub fn create_federated_table_provider(self: Arc<Self>) -> FederatedTableProviderAdaptor {
+        let table_source = Self::create_federated_table_source(Arc::clone(&self));
+        FederatedTableProviderAdaptor::new_with_provider(table_source, self)
     }
 }
 

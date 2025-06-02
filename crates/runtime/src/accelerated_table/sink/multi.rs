@@ -42,6 +42,7 @@ use crate::{
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
 
+#[derive(Debug)]
 pub(crate) struct MultiSink {
     original_table_provider: Arc<dyn TableProvider>,
     synchronized_tables: Vec<SynchronizedTable>,

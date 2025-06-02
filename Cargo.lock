@@ -3197,7 +3197,6 @@ dependencies = [
  "clickhouse-rs",
  "datafusion",
  "datafusion-federation",
- "datafusion-federation-sql",
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
@@ -3545,27 +3544,14 @@ dependencies = [
 
 [[package]]
 name = "datafusion-federation"
-version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=dc11bd6edec00fb42ea48b8c5256970c8a533aa2#dc11bd6edec00fb42ea48b8c5256970c8a533aa2"
+version = "0.4.2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=9db74a4b360df6be1bb554c59a474a2fd4bfb7e9#9db74a4b360df6be1bb554c59a474a2fd4bfb7e9"
 dependencies = [
  "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
  "futures",
-]
-
-[[package]]
-name = "datafusion-federation-sql"
-version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=dc11bd6edec00fb42ea48b8c5256970c8a533aa2#dc11bd6edec00fb42ea48b8c5256970c8a533aa2"
-dependencies = [
- "async-trait",
- "datafusion",
- "datafusion-federation",
- "futures",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3851,7 +3837,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=11ab0dbc0c985822a883c60564e191ca76887064#11ab0dbc0c985822a883c60564e191ca76887064"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d53510efd7b9ffb8d7f87e63df33ca0a5756e234#d53510efd7b9ffb8d7f87e63df33ca0a5756e234"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3866,7 +3852,6 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-federation",
- "datafusion-federation-sql",
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
@@ -3939,9 +3924,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96f51383ba327a1403e6e3458f8fc979d09d7200af56fa32681619f6c760dee"
+checksum = "547318d6ee083b99d0e1daef01c3873b8c9e2f832bbbf1c5fa2f248051046cbf"
 dependencies = [
  "arrow",
  "bytes",
@@ -3968,9 +3953,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7b49a2e67ebafbe644e36f251ee985f237bfb39e4ef1e312eb5876535bc449e"
+checksum = "5acac3d1b207020f0754cbc827c1d71fb342b78bcf8ab0a8e3cf79d264f22d54"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10945,7 +10930,6 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-federation",
- "datafusion-federation-sql",
  "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",

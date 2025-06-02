@@ -114,7 +114,7 @@ impl McpToolCatalog {
                     protocol_version: ProtocolVersion::default(),
                     capabilities: ClientCapabilities::default(),
                     client_info: Implementation {
-                        name: "Spice.ai".to_string(),
+                        name: "Spice.ai Open Source".to_string(),
                         version: env!("CARGO_PKG_VERSION").to_string(),
                     },
                 };

@@ -432,7 +432,7 @@ impl DataFusion {
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
-                            Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
+                            Arc::new(accelerated_table).table_provider(),
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -1094,7 +1094,7 @@ impl DataFusion {
         self.ctx
             .register_table(
                 dataset.name.clone(),
-                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
+                Arc::new(accelerated_table).table_provider(),
             )
             .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -1478,10 +1478,7 @@ impl DataFusion {
                 })?;
 
         self.ctx
-            .register_table(
-                table.clone(),
-                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
-            )
+            .register_table(table.clone(), Arc::new(accelerated_table).table_provider())
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to registed view: {e}"),
             })?;

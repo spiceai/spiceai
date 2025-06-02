@@ -166,6 +166,7 @@ fn create_response_stream(
     first_message: &FlightData,
 ) -> impl futures::Stream<Item = Result<PutResult, Status>> + use<> {
     let dictionaries_by_id = Arc::new(HashMap::new());
+    tracing::debug!("Starting writing data into dataset: {path}");
 
     // Sometimes the first message only contains the schema and no data
     let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
@@ -227,12 +228,14 @@ fn create_response_stream(
                         None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
                             drop(batch_tx);
+                            tracing::trace!("No more messages in the stream, finalizing write operation for path: {path}");
 
                             // Wait for the write operation to complete
                             if let Err(e) = write_future.await {
                                 tracing::error!("Write operation failed. Details included in the response.");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
+                            tracing::trace!("Write operation completed successfully for path: {path}");
                             break;
                         }
                         Some(Err(e)) => {
@@ -245,7 +248,7 @@ fn create_response_stream(
             }
         };
 
-        tracing::trace!("Finished writing data to path: {path}");
+        tracing::debug!("Finished writing data into dataset: {path}");
     }
 }
 
