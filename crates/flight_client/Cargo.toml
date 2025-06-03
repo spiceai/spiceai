@@ -21,4 +21,3 @@ rustls-pemfile = "2.1.3"
 secrecy.workspace = true
 snafu.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
-util = { path = "../util" }
