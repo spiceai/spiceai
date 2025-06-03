@@ -35,9 +35,9 @@ use datafusion::{
     prelude::{DataFrame, SessionContext, col, lit},
     sql::TableReference,
 };
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::{OptionExt, ResultExt, Snafu};
-use spicepod::component::management::Management as spicepod_management;
+use spicepod::component::management::Management as SpicepodManagement;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -76,9 +76,9 @@ pub enum Error {
     },
 }
 
-pub(crate) async fn init_cloud_management(
+pub(crate) async fn init_management(
     runtime: Arc<Runtime>,
-    config: &spicepod_management,
+    config: &SpicepodManagement,
 ) -> Result<(), Error> {
     if !config.enabled {
         return Ok(());
@@ -97,24 +97,23 @@ pub(crate) async fn init_cloud_management(
 /// across on-premises and cluster environments.
 pub(crate) struct Management {
     runtime: Arc<Runtime>,
-    api_key: String,
+    api_key: SecretString,
     params: HashMap<String, SecretString>,
 }
 
 impl Management {
     pub async fn try_from(
-        config: &spicepod_management,
+        config: &SpicepodManagement,
         runtime: Arc<Runtime>,
     ) -> Result<Self, Error> {
         let params = get_params_with_secrets(runtime.secrets(), &config.params).await;
 
         let api_key = params
             .get("api_key")
-            .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "api_key" })?;
 
         Ok(Self {
-            api_key: api_key.to_string(),
+            api_key: api_key.clone(),
             runtime,
             params,
         })
@@ -122,7 +121,7 @@ impl Management {
 
     pub async fn start(&self) -> Result<(), Error> {
         self.start_task_history_export().await?;
-        tracing::info!("Initialized Spice Cloud management");
+        tracing::info!("Initialized management of the Spice runtime");
         Ok(())
     }
 
@@ -173,14 +172,17 @@ impl Management {
             )
             .await;
 
-        tracing::debug!("Enabled task history data export to Spice Cloud");
+        tracing::debug!("Enabled task history data export");
 
         Ok(())
     }
 
     async fn init_task_history_sink_table(&self) -> Result<(), Error> {
         let mut params = HashMap::new();
-        params.insert("spiceai_api_key".to_string(), self.api_key.to_string());
+        params.insert(
+            "spiceai_api_key".to_string(),
+            self.api_key.expose_secret().to_string(),
+        );
 
         if let Some(flight_endpoint) = self.params.get("flight_endpoint") {
             params.insert(

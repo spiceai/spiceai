@@ -808,8 +808,8 @@ impl Runtime {
             .as_ref()
             .and_then(|app| app.management.as_ref())
         {
-            if let Err(err) = management::init_cloud_management(Arc::clone(&self), cfg).await {
-                tracing::error!("Failed to initialize Spice Cloud management: {err}");
+            if let Err(err) = management::init_management(Arc::clone(&self), cfg).await {
+                tracing::error!("Failed to initialize management of the Spice runtime: {err}");
             }
         }
 
