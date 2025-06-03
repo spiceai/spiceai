@@ -51,9 +51,6 @@ jobs:
         with:
           ref: ${{ matrix.branch }}
 
-      - name: Update HTTP sources to HTTPS
-        uses: ./.github/actions/update-http-sources
-
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -114,9 +111,6 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Update HTTP sources to HTTPS
-        uses: ./.github/actions/update-http-sources
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
