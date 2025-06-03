@@ -158,7 +158,9 @@ pub trait Worker: Send + Sync {
 
     fn description(&self) -> Option<Cow<'_, str>>;
 
-    fn as_model(self: Arc<Self>) -> Option<Arc<dyn Chat>>;
+    fn as_model(self: Arc<Self>) -> Option<Arc<dyn Chat>> {
+        None
+    }
 
     fn schedule_parameters(&self) -> Option<WorkerScheduleParameters> {
         None
@@ -231,10 +233,6 @@ impl Worker for SQLWorker {
 
     fn description(&self) -> Option<Cow<'_, str>> {
         self.description.as_ref().map(Into::into)
-    }
-
-    fn as_model(self: Arc<Self>) -> Option<Arc<dyn Chat>> {
-        None // SQLWorker does not implement Chat
     }
 
     fn schedule_parameters(&self) -> Option<WorkerScheduleParameters> {
