@@ -97,11 +97,6 @@ impl Match {
     pub fn metadata(&self) -> &HashMap<String, serde_json::Value> {
         &self.metadata
     }
-
-    #[must_use]
-    pub fn data(&self) -> &HashMap<String, serde_json::Value> {
-        &self.data
-    }
 }
 
 pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowError> {
