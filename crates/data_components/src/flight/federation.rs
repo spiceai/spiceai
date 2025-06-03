@@ -1,6 +1,6 @@
 use async_trait::async_trait;
+use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use std::sync::Arc;
 
 use datafusion::{
@@ -13,32 +13,24 @@ use datafusion::{
 use super::{FlightTable, query_to_stream};
 
 impl FlightTable {
-    fn create_federated_table_source(
-        self: Arc<Self>,
-    ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
-        let table_name = self.table_reference.to_quoted_string();
+    fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
+        let table_name = self.table_reference.clone();
         tracing::trace!(
-            table_name,
             %self.table_reference,
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
-        Ok(Arc::new(SQLTableSource::new_with_schema(
+        Arc::new(SQLTableSource::new_with_schema(
             fed_provider,
             table_name,
             schema,
-        )?))
+        ))
     }
 
-    pub fn create_federated_table_provider(
-        self: Arc<Self>,
-    ) -> DataFusionResult<FederatedTableProviderAdaptor> {
-        let table_source = Self::create_federated_table_source(Arc::clone(&self))?;
-        Ok(FederatedTableProviderAdaptor::new_with_provider(
-            table_source,
-            self,
-        ))
+    pub fn create_federated_table_provider(self: Arc<Self>) -> FederatedTableProviderAdaptor {
+        let table_source = Self::create_federated_table_source(Arc::clone(&self));
+        FederatedTableProviderAdaptor::new_with_provider(table_source, self)
     }
 }
 
@@ -77,9 +69,5 @@ impl SQLExecutor for FlightTable {
         FlightTable::get_schema(self.client.clone(), TableReference::bare(table_name))
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))
-    }
-
-    fn subquery_use_partial_path(&self) -> bool {
-        self.subquery_use_partial_path
     }
 }

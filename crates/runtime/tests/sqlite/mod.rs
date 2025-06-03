@@ -63,7 +63,7 @@ fn decimal_queries(snapshot_name: &str, query_type: DecimalQuery) -> QueryTests<
         DecimalQuery::Federated => CheckFunction::ValidateSubPlan(vec![(
             "VirtualExecutionPlan",
             Box::new(|plan| {
-                plan.contains("sql=SELECT sum(\"decimal\".small_decimal), sum(\"decimal\".medium_decimal), sum(\"decimal\".large_decimal), sum(\"decimal\".precise_decimal) FROM \"decimal\" rewritten_sql=SELECT sum(`decimal`.`small_decimal`), sum(`decimal`.`medium_decimal`), sum(`decimal`.`large_decimal`), sum(`decimal`.`precise_decimal`) FROM `decimal`")
+                plan.contains("sql=SELECT sum(`decimal`.`small_decimal`), sum(`decimal`.`medium_decimal`), sum(`decimal`.`large_decimal`), sum(`decimal`.`precise_decimal`) FROM `decimal`")
             }),
         )]),
         DecimalQuery::NonFederated => {

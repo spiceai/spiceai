@@ -33,12 +33,6 @@ use test_framework::{
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    if args.common.concurrency < 2 {
-        return Err(anyhow::anyhow!(
-            "Concurrency should be greater than 1 for a load test"
-        ));
-    }
-
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);

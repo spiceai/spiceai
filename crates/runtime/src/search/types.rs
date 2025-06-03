@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
-use super::{CandidateAggregationSnafu, Result};
+use super::{Result, SearchAggregationSnafu};
 
 pub type ModelKey = String;
 pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
@@ -138,7 +138,7 @@ pub async fn to_pretty(agg: AggregationResult) -> Result<impl Display, ArrowErro
 pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let mut matches: Vec<Match> = Vec::new();
     for (a, b) in result {
-        let mut o = to_matches(&a, b).await.context(CandidateAggregationSnafu)?;
+        let mut o = to_matches(&a, b).await.context(SearchAggregationSnafu)?;
         matches.append(&mut o);
     }
 

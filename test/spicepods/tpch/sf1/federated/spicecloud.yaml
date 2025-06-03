@@ -6,7 +6,7 @@ datasets:
     name: customer
     params: &spicecloud_params
       spiceai_api_key: ${secrets:SPICEAI_TEST_TPCH_API_KEY}
-      spiceai_endpoint: 'https://dev-flight.spiceai.io'
+      spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}
   - from: spice.ai:spiceai/tpch/datasets/tpch.lineitem
     name: lineitem
     params: *spicecloud_params
