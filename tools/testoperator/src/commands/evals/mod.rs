@@ -145,7 +145,8 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let eval_result = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
 
-    // Extract metrics from the evaluation result
+    // Extract metrics from the evaluation result. If the evaluation run was not successful (EvalStatus::Failed),
+    // we will return an error at the end after printing statistics and cleaning up.
     let metrics = EvalMetrics::from_record_batch(&eval_result)?;
 
     let tasks_calls = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
@@ -189,7 +190,12 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     spiced_instance.stop()?;
 
-    println!("Benchmark completed");
+    // Report unsuccessful evaluation run as an error
+    if matches!(metrics.status, EvalStatus::Failed) {
+        return Err(anyhow::anyhow!("Evaluation run failed"));
+    }
+
+    println!("Benchmark completed successfully!");
 
     Ok(())
 }
