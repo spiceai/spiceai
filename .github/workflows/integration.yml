@@ -131,7 +131,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: integration-test-archive
-          path: ./integration.tar.zst
+          path: ./integration_test
 
       - name: Install Nextest
         run: |
@@ -185,7 +185,7 @@ jobs:
           AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --archive-file integration.tar.zst --nocapture
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --archive-file ./integration_test/integration.tar.zst --nocapture
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --nocapture --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --archive-file ./integration_test/integration.tar.zst --nocapture --skip spiceai_integration_test
           fi
