@@ -43,7 +43,7 @@ endif
 
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) --test-threads=6
+	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
