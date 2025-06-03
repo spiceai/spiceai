@@ -641,10 +641,14 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
 }
 
 fn is_transient_error(error: &Error) -> bool {
-    let error_message = error.to_string().to_lowercase();
-
-    // Common transient error patterns
-    error_message.contains("operation was canceled")
-        || error_message.contains("http2 error")
-        || error_message.contains("grpc-status header missing")
+    match error {
+        Error::UnableToPerformHandshake { source: _ } => true,
+        Error::UnableToQuery { source } => {
+            let error_message = source.to_string().to_lowercase();
+            error_message.contains("operation was canceled")
+                || error_message.contains("http2 error")
+                || error_message.contains("grpc-status header missing")
+        }
+        _ => false,
+    }
 }
