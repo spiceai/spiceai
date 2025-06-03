@@ -5,14 +5,14 @@ description: "Query: tpcds_q34"
 +-------------+--------------+--------------+-----------------------+------------------+-----+
 | c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
 +-------------+--------------+--------------+-----------------------+------------------+-----+
-| Alfred      | Joseph       | Mr.          | N                     | 25598            | 15  |
-| Anderson    | Wanda        | Mrs.         | Y                     | 49864            | 15  |
+| Adams       | Willie       | Sir          | Y                     | 88285            | 16  |
+| Akers       | Susan        | Miss         | N                     | 239968           | 15  |
+| Alston      | Jesus        | Sir          | Y                     | 52608            | 15  |
+| Anderson    | Martha       | Mrs.         | Y                     | 205757           | 16  |
+| Anderson    | Norma        | Miss         | Y                     | 132983           | 15  |
+| Andrews     | Cindy        | Miss         | Y                     | 132595           | 15  |
 | Andrews     | Robert       | Sir          | Y                     | 30467            | 16  |
-| Bailey      | Betty        | Mrs.         | N                     | 9759             | 15  |
-| Bishop      | Richard      | Mr.          | N                     | 24449            | 15  |
-| Bivens      | Ralph        | Mr.          | Y                     | 71937            | 16  |
-| Boudreau    | David        | Dr.          | Y                     | 37443            | 15  |
-| Boyd        | Mona         | Dr.          | N                     | 42557            | 16  |
-| Boyle       | Timothy      | Dr.          | Y                     | 21865            | 15  |
-| Buchanan    | Theresa      | Ms.          | N                     | 45028            | 16  |
+| Appleton    | Ivan         | Dr.          | Y                     | 74586            | 16  |
+| Archibald   | Cindy        | Miss         | Y                     | 87178            | 16  |
+| Baird       | Jovita       | Miss         | N                     | 27451            | 16  |
 +-------------+--------------+--------------+-----------------------+------------------+-----+

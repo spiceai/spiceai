@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q11"
 ---
-+------------------+---------------------+--------------------+--------------------------------------+
-| customer_id      | customer_first_name | customer_last_name | customer_email_address               |
-+------------------+---------------------+--------------------+--------------------------------------+
-| AAAAAAAAADNDAAAA | Robert              | Cass               | Robert.Cass@FI6orCmqi96.edu          |
-| AAAAAAAAAIBFAAAA | Sharon              | Steele             | Sharon.Steele@5Cj48dPpxgA.edu        |
-| AAAAAAAABDDEAAAA | Jake                | Lawrence           | Jake.Lawrence@USvo40k3jRcK2SGXX8.com |
-| AAAAAAAABFPBAAAA | Beth                | Sanches            | Beth.Sanches@yhhagS7RXZ9.edu         |
-| AAAAAAAABGLFAAAA |                     |                    | Sharon.Perez@3EtK.com                |
-| AAAAAAAABMJDAAAA | Brenda              | Castillo           | Brenda.Castillo@Qrbt7ADo.com         |
-| AAAAAAAACEBDAAAA | Gloria              | Bailey             | Gloria.Bailey@8AZGJrfgOZMzEZ8.org    |
-| AAAAAAAADHEGAAAA |                     |                    | Lloyd.Long@EaFsDE.com                |
-| AAAAAAAAEAHCAAAA | Berry               | Torres             | Berry.Torres@d.com                   |
-| AAAAAAAAEGHDAAAA | Nicolas             | Tyree              | Nicolas.Tyree@p.com                  |
-+------------------+---------------------+--------------------+--------------------------------------+
++------------------+---------------------+--------------------+-----------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address            |
++------------------+---------------------+--------------------+-----------------------------------+
+| AAAAAAAAAGEJAAAA | Michael             | Tolbert            | Michael.Tolbert@D8O5R.com         |
+| AAAAAAAAAGOLAAAA | Lawrence            | Reed               | Lawrence.Reed@4tUSGo1o.org        |
+| AAAAAAAAAHAGBAAA | Nilda               | Bernal             | Nilda.Bernal@afeQH6HuLAeQt.org    |
+| AAAAAAAAAHLFAAAA | Michelle            | Early              | Michelle.Early@XIPPlCYfJv.org     |
+| AAAAAAAAAIFBBAAA | Juana               | Giles              | Juana.Giles@D0JsFLeloECaxb.com    |
+| AAAAAAAAAJNGBAAA | Roger               | Kaufman            | Roger.Kaufman@rMosVj1GQS.org      |
+| AAAAAAAAAKOBBAAA | William             | Alderman           | William.Alderman@LHfDRblj.edu     |
+| AAAAAAAAALDHBAAA | Lori                | Barrett            | Lori.Barrett@XpjxdL.edu           |
+| AAAAAAAAANNNAAAA | Cindy               | Julian             | Cindy.Julian@ChEB5eyUCBe.org      |
+| AAAAAAAAAOGBAAAA | George              | Johnston           | George.Johnston@uxl3oglEmB1hA.org |
++------------------+---------------------+--------------------+-----------------------------------+
