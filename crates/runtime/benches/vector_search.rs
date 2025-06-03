@@ -303,7 +303,7 @@ async fn run_search_queries(
                         Some(vec!["data".to_string()]),
                         search_limit,
                         None,
-                        vec!["_id".to_string()],
+                        vec![],
                         vec![],
                     );
 
@@ -356,8 +356,8 @@ async fn to_search_result(result: VectorSearchResult) -> Result<HashMap<String, 
         match to_matches(&table_ref, agg_result).await {
             Ok(matches) => {
                 for m in matches {
-                    let id = m.metadata().get("_id").ok_or_else(|| {
-                        "Missing '_id' key value in search result metadata".to_string()
+                    let id = m.primary_key().get("_id").ok_or_else(|| {
+                        "Missing '_id' primary key value in search result".to_string()
                     })?;
 
                     let id = id
