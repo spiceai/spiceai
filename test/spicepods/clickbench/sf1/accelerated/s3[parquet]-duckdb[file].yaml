@@ -14,3 +14,5 @@ datasets:
     acceleration:
       engine: duckdb
       mode: file
+      params:
+        duckdb_memory_limit: 60gb
