@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use app::AppBuilder;
+use chrono::Timelike;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
@@ -44,6 +45,18 @@ fn create_loadbalance_worker(name: &str, models: &[&str], cron: &str, prompt: &s
                 .collect(),
         }),
         cron: Some(cron.to_string()),
+        sql: None,
+    }
+}
+
+fn create_sql_worker(name: &str, sql: &str, cron: &str) -> Worker {
+    Worker {
+        name: name.to_string(),
+        description: None,
+        params: HashMap::new(),
+        load_balance: None,
+        cron: Some(cron.to_string()),
+        sql: Some(sql.to_string()),
     }
 }
 
@@ -95,12 +108,78 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(40)).await; // wait for the cron job to run at least once
+            let second_now = chrono::Utc::now().second();
+            let wait = (second_now % 30) + 20; // wait for the next 30th second, and wait 20 seconds for the job to succeed
+
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();
 
             let data = rt
                 .datafusion()
                 .query_builder("SELECT task, input, captured_output FROM runtime.task_history WHERE task = 'scheduler::worker'")
+                .build()
+                .run()
+                .await
+                .boxed()
+                .expect("Failed to collect data")
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .boxed()
+                .expect("Failed to collect data");
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&data)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(pretty);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope_retry(3, || async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let ds_tpcds_item = get_tpcds_dataset("item", None, None);
+
+            let app = AppBuilder::new("test_worker_with_cron")
+                .with_dataset(ds_tpcds_item)
+                .with_worker(create_sql_worker(
+                    "sql_scheduled",
+                    "SELECT COUNT(*) FROM item",
+                    "*/15 * * * * *",
+                ))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let second_now = chrono::Utc::now().second();
+            let wait = (second_now % 15) + 2; // every 15th second, wait for 2 seconds for the job to succeed
+
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
+            let _ = trace_provider.force_flush();
+
+            let data = rt
+                .datafusion()
+                .query_builder("SELECT task, input, captured_output FROM runtime.task_history ORDER BY end_time DESC")
                 .build()
                 .run()
                 .await
