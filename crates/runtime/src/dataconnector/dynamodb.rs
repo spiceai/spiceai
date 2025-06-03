@@ -16,16 +16,14 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use aws_config::{BehaviorVersion, Region};
 use aws_sdk_dynamodb::Client;
-use aws_sdk_sts::config::Credentials;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
+    ParameterSpec, Parameters, parameters::aws::load_config,
 };
 
 #[derive(Debug)]
@@ -103,63 +101,20 @@ impl DataConnector for DynamoDB {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_name = dataset.path();
 
-        // Get and own all parameter values upfront
-        let region = self
-            .params
-            .get("aws_region")
-            .expose()
-            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "dynamodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: "aws_region is required".to_string(),
-            })?
-            .to_string();
-
-        let access_key_id = self
-            .params
-            .get("aws_access_key_id")
-            .expose()
-            .ok()
-            .map(ToString::to_string);
-
-        let secret_access_key = self
-            .params
-            .get("aws_secret_access_key")
-            .expose()
-            .ok()
-            .map(ToString::to_string);
-
-        let session_token = self
-            .params
-            .get("aws_session_token")
-            .expose()
-            .ok()
-            .map(ToString::to_string);
-
-        let config = match (access_key_id, secret_access_key) {
-            (Some(access_key_id), Some(secret_access_key)) => {
-                let credentials = Credentials::new(
-                    access_key_id,
-                    secret_access_key,
-                    session_token,
-                    None,
-                    "DynamoDBTableProvider",
-                );
-
-                aws_config::defaults(BehaviorVersion::v2025_01_17())
-                    .region(Region::new(region))
-                    .credentials_provider(credentials)
-                    .load()
-                    .await
-            }
-            _ => {
-                // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-                aws_config::defaults(BehaviorVersion::v2025_01_17())
-                    .region(Region::new(region))
-                    .load()
-                    .await
-            }
-        };
+        let config = load_config(
+            "DynamoDBTableProvider",
+            "aws_region",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            &self.params,
+        )
+        .await
+        .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "dynamodb".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message,
+        })?;
 
         let client = Client::new(&config);
         let provider = DynamoDBTableProvider::try_new(Arc::new(client), Arc::from(table_name))

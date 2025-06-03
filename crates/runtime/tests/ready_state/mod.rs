@@ -55,8 +55,8 @@ use runtime::{
     Runtime,
     component::dataset::Dataset,
     dataconnector::{
-        self, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-        NewDataConnectorResult,
+        self, DataConnector, DataConnectorError, DataConnectorFactory, NewDataConnectorResult,
+        parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
     request::{AsyncMarker, Protocol, RequestContext},
