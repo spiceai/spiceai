@@ -397,13 +397,16 @@ impl FlightClient {
         retry(retry_strategy, || async {
             match self.query_internal(query).await {
                 Ok(stream) => Ok(stream),
-                Err(e) => Err(RetryError::transient(e)),
+                Err(e) => {
+                    if is_transient_error(&e) {
+                        Err(RetryError::transient(e))
+                    } else {
+                        Err(RetryError::permanent(e))
+                    }
+                }
             }
         })
         .await
-        .map_err(|e| Error::UnableToQuery {
-            source: Box::new(e),
-        })
     }
 
     async fn query_internal(&self, query: &str) -> Result<FlightRecordBatchStream> {
@@ -635,4 +638,13 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     Error::UnableToQuery {
         source: e.message().into(),
     }
+}
+
+fn is_transient_error(error: &Error) -> bool {
+    let error_message = error.to_string().to_lowercase();
+
+    // Common transient error patterns
+    error_message.contains("operation was canceled")
+        || error_message.contains("http2 error")
+        || error_message.contains("grpc-status header missing")
 }
