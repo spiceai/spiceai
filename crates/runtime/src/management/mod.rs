@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Runtime,
     component::dataset::{Mode, builder::DatasetBuilder},
-    dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
+    dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     datafusion::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
