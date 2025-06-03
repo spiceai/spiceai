@@ -96,6 +96,12 @@ pub enum Error {
 
     #[snafu(display("Configuration loading failed: {message}"))]
     ConfigurationLoadingFailed { message: String },
+
+    #[snafu(display("Failed to refresh catalog: {source}"))]
+    RefreshFailed {
+        #[snafu(source)]
+        source: Box<dyn std::error::Error + Sync + Send>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

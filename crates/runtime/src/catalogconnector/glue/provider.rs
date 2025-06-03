@@ -17,14 +17,13 @@ limitations under the License.
 use super::state::GlueCatalogState;
 use super::{DatabaseName, Error, Result, TableType};
 use crate::dataconnector::DataConnectorFactory as _;
-use crate::dataconnector::parameters::aws::load_config;
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
     dataconnector::{parameters::ConnectorParams, s3::S3Factory},
 };
 use async_trait::async_trait;
-use aws_sdk_glue::{Client, types::Table};
+use aws_sdk_glue::types::Table;
 use data_components::RefreshableCatalogProvider;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
@@ -34,13 +33,13 @@ use datafusion::{
 use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_datafusion::IcebergTableProvider;
-use snafu::prelude::*;
+use snafu::ResultExt;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap, fmt};
 
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
-    pub(super) inner: Arc<GlueCatalogState>,
+    pub(super) state: Arc<GlueCatalogState>,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -59,75 +58,24 @@ pub struct GlueSchemaProvider {
 
 impl GlueCatalogProvider {
     pub async fn new(
-        mut parameters: ConnectorParams,
+        parameters: ConnectorParams,
         catalog: &Catalog,
         runtime: Arc<Runtime>,
     ) -> Result<Self> {
-        for validator in super::VALIDATORS.iter() {
-            validator
-                .validate(&mut parameters)
-                .await
-                .context(super::ParameterValidationSnafu)?;
-        }
-
-        // `file_format` is required early for ListingConnector which the S3
-        // connector uses. We can change the file format when we create
-        // TableProviders if we need to.
-        parameters
-            .parameters
-            .insert("file_format".to_string(), "parquet".into());
-
-        let config = load_config(
-            "GlueCatalogConnector",
-            "region",
-            "key",
-            "secret",
-            "session_token",
-            &parameters.parameters,
+        let state = GlueCatalogState::new(
+            catalog.include.clone(),
+            catalog.orig_include.clone(),
+            parameters,
+            runtime,
         )
-        .await
-        .map_err(|message| super::Error::ConfigurationLoadingFailed { message })?;
-        let glue = Client::new(&config);
+        .await?;
 
-        let get_databases_output = glue
-            .get_databases()
-            .send()
-            .await
-            .context(super::GetDatabasesSnafu)?;
+        // Load the catalog for the first time
+        state.refresh().await.context(super::RefreshFailedSnafu)?;
 
-        let mut databases = HashMap::new();
-        for db in get_databases_output.database_list {
-            if !database_might_match(&db.name, &catalog.orig_include) {
-                tracing::debug!("skipping database {}", &db.name);
-                continue;
-            }
-
-            let get_tables_output = glue
-                .get_tables()
-                .database_name(&db.name)
-                .send()
-                .await
-                .map_err(|source| super::Error::GetTables {
-                    database: db.name.to_string(),
-                    source,
-                })?;
-
-            let table_names = get_tables_output
-                .table_list
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| {
-                    !matches!(TableType::from(t), TableType::Unsupported)
-                        && is_included(catalog.include.as_ref(), &db.name, t.name())
-                })
-                .collect::<Vec<_>>();
-
-            databases.insert(db.name, table_names);
-        }
-
-        let inner = Arc::new(GlueCatalogState::new(databases, parameters, runtime));
-
-        Ok(Self { inner })
+        Ok(Self {
+            state: Arc::new(state),
+        })
     }
 }
 
@@ -137,14 +85,24 @@ impl CatalogProvider for GlueCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.inner.databases.keys().cloned().collect()
+        let databases = match self.state.databases.read() {
+            Ok(dbs) => dbs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        databases.keys().cloned().collect()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
-        if self.inner.databases.contains_key(name) {
+        let databases = match self.state.databases.read() {
+            Ok(dbs) => dbs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if databases.contains_key(name) {
             let schema_provider = GlueSchemaProvider {
                 database: name.to_string(),
-                state: Arc::clone(&self.inner),
+                state: Arc::clone(&self.state),
             };
             Some(Arc::new(schema_provider))
         } else {
@@ -156,8 +114,7 @@ impl CatalogProvider for GlueCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for GlueCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // TODO: #6012
-        Ok(())
+        self.state.refresh().await
     }
 }
 
@@ -258,24 +215,39 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.state
-            .databases
+        let databases = match self.state.databases.read() {
+            Ok(dbs) => dbs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        databases
             .get(&self.database)
             .map(|tables| tables.iter().map(|t| t.name.clone()).collect())
             .unwrap_or_default()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.state.databases.contains_key(name)
+        let databases = match self.state.databases.read() {
+            Ok(dbs) => dbs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        databases.contains_key(name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let Some(table) = self
-            .state
-            .databases
-            .get(&self.database)
-            .and_then(|tables| tables.iter().find(|t| t.name() == name))
-        else {
+        let table = {
+            let databases = match self.state.databases.read() {
+                Ok(dbs) => dbs,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            databases
+                .get(&self.database)
+                .and_then(|tables| tables.iter().find(|t| t.name() == name))
+                .cloned()
+        };
+
+        let Some(table) = table else {
             tracing::error!(
                 "Glue table `{name}` not found in database `{}`",
                 self.database
@@ -283,32 +255,12 @@ impl SchemaProvider for GlueSchemaProvider {
             return Ok(None);
         };
 
-        match TableType::from(table) {
-            TableType::HiveParquet => self.create_hive_parquet_provider(name, table).await,
-            TableType::Iceberg => self.create_iceberg_provider(name, table).await,
+        match TableType::from(&table) {
+            TableType::HiveParquet => self.create_hive_parquet_provider(name, &table).await,
+            TableType::Iceberg => self.create_iceberg_provider(name, &table).await,
             TableType::Unsupported => Ok(None),
         }
     }
-}
-
-fn database_might_match(database: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        pattern == database
-            || pattern.starts_with(&format!("{database}."))
-            || pattern.starts_with("*.")
-            || pattern == "*.*"
-    })
-}
-
-fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
-    let database_with_table = format!("{database}.{table}");
-    if let Some(include) = include {
-        if !include.is_match(&database_with_table) {
-            tracing::debug!("skipping table {database_with_table}");
-            return false;
-        }
-    }
-    true
 }
 
 fn get_metadata_location(
@@ -330,73 +282,6 @@ fn get_metadata_location(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use globset::{Glob, GlobSetBuilder};
-    use std::collections::HashMap;
-
-    #[test]
-    fn database_might_match_exact_match() {
-        let patterns = vec!["mydb".to_string()];
-        assert!(database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_prefix_match() {
-        let patterns = vec!["mydb.table1".to_string()];
-        assert!(database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_wildcard_prefix() {
-        let patterns = vec!["*.table1".to_string()];
-        assert!(database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_wildcard_all() {
-        let patterns = vec!["*.*".to_string()];
-        assert!(database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_no_match() {
-        let patterns = vec!["otherdb".to_string(), "otherdb.table1".to_string()];
-        assert!(!database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_empty_patterns() {
-        let patterns: Vec<String> = vec![];
-        assert!(!database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn is_included_no_globset() {
-        assert!(is_included(None, "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_matching_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("mydb.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(is_included(Some(&globset), "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_non_matching_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("otherdb.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(!is_included(Some(&globset), "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_wildcard_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("*.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(is_included(Some(&globset), "mydb", "table1"));
-    }
 
     #[test]
     fn get_metadata_location_success() {
