@@ -21,11 +21,11 @@ use async_openai::types::EmbeddingInput;
 use datafusion::logical_expr::sqlparser::ast::Expr;
 use datafusion::sql::sqlparser::ast::Ident;
 use datafusion::{execution::SendableRecordBatchStream, sql::TableReference};
+use itertools::Itertools;
 use llms::embeddings::Embed;
 use search::generation::{CandidateGeneration, Error as SearchGenerationError};
 use search::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use snafu::ResultExt;
-use tract_core::tract_data::itertools::Itertools;
 
 use crate::datafusion::DataFusion;
 
@@ -317,9 +317,9 @@ impl CandidateGeneration for VectorGeneration {
 
     fn supports_filters_pushdown(
         &self,
-        _filters: &[&Expr],
+        filters: &[&Expr],
     ) -> Result<Vec<bool>, SearchGenerationError> {
-        Ok(vec![])
+        Ok((0..filters.len()).map(|_| true).collect::<Vec<_>>())
     }
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
@@ -340,6 +340,8 @@ pub fn where_and(filters: &[&Expr]) -> String {
     if filters.is_empty() {
         return String::new();
     }
+
     let combined = filters.iter().map(|e| format!("{}", *e)).join(" AND ");
+
     format!("WHERE {combined}")
 }

@@ -126,6 +126,11 @@ impl FullTextSearch {
     }
 
     #[must_use]
+    pub fn primary_key(&self) -> &[String] {
+        self.primary_key.as_slice()
+    }
+
+    #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
         self.idx
             .schema()
