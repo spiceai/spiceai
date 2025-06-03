@@ -22,10 +22,16 @@ mod duckdb;
 
 /// Creates a new instance of the `DuckDB` dialect with support for Spice internal UDFs
 pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
-    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(vec![(
-        "cosine_distance",
-        Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
-    )]);
+    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(vec![
+        (
+            "cosine_distance",
+            Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
+        ),
+        (
+            "rand",
+            Box::new(duckdb::rand_to_random) as ScalarFnToSqlHandler,
+        ),
+    ]);
 
     Arc::new(dialect) as Arc<dyn Dialect>
 }

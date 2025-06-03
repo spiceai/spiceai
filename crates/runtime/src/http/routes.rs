@@ -110,6 +110,11 @@ pub(crate) struct ApiDoc;
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn get_api_doc() -> utoipa::openapi::OpenApi {
+    use utoipa::openapi::{
+        Required,
+        path::{Parameter, ParameterIn},
+    };
+
     let mut openai = ApiDoc::openapi();
 
     #[cfg(feature = "mcp")]
@@ -125,6 +130,51 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                     "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
              Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
                 ))
+                .build(),
+        );
+        openai.paths.add_path_operation(
+            "/v1/mcp/event",
+            vec![HttpMethod::Post],
+            Operation::builder()
+                .operation_id(Some("mcp_event"))
+                .tag("mcp")
+                .summary(Some("Send message to MCP server"))
+                .description(Some(
+                    "Send message to the MCP endoint, for a given session.",
+                ))
+                .parameter(
+                    Parameter::builder()
+                        .name("sessionId")
+                        .parameter_in(ParameterIn::Query)
+                        .required(Required::True)
+                        .build(),
+                )
+                .response(
+                    "202",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Message accepted. Response will stream via SSE.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Session not found. No active session for the given `session_id`.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "413",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Payload too large. Maximum allowed size is 4MB.")
+                        .build(),
+                )
+                .response(
+                    "500",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Internal server error. An unexpected issue occurred.")
+                        .build(),
+                )
                 .build(),
         );
     }

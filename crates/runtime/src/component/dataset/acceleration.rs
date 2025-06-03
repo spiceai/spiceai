@@ -291,6 +291,15 @@ impl Acceleration {
         self.primary_key = Some(primary_key);
         self
     }
+
+    #[must_use]
+    pub fn with_on_conflict(
+        mut self,
+        on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
+    ) -> Self {
+        self.on_conflict = on_conflict;
+        self
+    }
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {

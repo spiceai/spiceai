@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::component::dataset::acceleration::OnConflictBehavior;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
@@ -26,6 +27,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
@@ -102,12 +104,20 @@ impl TaskSpan {
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
+        let acceleration_settings = Acceleration::default().with_on_conflict(
+            [(
+                ColumnReference::new(vec!["span_id".to_string()]),
+                OnConflictBehavior::Upsert,
+            )]
+            .into(),
+        );
+
         create_internal_accelerated_table(
             status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),
             Some(vec!["span_id".to_string()]),
-            Acceleration::default(),
+            acceleration_settings,
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),

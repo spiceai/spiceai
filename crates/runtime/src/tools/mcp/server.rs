@@ -20,8 +20,8 @@ use futures::StreamExt;
 use rmcp::{
     Error as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestMethod, CallToolRequestParam, CallToolResult, Content, ListToolsResult,
-        PaginatedRequestParam,
+        CallToolRequestMethod, CallToolRequestParam, CallToolResult, Content, Implementation,
+        ListToolsResult, PaginatedRequestParam, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
 };
@@ -45,6 +45,18 @@ impl From<&Arc<Runtime>> for RuntimeServer {
 }
 
 impl ServerHandler for RuntimeServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            instructions: None,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "Spice.ai Open Source".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            protocol_version: ProtocolVersion::LATEST,
+        }
+    }
+
     fn call_tool(
         &self,
         request: CallToolRequestParam,

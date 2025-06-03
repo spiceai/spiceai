@@ -32,7 +32,7 @@ use futures::{StreamExt, stream};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{Notify, RwLock};
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
@@ -67,15 +67,13 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-        ready_sender: Option<oneshot::Sender<()>>,
+        ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
-
-        let mut ready_sender = ready_sender;
 
         while let Some(update) = changes_stream.next().await {
             match update {
@@ -85,8 +83,8 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.take() {
-                                ready_sender.send(()).ok();
+                            if let Some(ready_sender) = ready_sender.as_ref() {
+                                ready_sender.notify_waiters();
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
