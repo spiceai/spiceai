@@ -27,13 +27,13 @@ use snafu::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{Notify, RwLock};
 
 impl RefreshTask {
     pub async fn start_streaming_append(
         &self,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-        ready_sender: Option<oneshot::Sender<()>>,
+        ready_sender: Option<Arc<Notify>>,
         refresh: Arc<RwLock<Refresh>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
@@ -45,8 +45,6 @@ impl RefreshTask {
 
         let mut stream = Box::pin(self.get_append_stream().await);
 
-        let mut ready_sender = ready_sender;
-
         while let Some(update) = stream.next().await {
             match update {
                 Ok((start_time, data_update)) => {
@@ -57,8 +55,8 @@ impl RefreshTask {
                         .await
                         .is_ok()
                     {
-                        if let Some(ready_sender) = ready_sender.take() {
-                            ready_sender.send(()).ok();
+                        if let Some(ready_sender) = ready_sender.as_ref() {
+                            ready_sender.notify_waiters();
                         }
                         initial_load_completed.store(true, Ordering::Relaxed);
 

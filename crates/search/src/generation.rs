@@ -16,12 +16,29 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::sqlparser::ast::Expr;
 use snafu::Snafu;
 
+#[cfg(feature = "text_search")]
+pub mod text_search;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Error occured during search: {source}"))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[cfg(feature = "text_search")]
+    #[snafu(display("Error occured performing full text search: {source}"))]
+    TextSearchError { source: text_search::Error },
+}
+
+impl Error {
+    #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            Error::TextSearchError { source } if source.is_user_error()
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

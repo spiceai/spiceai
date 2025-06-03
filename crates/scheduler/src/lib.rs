@@ -57,6 +57,10 @@ pub enum Error {
         "The specified schedule '{name}' does not exist in the scheduler.\nEnsure the schedule is defined, and try again."
     ))]
     ScheduleNotFound { name: String },
+    #[snafu(display("An error occurred while executing the scheduled task.\n{source}"))]
+    RefreshTaskFailure {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

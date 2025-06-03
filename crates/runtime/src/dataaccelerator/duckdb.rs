@@ -35,15 +35,18 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBTableProviderFactory, write::DuckDBTableWriter},
+    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
 use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+
+mod settings;
 
 const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
@@ -92,7 +95,10 @@ impl DuckDBAccelerator {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(new_duckdb_dialect()),
+                .with_dialect(new_duckdb_dialect())
+                .with_settings_registry(
+                    DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+                ),
         }
     }
 

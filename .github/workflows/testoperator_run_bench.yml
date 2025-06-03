@@ -89,9 +89,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update HTTP sources to HTTPS
-        uses: ./.github/actions/update-http-sources
-
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
         run: |

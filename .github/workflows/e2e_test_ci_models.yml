@@ -78,11 +78,7 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Update HTTP sources to HTTPS
-        if: matrix.target.builder == 'spiceai-dev-runners'
-        uses: ./.github/actions/update-http-sources
-
+      
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
