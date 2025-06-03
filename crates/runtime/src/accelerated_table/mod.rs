@@ -47,7 +47,7 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
-use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -390,10 +390,8 @@ impl Builder {
     }
 
     /// Build the accelerated table
-    pub async fn build(
-        self,
-    ) -> AcceleratedTableBuilderResult<(AcceleratedTable, oneshot::Receiver<()>)> {
-        let (ready_sender, is_ready) = oneshot::channel::<()>();
+    pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
+        let on_complete_notification = Arc::new(Notify::new());
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
@@ -450,6 +448,7 @@ impl Builder {
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
+        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
         }
@@ -457,9 +456,7 @@ impl Builder {
             refresher.semaphore(semaphore);
         }
 
-        let refresh_handle = refresher
-            .start(acceleration_refresh_mode, ready_sender)
-            .await;
+        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
@@ -483,22 +480,19 @@ impl Builder {
                 .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
         }
 
-        Ok((
-            AcceleratedTable {
-                dataset_name: self.dataset_name,
-                accelerator: self.accelerator,
-                federated: self.federated,
-                refresh_trigger,
-                handlers,
-                zero_results_action: self.zero_results_action,
-                ready_state: self.ready_state,
-                refresh_params,
-                refresher,
-                disable_federation: self.disable_federation,
-                synchronized_with: self.synchronize_with,
-            },
-            is_ready,
-        ))
+        Ok(AcceleratedTable {
+            dataset_name: self.dataset_name,
+            accelerator: self.accelerator,
+            federated: self.federated,
+            refresh_trigger,
+            handlers,
+            zero_results_action: self.zero_results_action,
+            ready_state: self.ready_state,
+            refresh_params,
+            refresher,
+            disable_federation: self.disable_federation,
+            synchronized_with: self.synchronize_with,
+        })
     }
 }
 

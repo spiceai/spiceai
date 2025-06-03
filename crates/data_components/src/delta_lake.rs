@@ -39,17 +39,15 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
-use delta_kernel::ExpressionRef;
 use delta_kernel::Table;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::expressions::{
-    BinaryOperator, DecimalData, Expression, JunctionOperator, Scalar, UnaryOperator,
-};
+use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{ExpressionRef, Predicate};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
@@ -366,11 +364,11 @@ impl TableProvider for DeltaTable {
                     ScanBuilder::new(Arc::new(snapshot)).with_schema(projected_delta_schema);
 
                 // Convert and apply predicate if possible
-                if let Some(predicate) = filters_to_delta_kernel_expr(&filters_clone) {
+                if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
                     tracing::debug!(
                         "Using delta_kernel predicate for filter pushdown: {predicate:?}"
                     );
-                    scan_builder = scan_builder.with_predicate(predicate);
+                    scan_builder = scan_builder.with_predicate(Some(Arc::new(predicate)));
                 }
 
                 let scan = scan_builder
@@ -741,12 +739,6 @@ async fn get_parquet_access_plan(
     Ok(ParquetAccessPlan::new(row_groups))
 }
 
-#[derive(Debug, PartialEq)]
-enum DeltaBinaryOperator {
-    BinaryOperator(BinaryOperator),
-    JunctionOperator(JunctionOperator),
-}
-
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
 #[allow(clippy::too_many_lines)]
 #[allow(
@@ -759,15 +751,7 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
             let left = to_delta_kernel_expr(&binary.left)?;
             let right = to_delta_kernel_expr(&binary.right)?;
 
-            let op = to_delta_kernel_binary_op(binary.op)?;
-            match op {
-                DeltaBinaryOperator::BinaryOperator(op) => {
-                    Some(Expression::binary(op, left, right))
-                }
-                DeltaBinaryOperator::JunctionOperator(op) => {
-                    Some(Expression::junction(op, vec![left, right]))
-                }
-            }
+            Some(to_delta_kernel_binary_expression(binary.op, left, right)?)
         }
         Expr::Column(col) => {
             let field_names = vec![col.name.as_str()];
@@ -776,15 +760,15 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
         Expr::Literal(value) => Some(Expression::literal(to_delta_kernel_scalar(value.clone())?)),
         Expr::IsNull(expr) => {
             let expr = to_delta_kernel_expr(expr)?;
-            Some(Expression::is_null(expr))
+            Some(Expression::is_null(expr).into())
         }
         Expr::IsNotNull(expr) => {
             let expr = to_delta_kernel_expr(expr)?;
-            Some(Expression::is_not_null(expr))
+            Some(Expression::is_not_null(expr).into())
         }
         Expr::Not(expr) => {
-            let expr = to_delta_kernel_expr(expr)?;
-            Some(Expression::unary(UnaryOperator::Not, expr))
+            let expr = into_predicate(to_delta_kernel_expr(expr)?)?;
+            Some(Predicate::not(expr).into())
         }
         Expr::Case(_)
         | Expr::Cast(_)
@@ -819,32 +803,35 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     }
 }
 
-fn to_delta_kernel_binary_op(op: Operator) -> Option<DeltaBinaryOperator> {
+fn into_predicate(expr: Expression) -> Option<Predicate> {
+    match expr {
+        Expression::Predicate(predicate) => Some(*predicate),
+        _ => None,
+    }
+}
+
+fn to_delta_kernel_binary_expression(
+    op: Operator,
+    left: Expression,
+    right: Expression,
+) -> Option<Expression> {
     match op {
-        Operator::Plus => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Plus)),
-        Operator::Minus => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Minus)),
-        Operator::Multiply => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::Multiply,
+        Operator::Plus => Some(Expression::binary(BinaryExpressionOp::Plus, left, right)),
+        Operator::Minus => Some(Expression::binary(BinaryExpressionOp::Minus, left, right)),
+        Operator::Multiply => Some(Expression::binary(
+            BinaryExpressionOp::Multiply,
+            left,
+            right,
         )),
-        Operator::Divide => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Divide)),
-        Operator::Lt => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::LessThan,
-        )),
-        Operator::LtEq => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::LessThanOrEqual,
-        )),
-        Operator::Gt => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::GreaterThan,
-        )),
-        Operator::GtEq => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::GreaterThanOrEqual,
-        )),
-        Operator::Eq => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Equal)),
-        Operator::NotEq => Some(DeltaBinaryOperator::BinaryOperator(
-            BinaryOperator::NotEqual,
-        )),
-        Operator::And => Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::And)),
-        Operator::Or => Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::Or)),
+        Operator::Divide => Some(Expression::binary(BinaryExpressionOp::Divide, left, right)),
+        Operator::Lt => Some(Predicate::lt(left, right).into()),
+        Operator::LtEq => Some(Predicate::le(left, right).into()),
+        Operator::Gt => Some(Predicate::gt(left, right).into()),
+        Operator::GtEq => Some(Predicate::ge(left, right).into()),
+        Operator::Eq => Some(Predicate::eq(left, right).into()),
+        Operator::NotEq => Some(Predicate::ne(left, right).into()),
+        Operator::And => Some(Predicate::and(into_predicate(left)?, into_predicate(right)?).into()),
+        Operator::Or => Some(Predicate::or(into_predicate(left)?, into_predicate(right)?).into()),
         Operator::IsDistinctFrom
         | Operator::IsNotDistinctFrom
         | Operator::RegexMatch
@@ -1008,27 +995,30 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
 /// Convert a list of `DataFusion` filter expressions to a single `delta_kernel` expression
 ///
 /// This function processes multiple `DataFusion` expressions and returns a predicate for `delta_kernel`.
-fn filters_to_delta_kernel_expr(filters: &[Expr]) -> Option<ExpressionRef> {
+fn filters_to_delta_kernel_predicate(filters: &[Expr]) -> Option<Predicate> {
     if filters.is_empty() {
         return None;
     }
 
-    let mut exprs = Vec::new();
+    let mut predicates = Vec::new();
     for filter in filters {
         if let Some(expr) = to_delta_kernel_expr(filter) {
-            exprs.push(expr);
+            predicates.push(expr);
         }
     }
 
-    if exprs.is_empty() {
+    if predicates.is_empty() {
         None
-    } else if exprs.len() == 1 {
-        let expr = exprs.pop()?;
-        Some(Arc::new(expr))
+    } else if predicates.len() == 1 {
+        let expr = predicates.pop()?;
+        Some(into_predicate(expr)?)
     } else {
-        // Multiple filters are present, so we need to combine them using an AND operation
-        let junction_expr = Expression::junction(JunctionOperator::And, exprs);
-        Some(Arc::new(junction_expr))
+        // Multiple predicates are present, so we need to combine them using an AND operation
+        let predicates = predicates
+            .into_iter()
+            .filter_map(into_predicate)
+            .collect::<Vec<_>>();
+        Some(Predicate::and_from(predicates))
     }
 }
 
@@ -1199,77 +1189,6 @@ mod tests {
             dk_expr.is_none(),
             "ALIAS expressions should not be supported"
         );
-    }
-
-    #[test]
-    fn test_to_delta_kernel_binary_op() {
-        // Test supported operators
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Eq),
-            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Equal))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::NotEq),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::NotEqual
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Lt),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::LessThan
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::LtEq),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::LessThanOrEqual
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Gt),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::GreaterThan
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::GtEq),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::GreaterThanOrEqual
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Plus),
-            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Plus))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Minus),
-            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Minus))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Multiply),
-            Some(DeltaBinaryOperator::BinaryOperator(
-                BinaryOperator::Multiply
-            ))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Divide),
-            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Divide))
-        );
-
-        // Test variadic operators
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::And),
-            Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::And))
-        );
-        assert_eq!(
-            to_delta_kernel_binary_op(Operator::Or),
-            Some(DeltaBinaryOperator::JunctionOperator(JunctionOperator::Or))
-        );
-
-        // Test unsupported operators
-        assert_eq!(to_delta_kernel_binary_op(Operator::Modulo), None);
-        assert_eq!(to_delta_kernel_binary_op(Operator::StringConcat), None);
     }
 
     #[test]
@@ -1444,17 +1363,17 @@ mod tests {
     fn test_filters_to_delta_kernel_expr() {
         // Test empty filters
         let filters: Vec<Expr> = vec![];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(dk_expr.is_none(), "Empty filters should return None");
 
         // Test single filter (equality)
         let filters = vec![col("age").eq(lit(30))];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(dk_expr.is_some(), "Single filter should be converted");
 
         // Test multiple filters
         let filters = vec![col("age").gt(lit(20)), col("name").eq(lit("John"))];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "Multiple filters should be converted to a single expression"
@@ -1467,7 +1386,7 @@ mod tests {
             .expect("Failed to create case expression for unsupported expressions test");
 
         let filters = vec![col("age").gt(lit(20)), case_expr.clone()];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "Mix of supported and unsupported filters should return the supported ones"
@@ -1475,7 +1394,7 @@ mod tests {
 
         // Test filters with only unsupported expressions
         let filters = vec![case_expr.clone()];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_none(),
             "Only unsupported filters should return None"
@@ -1490,7 +1409,7 @@ mod tests {
                 false,
             ),
         ];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_none(),
             "Multiple unsupported filters should return None"
@@ -1501,7 +1420,7 @@ mod tests {
             col("age").gt(lit(20)).and(col("name").eq(lit("John"))),
             col("active").eq(lit(true)),
         ];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "AND variadic operator should be supported"
@@ -1512,7 +1431,7 @@ mod tests {
             col("age").gt(lit(20)).or(col("name").eq(lit("John"))),
             col("active").eq(lit(true)),
         ];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "OR variadic operator should be supported"
@@ -1525,7 +1444,7 @@ mod tests {
                 .and(col("name").eq(lit("John")))
                 .or(col("active").eq(lit(true))),
         ];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "Nested variadic operators should be supported"
@@ -1537,7 +1456,7 @@ mod tests {
         // Test simple comparison expressions
         let filter = col("category").eq(lit("electronics"));
         let filters = vec![filter];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(
             dk_expr.is_some(),
             "Simple equality expression should be supported"
@@ -1546,7 +1465,7 @@ mod tests {
         // Test NOT expressions
         let filter = not(col("deleted").eq(lit(true)));
         let filters = vec![filter];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        let dk_expr = filters_to_delta_kernel_predicate(&filters);
         assert!(dk_expr.is_some(), "NOT expression should be supported");
     }
 

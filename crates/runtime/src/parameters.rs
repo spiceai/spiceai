@@ -227,7 +227,7 @@ impl Parameters {
 #[derive(Clone)]
 pub struct Parameters {
     params: Vec<(String, SecretString)>,
-    prefix: &'static str,
+    pub(crate) prefix: &'static str,
     all_params: &'static [ParameterSpec],
 }
 

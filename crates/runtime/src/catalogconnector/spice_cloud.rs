@@ -20,7 +20,8 @@ use crate::{
     App, Runtime,
     component::{catalog::Catalog, dataset::Dataset},
     dataconnector::{
-        ConnectorParams, ConnectorParamsBuilder, DataConnector, DataConnectorFactory,
+        DataConnector, DataConnectorFactory,
+        parameters::{ConnectorParams, ConnectorParamsBuilder},
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,

@@ -21,16 +21,19 @@ use scheduler::{
     channel::cron::CronRequestChannel,
     schedule::Schedule,
     scheduler::{Running, Scheduler, SchedulerBuilder},
+    task::ScheduledTask,
 };
-use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::worker::Worker;
 use tokio::sync::RwLock;
 
 use crate::{
     Result, Runtime,
     component::dataset::Dataset,
-    scheduling::{DatasetRefreshTask, WorkerPromptTask},
+    scheduling::{
+        dataset::DatasetRefreshTask,
+        worker::{WorkerPromptTask, WorkerSqlTask},
+    },
+    worker::{Worker, WorkerScheduleParameters},
 };
 
 const REFRESH_SCHEDULER_NAME: &str = "refresh_scheduler";
@@ -117,59 +120,42 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn create_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
-        let (start_cron, prompt) = match (worker.cron.clone(), worker.params.get("prompt")) {
-            (Some(cron), Some(Value::String(prompt))) => (cron, prompt.clone()),
-            (Some(_), None) => {
-                tracing::warn!(
-                    "Worker '{}' has a 'start_cron' but no prompt is specified.\nThe worker will not be scheduled to run.\nSpecify a 'prompt' parameter and try again.",
-                    worker.name
-                );
-                return Ok(());
-            }
-            (None, Some(Value::String(_))) => {
-                tracing::warn!(
-                    "Worker '{}' has a 'prompt' but no 'start_cron' is specified.\nThe worker will not be scheduled to run.\nSpecify a 'start_cron' parameter and try again.",
-                    worker.name
-                );
-                return Ok(());
-            }
-            (_, Some(v)) => {
-                tracing::warn!(
-                    "Worker '{}' has a 'prompt' but it is not a string: {v}.\nThe worker will not be scheduled to run.\nSpecify a valid 'prompt' parameter and try again.",
-                    worker.name,
-                );
-                return Ok(());
-            }
-            (None, None) => {
-                tracing::debug!(
-                    "Worker {} has no start cron or prompt, skipping schedule creation",
-                    worker.name
-                );
-                return Ok(());
-            }
+    pub async fn create_worker_schedule(self: Arc<Self>, worker: Arc<dyn Worker>) -> Result<()> {
+        let Some(worker_parameters) = worker.schedule_parameters() else {
+            tracing::debug!(
+                "Worker '{}' has no schedule parameters, skipping schedule creation",
+                worker.name()
+            );
+            return Ok(());
         };
+
+        let cron = worker_parameters.cron();
 
         let scheduler_lock = Arc::clone(&self.schedulers);
         let mut schedulers = scheduler_lock.write().await;
-        let worker_name = worker.name.to_string().into();
+        let worker_name = worker.name().to_string().into();
 
-        let worker_prompt_task = Arc::new(WorkerPromptTask::new(
-            Arc::clone(&self),
-            Arc::new(worker),
-            Arc::from(prompt),
-        ));
+        let scheduled_task = match worker_parameters {
+            WorkerScheduleParameters::Sql { sql, .. } => Arc::new(WorkerSqlTask::new(
+                Arc::clone(&self),
+                Arc::clone(&worker_name),
+                Arc::from(sql),
+            )) as Arc<dyn ScheduledTask>,
+            WorkerScheduleParameters::Prompt { prompt, .. } => Arc::new(WorkerPromptTask::new(
+                Arc::clone(&self),
+                Arc::clone(&worker_name),
+                Arc::from(prompt),
+            ))
+                as Arc<dyn ScheduledTask>,
+        };
 
         let cron_request_channel = Arc::new(RwLock::new(
-            CronRequestChannel::new(&start_cron.clone().into()).context(
-                crate::FailedToCreateCronChannelSnafu {
-                    cron: start_cron.clone(),
-                },
-            )?,
+            CronRequestChannel::new(&cron.clone().into())
+                .context(crate::FailedToCreateCronChannelSnafu { cron: cron.clone() })?,
         ));
 
         let schedule = Arc::new(
-            Schedule::new(Arc::clone(&worker_name), worker_prompt_task)
+            Schedule::new(Arc::clone(&worker_name), scheduled_task)
                 .add_trigger(cron_request_channel),
         );
 
@@ -214,17 +200,14 @@ impl Runtime {
                 .context(crate::FailedToStartSchedulerSnafu)?,
         );
         schedulers.insert(WORKER_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
-        tracing::debug!(
-            "Worker scheduler created for worker '{worker_name}' with cron: {start_cron}",
-        );
+        tracing::debug!("Worker scheduler created for worker '{worker_name}' with cron: {cron}",);
 
         Ok(())
     }
 
-    pub async fn remove_worker_schedule(self: Arc<Self>, worker: Worker) -> Result<()> {
+    pub async fn remove_worker_schedule(self: Arc<Self>, worker_name: Arc<str>) -> Result<()> {
         let scheduler_lock = Arc::clone(&self.schedulers);
         let schedulers = scheduler_lock.read().await;
-        let worker_name = worker.name.to_string().into();
 
         if let Some(scheduler) = schedulers.get(WORKER_SCHEDULER_NAME) {
             if scheduler

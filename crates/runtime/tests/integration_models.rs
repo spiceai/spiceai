@@ -26,6 +26,8 @@ use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 #[cfg(feature = "models")]
 mod models;
 mod utils;
+#[cfg(feature = "models")]
+mod workers;
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
@@ -43,7 +45,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
-fn init_tracing_with_task_history(
+pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
 ) -> (DefaultGuard, TracerProvider) {

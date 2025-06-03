@@ -28,6 +28,7 @@ use spicepod::{
         dataset::Dataset,
         embeddings::Embeddings,
         eval::Eval,
+        management::Management,
         model::Model,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
@@ -67,6 +68,8 @@ pub struct App {
     pub spicepods: Vec<Spicepod>,
 
     pub runtime: Runtime,
+
+    pub management: Option<Management>,
 }
 
 impl App {
@@ -106,6 +109,7 @@ pub struct AppBuilder {
     workers: Vec<Worker>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
+    management: Option<Management>,
 }
 
 impl AppBuilder {
@@ -124,6 +128,7 @@ impl AppBuilder {
             workers: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
+            management: None,
         }
     }
 
@@ -132,6 +137,7 @@ impl AppBuilder {
         self.runtime = spicepod.runtime.clone();
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
+        self.management.clone_from(&spicepod.management);
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
@@ -241,6 +247,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_management(mut self, management: Management) -> AppBuilder {
+        self.management = Some(management);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -256,6 +268,7 @@ impl AppBuilder {
             workers: self.workers,
             spicepods: self.spicepods,
             runtime: self.runtime,
+            management: self.management,
         }
     }
 
@@ -272,6 +285,7 @@ impl AppBuilder {
         let secrets = spicepod.secrets.clone();
         let runtime = spicepod.runtime.clone();
         let extensions = spicepod.extensions.clone();
+        let management = spicepod.management.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -369,6 +383,7 @@ impl AppBuilder {
             workers,
             spicepods,
             runtime,
+            management,
         })
     }
 }

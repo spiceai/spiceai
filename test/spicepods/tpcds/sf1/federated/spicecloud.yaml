@@ -5,7 +5,8 @@ datasets:
   - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_sales
     name: catalog_sales
     params: &spicecloud_params
-      spiceai_api_key: ${secrets:SPICEAI_TPCDS_API_KEY}
+      spiceai_api_key: ${secrets:SPICEAI_TEST_TPCDS_API_KEY}
+      spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}
   - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_returns
     name: catalog_returns
     params: *spicecloud_params

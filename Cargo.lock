@@ -3877,7 +3877,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d53510efd7b9ffb8d7f87e63df33ca0a5756e234#d53510efd7b9ffb8d7f87e63df33ca0a5756e234"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d2cfe4644286df7cad006c090174e475716cb8d8#d2cfe4644286df7cad006c090174e475716cb8d8"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3964,9 +3964,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96f51383ba327a1403e6e3458f8fc979d09d7200af56fa32681619f6c760dee"
+checksum = "547318d6ee083b99d0e1daef01c3873b8c9e2f832bbbf1c5fa2f248051046cbf"
 dependencies = [
  "arrow",
  "bytes",
@@ -3993,9 +3993,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7b49a2e67ebafbe644e36f251ee985f237bfb39e4ef1e312eb5876535bc449e"
+checksum = "5acac3d1b207020f0754cbc827c1d71fb342b78bcf8ab0a8e3cf79d264f22d54"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6289,6 +6289,24 @@ dependencies = [
  "url",
  "uuid 1.17.0",
  "zstd",
+]
+
+[[package]]
+name = "iceberg-catalog-glue"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45ce11d460ba82a35dfbdcf7a1ba241df2ddb98cb1317ecbd222d93362ddf596"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-glue",
+ "iceberg",
+ "log",
+ "serde_json",
+ "tokio",
+ "typed-builder 0.20.1",
+ "uuid 1.17.0",
 ]
 
 [[package]]
@@ -11066,6 +11084,7 @@ dependencies = [
  "hyper 1.6.0",
  "hyper-util",
  "iceberg",
+ "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
  "imap",

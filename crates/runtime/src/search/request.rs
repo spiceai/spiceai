@@ -47,7 +47,8 @@ pub struct SearchRequestBaseJson {
     #[serde(rename = "where", default)]
     pub where_cond: Option<String>,
 
-    /// Additional columns to return from the dataset.
+    /// Additional columns to return from the dataset. If the column is a primary key, it will be
+    /// returned within the response under `.primary_key`, not `.data`.
     #[serde(default)]
     pub additional_columns: Vec<String>,
 }

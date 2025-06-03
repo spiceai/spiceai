@@ -87,7 +87,7 @@ datafusion-datasource = "47"
 datafusion-federation = { version = "0.4.2", features = ["sql"] }
 datafusion-functions-json = "0.47"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.10", features = ["default-engine", "arrow-55"] }
+delta_kernel = { version = "0.11", features = ["default-engine", "arrow-55"] }
 dotenvy = "0.15"
 duckdb = "1.1.3"
 fundu = "2.0.1"
@@ -98,6 +98,7 @@ graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.3.1"
 iceberg = "0.4.0"
+iceberg-catalog-glue = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
@@ -184,7 +185,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "b5
 datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "b5c62f29d2c70c5331ff50015b67b5e1cafcd578" } # spiceai-47
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "9db74a4b360df6be1bb554c59a474a2fd4bfb7e9" } # spiceai-47
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d53510efd7b9ffb8d7f87e63df33ca0a5756e234" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d2cfe4644286df7cad006c090174e475716cb8d8" } # spiceai
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "69ae7518ee093a1b070e9e4e6f011ef353431086" } # spiceai-1.1.3-backported-arrow-55
 

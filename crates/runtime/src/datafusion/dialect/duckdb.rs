@@ -84,6 +84,30 @@ pub(crate) fn cosine_distance_to_sql(
 
     Ok(Some(ast_fn))
 }
+
+#[allow(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
+pub(crate) fn rand_to_random(
+    _unparser: &datafusion::sql::unparser::Unparser,
+    _args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    let ast_fn = ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("random"))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    Ok(Some(ast_fn))
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::{
