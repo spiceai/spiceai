@@ -1,3 +1,5 @@
+# This action updates the apt sources from HTTP to HTTPS.
+# Add to workflow when HTTP sources are down
 name: Update HTTP to HTTPS sources
 description: 'composite action'
 
