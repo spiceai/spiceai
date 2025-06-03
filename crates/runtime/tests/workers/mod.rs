@@ -116,7 +116,7 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
             let data = rt
                 .datafusion()
-                .query_builder("SELECT task, input, captured_output FROM runtime.task_history WHERE task = 'scheduler::worker'")
+                .query_builder("SELECT task, input, captured_output FROM runtime.task_history WHERE task = 'scheduled_worker'")
                 .build()
                 .run()
                 .await
