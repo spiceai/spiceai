@@ -110,7 +110,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: integration-test-archive
-          path: ./integration_test
+          path: ./integration.tar.zst
           retention-days: 1
 
   test:
@@ -131,7 +131,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: integration-test-archive
-          path: ./integration_test
+          path: ./integration.tar.zst
 
       - name: Install Nextest
         run: |
