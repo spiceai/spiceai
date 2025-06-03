@@ -1,5 +1,3 @@
-use arrow::array::RecordBatch;
-use arrow_schema::Schema;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -15,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use arrow::{array::RecordBatch, datatypes::Schema};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -24,41 +23,43 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr,
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionContext,
-    sql::TableReference,
-};
-use search::generation::{
-    CandidateGeneration, Error as SearchGenerationError, text_search::FullTextSearch,
 };
 
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
 use std::sync::Arc;
 
-use crate::datafusion::DataFusion;
+use crate::generation::{CandidateGeneration, InternalSnafu, Result};
 
-/// [`Fts`] adds filter predicate and additional projection support to [`FullTextSearch`].
-pub struct Fts {
-    df: Arc<DataFusion>,
-    fts: FullTextSearch,
-    tbl: TableReference,
+/// [`PostApplyCandidateGeneration`] applies filter predicate and retrieves additional columns to a
+///  [`CandidateGeneration`] that may not have full support.
+pub struct PostApplyCandidateGeneration {
+    table_provider: Arc<dyn TableProvider>,
+    inner: Arc<dyn CandidateGeneration>,
+    primary_key: Vec<String>,
 }
 
-impl Fts {
-    pub fn new(df: Arc<DataFusion>, fts: FullTextSearch, tbl: TableReference) -> Self {
-        Self { df, fts, tbl }
-    }
+/// Temporary table names used internally in SQL.
+static TABLE_PROVIDER_TABLE_NAME: &str = "table_provider";
+static CANDIDATE_GENERATION_TABLE_NAME: &str = "candidate_generation";
 
-    async fn table_provider(&self) -> Option<Arc<dyn TableProvider>> {
-        self.df.get_table(&self.tbl).await
+impl PostApplyCandidateGeneration {
+    pub fn new(
+        table: Arc<dyn TableProvider>,
+        inner: Arc<dyn CandidateGeneration>,
+        primary_key: Vec<String>,
+    ) -> Self {
+        Self {
+            table_provider: table,
+            inner,
+            primary_key,
+        }
     }
 
     /// Return the subset of `filters` that are supported by the underlying FTS.
-    fn supported_underlying_filters<'a>(
-        &self,
-        filters: &'a [&'a Expr],
-    ) -> Result<Vec<&'a Expr>, SearchGenerationError> {
+    fn supported_underlying_filters<'a>(&self, filters: &'a [&'a Expr]) -> Result<Vec<&'a Expr>> {
         let underlying_filters = self
-            .fts
+            .inner
             .supports_filters_pushdown(filters)?
             .into_iter()
             .zip(filters.iter())
@@ -72,8 +73,8 @@ impl Fts {
     fn supported_underlying_projection<'a>(
         &self,
         projections: &[&'a Expr],
-    ) -> Result<Vec<&'a Expr>, SearchGenerationError> {
-        let supported = self.fts.supports_columns(projections)?;
+    ) -> Result<Vec<&'a Expr>> {
+        let supported = self.inner.supports_columns(projections)?;
         let underlying_projection = supported
             .into_iter()
             .zip(projections.iter())
@@ -88,27 +89,17 @@ impl Fts {
         stream: SendableRecordBatchStream,
         remaining_filters: &[&Expr],
         remaining_projection: &[&Expr],
-    ) -> Result<SendableRecordBatchStream, SearchGenerationError> {
-        let provider =
-            self.table_provider()
-                .await
-                .ok_or_else(|| SearchGenerationError::InternalError {
-                    source: Box::from(""),
-                })?;
-
+    ) -> Result<SendableRecordBatchStream> {
         let ctx = SessionContext::new();
         let _ = ctx
-            .register_table(self.tbl.clone(), provider)
+            .register_table("table", Arc::clone(&self.table_provider))
             .boxed()
-            .map_err(|source| SearchGenerationError::InternalError { source })?;
+            .context(InternalSnafu)?;
 
-        let pk = self.fts.primary_key();
-
-        let (new_schema, strm) = Self::apply_augmentation(
+        let (new_schema, strm) = Self::apply_postprocessing(
             stream,
             ctx,
-            self.tbl.clone(),
-            pk.to_vec(),
+            self.primary_key.clone(),
             remaining_filters
                 .iter()
                 .cloned()
@@ -126,10 +117,9 @@ impl Fts {
     }
 
     /// For each [`RecordBatch`] provided, add the remaining columns (joining on primary keys), and apply the appropriate fiters.
-    async fn apply_augmentation(
+    async fn apply_postprocessing(
         mut stream: SendableRecordBatchStream,
         ctx: SessionContext,
-        tbl: TableReference,
         primary_key: Vec<String>,
         remaining_filters: Vec<Expr>,
         remaining_projection: Vec<Expr>,
@@ -150,7 +140,7 @@ impl Fts {
                     }
                 };
 
-                if let Err(e) = ctx.register_table("fts_temp", Arc::new(t)) {
+                if let Err(e) = ctx.register_table(CANDIDATE_GENERATION_TABLE_NAME, Arc::new(t)) {
                     yield Err(e);
                     continue;
                 };
@@ -160,13 +150,13 @@ impl Fts {
 
                 let df = match ctx.sql(format!(
                     "SELECT {proj} \n\
-                    FROM {tbl} \n\
-                    JOIN fts_temp t ON {primary_key_join} \n\
+                    FROM {TABLE_PROVIDER_TABLE_NAME} \n\
+                    JOIN {CANDIDATE_GENERATION_TABLE_NAME} t ON {primary_key_join} \n\
                     WHERE {cond}",
                     proj = cols.join(", "),
                     primary_key_join = primary_key
                         .iter()
-                        .map(|pk| format!("t.{pk} = {tbl}.{pk}"))
+                        .map(|pk| format!("t.{pk} = {TABLE_PROVIDER_TABLE_NAME}.{pk}"))
                         .collect::<Vec<_>>()
                         .join(" AND "),
                     cond = remaining_filters
@@ -211,19 +201,19 @@ impl Fts {
 }
 
 #[async_trait]
-impl CandidateGeneration for Fts {
+impl CandidateGeneration for PostApplyCandidateGeneration {
     async fn search(
         &self,
         query: String,
         opt_filters: &[&Expr],
         addition_projection: &[&Expr],
         limit: usize,
-    ) -> search::generation::Result<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         let underlying_filters = self.supported_underlying_filters(opt_filters)?;
         let underlying_projection = self.supported_underlying_projection(addition_projection)?;
 
         let underlying = self
-            .fts
+            .inner
             .search(
                 query,
                 underlying_filters.as_slice(),
@@ -257,18 +247,15 @@ impl CandidateGeneration for Fts {
         .await
     }
 
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<bool>, SearchGenerationError> {
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<bool>> {
         Ok((0..filters.len()).map(|_| true).collect::<Vec<_>>())
     }
 
-    fn supports_columns(&self, _projection: &[&Expr]) -> Result<Vec<bool>, SearchGenerationError> {
+    fn supports_columns(&self, _projection: &[&Expr]) -> Result<Vec<bool>> {
         Ok(vec![])
     }
 
     fn value_derived_from(&self) -> String {
-        self.fts.value_derived_from()
+        self.inner.value_derived_from()
     }
 }
