@@ -135,14 +135,21 @@ impl DataSink for FlightDataSink {
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
         let mut num_rows = 0;
-        let mut flight_client = self.flight_client.clone();
+        let mut batches = Vec::new();
 
+        // We collect all batches to publish them in one go, as each publishing operation is a separate
+        // Flight DoPut invocation, including finalizing the write and rate limiting.
+        // This makes the write operation atomic, meaning that if it fails, no data is published.
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;
             num_rows += batch.num_rows() as u64;
+            batches.push(batch);
+        }
 
+        if !batches.is_empty() {
+            let mut flight_client = self.flight_client.clone();
             flight_client
-                .publish(&format!("{}", self.table_reference), vec![batch])
+                .publish(&format!("{}", self.table_reference), batches)
                 .await
                 .context(UnableToPublishDataSnafu)
                 .map_err(to_external_error)?;
