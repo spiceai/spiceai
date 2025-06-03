@@ -28,7 +28,7 @@ use tantivy::{
     collector::TopDocs,
     query::{QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
-    schema::{Field, FieldType, OwnedValue},
+    schema::{Field, OwnedValue},
 };
 
 use super::{
@@ -179,7 +179,7 @@ impl FullTextSearch {
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
-                };
+                }
 
                 let mut v =
                     serde_json::to_value(&doc_w_col_names).context(SerdeJsonConversionSnafu)?;

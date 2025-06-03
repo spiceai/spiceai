@@ -25,6 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
+use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearch;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
@@ -202,13 +203,19 @@ impl TableWithFullText {
 
     pub fn as_search_generator(
         &self,
-    ) -> std::result::Result<FullTextSearch, search::generation::Error> {
-        FullTextSearch::try_new(
+    ) -> std::result::Result<Arc<dyn CandidateGeneration>, search::generation::Error> {
+        let base = FullTextSearch::try_new(
             Arc::clone(&self.index),
             self.search_field.clone(),
             self.primary_key.clone(),
         )
-        .map_err(|source| search::generation::Error::TextSearchError { source })
+        .map_err(|source| search::generation::Error::TextSearchError { source })?;
+
+        Ok(Arc::new(PostApplyCandidateGeneration::new(
+            Arc::clone(&self.base_table),
+            Arc::new(base),
+            self.primary_key.clone(),
+        )))
     }
 }
 

@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use datafusion::{
     logical_expr::sqlparser::ast::Expr,
     sql::sqlparser::{
@@ -51,13 +53,13 @@ pub struct SearchPipeline<A>
 where
     A: CandidateAggregation,
 {
-    generators: Vec<Box<dyn CandidateGeneration>>,
+    generators: Vec<Arc<dyn CandidateGeneration>>,
     aggregator: A,
 }
 
 impl<A: CandidateAggregation> SearchPipeline<A> {
     #[must_use]
-    pub fn new(generators: Vec<Box<dyn CandidateGeneration>>, aggregator: A) -> Self {
+    pub fn new(generators: Vec<Arc<dyn CandidateGeneration>>, aggregator: A) -> Self {
         SearchPipeline {
             generators,
             aggregator,

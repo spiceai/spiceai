@@ -217,7 +217,9 @@ fn transpose_and_convert(
 
     for (key, vv) in column_format {
         for (i, row_values) in vv.into_iter().enumerate() {
-            rows[i].insert(key.clone(), row_values.into());
+            if !row_values.is_empty() {
+                rows[i].insert(key.clone(), row_values.into());
+            }
         }
     }
 

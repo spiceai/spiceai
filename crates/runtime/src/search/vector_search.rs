@@ -20,7 +20,6 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::SearchGenerationSnafu;
 use crate::search::util::search_table;
 use crate::search::{
     SearchPipelineSnafu,
@@ -166,10 +165,10 @@ impl VectorSearch {
 
                 async move {
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
-                    let mut generators: Vec<Box<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
+                    let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {
-                        generators.insert(i, Box::new(self.vector_search_generator(
+                        generators.insert(i, Arc::new(self.vector_search_generator(
                                 &tbl,
                                 col.as_str(),
                                 primary_keys,
@@ -177,9 +176,9 @@ impl VectorSearch {
                         );
                     };
 
-                    if let Some(fts) = search_table(&self.df, &tbl).await {
-                        let genn = fts.as_search_generator().context(SearchGenerationSnafu)?;
-                        generators.push(Box::new(genn));
+                    // If the dataset is configured with full text search capabilities, add as generator.
+                    if let Some(fts) = search_table(&self.df, &tbl).await.transpose()? {
+                        generators.push(fts);
                     }
 
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(

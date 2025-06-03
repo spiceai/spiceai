@@ -20,6 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use search::generation::CandidateGeneration;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -27,8 +28,9 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use crate::embeddings::table::EmbeddingTable;
+use crate::search::SearchGenerationSnafu;
 
-use super::full_text::table::TableWithFullText;
+use super::{Error, Result, full_text::table::TableWithFullText};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
 pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
@@ -110,7 +112,7 @@ pub async fn parse_explicit_primary_keys(
     })
 }
 
-pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> super::Result<Vec<String>> {
+pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> Result<Vec<String>> {
     let constraint_idx = tbl
         .constraints()
         .map(|c| c.iter())
@@ -132,17 +134,17 @@ pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> super::Resu
                 .collect::<Vec<_>>()
         })
         .boxed()
-        .map_err(|e| super::Error::DataFusionError { source: e })
+        .map_err(|e| Error::DataFusionError { source: e })
 }
 
 pub(crate) async fn get_primary_keys_from_table(
     df: &Arc<DataFusion>,
     table: &TableReference,
-) -> super::Result<Vec<String>> {
+) -> Result<Vec<String>> {
     let tbl_ref = df
         .get_table(table)
         .await
-        .ok_or_else(|| super::Error::DataSourcesNotFound {
+        .ok_or_else(|| Error::DataSourcesNotFound {
             data_source: vec![table.clone()],
         })?;
 
@@ -156,7 +158,7 @@ pub async fn get_primary_keys_with_overrides(
     df: &Arc<DataFusion>,
     tables: &[TableReference],
     explicit_primary_keys: &HashMap<TableReference, Vec<String>>,
-) -> super::Result<HashMap<TableReference, Vec<String>>> {
+) -> Result<HashMap<TableReference, Vec<String>>> {
     let mut tbl_to_pks: HashMap<TableReference, Vec<String>> = HashMap::new();
 
     for tbl in tables {
@@ -176,9 +178,7 @@ pub async fn get_primary_keys_with_overrides(
     Ok(tbl_to_pks)
 }
 
-pub async fn user_tables_with_embeddings(
-    df: &Arc<DataFusion>,
-) -> super::Result<Vec<TableReference>> {
+pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
     let tables = df.get_user_table_names();
     let mut tables_with_embeddings = Vec::new();
 
@@ -187,7 +187,7 @@ pub async fn user_tables_with_embeddings(
             .get_table(&t)
             .await
             // we should not fail here, as we are iterating over the tables that we know exist
-            .ok_or_else(|| super::Error::DataSourceNotFound { table: t.clone() })?;
+            .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
         if find_concrete_table_provider::<EmbeddingTable>(&table_provider)
             .await
             .is_some()
@@ -204,18 +204,15 @@ pub async fn user_tables_with_embeddings(
 pub async fn embedding_columns_from_table(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
-) -> super::Result<Vec<String>> {
-    let table_provider = df
-        .get_table(tbl)
-        .await
-        .ok_or(super::Error::DataSourcesNotFound {
-            data_source: vec![tbl.clone()],
-        })?;
+) -> Result<Vec<String>> {
+    let table_provider = df.get_table(tbl).await.ok_or(Error::DataSourcesNotFound {
+        data_source: vec![tbl.clone()],
+    })?;
 
     let Some(embedding_table) =
         find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
     else {
-        return Err(super::Error::CannotVectorSearchDataset {
+        return Err(Error::CannotVectorSearchDataset {
             data_source: tbl.clone(),
         });
     };
@@ -225,8 +222,9 @@ pub async fn embedding_columns_from_table(
 pub async fn search_table(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
-) -> Option<Arc<TableWithFullText>> {
+) -> Option<Result<Arc<dyn CandidateGeneration>>> {
     let table_provider = df.get_table(tbl).await?;
+    let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
 
-    find_concrete_table_provider::<TableWithFullText>(&table_provider).await
+    Some(fts.as_search_generator().context(SearchGenerationSnafu))
 }
