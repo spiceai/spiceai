@@ -13,10 +13,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::{
-    datatypes::{DataType, Field, FieldRef, Schema},
-    error::ArrowError,
-};
+use arrow::error::ArrowError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
