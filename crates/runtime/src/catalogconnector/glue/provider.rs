@@ -31,10 +31,8 @@ use datafusion::{
     common::Result as DFResult,
     error::DataFusionError,
 };
-use iceberg::{
-    NamespaceIdent, TableIdent, io::FileIOBuilder, spec::TableMetadata,
-    table::Table as IcebergTable,
-};
+use iceberg::{NamespaceIdent, TableIdent};
+use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_datafusion::IcebergTableProvider;
 use snafu::prelude::*;
 use std::sync::Arc;
@@ -166,44 +164,20 @@ impl GlueSchemaProvider {
         name: &str,
         table: &Table,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let file_io = FileIOBuilder::new("s3").build().map_err(|e| {
-            DataFusionError::External(Box::new(super::Error::BuildFileIO { source: e }))
-        })?;
-
         let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let input_file = file_io.new_input(&metadata_location).map_err(|e| {
-            DataFusionError::External(Box::new(super::Error::CreateFileInput {
-                source: e,
-                location: metadata_location.clone(),
-            }))
-        })?;
-
-        let metadata_content = input_file.read().await.map_err(|e| {
-            DataFusionError::External(Box::new(super::Error::ReadMetadata {
-                source: e,
-                location: metadata_location.clone(),
-            }))
-        })?;
-
-        let metadata = serde_json::from_slice::<TableMetadata>(&metadata_content).map_err(|e| {
-            DataFusionError::External(Box::new(super::Error::DeserializeMetadata { source: e }))
-        })?;
 
         let identifier =
             TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
 
-        let table = IcebergTable::builder()
-            .file_io(file_io)
-            .metadata(metadata)
-            .identifier(identifier)
-            .build()
-            .map_err(|e| {
-                DataFusionError::External(Box::new(super::Error::BuildIcebergTable { source: e }))
-            })?;
+        let config = GlueCatalogConfig::builder()
+            .warehouse(metadata_location)
+            .build();
+        let catalog = GlueCatalog::new(config)
+            .await
+            .map_err(|e| DataFusionError::External(e.into()))?;
 
-        let table_provider = IcebergTableProvider::try_new_from_table(table)
+        let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
             .await
             .map_err(|e| {
                 DataFusionError::External(Box::new(super::Error::CreateIcebergTableProvider {
