@@ -134,6 +134,7 @@ fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefi
             .map(ComponentOrReference::Component)
             .collect(),
         runtime: spicepod::component::runtime::Runtime::default(),
+        management: None,
         extensions: HashMap::default(),
         secrets: Vec::default(),
         metadata: HashMap::default(),

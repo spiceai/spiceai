@@ -22,7 +22,7 @@ use crate::{
     OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
     UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{
         self, Dataset,
@@ -556,7 +556,7 @@ impl Runtime {
         Arc::clone(&self).remove_dataset_schedule(&ds.name).await?;
 
         // create new accelerated table for updated data connector
-        let (accelerated_table, is_ready) = self
+        let accelerated_table = self
             .df
             .create_accelerated_table(&ds, Arc::clone(&connector), federated_table, self.secrets())
             .await
@@ -564,10 +564,12 @@ impl Runtime {
                 dataset: ds.name.clone(),
             })?;
 
+        let notifier = accelerated_table.refresher().on_complete_notification();
+
         // wait for accelerated table to be ready
-        is_ready
-            .await
-            .context(UnableToReceiveAcceleratedTableStatusSnafu)?;
+        if let Some(notifier) = notifier {
+            notifier.notified().await;
+        }
 
         // recreate the scheduler, which also recreates with any updated parameters
         Arc::clone(&self)
@@ -684,7 +686,7 @@ impl Runtime {
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        let is_ready = self
+        let notifier = self
             .df
             .register_table(
                 Arc::clone(&ds),
@@ -701,19 +703,18 @@ impl Runtime {
                 connector_component: ConnectorComponent::from(&ds),
             })?;
 
-        if let Some(is_ready) = is_ready {
+        if let Some(notifier) = notifier {
             // spawn a background task to wait for the accelerated table to be ready before creating schedules
             let runtime = Arc::clone(&self);
             let ds = Arc::clone(&ds);
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
-                if let Ok(()) = is_ready.await {
-                    if let Err(e) = runtime.create_dataset_schedule(ds).await {
-                        tracing::error!(
-                            "Failed to create dataset schedule for '{}': {e}",
-                            dataset_name
-                        );
-                    }
+                notifier.notified().await;
+                if let Err(e) = runtime.create_dataset_schedule(ds).await {
+                    tracing::error!(
+                        "Failed to create dataset schedule for '{}': {e}",
+                        dataset_name
+                    );
                 }
             });
         }

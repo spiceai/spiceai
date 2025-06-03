@@ -17,12 +17,16 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::configure_test_datafusion;
-use crate::{RecordBatch, init_tracing, utils::test_request_context};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{runtime_ready_check, test_request_context},
+};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use scopeguard::defer;
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
@@ -30,6 +34,23 @@ fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset 
         format!("duckdb:read_{fn_name}({path_str})"),
         fn_name.to_string(),
     );
+    dataset.name = ds_name.to_string();
+    dataset
+}
+
+fn make_duckdb_acceleration_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        format!("duckdb:read_{fn_name}({path_str})"),
+        fn_name.to_string(),
+    );
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        refresh_sql: None,
+        ..Acceleration::default()
+    });
     dataset.name = ds_name.to_string();
     dataset
 }
@@ -135,6 +156,85 @@ async fn duckdb_from_functions() -> Result<(), String> {
 
                 assert_batches_eq!(expected_results, &data);
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn duckdb_order_by_special_cases() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            // Write the sample file to a temporary directory
+            let temp_dir = std::env::temp_dir().join("spiced_test_data_order_by");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+            let sample_csv_path = temp_dir.join("taxi_sample.csv");
+            std::fs::write(&sample_csv_path, sample_csv_contents)
+                .expect("failed to write sample file");
+            defer! {
+                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+            }
+
+            let app = AppBuilder::new("duckdb_order_by_test")
+                .with_dataset(make_duckdb_acceleration_dataset(
+                    "csv_test",
+                    "csv",
+                    &format!("'{}'", sample_csv_path.display()),
+                ))
+                .build();
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Test ORDER BY NULL
+            let order_by_null_query = "SELECT \"VendorID\" FROM csv_test ORDER BY NULL LIMIT 5";
+            let query_result = rt
+                .datafusion()
+                .query_builder(order_by_null_query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("ORDER BY NULL query failed: {e}"))?;
+
+            let _data = query_result
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("ORDER BY NULL query execution failed: {e}"))?;
+
+            // Test ORDER BY rand()
+            let order_by_rand_query = "SELECT \"VendorID\" FROM csv_test ORDER BY rand() LIMIT 5";
+            let query_result = rt
+                .datafusion()
+                .query_builder(order_by_rand_query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("ORDER BY rand() query failed: {e}"))?;
+
+            let _data = query_result
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("ORDER BY rand() query execution failed: {e}"))?;
 
             Ok(())
         })
