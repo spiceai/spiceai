@@ -12,3 +12,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.2.2,2025-05-13T00:30:00Z,2025-05-13T19:00:00Z,7,6,66,66,2,AI QA engineer runs recipes post-release.
 1.3.0,2025-05-19T20:30:00Z,2025-05-20T06:00:00Z,7,7,67,67,2,AI QA engineer runs recipes post-release.
 1.3.1,2025-05-26T00:27:00Z,2025-05-26T03:20:28Z,5,4,67,67,2,AI QA engineer runs recipes post-release.
+1.3.2,2025-06-03T00:27:00Z,2025-06-03T03:20:28Z,3,1,2,2,2,"Patch release with only two small commits, only targeted testing done."

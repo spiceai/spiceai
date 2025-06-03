@@ -324,7 +324,7 @@ pub(crate) async fn refresh(
         )
         .await
     {
-        Ok(()) => (
+        Ok(_) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
                 message: format!("Dataset refresh triggered for {dataset_name}."),

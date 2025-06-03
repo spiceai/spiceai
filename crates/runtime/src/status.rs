@@ -156,12 +156,9 @@ impl RuntimeStatus {
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
-        let mut components = match self.statuses.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let full_name = format!("worker:{name}");
-        components.insert(full_name, status);
+        let worker_name = name.to_string();
+        self.update_component_status(format!("worker:{worker_name}"), status);
+        metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
     }
 
     /// Get the status of a worker

@@ -19,13 +19,14 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StructArray, TimestampNanosecondBuilder,
+    StructArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
     SchemaRef, TimeUnit,
 };
 use arrow::error::ArrowError;
+use arrow::temporal_conversions::NANOSECONDS;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -255,58 +256,72 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
 }
 
 fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Result<ArrayRef, Error> {
-    let struct_array = column.as_any().downcast_ref::<StructArray>().context(
-        UnableToCastSnowflakeTimestampSnafu {
-            reason: "value is not a struct",
-        },
-    )?;
-
-    let expected_fields = if is_tz { 3 } else { 2 };
-    if struct_array.columns().len() < expected_fields {
-        return UnableToCastSnowflakeTimestampSnafu {
-            reason: format!("value is not a struct with {expected_fields} columns"),
+    // Try to downcast to StructArray first
+    if let Some(struct_array) = column.as_any().downcast_ref::<StructArray>() {
+        let expected_fields = if is_tz { 3 } else { 2 };
+        if struct_array.columns().len() < expected_fields {
+            return UnableToCastSnowflakeTimestampSnafu {
+                reason: format!("struct has fewer than {expected_fields} columns"),
+            }
+            .fail();
         }
-        .fail();
-    }
 
-    let epoch_array = struct_array
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .context(UnableToCastSnowflakeTimestampSnafu {
-            reason: "epoch is missing",
-        })?;
-    let fraction_array = struct_array
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .context(UnableToCastSnowflakeTimestampSnafu {
-            reason: "fraction is missing",
-        })?;
+        let epoch_array = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context(UnableToCastSnowflakeTimestampSnafu {
+                reason: "epoch is missing or not an Int64Array",
+            })?;
+        let fraction_array = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context(UnableToCastSnowflakeTimestampSnafu {
+                reason: "fraction is missing or not an Int32Array",
+            })?;
 
-    let builder = TimestampNanosecondBuilder::with_capacity(struct_array.len());
+        let mut builder = TimestampNanosecondArray::builder(struct_array.len());
+        if is_tz {
+            builder = builder.with_timezone(Arc::clone(&UTC_TIMEZONE));
+        }
 
-    // Snowflake already stores timestamps in UTC, so we don't need to adjust for timezone
-    let mut builder = if is_tz {
-        builder.with_timezone(Arc::clone(&UTC_TIMEZONE))
+        for idx in 0..struct_array.len() {
+            if struct_array.is_null(idx) {
+                builder.append_null();
+            } else {
+                let epoch = epoch_array.value(idx);
+                let fraction = i64::from(fraction_array.value(idx));
+                let timestamp = epoch * NANOSECONDS + fraction;
+                builder.append_value(timestamp);
+            }
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    } else if let Some(epoch_array) = column.as_any().downcast_ref::<Int64Array>() {
+        // Handle case where Snowflake returns a primitive Int64Array (seconds precision)
+        let mut builder = TimestampNanosecondArray::builder(epoch_array.len());
+        if is_tz {
+            builder = builder.with_timezone(Arc::clone(&UTC_TIMEZONE));
+        }
+
+        for idx in 0..epoch_array.len() {
+            if epoch_array.is_null(idx) {
+                builder.append_null();
+            } else {
+                // Convert epoch seconds to nanoseconds
+                let timestamp = epoch_array.value(idx) * NANOSECONDS;
+                builder.append_value(timestamp);
+            }
+        }
+
+        Ok(Arc::new(builder.finish()) as ArrayRef)
     } else {
-        builder
-    };
-
-    for idx in 0..struct_array.len() {
-        if struct_array.is_null(idx) {
-            builder.append_null();
-        } else {
-            let epoch = epoch_array.value(idx);
-            let fraction = i64::from(fraction_array.value(idx));
-            let timestamp = epoch * 1_000_000_000 + fraction;
-
-            builder.append_value(timestamp);
+        UnableToCastSnowflakeTimestampSnafu {
+            reason: "input is neither a StructArray nor an Int64Array",
         }
+        .fail()
     }
-
-    let timestamp_array = builder.finish();
-    Ok(Arc::new(timestamp_array) as ArrayRef)
 }
 
 fn cast_sf_fixed_point_number_to_decimal(
@@ -453,6 +468,50 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow::util::display;
     use std::sync::Arc;
+
+    #[test]
+    fn test_cast_sf_timestamp_ntz_seconds_precision_to_arrow_timestamp() {
+        let mut builder = Int64Builder::new();
+        builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
+        let timestamp_ntz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_ntz_array, false)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            Some(1_714_647_301_000_000_000),
+        ];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert_eq!(result.value(1), expected_timestamps[1].unwrap_or_default());
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_tz_seconds_precision_to_arrow_timestamp() {
+        let mut builder = Int64Builder::new();
+        builder.append_values(&[1_696_164_330, 1_714_647_301], &[true, true]);
+        let timestamp_tz_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_tz_array, true)
+            .expect("Should cast Snowflake timestamp to Arrow timestamp");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        let expected_timestamps = [
+            Some(1_696_164_330_000_000_000),
+            Some(1_714_647_301_000_000_000),
+        ];
+
+        assert_eq!(result.value(0), expected_timestamps[0].unwrap_or_default());
+        assert_eq!(result.value(1), expected_timestamps[1].unwrap_or_default());
+    }
 
     #[test]
     fn test_cast_sf_timestamp_ntz_to_arrow_timestamp() {

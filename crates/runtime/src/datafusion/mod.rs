@@ -66,7 +66,7 @@ use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
-use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::time::{Instant, sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -406,12 +406,12 @@ impl DataFusion {
         Ok(())
     }
 
-    // Returns a oneshot::Receiver if the table supports notifying the runtime when the table is ready.
+    // Returns a Notify if the table supports notifying the runtime when the table is ready.
     pub async fn register_table(
         &self,
         dataset: Arc<Dataset>,
         table: Table,
-    ) -> Result<Option<oneshot::Receiver<()>>> {
+    ) -> Result<Option<Arc<Notify>>> {
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_mode = dataset.mode();
@@ -428,7 +428,7 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
-
+                    let notifier = accelerated_table.refresher().on_complete_notification();
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
@@ -436,7 +436,7 @@ impl DataFusion {
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
-                    None
+                    notifier
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
@@ -450,15 +450,8 @@ impl DataFusion {
                         });
                     None
                 } else {
-                    Some(
-                        self.register_accelerated_table(
-                            dataset,
-                            source,
-                            federated_read_table,
-                            secrets,
-                        )
-                        .await?,
-                    )
+                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
+                        .await?
                 }
             }
             Table::Federated {
@@ -825,7 +818,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
+    ) -> Result<AcceleratedTable> {
         tracing::debug!("Creating accelerated table {dataset:?}");
         let source_table_provider = match dataset.mode() {
             Mode::Read => Arc::new(federated_read_table),
@@ -1087,10 +1080,11 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<oneshot::Receiver<()>> {
-        let (mut accelerated_table, is_ready) = self
+    ) -> Result<Option<Arc<Notify>>> {
+        let mut accelerated_table = self
             .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
             .await?;
+        let notifier = accelerated_table.refresher().on_complete_notification();
 
         source
             .on_accelerated_table_registration(&dataset, &mut accelerated_table)
@@ -1113,23 +1107,26 @@ impl DataFusion {
             .await
             .insert(dataset.name.clone());
 
-        Ok(is_ready)
+        Ok(notifier)
     }
 
     pub async fn refresh_table(
         &self,
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<Notify>>> {
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
-            return accelerated_table.trigger_refresh(overrides).await.context(
+            let notifier = accelerated_table.refresher().on_complete_notification();
+            accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
                 },
-            );
+            )?;
+
+            return Ok(notifier);
         }
         NotAcceleratedTableSnafu {
             table_name: dataset_name.to_string(),
@@ -1472,7 +1469,7 @@ impl DataFusion {
             builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
-        let (accelerated_table, _) =
+        let accelerated_table =
             builder
                 .build()
                 .await

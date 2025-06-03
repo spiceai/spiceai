@@ -56,6 +56,8 @@ impl Runtime {
             }
         };
 
+        let cloned_worker = Arc::clone(&worker);
+
         if let Some(model) = Arc::clone(&worker).as_model() {
             let mut llm_registry = self.llms.write().await;
             llm_registry.insert(cfg.name.clone(), model);
@@ -70,7 +72,10 @@ impl Runtime {
         self.status
             .update_worker(&cfg.name, status::ComponentStatus::Ready);
 
-        if let Err(e) = Arc::clone(&self).create_worker_schedule(cfg.clone()).await {
+        if let Err(e) = Arc::clone(&self)
+            .create_worker_schedule(cloned_worker)
+            .await
+        {
             tracing::error!("Failed to create scheduler for worker [{}]: {e}", cfg.name);
             self.status
                 .update_worker(&cfg.name, status::ComponentStatus::Error);
@@ -83,7 +88,10 @@ impl Runtime {
         let mut llm_registry = self.llms.write().await;
         llm_registry.remove(&cfg.name);
 
-        if let Err(e) = Arc::clone(&self).remove_worker_schedule(cfg.clone()).await {
+        if let Err(e) = Arc::clone(&self)
+            .remove_worker_schedule(cfg.name.clone().into())
+            .await
+        {
             tracing::error!("Failed to remove scheduler for worker [{}]: {e}", cfg.name);
             self.status
                 .update_worker(&cfg.name, status::ComponentStatus::Error);
