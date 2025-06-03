@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{CatalogConnector, ParameterSpec};
+use super::CatalogConnector;
 use crate::{
     Runtime,
     component::catalog::Catalog,
@@ -24,7 +24,6 @@ use crate::{
             self, ConnectorParams, Validator,
             aws::{AuthValidator, RegionValidator},
         },
-        s3,
     },
 };
 use async_trait::async_trait;
@@ -43,26 +42,6 @@ mod state;
 use provider::GlueCatalogProvider;
 
 pub static PREFIX: &str = "glue";
-
-pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    vec![
-        ParameterSpec::component("region")
-            .description("The AWS region for Glue operations")
-            .secret(),
-        ParameterSpec::component("key")
-            .description("The AWS access key ID for Glue authentication")
-            .secret(),
-        ParameterSpec::component("secret")
-            .description("The AWS secret access key for Glue authentication")
-            .secret(),
-        ParameterSpec::component("session_token")
-            .description("The AWS session token for Glue authentication")
-            .secret(),
-    ]
-    .into_iter()
-    .chain(s3::PARAMETERS.iter().cloned())
-    .collect()
-});
 
 static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,

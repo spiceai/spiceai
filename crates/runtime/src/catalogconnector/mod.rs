@@ -24,7 +24,7 @@ use std::{
 use crate::{
     Runtime,
     component::{ComponentInitialization, catalog::Catalog},
-    dataconnector::{ConnectorComponent, parameters::ConnectorParams},
+    dataconnector::{ConnectorComponent, parameters::ConnectorParams, s3},
     parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
@@ -147,7 +147,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             glue::GlueCatalog::new_connector,
             glue::PREFIX,
-            &glue::PARAMETERS,
+            &s3::PARAMETERS,
         ),
     );
 
