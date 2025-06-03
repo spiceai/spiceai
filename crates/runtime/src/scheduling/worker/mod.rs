@@ -137,7 +137,7 @@ impl ScheduledTask for WorkerSqlTask {
             let workers_lock = Arc::clone(&runtime.workers);
             let workers = workers_lock.read().await;
             // we don't actually need the worker, but validate that it still exists
-            if workers.get(&worker_name.to_string()).is_none() {
+            if !workers.contains_key(&worker_name.to_string()) {
                 tracing::debug!("Worker not found for ScheduledTask: {worker_name}");
                 return Ok(());
             }
