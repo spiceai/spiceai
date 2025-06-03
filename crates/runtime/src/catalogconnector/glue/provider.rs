@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::state::GlueCatalogState;
-use super::{Error, Result, TableType};
+use super::{DatabaseName, Error, Result, TableType};
 use crate::dataconnector::DataConnectorFactory as _;
 use crate::dataconnector::parameters::aws::load_config;
 use crate::{
@@ -53,7 +53,7 @@ impl fmt::Debug for GlueCatalogProvider {
 /// A schema provider for a specific Glue database, providing table metadata.
 #[derive(Debug)]
 pub struct GlueSchemaProvider {
-    database: String,
+    database: DatabaseName,
     state: Arc<GlueCatalogState>,
 }
 
