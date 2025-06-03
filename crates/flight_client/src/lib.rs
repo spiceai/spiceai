@@ -544,8 +544,6 @@ impl FlightClient {
             }?,
         };
 
-        let resp = resp.into_inner();
-
         // Wait for the server to acknowledge the data
         match resp.into_inner().try_collect::<Vec<_>>().await {
             Ok(_) => Ok(()),
