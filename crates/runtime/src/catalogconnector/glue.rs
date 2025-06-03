@@ -52,8 +52,11 @@ pub enum Error {
     #[snafu(display("Failed to get Glue databases: {source}"))]
     GetDatabases { source: SdkError<GetDatabasesError> },
 
-    #[snafu(display("Failed to get Glue tables: {source}"))]
-    GetTables { source: SdkError<GetTablesError> },
+    #[snafu(display("Failed to get Glue table from database `{database}`: {source}"))]
+    GetTables {
+        database: String,
+        source: SdkError<GetTablesError>,
+    },
 
     #[snafu(display("Failed to build FileIO: {source}"))]
     BuildFileIO { source: iceberg::Error },

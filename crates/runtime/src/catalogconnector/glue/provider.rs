@@ -107,7 +107,10 @@ impl GlueCatalogProvider {
                 .database_name(&db.name)
                 .send()
                 .await
-                .context(super::GetTablesSnafu)?;
+                .map_err(|source| super::Error::GetTables {
+                    database: db.name.to_string(),
+                    source,
+                })?;
 
             let table_names = get_tables_output
                 .table_list
