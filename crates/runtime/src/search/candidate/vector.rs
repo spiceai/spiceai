@@ -317,9 +317,9 @@ impl CandidateGeneration for VectorGeneration {
 
     fn supports_filters_pushdown(
         &self,
-        filters: &[&Expr],
+        _filters: &[&Expr],
     ) -> Result<Vec<bool>, SearchGenerationError> {
-        Ok((0..filters.len()).map(|_| true).collect::<Vec<_>>())
+        Ok(vec![])
     }
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
@@ -340,8 +340,6 @@ pub fn where_and(filters: &[&Expr]) -> String {
     if filters.is_empty() {
         return String::new();
     }
-
     let combined = filters.iter().map(|e| format!("{}", *e)).join(" AND ");
-
     format!("WHERE {combined}")
 }
