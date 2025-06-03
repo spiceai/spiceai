@@ -109,11 +109,7 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             let second_now = chrono::Utc::now().second();
-            let wait = if second_now < 30 {
-                35 - second_now
-            } else {
-                65 - second_now
-            };
+            let wait = (second_now % 30) + 20; // wait for the next 30th second, and wait 20 seconds for the job to succeed
 
             tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();
@@ -158,7 +154,7 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
                 .with_worker(create_sql_worker(
                     "sql_scheduled",
                     "SELECT COUNT(*) FROM item",
-                    "*/30 * * * * *",
+                    "*/15 * * * * *",
                 ))
                 .build();
 
@@ -176,11 +172,7 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             let second_now = chrono::Utc::now().second();
-            let wait = if second_now < 30 {
-                35 - second_now
-            } else {
-                65 - second_now
-            };
+            let wait = (second_now % 15) + 2; // every 15th second, wait for 2 seconds for the job to succeed
 
             tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();
