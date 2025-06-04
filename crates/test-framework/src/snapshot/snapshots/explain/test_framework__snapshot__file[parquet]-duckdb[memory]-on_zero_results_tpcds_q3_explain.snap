@@ -28,46 +28,46 @@ description: "Query: tpcds_q3"
 |               |     ProjectionExec: expr=[d_year@0 as d_year, i_brand_id@2 as brand_id, i_brand@1 as brand, sum(store_sales.ss_net_profit)@3 as sum_agg]                             |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[d_year@0 as d_year, i_brand@1 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_net_profit)]        |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
-|               |           RepartitionExec: partitioning=Hash([d_year@0, i_brand@1, i_brand_id@2], 24), input_partitions=24                                                           |
+|               |           RepartitionExec: partitioning=Hash([d_year@0, i_brand@1, i_brand_id@2], 16), input_partitions=16                                                           |
 |               |             AggregateExec: mode=Partial, gby=[d_year@0 as d_year, i_brand@3 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_net_profit)]           |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
 |               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_item_sk@1, i_item_sk@0)], projection=[d_year@0, ss_net_profit@2, i_brand_id@4, i_brand@5]   |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
-|               |                     RepartitionExec: partitioning=Hash([ss_item_sk@1], 24), input_partitions=24                                                                      |
+|               |                     RepartitionExec: partitioning=Hash([ss_item_sk@1], 16), input_partitions=16                                                                      |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                    |
 |               |                         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d_date_sk@0, ss_sold_date_sk@0)], projection=[d_year@1, ss_item_sk@3, ss_net_profit@4] |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
-|               |                             RepartitionExec: partitioning=Hash([d_date_sk@0], 24), input_partitions=24                                                               |
+|               |                             RepartitionExec: partitioning=Hash([d_date_sk@0], 16), input_partitions=16                                                               |
 |               |                               ProjectionExec: expr=[d_date_sk@0 as d_date_sk, d_year@1 as d_year]                                                                    |
 |               |                                 BytesProcessedExec                                                                                                                   |
 |               |                                   CoalesceBatchesExec: target_batch_size=8192                                                                                        |
 |               |                                     FilterExec: d_moy@2 = 12                                                                                                         |
 |               |                                       SchemaCastScanExec                                                                                                             |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                        |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
 |               |                                           FallbackOnZeroResultsScanExec                                                                                              |
 |               |                                             CoalescePartitionsExec                                                                                                   |
-|               |                                               RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                  |
+|               |                                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                  |
 |               |                                                 DuckSqlExec sql= SELECT "d_date_sk", "d_year", "d_moy" FROM date_dim WHERE (d_moy = 12)                              |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
-|               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 24), input_partitions=24                                                         |
+|               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 16), input_partitions=16                                                         |
 |               |                               BytesProcessedExec                                                                                                                     |
 |               |                                 SchemaCastScanExec                                                                                                                   |
-|               |                                   RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                              |
+|               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                              |
 |               |                                     FallbackOnZeroResultsScanExec                                                                                                    |
 |               |                                       CoalescePartitionsExec                                                                                                         |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                        |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
 |               |                                           DuckSqlExec sql= SELECT "ss_sold_date_sk", "ss_item_sk", "ss_net_profit" FROM store_sales                                  |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
-|               |                     RepartitionExec: partitioning=Hash([i_item_sk@0], 24), input_partitions=24                                                                       |
+|               |                     RepartitionExec: partitioning=Hash([i_item_sk@0], 16), input_partitions=16                                                                       |
 |               |                       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_brand_id@1 as i_brand_id, i_brand@2 as i_brand]                                              |
 |               |                         BytesProcessedExec                                                                                                                           |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                |
 |               |                             FilterExec: i_manufact_id@3 = 445                                                                                                        |
 |               |                               SchemaCastScanExec                                                                                                                     |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                |
 |               |                                   FallbackOnZeroResultsScanExec                                                                                                      |
 |               |                                     CoalescePartitionsExec                                                                                                           |
-|               |                                       RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                          |
+|               |                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                          |
 |               |                                         DuckSqlExec sql= SELECT "i_item_sk", "i_brand_id", "i_brand", "i_manufact_id" FROM item WHERE (i_manufact_id = 445)          |
 |               |                                                                                                                                                                      |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+

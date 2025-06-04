@@ -9,7 +9,7 @@ datasets:
       pg_port: 5432
       pg_user: postgres
       pg_pass: ${secrets:POSTGRES_PASSWORD}
-      pg_db: tpcds
+      pg_db: tpcds_sf1
       pg_sslmode: disable
   - from: postgres:catalog_returns
     name: catalog_returns

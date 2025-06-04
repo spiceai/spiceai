@@ -34,7 +34,7 @@ use runtime::{
         replication::Replication,
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},
-    dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
+    dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},

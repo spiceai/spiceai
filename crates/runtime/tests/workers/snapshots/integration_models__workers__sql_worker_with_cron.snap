@@ -1,12 +1,11 @@
 ---
 source: crates/runtime/tests/workers/mod.rs
-assertion_line: 204
 expression: pretty
 ---
 +---------------------+---------------------------+-------------------+
 | task                | input                     | captured_output   |
 +---------------------+---------------------------+-------------------+
-| scheduler::worker   | SELECT COUNT(*) FROM item |                   |
+| scheduled_worker    | SELECT COUNT(*) FROM item |                   |
 | sql_query           | SELECT COUNT(*) FROM item | [{"count(*)":20}] |
 | accelerated_refresh | item                      |                   |
 | accelerated_refresh | runtime.task_history      |                   |

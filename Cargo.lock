@@ -6292,6 +6292,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-glue"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45ce11d460ba82a35dfbdcf7a1ba241df2ddb98cb1317ecbd222d93362ddf596"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-glue",
+ "iceberg",
+ "log",
+ "serde_json",
+ "tokio",
+ "typed-builder 0.20.1",
+ "uuid 1.17.0",
+]
+
+[[package]]
 name = "iceberg-catalog-rest"
 version = "0.4.0"
 source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a56b803272db4a7351b2807f412abfbfd3cfd422#a56b803272db4a7351b2807f412abfbfd3cfd422"
@@ -11066,6 +11084,7 @@ dependencies = [
  "hyper 1.6.0",
  "hyper-util",
  "iceberg",
+ "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
  "imap",

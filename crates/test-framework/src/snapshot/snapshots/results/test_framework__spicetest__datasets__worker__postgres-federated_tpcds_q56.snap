@@ -5,14 +5,14 @@ description: "Query: tpcds_q56"
 +------------------+-------------+
 | i_item_id        | total_sales |
 +------------------+-------------+
-| AAAAAAAAEELAAAAA | 8.46        |
-| AAAAAAAADBCBAAAA | 34.50       |
-| AAAAAAAAEAMAAAAA | 69.51       |
-| AAAAAAAAECFAAAAA | 100.98      |
-| AAAAAAAAMLGAAAAA | 118.80      |
-| AAAAAAAAMDBAAAAA | 167.70      |
-| AAAAAAAAHEOAAAAA | 171.99      |
-| AAAAAAAAECHAAAAA | 236.34      |
-| AAAAAAAACALAAAAA | 241.31      |
-| AAAAAAAAEJDBAAAA | 277.64      |
+| AAAAAAAAGHDAAAAA | 0.00        |
+| AAAAAAAAIDDAAAAA | 2.04        |
+| AAAAAAAAGEJAAAAA | 13.70       |
+| AAAAAAAAEOPCAAAA | 15.24       |
+| AAAAAAAACOKDAAAA | 25.41       |
+| AAAAAAAAIKOAAAAA | 27.20       |
+| AAAAAAAAKANAAAAA | 38.28       |
+| AAAAAAAAGPICAAAA | 41.14       |
+| AAAAAAAAALEEAAAA | 57.89       |
+| AAAAAAAAKNDDAAAA | 62.88       |
 +------------------+-------------+

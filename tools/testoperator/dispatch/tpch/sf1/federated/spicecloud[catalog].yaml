@@ -2,6 +2,6 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/spicecloud[catalog].yaml
     query_set: tpch
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     query_overrides: spicecloud-catalog
     validate_results: true
