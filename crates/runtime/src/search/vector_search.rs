@@ -134,13 +134,13 @@ impl VectorSearch {
         cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
-            tracing::debug!("Search cache is enabled");
+            tracing::trace!("Search cache is enabled");
             let search_key = SearchKey::from(req.clone());
             let cache_key = CacheKey::Search(&search_key);
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
 
             if let Some(cached_result) = cache_provider.get_raw_key(&raw_cache_key.as_u64()).await {
-                tracing::debug!("Search cache hit");
+                tracing::trace!("Search cache hit");
                 // each CachedAggregationResult needs to be re-mapped to an AggregationResult
                 let mut results = HashMap::new();
                 for (table_ref, cached_aggregation_result) in cached_result.results.iter() {
@@ -158,7 +158,7 @@ impl VectorSearch {
 
                 (results, CacheStatus::CacheHit)
             } else {
-                tracing::debug!("Search cache miss");
+                tracing::trace!("Search cache miss");
                 let results = self.search(req).await?;
                 (
                     wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
@@ -166,7 +166,7 @@ impl VectorSearch {
                 )
             }
         } else {
-            tracing::debug!("Search cache is disabled");
+            tracing::trace!("Search cache is disabled");
             (self.search(req).await?, CacheStatus::CacheDisabled)
         })
     }
@@ -336,7 +336,7 @@ fn wrap_cache_to_result(
         }
 
         if results.is_empty() {
-            tracing::debug!("No results to cache for tables: {expected_keys:?}");
+            tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
         } else if !expected_keys
             .iter()
@@ -344,20 +344,20 @@ fn wrap_cache_to_result(
             .collect::<Vec<_>>()
             .is_empty()
         {
-            tracing::debug!(
+            tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );
             return;
         }
 
-        tracing::debug!("Caching search results for key: {}", key.as_u64());
+        tracing::trace!("Caching search results for key: {}", key.as_u64());
 
         let result = CachedSearchResult {
             results: Arc::new(results),
         };
 
         if result.get_memory_size() > cache_provider.max_size() {
-            tracing::debug!("Search results exceed cache size, not caching");
+            tracing::trace!("Search results exceed cache size, not caching");
             return;
         }
 
