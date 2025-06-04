@@ -382,6 +382,7 @@ pub(crate) mod tests {
             .expect("failed to parse JSON string");
 
         normalise_result(&mut rb_as_value);
+
         rb_as_value
     }
 }

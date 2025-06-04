@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use app::AppBuilder;
-use chrono::Timelike;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
@@ -25,7 +24,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::models::get_tpcds_dataset;
-use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
+use crate::utils::{
+    runtime_ready_check, test_request_context, time_till_second, verify_env_secret_exists,
+};
 use crate::{init_tracing, init_tracing_with_task_history};
 
 fn create_loadbalance_worker(name: &str, models: &[&str], cron: &str, prompt: &str) -> Worker {
@@ -108,15 +109,13 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            let second_now = chrono::Utc::now().second();
-            let wait = (second_now % 30) + 20; // wait for the next 30th second, and wait 20 seconds for the job to succeed
-
-            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
+            // wait for the next 30th second, and wait 20 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(30, Some(20))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();
 
             let data = rt
                 .datafusion()
-                .query_builder("SELECT task, input, captured_output FROM runtime.task_history WHERE task = 'scheduler::worker'")
+                .query_builder("SELECT task, input, captured_output FROM runtime.task_history WHERE task = 'scheduled_worker'")
                 .build()
                 .run()
                 .await
@@ -171,10 +170,8 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            let second_now = chrono::Utc::now().second();
-            let wait = (second_now % 15) + 2; // every 15th second, wait for 2 seconds for the job to succeed
-
-            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await; // wait for the cron job to run at least once
+            // every 15th second, wait for 2 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(15, Some(2))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();
 
             let data = rt
