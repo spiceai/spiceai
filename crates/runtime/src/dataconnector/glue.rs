@@ -45,6 +45,12 @@ pub struct GlueDataConnector {
 }
 
 impl GlueDataConnector {
+    pub fn new(params: Parameters) -> Self {
+        Self { params }
+    }
+}
+
+impl GlueDataConnector {
     async fn client(&self) -> Result<Client, aws::Error> {
         let config = load_config(
             "GlueCatalogConnector",
@@ -80,9 +86,7 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let glue = GlueDataConnector {
-                params: params.parameters,
-            };
+            let glue = GlueDataConnector::new(params.parameters);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
     }
@@ -152,7 +156,6 @@ enum InputFormat {
 
 impl TryFrom<&Table> for InputFormat {
     type Error = ();
-
     fn try_from(table: &Table) -> Result<Self, Self::Error> {
         if table
             .parameters
@@ -244,5 +247,33 @@ fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result
             None => Err(()),
         },
         None => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_metadata_location_success() {
+        let mut params = HashMap::new();
+        params.insert(
+            "metadata_location".to_string(),
+            "s3://bucket/path".to_string(),
+        );
+        let result = get_metadata_location(Some(&params)).expect("metadata");
+        assert_eq!(result, "s3://bucket/path");
+    }
+
+    #[test]
+    fn get_metadata_location_missing_location() {
+        let params = HashMap::new();
+        assert!(get_metadata_location(Some(&params)).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_metadata_location_missing() {
+        let params: Option<&HashMap<String, String>> = None;
+        assert!(get_metadata_location(params).is_err());
     }
 }
