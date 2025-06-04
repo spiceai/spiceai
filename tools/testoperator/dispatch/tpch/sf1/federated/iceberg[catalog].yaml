@@ -3,5 +3,5 @@ tests:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/iceberg[catalog].yaml
     query_set: tpch
     query_overrides: iceberg-sf1
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true

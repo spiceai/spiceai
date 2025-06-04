@@ -3,4 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/tpcds/sf1/federated/spark[databricks].yaml
     query_set: tpcds
     query_overrides: spark
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
