@@ -175,8 +175,10 @@ impl TableWithFullText {
             .context(FailedToRetrieveDataFromSourceSnafu)?;
 
         let rbs = ctx
-            .sql(format!("SELECT {} FROM temp_table", cols.join(", ")).as_str())
+            .table("temp_table")
             .await
+            .context(FailedToRetrieveDataFromSourceSnafu)?
+            .select_columns(cols.as_slice())
             .context(FailedToRetrieveDataFromSourceSnafu)?
             .collect()
             .await
