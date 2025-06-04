@@ -39,6 +39,7 @@ use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
+use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 

@@ -50,6 +50,7 @@ const HF_TEST_MODEL_REQUIRES_HF_API_KEY: bool = true;
 mod nsql {
 
     use serde_json::json;
+    use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 
     use crate::{
         models::nsql::{TestCase, run_nsql_test},

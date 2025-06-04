@@ -34,7 +34,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
         _ => EnvFilter::new(
-            "runtime=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
+            "runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
         ),
     };
 
