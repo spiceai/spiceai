@@ -18,9 +18,12 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
     listing::{self, ListingTableConnector},
+    parameters::{
+        self, Validator,
+        aws::{AuthValidator, RegionValidator, S3EndpointValidator},
+    },
 };
 
-use crate::parameters::ParamLookup;
 use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
 
 use snafu::prelude::*;
@@ -34,41 +37,15 @@ use url::Url;
 
 static PREFIX: &str = "s3";
 
-// https://docs.aws.amazon.com/general/latest/gr/rande.html
-pub const AWS_REGIONS: [&str; 32] = [
-    "us-east-1",
-    "us-east-2",
-    "us-west-1",
-    "us-west-2",
-    "af-south-1",
-    "ap-east-1",
-    "ap-south-1",
-    "ap-south-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-southeast-3",
-    "ap-southeast-4",
-    "ap-southeast-5",
-    "ca-central-1",
-    "ca-west-1",
-    "eu-central-1",
-    "eu-central-2",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    "eu-south-1",
-    "eu-south-2",
-    "eu-north-1",
-    "sa-east-1",
-    "il-central-1",
-    "me-south-1",
-    "me-central-1",
-    "us-gov-east-1",
-    "us-gov-west-1",
-];
+static VALIDATORS: LazyLock<
+    Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
+> = LazyLock::new(|| {
+    vec![
+        Box::new(S3EndpointValidator),
+        Box::new(RegionValidator),
+        Box::new(AuthValidator),
+    ]
+});
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -122,7 +99,7 @@ pub enum Error {
 
 #[derive(Debug)]
 pub struct S3 {
-    params: Parameters,
+    pub(crate) params: Parameters,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -139,7 +116,8 @@ impl S3Factory {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
-static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region").secret(),
@@ -179,76 +157,8 @@ impl DataConnectorFactory for S3Factory {
         }
 
         Box::pin(async move {
-            if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-                if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-                    return Err(Box::new(Error::InvalidEndpoint {
-                        endpoint: endpoint.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-
-                if endpoint.starts_with("http://")
-                    && params.parameters.get("allow_http").expose().ok() != Some("true")
-                {
-                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
-                        endpoint: endpoint.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-            }
-
-            if let Some(region) = params.parameters.get("region").expose().ok() {
-                if AWS_REGIONS.contains(&region.to_lowercase().as_str())
-                    && !AWS_REGIONS.contains(&region)
-                {
-                    tracing::warn!(
-                        "{}",
-                        Error::InvalidRegionCorrected {
-                            region: region.to_string()
-                        }
-                    );
-                    params
-                        .parameters
-                        .insert("region".to_string(), region.to_lowercase().into());
-                } else if !AWS_REGIONS.contains(&region) {
-                    tracing::warn!(
-                        "{}",
-                        Error::InvalidRegion {
-                            region: region.to_string(),
-                        }
-                    );
-                }
-            }
-
-            match params.parameters.get("auth").expose().ok() {
-                None | Some("public" | "iam_role") => {
-                    // These parameters cannot be set unless the `s3_auth` parameter is set to 'key'.
-                    for param in ["key", "secret", "session_token"] {
-                        if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
-                            return Err(Box::new(Error::InvalidAuthParameterCombination {
-                                parameter: format!("{PREFIX}_{param}"),
-                                auth: "key".to_string(),
-                            })
-                                as Box<dyn std::error::Error + Send + Sync>);
-                        }
-                    }
-                }
-                Some("key") => {
-                    for (param, e) in [
-                        ("key", Error::NoAccessKey),
-                        ("secret", Error::NoAccessSecret),
-                    ] {
-                        if matches!(params.parameters.get(param), ParamLookup::Absent(_)) {
-                            return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-                        }
-                    }
-                }
-                Some(auth) => {
-                    return Err(Box::new(Error::UnsupportedAuthenticationMethod {
-                        method: auth.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
+            for validator in VALIDATORS.iter() {
+                validator.validate(&mut params).await?;
             }
 
             let s3 = S3 {

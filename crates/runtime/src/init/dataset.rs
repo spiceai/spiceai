@@ -30,10 +30,10 @@ use crate::{
         builder::DatasetBuilder,
     },
     dataconnector::{
-        self, ConnectorComponent, ConnectorParamsBuilder, DataConnector, DataConnectorError,
-        ODBC_DATACONNECTOR,
+        self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
+        parameters::ConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
     error_spaced,

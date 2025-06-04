@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-sqlite[memory]
 datasets:
-  - from: s3://benchmarks/clickbench/hits/
+  - from: s3://benchmarks/clickbench/hits.parquet
     name: hits
     params:
       file_format: parquet

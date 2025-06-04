@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q68"
 ---
-+-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+
-| c_last_name | c_first_name | ca_city         | bought_city | ss_ticket_number | extended_price | extended_tax | list_price |
-+-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+
-| Adair       | Sandra       | Springdale      | Farmington  | 47695            | 29778.70       | 449.13       | 41326.26   |
-| Adams       | Dorothy      | Sulphur Springs | Shady Grove | 6105             | 14076.28       | 905.66       | 26730.23   |
-| Adams       | Kristan      | Newport         | Mount Olive | 27218            | 22308.33       | 1158.63      | 37719.38   |
-| Adams       | Kevin        | Springdale      | Shiloh      | 60646            | 27503.96       | 680.56       | 40246.46   |
-| Adams       | Lina         | Union           | Franklin    | 66412            | 13057.49       | 785.70       | 35357.60   |
-| Adcock      | Dawn         | Sulphur Springs | Marion      | 19523            | 37144.42       | 2143.71      | 61434.97   |
-| Akin        | Kala         | Lebanon         | Friendship  | 44307            | 18390.17       | 266.87       | 31019.58   |
-| Akin        | Sharon       | Lakeside        | Jamestown   | 61782            | 19538.52       | 848.12       | 39807.45   |
-| Alaniz      | Elia         | Walnut Grove    | Green Acres | 39051            | 24088.99       | 831.86       | 48615.24   |
-| Albright    | Terrence     | Springfield     | Union       | 18171            | 39215.52       | 1528.79      | 67021.54   |
-+-------------+--------------+-----------------+-------------+------------------+----------------+--------------+------------+
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city       | bought_city    | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| Abbott      | Joseph       | Greenfield    | Midway         | 62751            | 26919.52       | 1116.58      | 57080.40   |
+| Abbott      | Harriet      | Wesley        | Forest Hills   | 84405            | 22861.50       | 1369.56      | 44009.90   |
+| Abney       | Louis        | Gladstone     | Green Acres    | 140967           | 19446.55       | 877.95       | 32461.55   |
+| Acosta      | Johnnie      | Centerville   | Enterprise     | 69183            | 11146.93       | 215.50       | 17512.59   |
+| Adair       | Kimberly     | Centerville   | Forest Hills   | 157619           | 14342.77       | 506.62       | 49363.10   |
+| Adams       | Jonathon     | Highland Park | Pleasant Grove | 26218            | 19024.55       | 813.18       | 38782.23   |
+| Adams       | Michelle     | Unionville    | Hillcrest      | 55515            | 24054.10       | 1006.01      | 60759.95   |
+| Adams       | Genevieve    | Enterprise    | Union Hill     | 109910           | 38112.60       | 2078.45      | 68698.50   |
+| Adams       | David        | Bridgeport    | Antioch        | 213366           | 7487.49        | 228.52       | 16742.78   |
+| Adkins      | Daniel       | Wilson        | Providence     | 131164           | 20810.88       | 812.72       | 50529.61   |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+

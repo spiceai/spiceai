@@ -2,14 +2,14 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-large-runners
+    runner_type: spiceai-dev-large-runners
   load:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-large-runners
+    runner_type: spiceai-dev-large-runners
     duration: 28800

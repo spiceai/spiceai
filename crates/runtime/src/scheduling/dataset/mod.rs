@@ -35,7 +35,7 @@ impl From<Arc<Dataset>> for DatasetRefreshTask {
 impl ScheduledTask for DatasetRefreshTask {
     async fn execute(&self) -> Result<()> {
         let dataset = Arc::clone(&self.0);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduler::refresh", input = %dataset.name.to_string());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset.name.to_string());
         async {
             match dataset
                 .runtime()

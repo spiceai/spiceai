@@ -54,11 +54,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-runners'
+        default: 'spiceai-dev-runners'
         type: choice
         options:
-          - 'spiceai-runners'
-          - 'spiceai-large-runners'
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
 
 jobs:
   run-throughput:
@@ -70,9 +70,9 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -115,9 +115,9 @@ jobs:
             --disable-progress-bars \
             --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
-          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -131,10 +131,10 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: root
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
@@ -169,9 +169,9 @@ jobs:
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --concurrency ${{ github.event.inputs.concurrency_count }}
         env:
-          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -185,10 +185,10 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: root
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}

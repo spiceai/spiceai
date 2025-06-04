@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
-use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -25,11 +23,8 @@ use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
-use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
-use crate::secrets::Secrets;
-use app::App;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -48,7 +43,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
-use datafusion_table_providers::UnsupportedTypeAction;
+use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -56,7 +51,6 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 
 use std::future::Future;
 
@@ -98,6 +92,7 @@ pub mod deferred;
 pub mod iceberg;
 #[cfg(feature = "imap")]
 pub mod imap;
+pub mod parameters;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -601,104 +596,6 @@ impl std::fmt::Display for ConnectorComponent {
     }
 }
 
-pub struct ConnectorParams {
-    pub(crate) parameters: Parameters,
-    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub(crate) component: ConnectorComponent,
-    pub(crate) app: Option<Arc<App>>,
-    #[allow(dead_code)] // will be utilized in https://github.com/spiceai/spiceai/pull/5542
-    pub(crate) runtime: Option<Arc<Runtime>>,
-}
-
-pub struct ConnectorParamsBuilder {
-    connector: Arc<str>,
-    component: ConnectorComponent,
-}
-
-impl ConnectorParamsBuilder {
-    #[must_use]
-    pub fn new(connector: Arc<str>, component: ConnectorComponent) -> Self {
-        Self {
-            connector,
-            component,
-        }
-    }
-
-    pub async fn build(
-        self,
-        secrets: Arc<RwLock<Secrets>>,
-    ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        let name = self.connector.to_string();
-        let mut unsupported_type_action = None;
-        let (params, prefix, parameters, app, runtime) = match &self.component {
-            ConnectorComponent::Catalog(catalog) => {
-                let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
-
-                let factory =
-                    connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
-                        dataconnector: name.clone(),
-                        connector_component: self.component.clone(),
-                    })?;
-
-                (
-                    get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
-                    factory.prefix(),
-                    factory.parameters(),
-                    Some(catalog.app()),
-                    Some(catalog.runtime()),
-                )
-            }
-            ConnectorComponent::Dataset(dataset) => {
-                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
-
-                unsupported_type_action = dataset.unsupported_type_action;
-
-                let factory = connector_factory.ok_or_else(|| {
-                    if name == ODBC_DATACONNECTOR {
-                        DataConnectorError::OdbcNotInstalled {
-                            connector_component: self.component.clone(),
-                        }
-                    } else {
-                        DataConnectorError::InvalidConnectorType {
-                            dataconnector: name.clone(),
-                            connector_component: self.component.clone(),
-                        }
-                    }
-                })?;
-
-                let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
-
-                (
-                    params,
-                    factory.prefix(),
-                    factory.parameters(),
-                    Some(dataset.app()),
-                    Some(dataset.runtime()),
-                )
-            }
-        };
-
-        let parameters = Parameters::try_new(
-            &format!("connector {name}"),
-            params.into_iter().collect(),
-            prefix,
-            secrets,
-            parameters,
-        )
-        .await?;
-
-        Ok(ConnectorParams {
-            parameters,
-            unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
-            component: self.component,
-            app,
-            runtime,
-        })
-    }
-}
-
 /// Ensures that the associated computed columns (e.g., embeddings) are included
 /// in the `LogicalPlan::Projection` node.
 /// If any required computed columns are missing, they are automatically added to the projection.
@@ -741,9 +638,14 @@ fn include_computed_columns(
 
 #[cfg(test)]
 mod tests {
+    use datafusion_table_providers::UnsupportedTypeAction;
+    use tokio::sync::RwLock;
+
     use super::*;
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::parameters::ConnectorParamsBuilder;
+    use crate::secrets::Secrets;
 
     #[tokio::test]
     async fn test_connector_params_builder_unsupported_type_action() {

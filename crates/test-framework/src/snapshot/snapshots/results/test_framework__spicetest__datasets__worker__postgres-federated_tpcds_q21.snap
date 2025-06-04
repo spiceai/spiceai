@@ -5,14 +5,14 @@ description: "Query: tpcds_q21"
 +---------------------+------------------+------------+-----------+
 | w_warehouse_name    | i_item_id        | inv_before | inv_after |
 +---------------------+------------------+------------+-----------+
-| Conventional childr | AAAAAAAAAOBBAAAA | 1836       | 2683      |
-| Conventional childr | AAAAAAAABIDBAAAA | 2701       | 2753      |
-| Conventional childr | AAAAAAAABNLAAAAA | 1082       | 1689      |
-| Conventional childr | AAAAAAAACFEAAAAA | 1635       | 2318      |
-| Conventional childr | AAAAAAAACMLAAAAA | 2632       | 2680      |
-| Conventional childr | AAAAAAAACNEBAAAA | 2546       | 2565      |
-| Conventional childr | AAAAAAAADEJAAAAA | 934        | 1785      |
-| Conventional childr | AAAAAAAADFLAAAAA | 1486       | 2058      |
-| Conventional childr | AAAAAAAADGKAAAAA | 1416       | 2396      |
-| Conventional childr | AAAAAAAAEAPAAAAA | 2122       | 2434      |
+| Conventional childr | AAAAAAAAAAHDAAAA | 1861       | 2672      |
+| Conventional childr | AAAAAAAAAALAAAAA | 2031       | 2323      |
+| Conventional childr | AAAAAAAAACLDAAAA | 2267       | 2625      |
+| Conventional childr | AAAAAAAAACPDAAAA | 1794       | 2310      |
+| Conventional childr | AAAAAAAAADGBAAAA | 2264       | 2930      |
+| Conventional childr | AAAAAAAAAEADAAAA | 1583       | 2049      |
+| Conventional childr | AAAAAAAAAFACAAAA | 1591       | 2075      |
+| Conventional childr | AAAAAAAAAFDCAAAA | 2432       | 3101      |
+| Conventional childr | AAAAAAAAAJCAAAAA | 2406       | 2772      |
+| Conventional childr | AAAAAAAAAJKBAAAA | 1216       | 1457      |
 +---------------------+------------------+------------+-----------+
