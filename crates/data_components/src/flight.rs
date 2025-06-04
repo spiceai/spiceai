@@ -558,9 +558,9 @@ fn map_connection_reset_error(error: FlightError) -> Error {
                     }),
                 };
             }
-            return Error::ArrowFlight {
+            Error::ArrowFlight {
                 source: Box::new(error),
-            };
+            }
         }
         _ => Error::ArrowFlight {
             source: Box::new(error),
