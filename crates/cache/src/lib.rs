@@ -86,6 +86,7 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>: HashProvider + std::f
     fn invalidate_all(&self);
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
+    fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
 
