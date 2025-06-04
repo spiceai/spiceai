@@ -46,15 +46,16 @@ pub struct TableWithFullText {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("",))]
-    Bad {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
     #[snafu(display("Full text search requires a primary key, and the table did not have one.",))]
     NoPrimaryKey,
 
-    #[snafu(display("",))]
+    #[snafu(display(
+        "Primary key column '{column}' used in search index has unsupported data type: '{data_type}'",
+    ))]
     PrimaryKeyInvalidType { column: String, data_type: DataType },
+
+    #[snafu(display("Primary key column '{column}' not found in table.",))]
+    PrimaryKeyNotFound { column: String },
 
     #[snafu(display("Failed to create a full text search index: {source}.",))]
     IndexCreationError { source: TantivyError },
@@ -80,6 +81,7 @@ impl TableWithFullText {
         search_field: String,
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Self, Error> {
+        // Use 'primary_key_override', fallback to underlying in table.
         let pks = match (
             primary_key_override,
             get_primary_keys(Arc::clone(&inner)).await,
@@ -120,7 +122,7 @@ impl TableWithFullText {
                 continue;
             }
             let Some((_, field)) = schema.column_with_name(p) else {
-                continue;
+                return Err(Error::PrimaryKeyNotFound { column: p.clone() });
             };
             match field.data_type() {
                 DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -201,9 +203,10 @@ impl TableWithFullText {
         Ok(Arc::new(index))
     }
 
-    pub fn as_search_generator(
+    /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
+    pub fn as_candidate_generation(
         &self,
-    ) -> std::result::Result<Arc<dyn CandidateGeneration>, search::generation::Error> {
+    ) -> Result<Arc<dyn CandidateGeneration>, search::generation::Error> {
         let base = FullTextSearch::try_new(
             Arc::clone(&self.index),
             self.search_field.clone(),
@@ -261,7 +264,6 @@ impl TableProvider for TableWithFullText {
             .await
     }
 
-    /// Any filter in [`filters`] can still be exact
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

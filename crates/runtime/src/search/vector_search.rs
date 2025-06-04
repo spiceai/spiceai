@@ -20,7 +20,7 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::util::search_table;
+use crate::search::util::full_text_search_candidates;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -177,7 +177,7 @@ impl VectorSearch {
                     };
 
                     // If the dataset is configured with full text search capabilities, add as generator.
-                    if let Some(fts) = search_table(&self.df, &tbl).await.transpose()? {
+                    if let Some(fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
                         generators.push(fts);
                     }
 

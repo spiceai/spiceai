@@ -211,12 +211,18 @@ pub async fn embedding_columns_from_table(
     Some(embedding_table.get_embedding_columns())
 }
 
-pub async fn search_table(
+/// Returns a full text search [`CandidateGeneration`] if the [`TableReference`] has the appropriate index(es) defined in [`DataFusion`].
+///
+/// Returns:
+///   None:
+///     - `tbl` does not exist
+///     - `tbl` does not have relevant full text search support.
+pub async fn full_text_search_candidates(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
 ) -> Option<Result<Arc<dyn CandidateGeneration>>> {
     let table_provider = df.get_table(tbl).await?;
     let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
 
-    Some(fts.as_search_generator().context(SearchGenerationSnafu))
+    Some(fts.as_candidate_generation().context(SearchGenerationSnafu))
 }
