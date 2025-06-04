@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q47"
 ---
-+------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+----------+
-| i_category | i_brand            | s_store_name | s_company_name | d_year | avg_monthly_sales | sum_sales | psum    | nsum     |
-+------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+----------+
-| Men        | importoimporto #2  | able         | Unknown        | 2001   | 7443.967500       | 2860.00   | 4455.74 | 4230.61  |
-| Men        | importoimporto #2  | able         | Unknown        | 2001   | 7443.967500       | 3081.55   | 3303.93 | 11532.74 |
-| Music      | exportischolar #2  | able         | Unknown        | 2001   | 6463.825833       | 2140.91   | 2159.58 | 3515.21  |
-| Music      | exportischolar #2  | able         | Unknown        | 2001   | 6463.825833       | 2159.58   | 3836.63 | 2140.91  |
-| Women      | edu packamalg #2   | able         | Unknown        | 2001   | 7241.035833       | 3037.62   | 3414.69 | 3694.09  |
-| Men        | importoimporto #2  | able         | Unknown        | 2001   | 7443.967500       | 3303.93   | 4960.38 | 3081.55  |
-| Men        | edu packimporto #2 | ought        | Unknown        | 2001   | 7065.214166       | 2986.21   | 4006.29 | 9003.94  |
-| Men        | edu packimporto #2 | able         | Unknown        | 2001   | 7596.203333       | 3535.30   | 4424.99 | 4975.24  |
-| Women      | edu packamalg #2   | able         | Unknown        | 2001   | 7241.035833       | 3414.69   | 4706.62 | 3037.62  |
-| Women      | exportiamalg #2    | able         | Unknown        | 2001   | 6999.654166       | 3219.68   | 3524.63 | 4129.75  |
-+------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+----------+
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+
+| i_category | i_brand            | s_store_name | s_company_name | d_year | avg_monthly_sales | sum_sales | psum    | nsum    |
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+
+| Shoes      | importoedu pack #2 | able         | Unknown        | 2001   | 7627.086666       | 2936.33   | 5480.07 | 4058.81 |
+| Men        | importoimporto #2  | ese          | Unknown        | 2001   | 7497.674166       | 2924.52   | 4734.38 | 3797.43 |
+| Men        | importoimporto #2  | ation        | Unknown        | 2001   | 7784.624166       | 3216.53   | 4992.67 | 5380.59 |
+| Children   | exportiexporti #2  | eing         | Unknown        | 2001   | 6837.600000       | 2360.39   | 3388.26 | 4503.41 |
+| Music      | importoscholar #2  | ation        | Unknown        | 2001   | 8033.681666       | 3571.12   | 4227.43 | 4608.46 |
+| Shoes      | importoedu pack #2 | ought        | Unknown        | 2001   | 7435.618333       | 2987.39   | 3797.90 | 3572.56 |
+| Music      | importoscholar #2  | ought        | Unknown        | 2001   | 7797.459166       | 3352.52   | 5289.57 | 4423.50 |
+| Music      | importoscholar #2  | able         | Unknown        | 2001   | 7520.386666       | 3184.79   | 4930.06 | 4550.93 |
+| Shoes      | importoedu pack #2 | ese          | Unknown        | 2001   | 8061.617500       | 3749.84   | 4953.00 | 5158.90 |
+| Men        | importoimporto #2  | bar          | Unknown        | 2001   | 7508.208333       | 3202.76   | 4061.76 | 4226.74 |
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+
