@@ -35,7 +35,7 @@ on:
 jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
@@ -54,9 +54,9 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -104,7 +104,7 @@ jobs:
 
   dispatch-input:
     name: Dispatch tests - Input
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}
@@ -115,9 +115,9 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced

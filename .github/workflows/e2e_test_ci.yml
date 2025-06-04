@@ -70,7 +70,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "spiceai-runners",
+                builder: "spiceai-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",

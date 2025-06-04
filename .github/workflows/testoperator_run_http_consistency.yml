@@ -53,7 +53,7 @@ on:
 jobs:
   run-http-consistency:
     name: Run http consistency tests
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     timeout-minutes: 600
     steps:
       - name: Run details
@@ -75,9 +75,9 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced

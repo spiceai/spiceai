@@ -51,7 +51,7 @@ env:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@v4
 
@@ -66,8 +66,34 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
+      - name: Set up sccache
+        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          os: 'linux'
+      
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       # Build the test binary without running tests
       - name: Build integration test binary
+        env:
+            RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+            AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+            CARGO_INCREMENTAL: 0
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
@@ -77,15 +103,14 @@ jobs:
             echo "Excluding extended_tests"
           fi
 
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
-          cp $TEST_BINARY_PATH ./integration_test
+          cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
 
-      # Upload the test binary as an artifact
-      - name: Upload test binary
+      # Upload the test archive as an artifact
+      - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
-          name: integration-test-binary
-          path: ./integration_test
+          name: integration-test-archive
+          path: ./integration.tar.zst
           retention-days: 1
 
   test:
@@ -101,18 +126,17 @@ jobs:
         with:
           os: 'linux'
 
-      # Download the test binary artifact
-      - name: Download test binary
+      # Download the test archive artifact
+      - name: Download test archive
         uses: actions/download-artifact@v4
         with:
-          name: integration-test-binary
+          name: integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/integration_test
-
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        
       - name: Login to ACR
         uses: docker/login-action@v3
         # This will fail for forks, so we only run it for the main repo
@@ -161,7 +185,7 @@ jobs:
           AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi

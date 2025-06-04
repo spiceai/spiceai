@@ -2,13 +2,13 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/clickbench/sf1/federated/s3[parquet].yaml
     query_set: clickbench
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   throughput:
     spicepod_path: ./test/spicepods/clickbench/sf1/federated/s3[parquet].yaml
     query_set: clickbench
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   load:
     spicepod_path: ./test/spicepods/clickbench/sf1/federated/s3[parquet].yaml
     query_set: clickbench
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     duration: 28800

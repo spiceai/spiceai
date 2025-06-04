@@ -211,8 +211,7 @@ impl Query {
                 .results_cache_hit(true)
         });
 
-        let record_batch_stream =
-            CachedStream::try_new(cached_result.records, cached_result.schema);
+        let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
 
         Ok((
             CacheResult::Hit(QueryResult::new(

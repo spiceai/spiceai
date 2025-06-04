@@ -49,13 +49,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-runners'
+        default: 'spiceai-dev-runners'
         type: choice
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-          - 'spiceai-runners'
-          - 'spiceai-large-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false
@@ -91,27 +89,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select environment secrets
-        id: select-env-secrets
-        run: |
-          if [[ "${{ github.event.inputs.runner_type }}" == "spiceai-dev-runners" || "${{ github.event.inputs.runner_type }}" == "spiceai-dev-large-runners" ]]; then
-            echo "IS_DEV=true" >> $GITHUB_OUTPUT
-            echo "MINIO_ENDPOINT=${{ secrets.TEST_MINIO_ENDPOINT }}" >> $GITHUB_OUTPUT
-            echo "MINIO_ACCESS_KEY=${{ secrets.TEST_MINIO_ACCESS_KEY }}" >> $GITHUB_OUTPUT
-            echo "MINIO_SECRET_KEY=${{ secrets.TEST_MINIO_SECRET_KEY }}" >> $GITHUB_OUTPUT
-            echo "MYSQL_HOST=${{ secrets.TEST_MYSQL_HOST }}" >> $GITHUB_OUTPUT
-            echo "MYSQL_USERNAME=${{ secrets.TEST_MYSQL_USERNAME }}" >> $GITHUB_OUTPUT
-            echo "MYSQL_PASSWORD=${{ secrets.TEST_MYSQL_PASSWORD }}" >> $GITHUB_OUTPUT
-          else
-            echo "IS_DEV=false" >> $GITHUB_OUTPUT
-            echo "MINIO_ENDPOINT=${{ secrets.MINIO_ENDPOINT }}" >> $GITHUB_OUTPUT
-            echo "MINIO_ACCESS_KEY=${{ secrets.MINIO_ACCESS_KEY }}" >> $GITHUB_OUTPUT
-            echo "MINIO_SECRET_KEY=${{ secrets.MINIO_SECRET_KEY }}" >> $GITHUB_OUTPUT
-            echo "MYSQL_HOST=${{ secrets.MYSQL_HOST }}" >> $GITHUB_OUTPUT
-            echo "MYSQL_USERNAME=root" >> $GITHUB_OUTPUT
-            echo "MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
         run: |
@@ -122,9 +99,9 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ steps.select-env-secrets.outputs.MINIO_ENDPOINT }}
-          minio_access_key: ${{ steps.select-env-secrets.outputs.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ steps.select-env-secrets.outputs.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -143,7 +120,6 @@ jobs:
         uses: ./.github/actions/setup-testoperator-data
         with:
           query_set: ${{ github.event.inputs.query_set }}
-          is_dev: ${{ steps.select-env-secrets.outputs.IS_DEV }}
 
       - name: Setup MySQL
         run: |
@@ -173,9 +149,9 @@ jobs:
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
-          S3_ENDPOINT: ${{ steps.select-env-secrets.outputs.MINIO_ENDPOINT }}
-          S3_KEY: ${{ steps.select-env-secrets.outputs.MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ steps.select-env-secrets.outputs.MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -189,13 +165,13 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ steps.select-env-secrets.outputs.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ steps.select-env-secrets.outputs.MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ steps.select-env-secrets.outputs.MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
@@ -232,9 +208,9 @@ jobs:
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
-          S3_ENDPOINT: ${{ steps.select-env-secrets.outputs.MINIO_ENDPOINT }}
-          S3_KEY: ${{ steps.select-env-secrets.outputs.MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ steps.select-env-secrets.outputs.MINIO_SECRET_KEY }}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -248,13 +224,13 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ steps.select-env-secrets.outputs.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: ${{ steps.select-env-secrets.outputs.MYSQL_USERNAME }}
-          MYSQL_PASSWORD: ${{ steps.select-env-secrets.outputs.MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}

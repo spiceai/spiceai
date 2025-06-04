@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q62"
 ---
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
-| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | web_name | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
-| Conventional childr                                   | EXPRESS   | site_0   | 1261    | 1343       | 1335       | 1270        | 0         |
-| Conventional childr                                   | EXPRESS   | site_1   | 854     | 900        | 871        | 885         | 0         |
-| Conventional childr                                   | LIBRARY   | site_0   | 993     | 977        | 1024       | 998         | 0         |
-| Conventional childr                                   | LIBRARY   | site_1   | 658     | 667        | 613        | 674         | 0         |
-| Conventional childr                                   | NEXT DAY  | site_0   | 1272    | 1223       | 1317       | 1263        | 0         |
-| Conventional childr                                   | NEXT DAY  | site_1   | 855     | 837        | 914        | 913         | 0         |
-| Conventional childr                                   | OVERNIGHT | site_0   | 973     | 1027       | 934        | 969         | 0         |
-| Conventional childr                                   | OVERNIGHT | site_1   | 676     | 651        | 701        | 654         | 0         |
-| Conventional childr                                   | REGULAR   | site_0   | 961     | 1004       | 904        | 980         | 0         |
-| Conventional childr                                   | REGULAR   | site_1   | 657     | 662        | 746        | 641         | 0         |
-+-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
++-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type | web_name | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+
+| Conventional childr                                   | EXPRESS | site_0   | 320     | 325        | 309        | 314         | 0         |
+| Conventional childr                                   | EXPRESS | site_1   | 280     | 243        | 274        | 276         | 0         |
+| Conventional childr                                   | EXPRESS | site_2   | 270     | 279        | 260        | 259         | 0         |
+| Conventional childr                                   | EXPRESS | site_3   | 307     | 294        | 314        | 302         | 0         |
+| Conventional childr                                   | EXPRESS | site_4   | 303     | 289        | 316        | 307         | 0         |
+| Conventional childr                                   | LIBRARY | site_0   | 258     | 229        | 272        | 235         | 0         |
+| Conventional childr                                   | LIBRARY | site_1   | 223     | 262        | 248        | 255         | 0         |
+| Conventional childr                                   | LIBRARY | site_2   | 238     | 219        | 202        | 204         | 0         |
+| Conventional childr                                   | LIBRARY | site_3   | 166     | 208        | 170        | 183         | 0         |
+| Conventional childr                                   | LIBRARY | site_4   | 206     | 206        | 200        | 218         | 0         |
++-------------------------------------------------------+---------+----------+---------+------------+------------+-------------+-----------+

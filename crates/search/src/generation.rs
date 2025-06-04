@@ -16,6 +16,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::sqlparser::ast::Expr;
 use snafu::Snafu;
 
+pub mod post_apply;
 #[cfg(feature = "text_search")]
 pub mod text_search;
 

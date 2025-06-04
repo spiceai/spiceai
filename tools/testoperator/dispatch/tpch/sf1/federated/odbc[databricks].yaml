@@ -3,5 +3,5 @@ tests:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/odbc[databricks].yaml
     query_set: tpch
     query_overrides: odbc-databricks
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true
