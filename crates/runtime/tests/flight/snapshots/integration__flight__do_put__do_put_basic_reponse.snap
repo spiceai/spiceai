@@ -2,4 +2,4 @@
 source: crates/runtime/tests/flight/do_put.rs
 expression: response_str
 ---
-[PutResult { app_metadata: b"" }, PutResult { app_metadata: b"" }]
+[PutResult { app_metadata: b"" }]
