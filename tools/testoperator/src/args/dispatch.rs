@@ -145,13 +145,16 @@ pub struct LoadArgs {
     pub duration: Option<u64>,
 }
 
-/// Represents the type of runner to use in the action
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum RunnerType {
     #[serde(rename = "spiceai-runners")]
     SelfHosted,
     #[serde(rename = "spiceai-large-runners")]
     LargeSelfHosted,
+    #[serde(rename = "spiceai-dev-runners")]
+    Dev,
+    #[serde(rename = "spiceai-dev-large-runners")]
+    DevLarge,
 }
 
 /// Payload sent to the GitHub Actions workflow request for HTTP consistency tests
