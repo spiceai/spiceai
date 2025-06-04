@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::FlightData;
 use arrow_flight::FlightDescriptor;
@@ -32,6 +33,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
+use futures::Stream;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
 use secrecy::ExposeSecret;
@@ -509,17 +511,33 @@ impl FlightClient {
     ///
     /// Returns an error if the data cannot be published to the flight source via `DoPut`.
     pub async fn publish(&mut self, dataset_path: &str, data: Vec<RecordBatch>) -> Result<()> {
+        let data_stream = futures::stream::iter(data.into_iter().map(Ok));
+        self.publish_streaming(dataset_path, data_stream).await
+    }
+
+    /// Publishes a stream of data to a dataset via the `DoPut` Flight method.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset_path` - The dataset to publish to.
+    /// * `data_stream` - A stream of [`RecordBatch`] items to publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be published to the flight source via `DoPut`.
+    pub async fn publish_streaming<S>(&mut self, dataset_path: &str, data_stream: S) -> Result<()>
+    where
+        S: Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
+    {
         let token = self.authenticate_basic_token().await?;
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
 
-        let converted_input_stream = futures::stream::iter(data.into_iter().map(Ok));
-
         let flight_data_stream = FlightDataEncoderBuilder::new()
             .with_flight_descriptor(Some(flight_descriptor))
-            .build(converted_input_stream);
+            .build(data_stream.map(|res| res.map_err(FlightError::from)));
 
-        let mut request = Box::pin(flight_data_stream); // Pin to heap
+        let mut request = Box::pin(flight_data_stream);
         let request_stream = futures::stream::poll_fn(move |cx| {
             Poll::Ready(match ready!(request.poll_next_unpin(cx)) {
                 Some(Ok(data)) => Some(data),
