@@ -204,19 +204,11 @@ pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<Tab
 pub async fn embedding_columns_from_table(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
-) -> Result<Vec<String>> {
-    let table_provider = df.get_table(tbl).await.ok_or(Error::DataSourcesNotFound {
-        data_source: vec![tbl.clone()],
-    })?;
+) -> Option<Vec<String>> {
+    let table_provider = df.get_table(tbl).await?;
 
-    let Some(embedding_table) =
-        find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
-    else {
-        return Err(Error::CannotVectorSearchDataset {
-            data_source: tbl.clone(),
-        });
-    };
-    Ok(embedding_table.get_embedding_columns())
+    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider).await?;
+    Some(embedding_table.get_embedding_columns())
 }
 
 pub async fn search_table(

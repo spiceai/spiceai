@@ -164,7 +164,7 @@ impl VectorSearch {
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
-                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
+                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {
