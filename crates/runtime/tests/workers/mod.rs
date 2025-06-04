@@ -100,6 +100,9 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
 
             let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
+            // don't startup until we've got some time to load before the next cron job
+            tokio::time::sleep(time_till_second(30, Some(2))).await;
+
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
@@ -160,6 +163,10 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
+            // don't startup until we've got some time to load before the next cron job
+            // this avoids an extra task history trace that does nothing, because the task is a no-op while the runtime isn't ready
+            tokio::time::sleep(time_till_second(15, Some(2))).await;
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
