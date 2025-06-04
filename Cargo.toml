@@ -176,6 +176,12 @@ x509-certificate = "0.23.1"
 inherits = "release"
 lto = true
 
+[profile.lint]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = false
+lto = "off"
+
 [patch.crates-io]
 
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "b5c62f29d2c70c5331ff50015b67b5e1cafcd578" }            # spiceai-47

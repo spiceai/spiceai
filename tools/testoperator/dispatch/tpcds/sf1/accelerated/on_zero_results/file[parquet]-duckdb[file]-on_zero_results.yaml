@@ -3,4 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/on_zero_results/file[parquet]-duckdb[file]-on_zero_results.yaml
     query_set: tpcds
     query_overrides: duckdb-zero-results
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners

@@ -1,0 +1,29 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      },
+      "score": 0.94
+    },
+    {
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": "Close customers might struggle away different mem"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 15
+      },
+      "score": 0.939
+    }
+  ]
+}

@@ -40,6 +40,7 @@ pub struct LruCache<
 > {
     cache: Cache<u64, V, T>,
     hasher: T,
+    max_size: u64,
 }
 
 impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
@@ -117,7 +118,11 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        LruCache { cache, hasher }
+        LruCache {
+            cache,
+            hasher,
+            max_size: cache_max_size,
+        }
     }
 }
 
@@ -169,6 +174,10 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
 
     fn item_count(&self) -> u64 {
         self.cache.entry_count()
+    }
+
+    fn max_size(&self) -> usize {
+        usize::try_from(self.max_size).unwrap_or_default()
     }
 
     async fn checkpoint(&self) {

@@ -33,9 +33,17 @@ ci:
 test:
 	@cargo test --all --lib
 
+ifdef RUST_PROFILE
+    CARGO_PROFILE := --profile $(RUST_PROFILE)
+	NEXTEST_CARGO_PROFILE := --cargo-profile $(RUST_PROFILE)
+else
+	CARGO_PROFILE := --profile dev
+	NEXTEST_CARGO_PROFILE := --cargo-profile dev
+endif
+
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all
+	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -74,7 +82,7 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

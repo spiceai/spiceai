@@ -44,7 +44,7 @@ impl WorkerPromptTask {
 #[async_trait]
 impl ScheduledTask for WorkerPromptTask {
     async fn execute(&self) -> Result<()> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduler::worker", input = %self.prompt, worker = %self.worker_name, prompt = %self.prompt);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduled_worker", input = %self.prompt, worker = %self.worker_name, prompt = %self.prompt);
 
         async {
             let worker_name = Arc::clone(&self.worker_name);
@@ -122,7 +122,7 @@ impl WorkerSqlTask {
 #[async_trait]
 impl ScheduledTask for WorkerSqlTask {
     async fn execute(&self) -> Result<()> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduler::worker", input = %self.sql, worker = %self.worker_name);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "scheduled_worker", input = %self.sql, worker = %self.worker_name);
 
         async {
             let worker_name = Arc::clone(&self.worker_name);

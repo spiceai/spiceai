@@ -25,10 +25,19 @@ use crate::search::{
     util::{embedding_columns_from_table, get_primary_keys_with_overrides},
 };
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
+use arrow::array::RecordBatch;
+use async_stream::stream;
+use cache::key::{CacheKey, RawCacheKey, SearchKey};
+use cache::result::CacheStatus;
+use cache::result::query::CachedStream;
+use cache::result::search::{CachedAggregationResult, CachedSearchResult};
+use cache::{CacheProvider, Sizeable};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{
     TableReference,
     sqlparser::ast::{Expr, Ident},
 };
+use futures::StreamExt;
 use itertools::Itertools;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
@@ -119,6 +128,49 @@ impl VectorSearch {
         ))
     }
 
+    pub async fn search_with_cache(
+        &self,
+        req: &SearchRequest,
+        cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> Result<(VectorSearchResult, CacheStatus)> {
+        Ok(if let Some(cache_provider) = cache_provider {
+            tracing::trace!("Search cache is enabled");
+            let search_key = SearchKey::from(req.clone());
+            let cache_key = CacheKey::Search(&search_key);
+            let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
+
+            if let Some(cached_result) = cache_provider.get_raw_key(&raw_cache_key.as_u64()).await {
+                tracing::trace!("Search cache hit");
+                // each CachedAggregationResult needs to be re-mapped to an AggregationResult
+                let mut results = HashMap::new();
+                for (table_ref, cached_aggregation_result) in cached_result.results.iter() {
+                    let result = AggregationResult {
+                        data: Box::pin(CachedStream::new(
+                            Arc::clone(&cached_aggregation_result.records),
+                            Arc::clone(&cached_aggregation_result.schema),
+                        )),
+                        primary_key: cached_aggregation_result.primary_keys.clone(),
+                        data_columns: cached_aggregation_result.data_columns.clone(),
+                        matches: cached_aggregation_result.matches.clone(),
+                    };
+                    results.insert(table_ref.clone(), result);
+                }
+
+                (results, CacheStatus::CacheHit)
+            } else {
+                tracing::trace!("Search cache miss");
+                let results = self.search(req).await?;
+                (
+                    wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                    CacheStatus::CacheMiss,
+                )
+            }
+        } else {
+            tracing::trace!("Search cache is disabled");
+            (self.search(req).await?, CacheStatus::CacheDisabled)
+        })
+    }
+
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
             text: query,
@@ -198,4 +250,119 @@ impl VectorSearch {
             }
         }
     }
+}
+
+fn wrap_cache_to_result(
+    key: RawCacheKey,
+    aggregation_result: HashMap<TableReference, AggregationResult>,
+    cache_provider: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+) -> HashMap<TableReference, AggregationResult> {
+    // each hashmap entry is an aggregation result which contains a sendable record batch stream
+    // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches
+    // because these occur on different streams though, we need a channel to centralise the results
+    // once the results are collated, we can cache the result
+    let mut wrapped_results = HashMap::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(TableReference, CachedAggregationResult)>(100);
+    let tx = Arc::new(tx);
+    let expected_keys = aggregation_result.keys().cloned().collect::<Vec<_>>();
+
+    for (table_ref, aggregation_result) in aggregation_result {
+        let tx = Arc::clone(&tx);
+        let primary_key = aggregation_result.primary_key.clone();
+        let data_columns = aggregation_result.data_columns.clone();
+        let matches = aggregation_result.matches.clone();
+        let mut stream = aggregation_result.data;
+        let schema = stream.schema();
+
+        let cloned_table_ref = table_ref.clone();
+        let cloned_primary_key = primary_key.clone();
+        let cloned_data_columns = data_columns.clone();
+        let cloned_matches = matches.clone();
+        let cloned_schema = Arc::clone(&schema);
+        let cloned_cache_provider = Arc::clone(&cache_provider);
+
+        let cached_stream = stream! {
+            let mut records: Vec<RecordBatch> = Vec::new();
+            let mut records_size: usize = 0;
+            let cache_max_size = cloned_cache_provider.max_size();
+
+            while let Some(batch_result) = stream.next().await {
+                if records_size < cache_max_size {
+                    if let Ok(batch) = &batch_result {
+                        records.push(batch.clone());
+                        records_size += batch.get_array_memory_size();
+                    }
+                }
+
+                yield batch_result;
+            }
+
+            if records_size < cache_max_size {
+                let cached_result = CachedAggregationResult::new(
+                    Arc::new(records),
+                    cloned_primary_key,
+                    cloned_data_columns,
+                    cloned_matches,
+                    cloned_schema,
+                );
+                if tx.send((cloned_table_ref.clone(), cached_result)).await.is_err() {
+                    tracing::error!("Failed to send cached search result for {cloned_table_ref}");
+                }
+            }
+        };
+
+        wrapped_results.insert(
+            table_ref,
+            AggregationResult {
+                primary_key,
+                data_columns,
+                matches,
+                data: Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    Box::pin(cached_stream),
+                )),
+            },
+        );
+    }
+
+    // start a background task to collect the results and cache them
+    // if we try to do this in this function before returning, we never return results so the stream never gets polled
+    // if the stream never gets polled, we never get results on the channel
+    // deadlock!
+    tokio::spawn(async move {
+        let mut results = HashMap::new();
+        while let Some((table_ref, cached_result)) = rx.recv().await {
+            results.insert(table_ref, cached_result);
+        }
+
+        if results.is_empty() {
+            tracing::trace!("No results to cache for tables: {expected_keys:?}");
+            return;
+        } else if !expected_keys
+            .iter()
+            .filter(|key| !results.contains_key(key))
+            .collect::<Vec<_>>()
+            .is_empty()
+        {
+            tracing::trace!(
+                "Not all expected keys were found in the cached results: {expected_keys:?}"
+            );
+            return;
+        }
+
+        tracing::trace!("Caching search results for key: {}", key.as_u64());
+
+        let result = CachedSearchResult {
+            results: Arc::new(results),
+        };
+
+        if result.get_memory_size() > cache_provider.max_size() {
+            tracing::trace!("Search results exceed cache size, not caching");
+            return;
+        }
+
+        cache_provider.put_raw_key(&key.as_u64(), result).await;
+    });
+
+    wrapped_results
 }

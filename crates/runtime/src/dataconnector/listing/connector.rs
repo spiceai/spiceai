@@ -409,7 +409,7 @@ pub trait ListingTableConnector: DataConnector {
         let (schema_infer_url, schema_infer_meta) =
             if let Some(url) = dataset.params.get("schema_source_path") {
                 let url = self.get_object_store_url(dataset, Some(url))?;
-                let schema_infer_url = ListingTableUrl::parse(url).boxed().context(
+                let schema_infer_url = ListingTableUrl::parse(&url).boxed().context(
                     crate::dataconnector::UnableToGetSchemaInternalSnafu {
                         dataconnector: format!("{self}"),
                         connector_component: ConnectorComponent::from(dataset),
@@ -424,7 +424,10 @@ pub trait ListingTableConnector: DataConnector {
                     &object_store,
                 )
                 .await?;
-                (schema_infer_url, schema_infer_meta)
+                (
+                    SensitiveListingTableUrl::new(schema_infer_url, url),
+                    schema_infer_meta,
+                )
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
                 // Report an error if no files matching required extension are found.
@@ -450,14 +453,15 @@ pub trait ListingTableConnector: DataConnector {
             };
 
         tracing::debug!(
-            "Dataset '{}' schema will be resolved based on {schema_infer_url}",
-            dataset.name
+            "Dataset '{name}' schema will be resolved based on {sanitized_url}",
+            name = dataset.name,
+            sanitized_url = schema_infer_url.sanitized_url(),
         );
 
         let mut options = ListingOptions::new(file_format).with_file_extension(extension);
 
         let resolved_schema = options
-            .infer_schema(&ctx.state(), &schema_infer_url)
+            .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
             .await
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
@@ -765,16 +769,47 @@ fn to_listing_table_url(
     path: &Path,
     dataset: &Dataset,
     dataconnector: &str,
-) -> DataConnectorResult<ListingTableUrl> {
+) -> DataConnectorResult<SensitiveListingTableUrl> {
     let mut new_url = original_url.clone();
     new_url.set_path(&format!("/{path}"));
 
-    ListingTableUrl::parse(new_url).boxed().context(
+    let sensitive_url = ListingTableUrl::parse(&new_url).boxed().context(
         crate::dataconnector::UnableToGetSchemaInternalSnafu {
             dataconnector: dataconnector.to_string(),
             connector_component: ConnectorComponent::from(dataset),
         },
-    )
+    )?;
+
+    Ok(SensitiveListingTableUrl::new(sensitive_url, new_url))
+}
+
+fn sanitize_url(mut url: Url) -> Url {
+    url.set_fragment(None);
+    url
+}
+
+/// Wrapper struct that contains a potentially sensitive URL with fragments containing secrets,
+/// and a sanitized URL without the fragments that can be used for logging and error messages.
+struct SensitiveListingTableUrl {
+    sensitive_url: ListingTableUrl,
+    sanitized_url: Url,
+}
+
+impl SensitiveListingTableUrl {
+    fn new(sensitive_url: ListingTableUrl, url: Url) -> Self {
+        Self {
+            sensitive_url,
+            sanitized_url: sanitize_url(url),
+        }
+    }
+
+    fn expose_sensitive_url(&self) -> &ListingTableUrl {
+        &self.sensitive_url
+    }
+
+    fn sanitized_url(&self) -> &Url {
+        &self.sanitized_url
+    }
 }
 
 #[cfg(test)]

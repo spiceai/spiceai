@@ -22,6 +22,7 @@ use std::{
 };
 
 use arrow::array::RecordBatch;
+use chrono::Timelike;
 use futures::StreamExt;
 use runtime::{
     Runtime,
@@ -63,6 +64,25 @@ where
     }
 
     false
+}
+
+/// Returns the duration until the next occurrence of the nearest second.
+/// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
+#[allow(dead_code)]
+pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
+    assert!(
+        nearest_second < 60,
+        "nearest_second must be between 0 and 59"
+    );
+    let now_second = chrono::Utc::now().second();
+    let modulus = now_second % nearest_second;
+    let time_until_nearest = if modulus == 0 {
+        0
+    } else {
+        nearest_second - modulus
+    };
+
+    Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
 }
 
 #[allow(dead_code)]

@@ -58,7 +58,7 @@ pub struct CachedStream {
 
 impl CachedStream {
     #[must_use]
-    pub fn try_new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
+    pub fn new(data: Arc<Vec<RecordBatch>>, schema: SchemaRef) -> Self {
         Self {
             data,
             schema,
