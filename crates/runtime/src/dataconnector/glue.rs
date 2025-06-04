@@ -45,6 +45,7 @@ pub struct GlueDataConnector {
 }
 
 impl GlueDataConnector {
+    #[must_use]
     pub fn new(params: Parameters) -> Self {
         Self { params }
     }
@@ -110,8 +111,21 @@ impl DataConnector for GlueDataConnector {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = dataset.parse_path(false, None).unwrap();
-        let database = path.schema().unwrap();
+        let path = dataset.parse_path(false, None).map_err(|e| {
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: "dataset parse_path failed".to_string(),
+                source: e.into(),
+            }
+        })?;
+        let database =
+            path.schema()
+                .ok_or_else(|| super::DataConnectorError::UnableToGetSchemaInternal {
+                    dataconnector: PREFIX.to_string(),
+                    connector_component: dataset.into(),
+                    source: format!("schema unavailable for path `{path}`").into(),
+                })?;
         let table = path.table();
 
         let client = self.client().await.map_err(|e| {
@@ -128,17 +142,41 @@ impl DataConnector for GlueDataConnector {
             .name(table)
             .send()
             .await
-            .unwrap();
+            .map_err(|e| super::DataConnectorError::UnableToConnectInternal {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                source: e.into(),
+            })?;
 
-        let table = get_table_output.table.unwrap();
+        let table =
+            get_table_output
+                .table
+                .ok_or_else(|| super::DataConnectorError::InvalidTableName {
+                    dataconnector: PREFIX.to_string(),
+                    connector_component: dataset.into(),
+                    table_name: table.to_string(),
+                })?;
 
-        match InputFormat::try_from(&table).map_err(|_| todo!())? {
+        match InputFormat::try_from(&table).map_err(|message| {
+            super::DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message,
+            }
+        })? {
             InputFormat::Parquet => {
                 create_parquet_provider(dataset.clone(), self.params.clone(), &table).await
             }
             InputFormat::Iceberg => {
-                let region = self.params.get("region").expose().ok().unwrap();
-                create_iceberg_provider(region.to_string(), database.to_string(), &table).await
+                let region = self.params.get("region").expose().ok().ok_or_else(|| {
+                    super::DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: PREFIX.to_string(),
+                        connector_component: dataset.into(),
+                        message: "region not found".to_string(),
+                    }
+                })?;
+                create_iceberg_provider(dataset, region.to_string(), database.to_string(), &table)
+                    .await
             }
         }
     }
@@ -155,7 +193,7 @@ enum InputFormat {
 }
 
 impl TryFrom<&Table> for InputFormat {
-    type Error = ();
+    type Error = String;
     fn try_from(table: &Table) -> Result<Self, Self::Error> {
         if table
             .parameters
@@ -166,27 +204,38 @@ impl TryFrom<&Table> for InputFormat {
             return Ok(Self::Iceberg);
         }
 
-        if table
-            .storage_descriptor
-            .as_ref()
-            .and_then(|sd| sd.input_format.as_ref())
-            .is_some_and(|input_format| {
-                input_format == "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-            })
-        {
-            return Ok(Self::Parquet);
-        }
+        let Some(storage_descriptor) = table.storage_descriptor() else {
+            return Err(format!(
+                "table `{}` has no storage descriptor",
+                table.name()
+            ));
+        };
 
-        Err(())
+        let Some(input_format) = storage_descriptor.input_format() else {
+            return Err(format!("table `{}` has not input format", table.name(),));
+        };
+
+        Ok(match input_format {
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
+            input_format => return Err(format!("input format `{input_format} is not supported`")),
+        })
     }
 }
 
 async fn create_iceberg_provider(
+    dataset: &Dataset,
     region: String,
     database: String,
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-    let metadata_location = get_metadata_location(table.parameters.as_ref()).unwrap();
+    let metadata_location =
+        get_metadata_location(table.parameters.as_ref()).map_err(|message| {
+            super::DataConnectorError::InternalWithSource {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                source: message.into(),
+            }
+        })?;
 
     let props = HashMap::from([
         (AWS_REGION_NAME.to_string(), region.clone()),
@@ -198,13 +247,23 @@ async fn create_iceberg_provider(
         .props(props)
         .build();
 
-    let catalog = GlueCatalog::new(config).await.unwrap();
+    let catalog = GlueCatalog::new(config).await.map_err(|e| {
+        super::DataConnectorError::UnableToGetCatalogProvider {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            source: e.into(),
+        }
+    })?;
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
     let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
         .await
-        .unwrap();
+        .map_err(|e| super::DataConnectorError::InternalWithSource {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            source: e.into(),
+        })?;
 
     Ok(Arc::new(table_provider))
 }
@@ -215,11 +274,23 @@ async fn create_parquet_provider(
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
-        panic!();
+        return Err(super::DataConnectorError::InternalWithSource {
+            dataconnector: PREFIX.to_string(),
+            connector_component: (&dataset).into(),
+            source: format!("table `{}` has no storage descriptor", table.name()).into(),
+        });
     };
 
     let Some(mut from) = storage_descriptor.location().map(String::from) else {
-        panic!();
+        return Err(super::DataConnectorError::InternalWithSource {
+            dataconnector: PREFIX.to_string(),
+            connector_component: (&dataset).into(),
+            source: format!(
+                "table `{}` storage descriptor has no location",
+                table.name()
+            )
+            .into(),
+        });
     };
 
     if !from.ends_with('/') {
@@ -239,14 +310,14 @@ async fn create_parquet_provider(
     s3.read_provider(&dataset).await
 }
 
-fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, ()> {
+fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, String> {
     const METADATA_LOCATION: &str = "metadata_location";
     match parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
             Some(location) => Ok(location.to_string()),
-            None => Err(()),
+            None => Err(format!("no property `{METADATA_LOCATION}` found")),
         },
-        None => Err(()),
+        None => Err("no parameters found".to_string()),
     }
 }
 
