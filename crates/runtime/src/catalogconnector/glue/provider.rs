@@ -15,27 +15,24 @@ limitations under the License.
 */
 
 use super::state::GlueCatalogState;
-use super::{DatabaseName, Error, Result, TableType};
-use crate::dataconnector::DataConnectorFactory as _;
+use super::{DatabaseName, Result};
+use crate::dataconnector::DataConnector;
+use crate::dataconnector::glue::GlueDataConnector;
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
-    dataconnector::{parameters::ConnectorParams, s3::S3Factory},
+    dataconnector::parameters::ConnectorParams,
 };
 use async_trait::async_trait;
-use aws_sdk_glue::types::Table;
 use data_components::RefreshableCatalogProvider;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
     common::Result as DFResult,
     error::DataFusionError,
 };
-use iceberg::{NamespaceIdent, TableIdent};
-use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
-use iceberg_datafusion::IcebergTableProvider;
-use snafu::ResultExt;
+use snafu::ResultExt as _;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap, fmt};
+use std::{any::Any, fmt};
 
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
@@ -118,96 +115,6 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
     }
 }
 
-impl GlueSchemaProvider {
-    async fn create_iceberg_provider(
-        &self,
-        name: &str,
-        table: &Table,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let identifier =
-            TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
-
-        let config = GlueCatalogConfig::builder()
-            .warehouse(metadata_location)
-            .build();
-        let catalog = GlueCatalog::new(config)
-            .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
-
-        let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
-            .await
-            .map_err(|e| {
-                DataFusionError::External(Box::new(super::Error::CreateIcebergTableProvider {
-                    source: e,
-                }))
-            })?;
-
-        Ok(Some(Arc::new(table_provider)))
-    }
-
-    async fn create_hive_parquet_provider(
-        &self,
-        name: &str,
-        table: &Table,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let Some(storage_descriptor) = table.storage_descriptor() else {
-            return Err(DataFusionError::External(
-                format!("table `{name}` does not have a storage descriptor").into(),
-            ));
-        };
-
-        let Some(mut from) = storage_descriptor.location().map(String::from) else {
-            return Err(DataFusionError::External(
-                format!("table `{name}` does not have a location").into(),
-            ));
-        };
-
-        if !from.ends_with('/') {
-            from.push('/');
-        }
-
-        let mut params = self.state.parameters.clone();
-        params
-            .parameters
-            .insert("endpoint".into(), from.clone().into());
-        params.parameters.prefix = "s3";
-
-        let s3 = S3Factory::new()
-            .create(self.state.parameters.clone())
-            .await
-            .map_err(DataFusionError::External)?;
-
-        let app = self
-            .state
-            .parameters
-            .app
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| DataFusionError::External("Missing application".into()))?;
-
-        let mut dataset = DatasetBuilder::try_new(from, name)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .with_runtime(Arc::clone(&self.state.runtime))
-            .with_app(app)
-            .build()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        dataset
-            .params
-            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
-
-        let provider = s3
-            .read_provider(&dataset)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        Ok(Some(provider))
-    }
-}
-
 #[async_trait]
 impl SchemaProvider for GlueSchemaProvider {
     fn as_any(&self) -> &dyn Any {
@@ -236,78 +143,25 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let table = {
-            let databases = match self.state.databases.read() {
-                Ok(dbs) => dbs,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            databases
-                .get(&self.database)
-                .and_then(|tables| tables.iter().find(|t| t.name() == name))
-                .cloned()
-        };
-
-        let Some(table) = table else {
-            tracing::error!(
-                "Glue table `{name}` not found in database `{}`",
-                self.database
-            );
-            return Ok(None);
-        };
-
-        match TableType::from(&table) {
-            TableType::HiveParquet => self.create_hive_parquet_provider(name, &table).await,
-            TableType::Iceberg => self.create_iceberg_provider(name, &table).await,
-            TableType::Unsupported => Ok(None),
-        }
-    }
-}
-
-fn get_metadata_location(
-    parameters: Option<&HashMap<String, String>>,
-    table: &str,
-) -> Result<String> {
-    const METADATA_LOCATION: &str = "metadata_location";
-    match parameters {
-        Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
-            None => Err(Error::MissingMetadataLocation {
-                table: table.to_string(),
-            }),
-        },
-        None => Err(Error::MissingParameters),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn get_metadata_location_success() {
-        let mut params = HashMap::new();
-        params.insert(
-            "metadata_location".to_string(),
-            "s3://bucket/path".to_string(),
-        );
-        let result = get_metadata_location(Some(&params), "table").expect("metadata");
-        assert_eq!(result, "s3://bucket/path");
-    }
-
-    #[test]
-    fn get_metadata_location_missing_location() {
-        let params = HashMap::new();
-        let result = get_metadata_location(Some(&params), "table");
-        assert!(matches!(result, Err(Error::MissingMetadataLocation { .. })));
-        if let Err(Error::MissingMetadataLocation { table }) = result {
-            assert_eq!(table, "table");
-        }
-    }
-
-    #[tokio::test]
-    async fn get_metadata_location_missing() {
-        let params: Option<&HashMap<String, String>> = None;
-        let result = get_metadata_location(params, "table");
-        assert!(matches!(result, Err(Error::MissingParameters)));
+        let connector = GlueDataConnector::new(self.state.parameters.parameters.clone());
+        let from = format!("{}.{name}", self.database);
+        let runtime = Arc::clone(&self.state.runtime);
+        let app = runtime
+            .app()
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| DataFusionError::External("no app".into()))?;
+        let dataset = DatasetBuilder::try_new(from, name)
+            .map_err(|e| DataFusionError::External(e.into()))?
+            .with_app(app)
+            .with_runtime(runtime)
+            .build()
+            .map_err(|e| DataFusionError::External(e.into()))?;
+        connector
+            .read_provider(&dataset)
+            .await
+            .map(Option::Some)
+            .map_err(|e| DataFusionError::External(e.into()))
     }
 }

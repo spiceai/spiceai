@@ -78,6 +78,9 @@ pub enum Error {
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
+    #[snafu(display("No region specified using {region}"))]
+    NoRegionSpecified { region: String },
+
     #[snafu(display("Missing access key"))]
     NoAccessKey,
 
@@ -195,11 +198,13 @@ pub async fn load_config(
     secret_name: &'static str,
     token_name: &'static str,
     params: &Parameters,
-) -> Result<SdkConfig, String> {
+) -> Result<SdkConfig, Error> {
     let region = params
         .get(region_name)
         .expose()
-        .ok_or_else(|_| format!("{region_name} is required"))?
+        .ok_or_else(|_| Error::NoRegionSpecified {
+            region: region_name.to_string(),
+        })?
         .to_string();
 
     let access_key_id = params.get(key_name).expose().ok().map(ToString::to_string);
