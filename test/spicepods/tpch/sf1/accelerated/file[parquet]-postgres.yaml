@@ -13,7 +13,7 @@ datasets:
         pg_port: 5432
         pg_user: postgres
         pg_pass: ${secrets:POSTGRES_PASSWORD}
-        pg_db: tpch_accelerated
+        pg_db: tpch_file_accelerated
         pg_sslmode: disable
   - from: file:data/lineitem.parquet
     name: lineitem

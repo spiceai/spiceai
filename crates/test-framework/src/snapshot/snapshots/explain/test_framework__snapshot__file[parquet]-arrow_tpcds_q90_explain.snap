@@ -65,44 +65,44 @@ description: "Query: tpcds_q90"
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
 |               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                 |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
-|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 24), input_partitions=24                                                                        |
+|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 16), input_partitions=16                                                                        |
 |               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
 |               |                           HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_sold_time_sk@0, t_time_sk@0)], projection=[ws_web_page_sk@1]                              |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
-|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 24), input_partitions=24                                                               |
+|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 16), input_partitions=16                                                               |
 |               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
 |               |                                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_ship_hdemo_sk@1, hd_demo_sk@0)], projection=[ws_sold_time_sk@0, ws_web_page_sk@2] |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
-|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 24), input_partitions=24                                                      |
+|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 16), input_partitions=16                                                      |
 |               |                                         BytesProcessedExec                                                                                                                   |
 |               |                                           SchemaCastScanExec                                                                                                                 |
-|               |                                             RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                            |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                            |
 |               |                                               DataSourceExec: partitions=1, partition_sizes=[88]                                                                             |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
-|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 24), input_partitions=24                                                            |
+|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 16), input_partitions=16                                                            |
 |               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                    |
 |               |                                           BytesProcessedExec                                                                                                                 |
 |               |                                             CoalesceBatchesExec: target_batch_size=8192                                                                                      |
 |               |                                               FilterExec: hd_dep_count@1 = 2                                                                                                 |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                        |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
 |               |                                                   SchemaCastScanExec                                                                                                         |
 |               |                                                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                        |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
-|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 24), input_partitions=24                                                                     |
+|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 16), input_partitions=16                                                                     |
 |               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                              |
 |               |                                   BytesProcessedExec                                                                                                                         |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
 |               |                                       FilterExec: t_hour@1 >= 9 AND t_hour@1 <= 10                                                                                           |
 |               |                                         SchemaCastScanExec                                                                                                                   |
-|               |                                           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                              |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                              |
 |               |                                             DataSourceExec: partitions=1, partition_sizes=[11]                                                                               |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
-|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 24), input_partitions=24                                                                        |
+|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 16), input_partitions=16                                                                        |
 |               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                            |
 |               |                           BytesProcessedExec                                                                                                                                 |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                               FilterExec: wp_char_count@1 >= 2500 AND wp_char_count@1 <= 5200                                                                                |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                        |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                        |
 |               |                                   SchemaCastScanExec                                                                                                                         |
 |               |                                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                        |
 |               |       ProjectionExec: expr=[count(Int64(1))@0 as pmc]                                                                                                                        |
@@ -113,44 +113,44 @@ description: "Query: tpcds_q90"
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
 |               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                 |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
-|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 24), input_partitions=24                                                                        |
+|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 16), input_partitions=16                                                                        |
 |               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
 |               |                           HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_sold_time_sk@0, t_time_sk@0)], projection=[ws_web_page_sk@1]                              |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
-|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 24), input_partitions=24                                                               |
+|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 16), input_partitions=16                                                               |
 |               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
 |               |                                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_ship_hdemo_sk@1, hd_demo_sk@0)], projection=[ws_sold_time_sk@0, ws_web_page_sk@2] |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
-|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 24), input_partitions=24                                                      |
+|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 16), input_partitions=16                                                      |
 |               |                                         BytesProcessedExec                                                                                                                   |
 |               |                                           SchemaCastScanExec                                                                                                                 |
-|               |                                             RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                            |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                            |
 |               |                                               DataSourceExec: partitions=1, partition_sizes=[88]                                                                             |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
-|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 24), input_partitions=24                                                            |
+|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 16), input_partitions=16                                                            |
 |               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                    |
 |               |                                           BytesProcessedExec                                                                                                                 |
 |               |                                             CoalesceBatchesExec: target_batch_size=8192                                                                                      |
 |               |                                               FilterExec: hd_dep_count@1 = 2                                                                                                 |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                        |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
 |               |                                                   SchemaCastScanExec                                                                                                         |
 |               |                                                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                        |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
-|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 24), input_partitions=24                                                                     |
+|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 16), input_partitions=16                                                                     |
 |               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                              |
 |               |                                   BytesProcessedExec                                                                                                                         |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
 |               |                                       FilterExec: t_hour@1 >= 15 AND t_hour@1 <= 16                                                                                          |
 |               |                                         SchemaCastScanExec                                                                                                                   |
-|               |                                           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                              |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                              |
 |               |                                             DataSourceExec: partitions=1, partition_sizes=[11]                                                                               |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
-|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 24), input_partitions=24                                                                        |
+|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 16), input_partitions=16                                                                        |
 |               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                            |
 |               |                           BytesProcessedExec                                                                                                                                 |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                               FilterExec: wp_char_count@1 >= 2500 AND wp_char_count@1 <= 5200                                                                                |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                        |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                        |
 |               |                                   SchemaCastScanExec                                                                                                                         |
 |               |                                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                        |
 |               |                                                                                                                                                                              |

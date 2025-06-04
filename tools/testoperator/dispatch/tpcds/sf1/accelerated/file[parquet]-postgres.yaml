@@ -3,18 +3,18 @@ tests:
     spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-postgres.yaml
     query_set: tpcds
     query_overrides: postgresql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     ready_wait: 300
   throughput:
     spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-postgres.yaml
     query_set: tpcds
     query_overrides: postgresql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     ready_wait: 300
   load:
     spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-postgres.yaml
     query_set: tpcds
     query_overrides: postgresql
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     ready_wait: 300
     duration: 28800

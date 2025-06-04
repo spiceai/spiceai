@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-arrow
 datasets:
-  - from: s3://benchmarks/clickbench/hits/
+  - from: s3://benchmarks/clickbench/hits.parquet
     name: hits
     params:
       file_format: parquet
@@ -14,3 +14,4 @@ datasets:
     acceleration:
       enabled: true
       engine: arrow
+      refresh_sql: "SELECT * FROM hits LIMIT 50000000" # dev-runners do not have enough memory for full clickbench in-memory

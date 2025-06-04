@@ -2,5 +2,5 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/abfs[parquet].yaml
     query_set: tpch
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true
