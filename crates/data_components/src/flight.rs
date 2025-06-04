@@ -39,7 +39,9 @@ use datafusion::{
 };
 use datafusion_federation::sql::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
-use flight_client::FlightClient;
+use flight_client::{
+    Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
+};
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
@@ -68,7 +70,9 @@ pub enum Error {
     },
 
     #[snafu(display("Query execution failed.\n{source}\nVerify the configuration and try again."))]
-    ArrowFlight { source: FlightError },
+    ArrowFlight {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -520,7 +524,7 @@ fn query_to_stream(
                     match batch {
                         Ok(batch) => yield Ok(batch),
                         Err(error) => {
-                            yield Err(to_execution_error(Error::ArrowFlight { source: error }));
+                            yield Err(to_execution_error(map_connection_reset_error(error)));
                         }
                     }
                 }
@@ -540,5 +544,26 @@ fn to_execution_error(e: Error) -> DataFusionError {
             _ => DataFusionError::Execution(format!("{source}")),
         },
         _ => DataFusionError::Execution(format!("{e}")),
+    }
+}
+
+fn map_connection_reset_error(error: FlightError) -> Error {
+    match error {
+        FlightError::Tonic(ref source) => {
+            let source_owned = *source.clone();
+            if is_connection_reset_error(&source_owned) {
+                return Error::ArrowFlight {
+                    source: Box::new(FlightClientError::ConnectionReset {
+                        source: TonicStatusError::from(source_owned),
+                    }),
+                };
+            }
+            Error::ArrowFlight {
+                source: Box::new(error),
+            }
+        }
+        _ => Error::ArrowFlight {
+            source: Box::new(error),
+        },
     }
 }

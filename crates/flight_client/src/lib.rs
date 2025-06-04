@@ -172,6 +172,9 @@ pub enum Error {
         "No endpoints found. Ensure the endpoint is configured and the server is running."
     ))]
     NoEndpointsFound,
+
+    #[snafu(display("Connection is reset by the server. Please retry the request.\n{source}"))]
+    ConnectionReset { source: TonicStatusError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -599,8 +602,17 @@ impl FlightClient {
             .clone()
             .handshake(req)
             .await
-            .map_err(TonicStatusError::from)
-            .context(UnableToPerformHandshakeSnafu)?;
+            .map_err(|e| {
+                if is_connection_reset_error(&e) {
+                    Error::ConnectionReset {
+                        source: TonicStatusError::from(e),
+                    }
+                } else {
+                    Error::UnableToPerformHandshake {
+                        source: TonicStatusError::from(e),
+                    }
+                }
+            })?;
         let mut token: Option<Token> = None;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
@@ -629,7 +641,25 @@ impl FlightClient {
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
+    if is_connection_reset_error(&e) {
+        return Error::ConnectionReset {
+            source: TonicStatusError::from(e),
+        };
+    }
     Error::UnableToQuery {
         source: e.message().into(),
     }
+}
+
+pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
+    if error.code() == tonic::Code::Internal {
+        let error_message = error.message().to_lowercase();
+        if error_message.contains("operation was canceled")
+            || error_message.contains("http2 error")
+            || error_message.contains("grpc-status header missing")
+        {
+            return true;
+        }
+    }
+    false
 }
