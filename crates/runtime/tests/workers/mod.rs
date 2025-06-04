@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use app::AppBuilder;
-use chrono::Timelike;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use snafu::ResultExt;
