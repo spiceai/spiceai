@@ -171,8 +171,6 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            let second_now = chrono::Utc::now().second();
-
             // every 15th second, wait for 2 seconds for the job to succeed
             tokio::time::sleep(time_till_second(15, Some(2))).await; // wait for the cron job to run at least once
             let _ = trace_provider.force_flush();

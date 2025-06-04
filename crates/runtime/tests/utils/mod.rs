@@ -68,6 +68,7 @@ where
 
 /// Returns the duration until the next occurrence of the nearest second.
 /// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
+#[allow(dead_code)]
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
     assert!(
         nearest_second < 60,
