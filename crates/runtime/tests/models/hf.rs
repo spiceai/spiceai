@@ -72,11 +72,15 @@ mod nsql {
             .scope(async {
 
                 let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
-                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "store_and_fwd_flag".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: None,
-                    chunking: None,
+                taxi_trips_with_embeddings.columns = vec![Column {
+                        name: "store_and_fwd_flag".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "hf_minilm".to_string(),
+                            row_ids: None,
+                            chunking: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
                 }];
 
                 let app = AppBuilder::new("text-to-sql")

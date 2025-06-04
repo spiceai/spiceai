@@ -59,12 +59,16 @@ mod nsql {
                 .map_err(anyhow::Error::msg)?;
 
             let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
-                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "store_and_fwd_flag".to_string(),
-                    model: "openai_embeddings".to_string(),
-                    primary_keys: None,
-                    chunking: None,
-                }];
+            taxi_trips_with_embeddings.columns = vec![Column {
+                    name: "store_and_fwd_flag".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "openai_embeddings".to_string(),
+                        row_ids: None,
+                        chunking: None,
+                    }],
+                    description: None,
+                    full_text_search: None,
+            }];
 
             let app = AppBuilder::new("text-to-sql")
                 .with_dataset(taxi_trips_with_embeddings)
@@ -219,23 +223,31 @@ mod search {
         let mut clickbench_dataset_no_chunking =
             get_small_clickbench_dataset("clickbench_no_chunking");
         let mut clickbench_dataset_chunking = get_small_clickbench_dataset("clickbench_chunking");
-        clickbench_dataset_no_chunking.embeddings = vec![ColumnEmbeddingConfig {
-            column: "Referer".to_string(),
-            model: "openai_embeddings".to_string(),
-            primary_keys: None,
-            chunking: None,
+        clickbench_dataset_no_chunking.columns = vec![Column {
+            name: "Referer".to_string(),
+            embeddings: vec![ColumnLevelEmbeddingConfig {
+                model: "openai_embeddings".to_string(),
+                row_ids: None,
+                chunking: None,
+            }],
+            description: None,
+            full_text_search: None,
         }];
 
-        clickbench_dataset_chunking.embeddings = vec![ColumnEmbeddingConfig {
-            column: "Referer".to_string(),
-            model: "openai_embeddings".to_string(),
-            primary_keys: None,
-            chunking: Some(EmbeddingChunkConfig {
-                enabled: true,
-                target_chunk_size: 512,
-                overlap_size: 128,
-                trim_whitespace: false,
-            }),
+        clickbench_dataset_chunking.columns = vec![Column {
+            name: "Referer".to_string(),
+            embeddings: vec![ColumnLevelEmbeddingConfig {
+                model: "openai_embeddings".to_string(),
+                row_ids: None,
+                chunking: Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            }],
+            description: None,
+            full_text_search: None,
         }];
 
         let app = AppBuilder::new("search_app")
@@ -424,11 +436,15 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                 .map_err(anyhow::Error::msg)?;
 
             let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
-            ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                column: "i_item_desc".to_string(),
-                model: "openai_embeddings".to_string(),
-                primary_keys: Some(vec!["i_item_sk".to_string()]),
-                chunking: None,
+            ds_tpcds_item.columns = vec![Column {
+                name: "i_item_desc".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "openai_embeddings".to_string(),
+                    row_ids: Some(vec!["i_item_sk".to_string()]),
+                    chunking: None,
+                }],
+                description: None,
+                full_text_search: None,
             }];
 
             let app = AppBuilder::new("text-to-sql")

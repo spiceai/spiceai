@@ -108,11 +108,15 @@ pub(crate) fn item_tpch_dataset_w_embeddings(
     chunking: Option<EmbeddingChunkConfig>,
 ) -> Dataset {
     let mut ds_tpcds_item = get_tpcds_dataset("item", Some(ds_name), None);
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: model.to_string(),
-        primary_keys,
-        chunking,
+    ds_tpcds_item.columns = vec![Column {
+        name: "i_item_desc".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: model.to_string(),
+            row_ids: primary_keys,
+            chunking,
+        }],
+        description: None,
+        full_text_search: None,
     }];
 
     ds_tpcds_item
@@ -131,11 +135,15 @@ pub(crate) fn catalog_page_tpch_dataset_w_embeddings(
             "select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from {ds_name} limit 20"
         ).as_str()),
     );
-    ds_tpcds_cp.embeddings = vec![ColumnEmbeddingConfig {
-        column: "cp_description".to_string(),
-        model: model.to_string(),
-        primary_keys,
-        chunking,
+    ds_tpcds_cp.columns = vec![Column {
+        name: "cp_description".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: model.to_string(),
+            row_ids: primary_keys,
+            chunking,
+        }],
+        description: None,
+        full_text_search: None,
     }];
     ds_tpcds_cp
 }
@@ -195,11 +203,15 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
             trim_whitespace: false,
         }),
     );
-    chunked.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-        chunking: None,
+    chunked.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: model.to_string(),
+            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
 
     let app = AppBuilder::new("search_app")
@@ -253,11 +265,15 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
         Some(vec!["cp_catalog_page_sk".to_string()]),
         None,
     );
-    ds.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-        chunking: None,
+    ds.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: "hf_minilm".to_string(),
+            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
 
     let app = AppBuilder::new("search_app")
@@ -308,13 +324,16 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
 async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
-    chunked.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: None,
-        chunking: None,
+    chunked.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: "hf_minilm".to_string(),
+            row_ids: None,
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
-
     let app = AppBuilder::new("search_app")
         .with_dataset(chunked)
         .with_embedding(get_huggingface_embeddings(
