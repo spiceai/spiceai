@@ -23,7 +23,7 @@ pub use spicepod;
 use spicepod::{
     Spicepod,
     component::{
-        caching::ResultsCache,
+        caching::{CacheConfig, ResultsCache},
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
@@ -213,6 +213,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
         self.runtime.results_cache = Some(results_cache);
+        self
+    }
+
+    #[must_use]
+    pub fn with_search_cache(mut self, search_cache: CacheConfig) -> AppBuilder {
+        self.runtime.caching.search_results = search_cache;
         self
     }
 

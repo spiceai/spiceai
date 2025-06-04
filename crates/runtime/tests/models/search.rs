@@ -23,12 +23,14 @@ use runtime::auth::EndpointAuth;
 use runtime::config::Config;
 use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
+use spicepod::component::caching::CacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::models::hf::get_huggingface_embeddings;
 use crate::models::openai::get_openai_embeddings;
@@ -429,4 +431,63 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
         ],
     )
     .await
+}
+
+#[tokio::test]
+async fn test_search_with_cache() -> Result<(), anyhow::Error> {
+    let chunked = catalog_page_tpch_dataset_w_embeddings(
+        "cached_search",
+        "hf_minilm",
+        Some(vec!["cp_catalog_page_sk".to_string()]),
+        Some(EmbeddingChunkConfig {
+            enabled: true,
+            target_chunk_size: 512,
+            overlap_size: 128,
+            trim_whitespace: false,
+        }),
+    );
+
+    let cache_config = CacheConfig {
+        enabled: true,
+        item_ttl: Some("10s".to_string()),
+        ..Default::default()
+    };
+
+    let app = AppBuilder::new("cached_search")
+        .with_dataset(chunked)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .with_search_cache(cache_config)
+        .build();
+
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let start = Instant::now();
+            run_search_test(http_base_url.as_str(), &SearchTestCase {
+                name: "pre_cache",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                }),
+            }).await?;
+            let duration = start.elapsed();
+            let start = Instant::now();
+            run_search_test(http_base_url.as_str(), &SearchTestCase {
+                name: "post_cache",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                }),
+            }).await?;
+            let duration_cached = start.elapsed();
+            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
 }

@@ -108,6 +108,7 @@ impl TryFrom<SearchRequestAIJson> for SearchRequest {
     }
 }
 
+#[derive(Debug, Clone)]
 #[allow(clippy::doc_markdown)]
 pub struct SearchRequest {
     /// The text to search documents for similarity

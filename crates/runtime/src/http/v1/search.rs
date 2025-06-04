@@ -146,8 +146,9 @@ pub(crate) async fn post(
         }
     };
 
-    match vs.search(&search_request).await {
-        Ok(resp) => match to_matches_sorted(resp, search_request.limit).await {
+    let cache_provider = vs.df.search_cache_provider();
+    match vs.search_with_cache(&search_request, cache_provider).await {
+        Ok((resp, _)) => match to_matches_sorted(resp, search_request.limit).await {
             Ok(m) => (
                 StatusCode::OK,
                 Json(SearchResponse {
