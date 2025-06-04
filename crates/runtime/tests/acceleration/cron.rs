@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::wait_until_true;
+use crate::utils::{time_till_second, wait_until_true};
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use chrono::Timelike;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::{auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
@@ -132,10 +131,8 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // wait 30 seconds for at least one run of the cron job
-            let second_now = chrono::Utc::now().second();
-            let wait = (second_now % 30) + 10; // wait for the next 30th second, and wait 10 seconds for the job to succeed
-            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await;
+            // wait for the next 30th second, and wait 10 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(30, Some(10))).await;
 
             let result: Vec<RecordBatch> = rt
                 .datafusion()
@@ -259,10 +256,8 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // wait 30 seconds for at least one run of the cron job
-            let second_now = chrono::Utc::now().second();
-            let wait = (second_now % 30) + 10; // wait for the next 30th second, and wait 10 seconds for the job to succeed
-            tokio::time::sleep(std::time::Duration::from_secs(u64::from(wait))).await;
+            // wait for the next 30th second, and wait 10 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(30, Some(10))).await;
 
             for dataset_name in dataset_names.clone() {
                 let result: Vec<RecordBatch> = rt
