@@ -40,6 +40,7 @@ datasets:
         ss_customer_sk: enabled
         ss_ticket_number: enabled
         ss_hdemo_sk: enabled
+        (ss_customer_sk, ss_sold_date_sk): enabled
   - from: file:data/store_returns.parquet
     name: store_returns
     acceleration: *acceleration
