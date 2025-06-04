@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use aws_sdk_glue::{Client, types::Table};
 use datafusion::catalog::TableProvider;
+use iceberg::{NamespaceIdent, TableIdent, io::S3_REGION};
+use iceberg_catalog_glue::{AWS_REGION_NAME, GlueCatalog, GlueCatalogConfig};
+use iceberg_datafusion::IcebergTableProvider;
 
 use crate::{
     component::dataset::Dataset,
@@ -129,7 +132,10 @@ impl DataConnector for GlueDataConnector {
             InputFormat::Parquet => {
                 create_parquet_provider(dataset.clone(), self.params.clone(), &table).await
             }
-            InputFormat::Iceberg => todo!(),
+            InputFormat::Iceberg => {
+                let region = self.params.get("region").expose().ok().unwrap();
+                create_iceberg_provider(region.to_string(), database.to_string(), &table).await
+            }
         }
     }
 }
@@ -172,34 +178,33 @@ impl TryFrom<&Table> for InputFormat {
     }
 }
 
-// async fn create_iceberg_provider(
-//     &self,
-//     name: &str,
-//     table: &Table,
-// ) -> DFResult<Option<Arc<dyn TableProvider>>> {
-//     let metadata_location = get_metadata_location(table.parameters.as_ref(), name)
-//         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+async fn create_iceberg_provider(
+    region: String,
+    database: String,
+    table: &Table,
+) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    let metadata_location = get_metadata_location(table.parameters.as_ref()).unwrap();
 
-//     let identifier =
-//         TableIdent::new(NamespaceIdent::new(self.database.clone()), name.to_string());
+    let props = HashMap::from([
+        (AWS_REGION_NAME.to_string(), region.clone()),
+        (S3_REGION.to_string(), region),
+    ]);
 
-//     let config = GlueCatalogConfig::builder()
-//         .warehouse(metadata_location)
-//         .build();
-//     let catalog = GlueCatalog::new(config)
-//         .await
-//         .map_err(|e| DataFusionError::External(e.into()))?;
+    let config = GlueCatalogConfig::builder()
+        .warehouse(metadata_location)
+        .props(props)
+        .build();
 
-//     let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
-//         .await
-//         .map_err(|e| {
-//             DataFusionError::External(Box::new(super::Error::CreateIcebergTableProvider {
-//                 source: e,
-//             }))
-//         })?;
+    let catalog = GlueCatalog::new(config).await.unwrap();
 
-//     Ok(Some(Arc::new(table_provider)))
-// }
+    let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
+
+    let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
+        .await
+        .unwrap();
+
+    Ok(Arc::new(table_provider))
+}
 
 async fn create_parquet_provider(
     mut dataset: Dataset,
@@ -229,4 +234,15 @@ async fn create_parquet_provider(
         .insert("hive_partitioning_enabled".to_string(), "true".to_string());
 
     s3.read_provider(&dataset).await
+}
+
+fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, ()> {
+    const METADATA_LOCATION: &str = "metadata_location";
+    match parameters {
+        Some(properties) => match properties.get(METADATA_LOCATION) {
+            Some(location) => Ok(location.to_string()),
+            None => Err(()),
+        },
+        None => Err(()),
+    }
 }
