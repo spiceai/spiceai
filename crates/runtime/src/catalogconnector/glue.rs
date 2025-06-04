@@ -94,8 +94,11 @@ pub enum Error {
         source: parameters::aws::Error,
     },
 
-    #[snafu(display("Configuration loading failed: {message}"))]
-    ConfigurationLoadingFailed { message: String },
+    #[snafu(display("Configuration loading failed: {source}"))]
+    ConfigurationLoadingFailed {
+        #[snafu(source)]
+        source: parameters::aws::Error,
+    },
 
     #[snafu(display("Failed to refresh catalog: {source}"))]
     RefreshFailed {

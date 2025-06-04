@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DatabaseName, TableType};
+use super::{ConfigurationLoadingFailedSnafu, DatabaseName, TableType};
 use crate::dataconnector::parameters::aws::load_config;
 use crate::{Runtime, dataconnector::parameters::ConnectorParams};
 use aws_sdk_glue::Client;
@@ -64,7 +64,7 @@ impl GlueCatalogState {
             &parameters.parameters,
         )
         .await
-        .map_err(|message| super::Error::ConfigurationLoadingFailed { message })?;
+        .context(ConfigurationLoadingFailedSnafu)?;
         let client = Client::new(&config);
 
         Ok(Self {
