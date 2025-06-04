@@ -146,17 +146,22 @@ impl SchemaProvider for GlueSchemaProvider {
         let connector = GlueDataConnector::new(self.state.parameters.parameters.clone());
         let from = format!("{}.{name}", self.database);
         let runtime = Arc::clone(&self.state.runtime);
-        let app = runtime.app().read().await.clone().unwrap();
+        let app = runtime
+            .app()
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| DataFusionError::External("no app".into()))?;
         let dataset = DatasetBuilder::try_new(from, name)
-            .unwrap()
+            .map_err(|e| DataFusionError::External(e.into()))?
             .with_app(app)
             .with_runtime(runtime)
             .build()
-            .unwrap();
+            .map_err(|e| DataFusionError::External(e.into()))?;
         connector
             .read_provider(&dataset)
             .await
             .map(Option::Some)
-            .map_err(|_| DataFusionError::Internal("".into()))
+            .map_err(|e| DataFusionError::External(e.into()))
     }
 }
