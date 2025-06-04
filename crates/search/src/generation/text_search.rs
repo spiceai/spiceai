@@ -270,10 +270,10 @@ impl CandidateGeneration for FullTextSearch {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
-    use datafusion::physical_plan::common::collect;
+    use datafusion::{execution::SendableRecordBatchStream, physical_plan::common::collect};
     use serde_json::Value;
     use tantivy::{
         Index, IndexWriter, doc,
@@ -282,10 +282,12 @@ mod tests {
 
     use crate::{
         aggregation::write_to_json_string,
-        generation::{CandidateGeneration, text_search::FullTextSearch},
+        generation::{
+            CandidateGeneration, Result as GenerationResult, text_search::FullTextSearch,
+        },
     };
 
-    fn normalise_result(value: &mut serde_json::Value) {
+    pub(crate) fn normalise_result(value: &mut serde_json::Value) {
         if let Value::Array(vv) = value {
             for v in vv {
                 if let Value::Object(obj) = v {
@@ -305,7 +307,8 @@ mod tests {
         }
     }
 
-    fn create_basic_index() -> Index {
+    // Keep in sync with `crate::generation::post_apply::tests::create_table_provider`.
+    pub(crate) fn create_basic_index() -> Index {
         let mut schema_builder = Schema::builder();
         let title = schema_builder.add_text_field("title", TEXT | STORED);
         let body = schema_builder.add_text_field("body", TEXT | STORED);
@@ -348,14 +351,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let result =
+        let fts =
             FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch")
-                .search("fish".into(), &[], &[], 3)
-                .await
-                .expect("Search was unsuccessful");
+                .expect("failed to create FullTextSearch");
 
-        let rbs = collect(result)
+        let rb_as_value = validate_result(fts.search("fish".into(), &[], &[], 3).await).await;
+
+        insta::assert_json_snapshot!(rb_as_value);
+    }
+
+    /// Validates the result of a search operation by collecting the [`RecordBatch`] results into a JSON value.
+    pub(crate) async fn validate_result(
+        output: GenerationResult<SendableRecordBatchStream>,
+    ) -> Value {
+        let output = output.expect("failed to execute search");
+        let rbs = collect(output)
             .await
             .expect("failed to collect search results");
 
@@ -367,6 +377,6 @@ mod tests {
 
         normalise_result(&mut rb_as_value);
 
-        insta::assert_json_snapshot!(rb_as_value);
+        rb_as_value
     }
 }

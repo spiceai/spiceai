@@ -98,6 +98,7 @@ graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.3.1"
 iceberg = "0.4.0"
+iceberg-catalog-glue = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
