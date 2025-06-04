@@ -57,6 +57,8 @@ on:
         options:
           - 'spiceai-runners'
           - 'spiceai-large-runners'
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
 
 jobs:
   run-data-consistency:
@@ -99,22 +101,23 @@ jobs:
             --disable-progress-bars \
             --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
         env:
-          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: root
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
@@ -141,22 +144,23 @@ jobs:
             --disable-progress-bars \
             --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
         env:
-          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
-          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
-          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
           DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_HOST: ${{ secrets.TEST_MYSQL_HOST }}
           MYSQL_TCP_PORT: 3306
-          MYSQL_USER: root
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
+          MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}

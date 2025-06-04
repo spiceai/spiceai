@@ -13,7 +13,7 @@ description: "Query: tpch_simple_q1"
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]        |
 |               |       BytesProcessedExec                                                        |
 |               |         SchemaCastScanExec                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1 |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
 |               |             DataSourceExec: partitions=1, partition_sizes=[1501]                |
 |               |                                                                                 |
 +---------------+---------------------------------------------------------------------------------+

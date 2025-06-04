@@ -5,14 +5,14 @@ description: "Query: tpcds_q40"
 +---------+------------------+--------------+-------------+
 | w_state | i_item_id        | sales_before | sales_after |
 +---------+------------------+--------------+-------------+
-| TN      | AAAAAAAAAAABAAAA | 4.21         | 0.00        |
-| TN      | AAAAAAAAABBAAAAA | 35.55        | 231.94      |
-| TN      | AAAAAAAAADKAAAAA | 335.10       | 68.20       |
-| TN      | AAAAAAAAAEHAAAAA | 11.13        | 87.27       |
-| TN      | AAAAAAAAAFCBAAAA | 1.53         | -476.99     |
-| TN      | AAAAAAAAAIEBAAAA | 154.97       | 207.45      |
-| TN      | AAAAAAAAAIFAAAAA | 150.51       | 32.41       |
-| TN      | AAAAAAAAAJCAAAAA | 148.25       | -53.20      |
-| TN      | AAAAAAAAALJAAAAA | -343.37      | 116.30      |
-| TN      | AAAAAAAAALOAAAAA | 57.04        | 7.44        |
+| TN      | AAAAAAAAAAABAAAA | 36.12        | 0.00        |
+| TN      | AAAAAAAAAAKBAAAA | 271.23       | 134.31      |
+| TN      | AAAAAAAAABBAAAAA | -400.48      | 0.00        |
+| TN      | AAAAAAAAABECAAAA | 34.97        | 154.15      |
+| TN      | AAAAAAAAACIBAAAA | 0.00         | 128.77      |
+| TN      | AAAAAAAAADBEAAAA | 53.44        | 98.51       |
+| TN      | AAAAAAAAADKAAAAA | 83.97        | 0.00        |
+| TN      | AAAAAAAAADLCAAAA | 0.00         | 149.82      |
+| TN      | AAAAAAAAAEBDAAAA | 37.78        | 121.04      |
+| TN      | AAAAAAAAAEHAAAAA | 0.00         | 83.31       |
 +---------+------------------+--------------+-------------+

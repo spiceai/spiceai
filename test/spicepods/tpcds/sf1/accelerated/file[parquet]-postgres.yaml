@@ -13,7 +13,7 @@ datasets:
         pg_port: 5432
         pg_user: postgres
         pg_pass: ${secrets:POSTGRES_PASSWORD}
-        pg_db: tpcds_accelerated
+        pg_db: tpcds_file_accelerated
         pg_sslmode: disable
   - from: file:data/catalog_sales.parquet
     name: catalog_sales

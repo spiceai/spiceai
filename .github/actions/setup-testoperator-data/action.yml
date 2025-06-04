@@ -11,11 +11,6 @@ inputs:
       - 'tpch[parameterized]'
       - 'tpcds'
       - 'clickbench'
-  is_dev:
-    description: "Is this running on the dev runners?"
-    required: true
-    type: boolean
-    default: false
 
 runs:
   using: 'composite'
@@ -29,132 +24,39 @@ runs:
 
     - name: Download DuckDB TPCH Data
       shell: bash
-      if: inputs.is_dev == 'true' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
 
     - name: Download DuckDB TPCDS Data
       shell: bash
-      if: inputs.is_dev == 'true' && inputs.query_set == 'tpcds'
+      if: inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
 
     - name: Download File Connector TPCH Data
       shell: bash
-      if: inputs.is_dev == 'true' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
     
     - name: Download File Connector TPCDS Data
       shell: bash
-      if: inputs.is_dev == 'true' && inputs.query_set == 'tpcds'
+      if: inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
         mkdir ./sf0_01
         cd ./sf0_01
-        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/* ./
+        mc cp --recursive spice-minio/benchmarks/tpcds_sf0_01/ ./
     
     - name: Download File Connector ClickBench Data
       shell: bash
-      if: inputs.is_dev == 'true' && inputs.query_set == 'clickbench'
+      if: inputs.query_set == 'clickbench'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
-    
-    # These should get deleted once the dev migration is completed. The folder layout is different to dev
-    - name: Download DuckDB TPCH Data
-      shell: bash
-      if: inputs.is_dev == 'false' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
-      run: |
-        cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/duckdb/tpch.db ./
-
-    - name: Download DuckDB TPCDS Data
-      shell: bash
-      if: inputs.is_dev == 'false' && inputs.query_set == 'tpcds'
-      run: |
-        cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/duckdb/tpcds.db ./
-
-    - name: Download File Connector TPCH Data
-      shell: bash
-      if: inputs.is_dev == 'false' && (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]')
-      run: |
-        cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/orders/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/part/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/partsupp/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/region/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
-    
-    - name: Download File Connector TPCDS Data
-      shell: bash
-      if: inputs.is_dev == 'false' && inputs.query_set == 'tpcds'
-      run: |
-        cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/customer/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/customer_address/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/customer_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/date_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/household_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/income_band/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/item/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/promotion/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/reason/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/ship_mode/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/warehouse/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/web_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
-        mkdir ./sf0_01
-        cd ./sf0_01
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/call_center.parquet ./call_center.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_page.parquet ./catalog_page.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_returns.parquet ./catalog_returns.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_sales.parquet ./catalog_sales.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer.parquet ./customer.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_address.parquet ./customer_address.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_demographics.parquet ./customer_demographics.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/date_dim.parquet ./date_dim.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/household_demographics.parquet ./household_demographics.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/income_band.parquet ./income_band.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/inventory.parquet ./inventory.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/item.parquet ./item.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/promotion.parquet ./promotion.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/reason.parquet ./reason.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/ship_mode.parquet ./ship_mode.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store.parquet ./store.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_returns.parquet ./store_returns.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_sales.parquet ./store_sales.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/time_dim.parquet ./time_dim.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/warehouse.parquet ./warehouse.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_page.parquet ./web_page.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_returns.parquet ./web_returns.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_sales.parquet ./web_sales.parquet
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_site.parquet ./web_site.parquet
-    
-    - name: Download File Connector ClickBench Data
-      shell: bash
-      if: inputs.is_dev == 'false' && inputs.query_set == 'clickbench'
-      run: |
-        cd /opt/spiced/data
-        mc cp spice-minio/benchmarks/clickbench/hits_partitioned/hits_0.parquet ./
-        mc cp spice-minio/benchmarks/clickbench/hits/hits.parquet ./
