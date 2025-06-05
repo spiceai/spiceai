@@ -21,6 +21,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
+    request::{CacheControl, CacheKeyType},
     search::{
         request::{SearchRequest, SearchRequestAIJson},
         types::to_pretty,
@@ -80,6 +81,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
                 .search_with_cache(
                     &search_request,
                     self.rt.datafusion().search_cache_provider(),
+                    CacheControl::Cache(CacheKeyType::Default),
                 )
                 .await
                 .boxed()?;

@@ -6,7 +6,7 @@ expression: normalize_search_response(response)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "spice.public.cached_search",
+      "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
@@ -16,7 +16,7 @@ expression: normalize_search_response(response)
       "score": 0.94
     },
     {
-      "dataset": "spice.public.cached_search",
+      "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": "Close customers might struggle away different mem"
       },

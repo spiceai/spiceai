@@ -20,12 +20,12 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::search::util::full_text_search_candidates;
+use crate::request::CacheControl;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
     util::{
-        embedding_columns_from_table, find_concrete_table_provider, get_primary_keys_with_overrides,
+        embedding_columns_from_table, find_concrete_table_provider, get_primary_keys_with_overrides,full_text_search_candidates
     },
 };
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
@@ -138,9 +138,15 @@ impl VectorSearch {
         &self,
         req: &SearchRequest,
         cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+        cache_control: CacheControl,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
+            if matches!(cache_control, CacheControl::NoCache) {
+                tracing::trace!("Search cache bypassed");
+                return Ok((self.search(req).await?, CacheStatus::CacheBypass));
+            }
+
             let search_key = SearchKey::from(req.clone());
             let cache_key = CacheKey::Search(&search_key);
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
