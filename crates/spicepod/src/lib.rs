@@ -272,3 +272,24 @@ fn from_definition(
         management: spicepod_definition.management,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_spicepods() {
+        const SPICEPOD_FILES: [&str; 5] = [
+            "./tests/basic_spicepod.yaml",
+            "./tests/spicepod_with_caching.yaml",
+            "./tests/spicepod_with_only_sql_results.yaml",
+            "./tests/spicepod_with_only_search_results.yaml",
+            "./tests/spicepod_with_results_cache.yaml",
+        ];
+
+        for file in SPICEPOD_FILES {
+            let path = PathBuf::from(file);
+            Spicepod::load_exact(&path).expect("Should load spicepod");
+        }
+    }
+}

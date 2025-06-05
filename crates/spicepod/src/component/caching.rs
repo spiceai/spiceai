@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{default_true, is_default};
+use super::{default_true, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,10 +40,10 @@ pub enum HashingAlgorithm {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Caching {
-    #[serde(skip_serializing_if = "is_default")]
-    pub sql_results: SQLResultsCacheConfig,
-    #[serde(skip_serializing_if = "is_default")]
-    pub search_results: CacheConfig,
+    #[serde(skip_serializing_if = "is_default_or_none")]
+    pub sql_results: Option<SQLResultsCacheConfig>,
+    #[serde(skip_serializing_if = "is_default_or_none")]
+    pub search_results: Option<CacheConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -21,6 +21,8 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TableInvalidator;
+use crate::current_time_secs;
+use crate::metrics::CacheMetrics;
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::sql::TableReference;
@@ -31,25 +33,34 @@ use spicepod::component::caching::HashingAlgorithm;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
-    V: Sizeable + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
+    metrics_last_reported_time: AtomicU64,
 }
 
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    std::fmt::Debug for LruCache<V, T>
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> std::fmt::Debug for LruCache<V, T>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruCache")
             .field("cache_size", &self.cache.weighted_size())
             .field("item_count", &self.cache.entry_count())
+            .field(
+                "metrics_reported_last_time",
+                &self.metrics_last_reported_time,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -60,7 +71,7 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
 ///
 /// - If the specified `max_size` cannot be parsed as a valid byte size.
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
-pub fn build_from_config<V: Sizeable + Clone + Send + Sync + 'static>(
+pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
     cache_config: &CacheConfig,
 ) -> Result<Arc<dyn CacheProvider<V> + Send + Sync>> {
     let cache_max_size: u64 = match &cache_config.max_size {
@@ -91,8 +102,10 @@ pub fn build_from_config<V: Sizeable + Clone + Send + Sync + 'static>(
     })
 }
 
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    LruCache<V, T>
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> LruCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
         let cache: Cache<u64, V, T> = Cache::builder()
@@ -122,12 +135,15 @@ impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send 
             cache,
             hasher,
             max_size: cache_max_size,
+            metrics_last_reported_time: AtomicU64::new(0),
         }
     }
 }
 
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    HashProvider for LruCache<V, T>
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> HashProvider for LruCache<V, T>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
@@ -153,19 +169,47 @@ impl<T: BuildHasher + Clone + Send + Sync + 'static> TableInvalidator
 }
 
 #[async_trait]
-impl<V: Sizeable + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    CacheProvider<V> for LruCache<V, T>
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> CacheProvider<V> for LruCache<V, T>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
-        self.cache.get(key).await
+        V::record_request();
+        match self.cache.get(key).await {
+            Some(v) => {
+                V::record_hit();
+                Some(v)
+            }
+            None => None,
+        }
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.cache.insert(*key, value).await;
+
+        let now_seconds = current_time_secs();
+        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+
+            V::record_item_count(self.item_count());
+            V::record_size(self.size_bytes());
+            V::record_max_size(self.max_size() as u64);
+        }
     }
 
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
+
+        let now_seconds = current_time_secs();
+        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+
+            V::record_item_count(self.item_count());
+            V::record_size(self.size_bytes());
+        }
     }
 
     fn size_bytes(&self) -> u64 {

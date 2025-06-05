@@ -218,7 +218,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_search_cache(mut self, search_cache: CacheConfig) -> AppBuilder {
-        self.runtime.caching.search_results = search_cache;
+        self.runtime.caching.search_results = Some(search_cache);
         self
     }
 

@@ -19,6 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use super::request::SearchRequest;
 use super::util::{get_embedding_table, user_tables_with_embeddings};
 use super::{Error, Result};
+use crate::request::CacheControl;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -132,9 +133,15 @@ impl VectorSearch {
         &self,
         req: &SearchRequest,
         cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+        cache_control: CacheControl,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
+            if matches!(cache_control, CacheControl::NoCache) {
+                tracing::trace!("Search cache bypassed");
+                return Ok((self.search(req).await?, CacheStatus::CacheBypass));
+            }
+
             let search_key = SearchKey::from(req.clone());
             let cache_key = CacheKey::Search(&search_key);
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());

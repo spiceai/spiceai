@@ -179,7 +179,7 @@ impl RuntimeBuilder {
                     "The `results_cache` Runtime parameter is deprecated and will be removed in a future release.\nUse `caching.sql_results` instead.\nFor more information, visit: https://spiceai.org/docs/features/caching"
                 );
             });
-            caching_config.sql_results = results_cache.into();
+            caching_config.sql_results = Some(results_cache.into());
         }
 
         let caching = Runtime::init_caching(self.app.as_ref().map(|app| &app.runtime.caching));

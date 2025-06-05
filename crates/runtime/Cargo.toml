@@ -111,12 +111,13 @@ prost = { version = "0.13.1", default-features = false, features = [
 rand = "0.9.1"
 regex.workspace = true
 reqwest.workspace = true
-rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "63ffdaea73ccce4c12f5eb88d1d4e146fa8a8387", optional = true, features = [
+rmcp = { workspace = true, optional = true, features = [
     "client",
+    "reqwest",
     "server",
     "transport-sse-server",
     "transport-io",
-    "transport-sse",
+    "transport-sse-client",
     "transport-child-process",
     "transport-streamable-http-server",
 ] }

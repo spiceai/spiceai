@@ -19,7 +19,6 @@ use std::fmt::Formatter;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -154,7 +153,6 @@ pub struct QueryResultsCacheProvider {
     cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
-    metrics_reported_last_time: AtomicU64,
 
     ignore_schemas: Box<[Box<str>]>,
 }
@@ -165,10 +163,6 @@ impl std::fmt::Debug for QueryResultsCacheProvider {
             .field("cache_max_size", &self.cache_max_size)
             .field("ttl", &self.ttl)
             .field("ignore_schemas", &self.ignore_schemas)
-            .field(
-                "metrics_reported_last_time",
-                &self.metrics_reported_last_time,
-            )
             .finish_non_exhaustive()
     }
 }
@@ -208,11 +202,8 @@ impl QueryResultsCacheProvider {
             },
             cache_max_size,
             ttl,
-            metrics_reported_last_time: AtomicU64::new(0),
             ignore_schemas,
         };
-
-        metrics::MAX_SIZE_BYTES.record(cache_max_size, &[]);
 
         Ok(cache_provider)
     }
@@ -229,12 +220,8 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
-        metrics::REQUESTS.add(1, &[]);
         match self.cache.get_raw_key(&raw_key.as_u64()).await {
-            Some(cached_result) => {
-                metrics::HITS.add(1, &[]);
-                Ok(Some(cached_result))
-            }
+            Some(cached_result) => Ok(Some(cached_result)),
             None => Ok(None),
         }
     }
@@ -256,19 +243,7 @@ impl QueryResultsCacheProvider {
         result: CachedQueryResult,
     ) -> Result<()> {
         let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
-        self.report_size_metrics();
         Ok(res)
-    }
-
-    fn report_size_metrics(&self) {
-        let now_seconds = current_time_secs();
-
-        if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_reported_last_time
-                .store(now_seconds, Ordering::Relaxed);
-            metrics::SIZE_BYTES.record(self.size(), &[]);
-            metrics::ITEMS.record(self.item_count(), &[]);
-        }
     }
 
     /// # Errors
@@ -340,7 +315,7 @@ impl Display for QueryResultsCacheProvider {
     }
 }
 
-fn current_time_secs() -> u64 {
+pub(crate) fn current_time_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
