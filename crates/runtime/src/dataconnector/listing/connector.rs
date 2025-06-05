@@ -279,12 +279,15 @@ pub trait ListingTableConnector: DataConnector {
             .ok()
             .unwrap_or_default();
 
-        let delimiter = params
-            .get(&format!("{delimiter}_delimiter"))
-            .expose()
-            .ok()
-            .and_then(|d| d.chars().next().map(|c| c as u8))
-            .unwrap_or(delimiter.separator());
+        let delimiter = match delimiter {
+            DelimitedFormat::Tsv => delimiter.separator(),
+            DelimitedFormat::Csv => params
+                .get("csv_delimiter")
+                .expose()
+                .ok()
+                .and_then(|d| d.chars().next().map(|c| c as u8))
+                .unwrap_or(delimiter.separator()),
+        };
 
         Ok(Arc::new(
             CsvFormat::default()
