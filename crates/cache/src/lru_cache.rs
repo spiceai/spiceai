@@ -57,6 +57,10 @@ impl<
         f.debug_struct("LruCache")
             .field("cache_size", &self.cache.weighted_size())
             .field("item_count", &self.cache.entry_count())
+            .field(
+                "metrics_reported_last_time",
+                &self.metrics_last_reported_time,
+            )
             .finish_non_exhaustive()
     }
 }
