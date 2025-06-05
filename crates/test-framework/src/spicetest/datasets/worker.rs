@@ -27,6 +27,8 @@ use indicatif::ProgressBar;
 use spiceai::Client as SpiceClient;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 use crate::{
     metrics::QueryStatus,
@@ -38,6 +40,8 @@ use crate::{
 };
 
 use super::EndCondition;
+
+pub(crate) const MAX_RETRIES: usize = 5;
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
@@ -401,6 +405,61 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(MAX_RETRIES))
+            .build();
+
+        let (duration, row_count) = match retry(retry_strategy, || async {
+            match self
+                .execute_query_internal(query, results_snapshot, validate)
+                .await
+            {
+                Ok((duration, row_count)) => Ok((duration, row_count)),
+                Err(e) => {
+                    if is_transient_error(&e) {
+                        Err(RetryError::transient(e))
+                    } else {
+                        Err(RetryError::permanent(e))
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok((duration, row_count)) => (duration, row_count),
+            Err(e) => {
+                eprintln!(
+                    "FAIL - Worker {} - Query '{}' failed: {}",
+                    self.id, query.name, e
+                );
+                query_durations.entry(Arc::clone(&query.name)).or_default();
+                return Err(e);
+            }
+        };
+
+        query_durations
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(duration);
+
+        row_counts
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(row_count);
+
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.inc(1);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_query_internal(
+        &self,
+        query: &Query,
+        results_snapshot: bool,
+        validate: bool,
+    ) -> Result<(Duration, usize)> {
         let query_start = Instant::now();
         let mut spice_client = self.spice_client.lock().await;
         let mut result_stream = spice_client
@@ -416,11 +475,6 @@ impl SpiceTestQueryWorker {
             match batch {
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.name, e
-                    );
-                    query_durations.entry(Arc::clone(&query.name)).or_default();
                     return Err(e.into());
                 }
                 Ok(Some(batch)) => {
@@ -496,20 +550,12 @@ impl SpiceTestQueryWorker {
         }
 
         let duration = query_start.elapsed();
-        query_durations
-            .entry(Arc::clone(&query.name))
-            .or_default()
-            .push(duration);
-
-        row_counts
-            .entry(Arc::clone(&query.name))
-            .or_default()
-            .push(row_count);
-
-        if let Some(pb) = self.progress_bar.as_ref() {
-            pb.inc(1);
-        }
-
-        Ok(())
+        Ok((duration, row_count))
     }
+}
+
+pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
+    e.to_string()
+        .to_lowercase()
+        .contains("connection is reset by the server. please retry the request.")
 }

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::spicetest::datasets::{MAX_RETRIES, is_transient_error};
 use anyhow::{Context, Result};
 use arrow::{
     array::ArrayRef,
@@ -28,6 +29,8 @@ use futures::StreamExt;
 use spiceai::Client as SpiceClient;
 use tokio::sync::Mutex;
 use tonic::{async_trait, transport::Channel};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 /// Query a flight client and return the result as a vector of record batches
 ///
@@ -35,6 +38,30 @@ use tonic::{async_trait, transport::Channel};
 ///
 /// - If the flight client fails to query
 pub async fn query_to_batches(
+    spice_client: Arc<Mutex<SpiceClient>>,
+    sql: &str,
+    params: Option<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let retry_strategy = FibonacciBackoffBuilder::new()
+        .max_retries(Some(MAX_RETRIES))
+        .build();
+
+    retry(retry_strategy, || async {
+        match query_to_batches_internal(Arc::clone(&spice_client), sql, params.clone()).await {
+            Ok(batches) => Ok(batches),
+            Err(e) => {
+                if is_transient_error(&e) {
+                    Err(RetryError::transient(e))
+                } else {
+                    Err(RetryError::permanent(e))
+                }
+            }
+        }
+    })
+    .await
+}
+
+pub async fn query_to_batches_internal(
     spice_client: Arc<Mutex<SpiceClient>>,
     sql: &str,
     params: Option<RecordBatch>,

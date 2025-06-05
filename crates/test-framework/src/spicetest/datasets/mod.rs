@@ -34,7 +34,9 @@ use tokio::task::JoinHandle;
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod worker;
-pub(crate) use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
+pub(crate) use worker::{
+    MAX_RETRIES, SpiceTestQueryWorker, SpiceTestQueryWorkerResult, is_transient_error,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum EndCondition {
