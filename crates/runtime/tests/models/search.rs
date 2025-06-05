@@ -499,7 +499,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "text_search_basic",
                 body: json!({
-                    "text": "new patient",
+                    "text": "Patient",
                     "limit": 2,
                     "datasets": ["item"],
                     "additional_columns": ["i_color", "i_item_id"],
@@ -508,10 +508,10 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "text_search_with_extra_columns_and_where",
                 body: json!({
-                    "text": "friends",
-                    "datasets": ["catalog_page_with_chunking"],
-                    "additional_columns": ["cp_department"],
-                    "where": "cp_catalog_number>0",
+                    "text": "Patient",
+                    "datasets": ["item"],
+                    "additional_columns": ["i_color", "i_item_id"],
+                    "where": "i_color='smoke'",
                     "limit": 1,
                 }),
             },
@@ -553,28 +553,28 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         AppBuilder::new("search_app").with_dataset(ds).build(),
         vec![
             SearchTestCase {
-                name: "multi_column_basic",
+                name: "multi_text_column_basic",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "general",
                     "limit": 2,
                     "datasets": ["catalog_page"]
                 }),
             },
             SearchTestCase {
-                name: "multi_column_additional",
+                name: "multi_text_column_additional",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "general",
                     "limit": 2,
                     "datasets": ["catalog_page"],
                     "additional_columns": ["cp_catalog_number"],
                 }),
             },
             SearchTestCase {
-                name: "multi_column_where",
+                name: "multi_text_column_where",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "patient",
                     "datasets": ["catalog_page"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
+                    "where": "cp_department='DEPARTMENT'"
                 }),
             },
         ],

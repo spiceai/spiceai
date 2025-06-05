@@ -240,7 +240,7 @@ mod tests {
             "key1".to_string(),
             vec![
                 vec![Value::String("A".into())],
-                vec![Value("B".into())],
+                vec![Value::String("B".into())],
                 vec![],
             ],
         );
@@ -253,11 +253,19 @@ mod tests {
         let mut column_format = HashMap::new();
         column_format.insert(
             "key1".to_string(),
-            vec![vec![Value("A".into())], vec![Value("B".into())], vec![]],
+            vec![
+                vec![Value::String("A".into())],
+                vec![Value::String("B".into())],
+                vec![],
+            ],
         );
         column_format.insert(
             "key2".to_string(),
-            vec![vec![], vec![Value("C".into())], vec![Value("D".into())]],
+            vec![
+                vec![],
+                vec![Value::String("C".into())],
+                vec![Value::String("D".into())],
+            ],
         );
 
         assert_json_snapshot!(transpose_and_convert(column_format));
@@ -278,7 +286,11 @@ mod tests {
         let mut column_format = HashMap::new();
         column_format.insert(
             "key1".to_string(),
-            vec![vec![Value("A".into())], vec![], vec![Value("B".into())]],
+            vec![
+                vec![Value::String("A".into())],
+                vec![],
+                vec![Value::String("B".into())],
+            ],
         );
 
         assert_json_snapshot!(transpose_and_convert(column_format));
