@@ -14,15 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{CacheProvider, HashProvider};
+use crate::{AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result};
 use async_trait::async_trait;
+use datafusion::sql::TableReference;
 use moka::future::Cache;
+use snafu::ResultExt;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
-    V: Clone + Send + Sync + 'static,
+    V: AsTableRefs + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
@@ -30,7 +33,7 @@ pub struct SimpleCache<
     max_size: u64,
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     std::fmt::Debug for SimpleCache<V, T>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,7 +44,7 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     SimpleCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
@@ -59,8 +62,8 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> HashProvider
-    for SimpleCache<V, T>
+impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+    HashProvider for SimpleCache<V, T>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
@@ -68,7 +71,7 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 }
 
 #[async_trait]
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
+impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
     CacheProvider<V> for SimpleCache<V, T>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
@@ -81,6 +84,20 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
+    }
+
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = match &table_ref {
+            TableReference::Bare { table }
+            | TableReference::Partial { table, .. }
+            | TableReference::Full { table, .. } => table,
+        };
+        let table_name = Arc::clone(table_name);
+        self.cache
+            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .context(FailedToInvalidateCacheSnafu { table_name })?;
+
+        Ok(())
     }
 
     fn size_bytes(&self) -> u64 {

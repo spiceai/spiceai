@@ -955,7 +955,7 @@ impl DataFusion {
 
         accelerated_table_builder.ready_state(dataset.ready_state);
 
-        accelerated_table_builder.cache_provider(self.results_cache_provider());
+        accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
@@ -1457,7 +1457,7 @@ impl DataFusion {
             refresh,
         );
         builder.initial_load_complete(initial_load_complete);
-        builder.cache_provider(self.results_cache_provider());
+        builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(DatasetCheckpoint::try_new(view).await.ok());
         builder.refresh_on_startup(acceleration.refresh_on_startup);
         builder.ready_state(view.ready_state);

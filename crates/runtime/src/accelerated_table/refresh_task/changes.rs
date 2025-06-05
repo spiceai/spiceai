@@ -20,7 +20,7 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
@@ -66,7 +66,7 @@ impl RefreshTask {
         &self,
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        caching: Option<Arc<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
@@ -92,7 +92,7 @@ impl RefreshTask {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider) = &cache_provider {
+                            if let Some(cache_provider) = caching.as_ref() {
                                 if let Err(e) =
                                     cache_provider.invalidate_for_table(dataset_name.clone())
                                 {

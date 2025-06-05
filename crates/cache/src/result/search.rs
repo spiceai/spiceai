@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 
-use crate::Sizeable;
+use crate::{AsTableRefs, Sizeable};
 
 #[derive(Clone)]
 pub struct CachedAggregationResult {
@@ -54,6 +54,12 @@ impl CachedAggregationResult {
 #[derive(Clone)]
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+}
+
+impl AsTableRefs for CachedSearchResult {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::new(self.results.keys().cloned().collect())
+    }
 }
 
 impl Sizeable for CachedSearchResult {
