@@ -212,8 +212,6 @@ impl QueryResultsCacheProvider {
             ignore_schemas,
         };
 
-        metrics::MAX_SIZE_BYTES.record(cache_max_size, &[]);
-
         Ok(cache_provider)
     }
 
@@ -229,10 +227,10 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
-        metrics::REQUESTS.add(1, &[]);
+        metrics::sql_results::REQUESTS.add(1, &[]);
         match self.cache.get_raw_key(&raw_key.as_u64()).await {
             Some(cached_result) => {
-                metrics::HITS.add(1, &[]);
+                metrics::sql_results::HITS.add(1, &[]);
                 Ok(Some(cached_result))
             }
             None => Ok(None),
@@ -266,8 +264,8 @@ impl QueryResultsCacheProvider {
         if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
             self.metrics_reported_last_time
                 .store(now_seconds, Ordering::Relaxed);
-            metrics::SIZE_BYTES.record(self.size(), &[]);
-            metrics::ITEMS.record(self.item_count(), &[]);
+            metrics::sql_results::SIZE_BYTES.record(self.size(), &[]);
+            metrics::sql_results::ITEMS.record(self.item_count(), &[]);
         }
     }
 
@@ -340,7 +338,7 @@ impl Display for QueryResultsCacheProvider {
     }
 }
 
-fn current_time_secs() -> u64 {
+pub(crate) fn current_time_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
