@@ -27,7 +27,6 @@ use arrow_flight::{decode::FlightRecordBatchStream, sql::client::FlightSqlServic
 use flight_client::FlightClient;
 use futures::StreamExt;
 use spiceai::Client as SpiceClient;
-use tokio::sync::Mutex;
 use tonic::{async_trait, transport::Channel};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -38,7 +37,7 @@ use util::{RetryError, retry};
 ///
 /// - If the flight client fails to query
 pub async fn query_to_batches(
-    spice_client: Arc<Mutex<SpiceClient>>,
+    spice_client: Arc<SpiceClient>,
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
@@ -62,11 +61,10 @@ pub async fn query_to_batches(
 }
 
 pub async fn query_to_batches_internal(
-    spice_client: Arc<Mutex<SpiceClient>>,
+    spice_client: Arc<SpiceClient>,
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut spice_client = spice_client.lock().await;
     let mut stream = spice_client
         .query_with_params(sql, params)
         .await

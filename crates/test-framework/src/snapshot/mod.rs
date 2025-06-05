@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::{panic, sync::Arc};
-use tokio::sync::Mutex;
 
 use crate::{flight::query_to_batches, queries::Query};
 use spiceai::Client as SpiceClient;
@@ -25,7 +24,7 @@ fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
 }
 
 pub async fn record_explain_plan(
-    spice_client: Arc<Mutex<SpiceClient>>,
+    spice_client: Arc<SpiceClient>,
     name: &str,
     query: &Query,
     scale_factor: f64,

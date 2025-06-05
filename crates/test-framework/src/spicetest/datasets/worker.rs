@@ -25,7 +25,6 @@ use anyhow::{Result, anyhow};
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use spiceai::Client as SpiceClient;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -53,7 +52,7 @@ pub(crate) struct SpiceTestQueryWorker {
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
-    spice_client: Arc<Mutex<SpiceClient>>,
+    spice_client: Arc<SpiceClient>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -99,7 +98,7 @@ impl SpiceTestQueryWorker {
             id,
             query_set,
             end_condition,
-            spice_client: Arc::new(Mutex::new(spice_client)),
+            spice_client: Arc::new(spice_client),
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
@@ -461,8 +460,8 @@ impl SpiceTestQueryWorker {
         validate: bool,
     ) -> Result<(Duration, usize)> {
         let query_start = Instant::now();
-        let mut spice_client = self.spice_client.lock().await;
-        let mut result_stream = spice_client
+        let mut result_stream = self
+            .spice_client
             .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await
             .map_err(|e| anyhow!("{e}"))?;
