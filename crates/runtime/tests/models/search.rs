@@ -555,7 +555,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             }, Some(bypass_headers)).await?;
             let duration_cached = start.elapsed().as_secs_f64();
 
-            assert!(duration >= duration_cached*0.7 || duration <= duration_cached*1.3, 
+            assert!(duration >= duration_cached*0.7 || duration <= duration_cached*1.3,
                 "Cache bypass did not return similar performance. First: {duration:?}, Second: {duration_cached:?}");
             Ok(())
         })
