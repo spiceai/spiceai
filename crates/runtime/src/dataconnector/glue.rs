@@ -309,16 +309,30 @@ async fn create_s3_provider(
         });
     };
 
+    match input_format {
+        InputFormat::Csv => {
+            // If the table specifies a delimiter, pass it down to the data connector
+            // as a parameter
+            if let Some(delimiter) = table
+                .parameters()
+                .and_then(|params| params.get("delimiter"))
+            {
+                params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
+            }
+        }
+        InputFormat::Parquet => {
+            dataset
+                .params
+                .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+        }
+        InputFormat::Iceberg => {}
+    }
+
     // Add required file_format parameter for S3
     params.insert("file_format".into(), input_format.file_format().into());
     let s3 = S3 { params };
 
     dataset.from = from;
-    if matches!(input_format, InputFormat::Parquet) {
-        dataset
-            .params
-            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
-    }
 
     s3.read_provider(&dataset).await
 }
