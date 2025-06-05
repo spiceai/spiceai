@@ -208,9 +208,16 @@ impl CandidateGeneration for FullTextSearch {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
 
-        if !addition_projection.is_empty() {
-            return Err(Error::UnsupportedAdditionalColumnsError)
-                .context(GenerationTextSearchSnafu)?;
+        let cols = self.all_columns();
+        for proj in addition_projection {
+            let is_supported = match proj {
+                Expr::Identifier(Ident { value, .. }) => cols.contains(value),
+                _ => false,
+            };
+            if !is_supported {
+                return Err(Error::UnsupportedAdditionalColumnsError)
+                    .context(GenerationTextSearchSnafu)?;
+            }
         }
 
         let hits = self

@@ -451,26 +451,26 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
         app,
         vec![
             SearchTestCase {
-                name: "multi_column_basic",
+                name: "multi_column_hybrid_basic",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "department",
                     "limit": 2,
                     "datasets": ["multi_column_hybrid_search"]
                 }),
             },
             SearchTestCase {
-                name: "multi_column_additional",
+                name: "multi_column_hybrid_additional",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "patient",
                     "limit": 2,
                     "datasets": ["multi_column_hybrid_search"],
                     "additional_columns": ["cp_catalog_number"],
                 }),
             },
             SearchTestCase {
-                name: "multi_column_where",
+                name: "multi_column_hybrid_where",
                 body: json!({
-                    "text": "basic patient",
+                    "text": "general",
                     "datasets": ["multi_column_hybrid_search"],
                     "where": "cp_catalog_page_sk % 2 = 1"
                 }),

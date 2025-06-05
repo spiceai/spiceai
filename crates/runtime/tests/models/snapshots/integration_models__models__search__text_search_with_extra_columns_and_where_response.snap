@@ -9,12 +9,14 @@ snapshot_kind: text
     {
       "data": {
         "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA",
-        "i_item_sk": 19
+        "i_item_id": "AAAAAAAADBAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": "Patient"
+      },
+      "primary_key": {
+        "i_item_sk": 19
       },
       "score": 10.071
     }

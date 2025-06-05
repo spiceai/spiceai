@@ -9,24 +9,28 @@ snapshot_kind: text
     {
       "data": {
         "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA",
-        "i_item_sk": 19
+        "i_item_id": "AAAAAAAADBAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": "Patient"
+      },
+      "primary_key": {
+        "i_item_sk": 19
       },
       "score": 10.071
     },
     {
       "data": {
         "i_color": "green",
-        "i_item_id": "AAAAAAAALNABAAAA",
-        "i_item_sk": 4315
+        "i_item_id": "AAAAAAAALNABAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": "Necessary patient"
+      },
+      "primary_key": {
+        "i_item_sk": 4315
       },
       "score": 9.641
     }

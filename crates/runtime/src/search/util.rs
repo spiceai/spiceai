@@ -101,7 +101,7 @@ pub async fn parse_explicit_primary_keys(
 
                 let primary_keys = match (pks_from_columns, pks_from_embeddings) {
                     (Some(pks), None) | (None, Some(pks)) => pks,
-                    (Some(pks), _) => {
+                    (Some(pks), Some(_)) => {
                         tracing::warn!("Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.", d.name);
                         pks
                     }

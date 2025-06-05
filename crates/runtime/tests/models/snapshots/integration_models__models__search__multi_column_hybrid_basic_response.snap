@@ -7,10 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "multi_column_search",
+      "dataset": "multi_column_hybrid_search",
       "matches": {
         "cp_department": "DEPARTMENT",
         "cp_description": "In general basic characters welcome. Clearly lively friends con"
@@ -21,15 +18,12 @@ snapshot_kind: text
       "score": 0.032
     },
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "multi_column_search",
+      "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 2
       },
       "score": 0.016
     }

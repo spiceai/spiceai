@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: e.to_string()
+snapshot_kind: text
+---
+HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: Ambiguous reference to unqualified field cp_catalog_page_sk

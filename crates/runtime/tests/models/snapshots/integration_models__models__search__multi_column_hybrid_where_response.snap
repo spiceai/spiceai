@@ -7,31 +7,34 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "multi_column_search",
+      "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
         "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032
+      "score": 0.016
     },
     {
-      "data": {
-        "cp_catalog_number": 1
+      "dataset": "multi_column_hybrid_search",
+      "matches": {
+        "cp_description": "Earlier different differences get just to a methods; masses inclu"
       },
-      "dataset": "multi_column_search",
+      "primary_key": {
+        "cp_catalog_page_sk": 3
+      },
+      "score": 0.016
+    },
+    {
+      "dataset": "multi_column_hybrid_search",
       "matches": {
         "cp_description": "Close customers might struggle away different mem"
       },
       "primary_key": {
         "cp_catalog_page_sk": 15
       },
-      "score": 0.016
+      "score": 0.015
     }
   ]
 }
