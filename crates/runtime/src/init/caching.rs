@@ -18,7 +18,9 @@ use std::{sync::Arc, time::Duration};
 
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, SimpleCache, lru_cache};
 use datafusion::logical_expr::LogicalPlan;
-use spicepod::component::caching::{Caching as CachingConfig, HashingAlgorithm};
+use spicepod::component::caching::{
+    CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
+};
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
@@ -33,9 +35,18 @@ impl Runtime {
 
         let mut caching = Caching::new();
 
-        if cache_config.sql_results.inner.enabled {
+        let sql_results_config = cache_config
+            .sql_results
+            .clone()
+            .unwrap_or(SQLResultsCacheConfig::default());
+        let search_results_config = cache_config
+            .search_results
+            .clone()
+            .unwrap_or(CacheConfig::default());
+
+        if sql_results_config.inner.enabled {
             match QueryResultsCacheProvider::try_new(
-                &cache_config.sql_results,
+                &sql_results_config,
                 Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
             ) {
                 Ok(cache_provider) => {
@@ -54,7 +65,7 @@ impl Runtime {
 
         // TODO: logical plan cache needs its own configuration?
         let plan_cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync> =
-            match cache_config.sql_results.inner.hashing_algorithm {
+            match sql_results_config.inner.hashing_algorithm {
                 HashingAlgorithm::Siphash => Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
@@ -69,9 +80,8 @@ impl Runtime {
 
         caching = caching.with_plans_cache(plan_cache_provider);
 
-        if cache_config.search_results.enabled {
-            let config = &cache_config.search_results;
-            match lru_cache::build_from_config(config) {
+        if search_results_config.enabled {
+            match lru_cache::build_from_config(&search_results_config) {
                 Ok(cache_provider) => {
                     crate::in_tracing_context(|| {
                         tracing::info!("Initialized search results cache;"); // TODO: update to include max size and ttl. https://github.com/spiceai/spiceai/issues/6019
