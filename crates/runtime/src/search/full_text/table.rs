@@ -200,7 +200,6 @@ impl TableWithFullText {
         })?;
         let docs = parse_json_array(&schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        tracing::warn!("'{}' documents in index", docs.len());
 
         let index = tantivy::Index::create_in_ram(schema);
         let mut index_writer: tantivy::IndexWriter = index
@@ -213,7 +212,7 @@ impl TableWithFullText {
         index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        tracing::warn!("documents committed to index");
+
         Ok(Arc::new(index))
     }
 
