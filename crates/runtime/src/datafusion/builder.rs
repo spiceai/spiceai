@@ -21,7 +21,8 @@ use std::{
 };
 
 use crate::{
-    dataaccelerator::AcceleratorEngineRegistry, object_store_registry::SpiceObjectStoreRegistry,
+    dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA,
+    object_store_registry::SpiceObjectStoreRegistry,
 };
 use cache::Caching;
 use datafusion::{
@@ -213,7 +214,14 @@ impl DataFusionBuilder {
         match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
             Ok(_) => {}
             Err(e) => {
-                panic!("Unable to register spice runtime schema: {e}");
+                panic!("Unable to register spice metadata schema: {e}");
+            }
+        }
+
+        match catalog.register_schema(SPICE_SCP_SCHEMA, Arc::new(SpiceSchemaProvider::new())) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice cloud platform schema: {e}");
             }
         }
 
