@@ -45,11 +45,17 @@ pub struct SearchTestCase {
     pub body: serde_json::Value,
 }
 
-pub async fn run_search_test(base_url: &str, ts: &SearchTestCase) -> Result<(), anyhow::Error> {
+pub async fn run_search_test(
+    base_url: &str,
+    ts: &SearchTestCase,
+    extra_headers: Option<HeaderMap>,
+) -> Result<(), anyhow::Error> {
     tracing::info!("Running test cases {}", ts.name);
 
     // Call /v1/search, check response
     let mut headers = HeaderMap::new();
+    headers.extend(extra_headers.unwrap_or_default());
+
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     match http_post(
@@ -177,7 +183,7 @@ pub(crate) async fn run_search(
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             for ts in test_cases {
-                run_search_test(http_base_url.as_str(), &ts).await?;
+                run_search_test(http_base_url.as_str(), &ts, None).await?;
             }
             Ok(())
         })
@@ -475,7 +481,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                     "text": "new patient",
                     "limit": 2,
                 }),
-            }).await?;
+            }, None).await?;
             let duration = start.elapsed();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
@@ -484,9 +490,73 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
                     "text": "new patient",
                     "limit": 2,
                 }),
-            }).await?;
+            }, None).await?;
             let duration_cached = start.elapsed();
             assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
+    let chunked = catalog_page_tpch_dataset_w_embeddings(
+        "cached_search_bypass",
+        "hf_minilm",
+        Some(vec!["cp_catalog_page_sk".to_string()]),
+        Some(EmbeddingChunkConfig {
+            enabled: true,
+            target_chunk_size: 512,
+            overlap_size: 128,
+            trim_whitespace: false,
+        }),
+    );
+
+    let cache_config = CacheConfig {
+        enabled: true,
+        item_ttl: Some("10s".to_string()),
+        ..Default::default()
+    };
+
+    let app = AppBuilder::new("test_search_with_cache_bypass")
+        .with_dataset(chunked)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .with_search_cache(cache_config)
+        .build();
+
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let start = Instant::now();
+
+            let mut bypass_headers = HeaderMap::new();
+            bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
+            run_search_test(http_base_url.as_str(), &SearchTestCase {
+                name: "pre_cache",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                }),
+            }, Some(bypass_headers.clone())).await?;
+            let duration = start.elapsed().as_secs_f64();
+            let start = Instant::now();
+            run_search_test(http_base_url.as_str(), &SearchTestCase {
+                name: "post_cache",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                }),
+            }, Some(bypass_headers)).await?;
+            let duration_cached = start.elapsed().as_secs_f64();
+
+            assert!(duration >= duration_cached*0.7 || duration <= duration_cached*1.3,
+                "Cache bypass did not return similar performance. First: {duration:?}, Second: {duration_cached:?}");
             Ok(())
         })
         .await
