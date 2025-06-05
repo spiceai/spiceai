@@ -128,12 +128,12 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                 .summary(Some("Establish an MCP SSE Connection"))
                 .description(Some(
                     "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
-             Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
+             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
                 ))
                 .build(),
         );
         openai.paths.add_path_operation(
-            "/v1/mcp/event",
+            "/v1/mcp/sse",
             vec![HttpMethod::Post],
             Operation::builder()
                 .operation_id(Some("mcp_event"))
