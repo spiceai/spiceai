@@ -276,8 +276,6 @@ mod tests {
         let mut column_format = HashMap::new();
         column_format.insert("key1".to_string(), vec![vec![], vec![], vec![]]);
 
-        let result = transpose_and_convert(column_format);
-
         assert_json_snapshot!(transpose_and_convert(column_format));
     }
 

@@ -76,7 +76,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
         for VectorSearchGenerationResult {
             data: stream,
             derived_from,
-        } in data.into_iter()
+        } in data
         {
             let schema = stream.schema();
             additional_columns.extend(additional_columns_of_schema(
@@ -96,7 +96,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
             let data = collect_batches(stream).await.context(DatafusionSnafu)?;
 
             // If data is empty, don't use.
-            if data.first().map(|rb| rb.num_rows() == 0).unwrap_or(true) {
+            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
                 continue;
             }
 
@@ -158,7 +158,7 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
     };
 
     for s in schemas {
-        if s.fields().len() == 0 {
+        if s.fields().is_empty() {
             // Empty schema -> empty data
             continue;
         }

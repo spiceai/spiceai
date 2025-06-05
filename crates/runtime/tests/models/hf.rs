@@ -22,7 +22,7 @@ use app::AppBuilder;
 use async_openai::types::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, Embeddings},
+    embeddings::Embeddings,
     model::Model,
 };
 

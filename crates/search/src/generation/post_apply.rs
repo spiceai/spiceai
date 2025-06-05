@@ -65,7 +65,7 @@ impl PostApplyCandidateGeneration {
         }
     }
 
-    pub fn with_ctx(mut self, ctx: Arc<SessionContext>) -> Self {
+    #[must_use] pub fn with_ctx(mut self, ctx: Arc<SessionContext>) -> Self {
         self.ctx = Some(ctx);
         self
     }

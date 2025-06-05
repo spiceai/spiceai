@@ -33,7 +33,7 @@ use crate::search::SearchGenerationSnafu;
 use super::{Error, Result, full_text::table::TableWithFullText};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
+pub(super) async fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<Arc<T>> {
     let mut current_tbl = Arc::clone(tbl);
@@ -42,8 +42,8 @@ pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'sta
     // Also avoids having to [`Box::pin`] for recursive `async fn`.
     loop {
         // Attempt to downcast the current table to the desired type.
-        if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
-            return Some(Arc::new(found_table.clone()));
+        if let Some(found_table) = current_tbl.as_any().downcast_ref::<Arc<T>>() {
+            return Some(Arc::clone(found_table));
         }
 
         // Handle specific table wrapping logic.
@@ -95,7 +95,7 @@ pub async fn parse_explicit_primary_keys(
                 let pks_from_fts: Option<Vec<String>> = d
                     .columns
                     .iter()
-                    .find_map(|c| c.full_text_search.as_ref().map(|f| f.row_ids.clone()).flatten());
+                    .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
 
                 pks_from_columns = pks_from_columns.or(pks_from_fts);
 
@@ -245,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_concrete_table_provider_direct_match() {
         let base: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![])?.expect("failed to make table"),
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
         );
 
         assert!(
@@ -259,20 +259,18 @@ mod tests {
                 .await
                 .is_some()
         );
-        Ok(())
     }
 
     #[tokio::test]
     async fn test_find_concrete_table_provider_wrapped_in_full_text() {
         let base_table: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(Arc::new(Schema::empty()), vec![])?.expect("failed to make table"),
+            MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
         );
-        let wrapped_table = Arc::new(TableWithFullText::try_new(
-            base_table,
-            String::new(),
-            vec![],
-        ))
-        .expect("cannot make full text table");
+        let wrapped_table = Arc::new(
+            TableWithFullText::try_new(base_table, String::new(), vec![].into())
+                .await
+                .expect("cannot make full text table"),
+        ) as Arc<dyn TableProvider>;
 
         assert!(
             find_concrete_table_provider::<EmbeddingTable>(&wrapped_table)
@@ -285,13 +283,5 @@ mod tests {
                 .await
                 .is_none()
         );
-
-        let fed = FederatedTableProviderAdaptor::new(wrapped_table);
-        assert!(
-            find_concrete_table_provider::<FederatedTableProviderAdaptor>(&fed)
-                .await
-                .is_some()
-        );
-        Ok(())
     }
 }

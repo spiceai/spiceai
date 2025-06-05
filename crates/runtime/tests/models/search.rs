@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
+use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
 use std::collections::HashMap;
@@ -371,7 +371,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         Some(vec!["cp_catalog_page_sk".to_string()]),
         None,
     );
-    let mut col: &mut Column = ds.columns.first_mut().expect("column to be defined");
+    let col: &mut Column = ds.columns.first_mut().expect("column to be defined");
     col.full_text_search = Some(FullTextSearchConfig {
         enabled: true,
         row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -525,9 +525,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset(
             "catalog_page",
             Some("catalog_page"),
-            Some(format!(
-                "select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20"
-            ).as_str()),
+            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20".to_string().as_str()),
         );
     ds.columns = vec![
         Column {

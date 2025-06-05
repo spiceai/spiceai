@@ -36,7 +36,7 @@ use opentelemetry_sdk::trace::TracerProvider;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
 use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, Embeddings},
+    embeddings::Embeddings,
     model::Model,
 };
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
