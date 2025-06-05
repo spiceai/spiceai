@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{ConfigurationLoadingFailedSnafu, DatabaseName, TableType};
+use super::{ConfigurationLoadingFailedSnafu, DatabaseName};
+use crate::dataconnector::glue::InputFormat;
 use crate::dataconnector::parameters::aws::load_config;
 use crate::{Runtime, dataconnector::parameters::ConnectorParams};
 use aws_sdk_glue::Client;
@@ -102,7 +103,7 @@ impl GlueCatalogState {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|t| {
-                    !matches!(TableType::from(t), TableType::Unsupported)
+                    InputFormat::try_from(t).is_ok()
                         && is_included(self.include.as_ref(), &db.name, t.name())
                 })
                 .collect::<Vec<_>>();

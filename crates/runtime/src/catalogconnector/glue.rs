@@ -30,7 +30,6 @@ use async_trait::async_trait;
 use aws_sdk_glue::{
     error::SdkError,
     operation::{get_databases::GetDatabasesError, get_tables::GetTablesError},
-    types::Table,
 };
 use snafu::prelude::*;
 use std::any::Any;
@@ -109,6 +108,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+type DatabaseName = String;
+
 /// A catalog connector for AWS Glue, providing access to database and table metadata.
 #[derive(Clone)]
 pub struct GlueCatalog {
@@ -142,40 +143,5 @@ impl CatalogConnector for GlueCatalog {
                     source: Box::new(e),
                 })?,
         ))
-    }
-}
-
-type DatabaseName = String;
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum TableType {
-    HiveParquet,
-    Iceberg,
-    Unsupported,
-}
-
-impl TableType {
-    fn from(table: &Table) -> TableType {
-        if table
-            .parameters
-            .as_ref()
-            .and_then(|params| params.get("table_type"))
-            .is_some_and(|value| value.to_lowercase() == "iceberg")
-        {
-            return Self::Iceberg;
-        }
-
-        if table
-            .storage_descriptor
-            .as_ref()
-            .and_then(|sd| sd.input_format.as_ref())
-            .is_some_and(|input_format| {
-                input_format == "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-            })
-        {
-            return Self::HiveParquet;
-        }
-
-        Self::Unsupported
     }
 }
