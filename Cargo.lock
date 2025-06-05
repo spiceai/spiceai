@@ -10936,7 +10936,7 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 [[package]]
 name = "rmcp"
 version = "0.1.5"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=375b55c388758530449a7ed95275eaa9200e191c#375b55c388758530449a7ed95275eaa9200e191c"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=ec71bd9b735c87cc903c33ed643a04bfd661273e#ec71bd9b735c87cc903c33ed643a04bfd661273e"
 dependencies = [
  "axum 0.8.4",
  "base64 0.22.1",
@@ -10968,7 +10968,7 @@ dependencies = [
 [[package]]
 name = "rmcp-macros"
 version = "0.1.5"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=375b55c388758530449a7ed95275eaa9200e191c#375b55c388758530449a7ed95275eaa9200e191c"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=ec71bd9b735c87cc903c33ed643a04bfd661273e#ec71bd9b735c87cc903c33ed643a04bfd661273e"
 dependencies = [
  "proc-macro2",
  "quote",
