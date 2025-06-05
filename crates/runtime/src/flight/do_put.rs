@@ -223,7 +223,11 @@ fn create_response_stream(
                                 }
                             };
 
-                            yield handle_record_batch(new_batch, &batch_tx).await;
+                            // Only report errors; a success message is sent as the final step upon successful write completion
+                            if let Err(err) = handle_record_batch(new_batch, &batch_tx).await {
+                                yield Err(err);
+                                break;
+                            }
                         }
                         None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
@@ -235,7 +239,8 @@ fn create_response_stream(
                                 tracing::error!("Write operation failed. Details included in the response.");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
-                            tracing::trace!("Write operation completed successfully for path: {path}");
+                            tracing::debug!("Write operation completed successfully for dataset: {path}");
+                            yield Ok(PutResult::default())
                             break;
                         }
                         Some(Err(e)) => {
