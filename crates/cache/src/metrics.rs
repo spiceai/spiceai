@@ -21,41 +21,117 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Meter},
 };
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("results_cache"));
+use crate::result::{query::CachedQueryResult, search::CachedSearchResult};
 
-pub(crate) static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("results_cache_size_bytes")
-        .with_description("Size of the cache in bytes.")
-        .with_unit("By")
-        .build()
-});
+macro_rules! generate_cache_metrics {
+    ($prefix:literal, $name:ident) => {
+        pub mod $name {
+            use super::*;
 
-pub(crate) static MAX_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("results_cache_max_size_bytes")
-        .with_description("Maximum allowed size of the cache in bytes.")
-        .with_unit("By")
-        .build()
-});
+            static METER: LazyLock<Meter> =
+                LazyLock::new(|| global::meter(concat!($prefix, "_cache")));
 
-pub(crate) static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("results_cache_requests")
-        .with_description("Number of requests to get a key from the cache.")
-        .build()
-});
+            pub static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_gauge(concat!($prefix, "_cache_size_bytes"))
+                    .with_description("Size of the cache in bytes.")
+                    .with_unit("By")
+                    .build()
+            });
 
-pub(crate) static HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("results_cache_hits")
-        .with_description("Cache hit count.")
-        .build()
-});
+            pub static MAX_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_gauge(concat!($prefix, "_cache_max_size_bytes"))
+                    .with_description("Maximum allowed size of the cache in bytes.")
+                    .with_unit("By")
+                    .build()
+            });
 
-pub(crate) static ITEMS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("results_cache_items_count")
-        .with_description("Number of items currently in the cache.")
-        .build()
-});
+            pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_requests"))
+                    .with_description("Number of requests to get a key from the cache.")
+                    .build()
+            });
+
+            pub static HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_hits"))
+                    .with_description("Cache hit count.")
+                    .build()
+            });
+
+            pub static ITEMS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_gauge(concat!($prefix, "_cache_items_count"))
+                    .with_description("Number of items currently in the cache.")
+                    .build()
+            });
+        }
+    };
+}
+
+generate_cache_metrics!("results", sql_results); // TODO: update the prefix to `sql_results` in v2.0 - https://github.com/spiceai/spiceai/issues/6128
+generate_cache_metrics!("search_results", search_results);
+
+pub trait CacheMetrics: Send + Sync {
+    fn record_hit()
+    where
+        Self: Sized;
+    fn record_request()
+    where
+        Self: Sized;
+    fn record_item_count(count: u64)
+    where
+        Self: Sized;
+    fn record_size(size: u64)
+    where
+        Self: Sized;
+    fn record_max_size(size: u64)
+    where
+        Self: Sized;
+}
+
+impl CacheMetrics for CachedSearchResult {
+    fn record_hit() {
+        search_results::HITS.add(1, &[]);
+    }
+
+    fn record_request() {
+        search_results::REQUESTS.add(1, &[]);
+    }
+
+    fn record_item_count(count: u64) {
+        search_results::ITEMS.record(count, &[]);
+    }
+
+    fn record_size(size: u64) {
+        search_results::SIZE_BYTES.record(size, &[]);
+    }
+
+    fn record_max_size(size: u64) {
+        search_results::MAX_SIZE_BYTES.record(size, &[]);
+    }
+}
+
+impl CacheMetrics for CachedQueryResult {
+    fn record_hit() {
+        sql_results::HITS.add(1, &[]);
+    }
+
+    fn record_request() {
+        sql_results::REQUESTS.add(1, &[]);
+    }
+
+    fn record_item_count(count: u64) {
+        sql_results::ITEMS.record(count, &[]);
+    }
+
+    fn record_size(size: u64) {
+        sql_results::SIZE_BYTES.record(size, &[]);
+    }
+
+    fn record_max_size(size: u64) {
+        sql_results::MAX_SIZE_BYTES.record(size, &[]);
+    }
+}
