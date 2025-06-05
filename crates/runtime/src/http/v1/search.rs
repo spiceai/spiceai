@@ -13,18 +13,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::search::{
-    Error as VectorSearchError,
-    request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
-    types::Match,
-    types::to_matches_sorted,
-    vector_search::VectorSearch,
+use crate::{
+    request::{AsyncMarker, RequestContext},
+    search::{
+        Error as VectorSearchError,
+        request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
+        types::{Match, to_matches_sorted},
+        vector_search::VectorSearch,
+    },
 };
 use axum::{
     Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 
@@ -146,17 +149,30 @@ pub(crate) async fn post(
         }
     };
 
+    let context = RequestContext::current(AsyncMarker::new().await);
     let cache_provider = vs.df.search_cache_provider();
-    match vs.search_with_cache(&search_request, cache_provider).await {
-        Ok((resp, _)) => match to_matches_sorted(resp, search_request.limit).await {
-            Ok(m) => (
-                StatusCode::OK,
-                Json(SearchResponse {
-                    results: m,
-                    duration_ms: start_time.elapsed().as_millis(),
-                }),
-            )
-                .into_response(),
+    match vs
+        .search_with_cache(&search_request, cache_provider, context.cache_control())
+        .await
+    {
+        Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {
+            Ok(m) => {
+                let mut headers = HeaderMap::new();
+
+                if let Some(val) = cache_status.to_header_string().and_then(|v| v.parse().ok()) {
+                    headers.insert("Search-Results-Cache-Status", val);
+                }
+
+                (
+                    StatusCode::OK,
+                    headers,
+                    Json(SearchResponse {
+                        results: m,
+                        duration_ms: start_time.elapsed().as_millis(),
+                    }),
+                )
+                    .into_response()
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {

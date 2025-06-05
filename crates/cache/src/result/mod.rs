@@ -28,3 +28,15 @@ pub enum CacheStatus {
     // The request was a cache miss.
     CacheMiss,
 }
+
+impl CacheStatus {
+    #[must_use]
+    pub fn to_header_string(&self) -> Option<String> {
+        match self {
+            CacheStatus::CacheDisabled => None,
+            CacheStatus::CacheBypass => Some("BYPASS".to_string()),
+            CacheStatus::CacheHit => Some("HIT".to_string()),
+            CacheStatus::CacheMiss => Some("MISS".to_string()),
+        }
+    }
+}
