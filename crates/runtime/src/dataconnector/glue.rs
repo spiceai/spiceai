@@ -232,7 +232,7 @@ impl TryFrom<&Table> for InputFormat {
         Ok(match input_format {
             "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
             "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            input_format => return Err(format!("input format `{input_format} is not supported`")),
+            input_format => return Err(format!("input format `{input_format}` is not supported")),
         })
     }
 }
