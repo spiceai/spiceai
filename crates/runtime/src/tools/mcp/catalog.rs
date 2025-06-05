@@ -25,7 +25,7 @@ use rmcp::{
     },
     serve_client,
     service::RunningService,
-    transport::{SseTransport, TokioChildProcess},
+    transport::{ConfigureCommandExt, SseClientTransport, TokioChildProcess},
 };
 use snafu::ResultExt;
 use std::{sync::Arc, time::Duration};
@@ -96,16 +96,18 @@ impl McpToolCatalog {
             MCPConfig::Stdio { command, args, env } => Ok(McpClient::Stdio(
                 serve_client(
                     (),
-                    TokioChildProcess::new(Command::new(command.as_str()).args(args).envs(env))
-                        .boxed()
-                        .context(UnderlyingTransportSnafu)?,
+                    TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
+                        c.envs(env).args(args);
+                    }))
+                    .boxed()
+                    .context(UnderlyingTransportSnafu)?,
                 )
                 .await
                 .boxed()
                 .context(UnderlyingTransportSnafu)?,
             )),
             MCPConfig::Https { url } => {
-                let transport = SseTransport::start(url.clone())
+                let transport = SseClientTransport::start(url.to_string())
                     .await
                     .boxed()
                     .context(UnderlyingTransportSnafu)?;
