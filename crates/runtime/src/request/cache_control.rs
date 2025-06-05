@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use app::App;
 use http::{HeaderMap, header::CACHE_CONTROL};
+use spicepod::component::caching::SQLResultsCacheConfig;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CacheKeyType {
@@ -35,11 +36,20 @@ impl CacheKeyType {
             return Self::Default;
         };
 
+        let sql_results_config = app
+            .runtime
+            .caching
+            .sql_results
+            .clone()
+            .unwrap_or(SQLResultsCacheConfig::default());
+
+        let cache_key_type = app.runtime.results_cache.as_ref().map_or_else(
+            || sql_results_config.cache_key_type,
+            |c| c.cache_key_type, // while results_cache is being deprecated, it has higher priority than sql_results
+        );
+
         // Mapping from the user-facing `CacheKeyType` to the internal `CacheKeyType`.
-        match app.runtime.results_cache.as_ref().map_or_else(
-            || app.runtime.caching.sql_results.cache_key_type,
-            |c| c.cache_key_type,
-        ) {
+        match cache_key_type {
             spicepod::component::caching::CacheKeyType::Plan => Self::Default,
             spicepod::component::caching::CacheKeyType::Sql => Self::Raw,
         }
