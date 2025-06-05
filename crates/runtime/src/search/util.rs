@@ -226,3 +226,65 @@ pub async fn full_text_search_candidates(
 
     Some(fts.as_candidate_generation().context(SearchGenerationSnafu))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TableWithFullText;
+    use super::*;
+    use arrow_schema::Schema;
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_find_concrete_table_provider_direct_match() {
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![])?.expect("failed to make table"),
+        );
+
+        assert!(
+            find_concrete_table_provider::<EmbeddingTable>(&base)
+                .await
+                .is_none()
+        );
+
+        assert!(
+            find_concrete_table_provider::<MemTable>(&base)
+                .await
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_concrete_table_provider_wrapped_in_full_text() {
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![])?.expect("failed to make table"),
+        );
+        let wrapped_table = Arc::new(TableWithFullText::try_new(
+            base_table,
+            String::new(),
+            vec![],
+        ))
+        .expect("cannot make full text table");
+
+        assert!(
+            find_concrete_table_provider::<EmbeddingTable>(&wrapped_table)
+                .await
+                .is_some()
+        );
+
+        assert!(
+            find_concrete_table_provider::<FederatedTableProviderAdaptor>(&wrapped_table)
+                .await
+                .is_none()
+        );
+
+        let fed = FederatedTableProviderAdaptor::new(wrapped_table);
+        assert!(
+            find_concrete_table_provider::<FederatedTableProviderAdaptor>(&fed)
+                .await
+                .is_some()
+        );
+        Ok(())
+    }
+}

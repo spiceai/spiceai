@@ -225,3 +225,62 @@ fn transpose_and_convert(
 
     rows
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use insta::assert_json_snapshot;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_transpose_and_convert_single_column() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![
+                vec![Value::String("A".into())],
+                vec![Value("B".into())],
+                vec![],
+            ],
+        );
+
+        assert_json_snapshot!(transpose_and_convert(column_format));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_multiple_columns() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![vec![Value("A".into())], vec![Value("B".into())], vec![]],
+        );
+        column_format.insert(
+            "key2".to_string(),
+            vec![vec![], vec![Value("C".into())], vec![Value("D".into())]],
+        );
+
+        assert_json_snapshot!(transpose_and_convert(column_format));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_all_rows_empty() {
+        let mut column_format = HashMap::new();
+        column_format.insert("key1".to_string(), vec![vec![], vec![], vec![]]);
+
+        let result = transpose_and_convert(column_format);
+
+        assert_json_snapshot!(transpose_and_convert(column_format));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_mixed_empty_and_non_empty_rows() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![vec![Value("A".into())], vec![], vec![Value("B".into())]],
+        );
+
+        assert_json_snapshot!(transpose_and_convert(column_format));
+    }
+}
