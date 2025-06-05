@@ -113,7 +113,7 @@ impl DataConnector for DynamoDB {
         .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),
-            message,
+            message: message.to_string(),
         })?;
 
         let client = Client::new(&config);
