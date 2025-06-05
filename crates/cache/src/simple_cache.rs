@@ -27,6 +27,7 @@ pub struct SimpleCache<
 > {
     cache: Cache<u64, V, T>,
     hasher: T,
+    max_size: u64,
 }
 
 impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
@@ -50,7 +51,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        SimpleCache { cache, hasher }
+        SimpleCache {
+            cache,
+            hasher,
+            max_size: cache_max_size,
+        }
     }
 }
 
@@ -84,6 +89,10 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 
     fn item_count(&self) -> u64 {
         self.cache.entry_count()
+    }
+
+    fn max_size(&self) -> usize {
+        usize::try_from(self.max_size).unwrap_or_default()
     }
 
     async fn checkpoint(&self) {

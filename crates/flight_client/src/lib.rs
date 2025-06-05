@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::FlightData;
 use arrow_flight::FlightDescriptor;
@@ -32,6 +33,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
+use futures::Stream;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
 use secrecy::ExposeSecret;
@@ -170,6 +172,9 @@ pub enum Error {
         "No endpoints found. Ensure the endpoint is configured and the server is running."
     ))]
     NoEndpointsFound,
+
+    #[snafu(display("Connection is reset by the server. Please retry the request.\n{source}"))]
+    ConnectionReset { source: TonicStatusError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -509,17 +514,33 @@ impl FlightClient {
     ///
     /// Returns an error if the data cannot be published to the flight source via `DoPut`.
     pub async fn publish(&mut self, dataset_path: &str, data: Vec<RecordBatch>) -> Result<()> {
+        let data_stream = futures::stream::iter(data.into_iter().map(Ok));
+        self.publish_streaming(dataset_path, data_stream).await
+    }
+
+    /// Publishes a stream of data to a dataset via the `DoPut` Flight method.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset_path` - The dataset to publish to.
+    /// * `data_stream` - A stream of [`RecordBatch`] items to publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be published to the flight source via `DoPut`.
+    pub async fn publish_streaming<S>(&mut self, dataset_path: &str, data_stream: S) -> Result<()>
+    where
+        S: Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
+    {
         let token = self.authenticate_basic_token().await?;
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
 
-        let converted_input_stream = futures::stream::iter(data.into_iter().map(Ok));
-
         let flight_data_stream = FlightDataEncoderBuilder::new()
             .with_flight_descriptor(Some(flight_descriptor))
-            .build(converted_input_stream);
+            .build(data_stream.map(|res| res.map_err(FlightError::from)));
 
-        let mut request = Box::pin(flight_data_stream); // Pin to heap
+        let mut request = Box::pin(flight_data_stream);
         let request_stream = futures::stream::poll_fn(move |cx| {
             Poll::Ready(match ready!(request.poll_next_unpin(cx)) {
                 Some(Ok(data)) => Some(data),
@@ -581,8 +602,17 @@ impl FlightClient {
             .clone()
             .handshake(req)
             .await
-            .map_err(TonicStatusError::from)
-            .context(UnableToPerformHandshakeSnafu)?;
+            .map_err(|e| {
+                if is_connection_reset_error(&e) {
+                    Error::ConnectionReset {
+                        source: TonicStatusError::from(e),
+                    }
+                } else {
+                    Error::UnableToPerformHandshake {
+                        source: TonicStatusError::from(e),
+                    }
+                }
+            })?;
         let mut token: Option<Token> = None;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
@@ -611,7 +641,25 @@ impl FlightClient {
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
+    if is_connection_reset_error(&e) {
+        return Error::ConnectionReset {
+            source: TonicStatusError::from(e),
+        };
+    }
     Error::UnableToQuery {
         source: e.message().into(),
     }
+}
+
+pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
+    if error.code() == tonic::Code::Internal {
+        let error_message = error.message().to_lowercase();
+        if error_message.contains("operation was canceled")
+            || error_message.contains("http2 error")
+            || error_message.contains("grpc-status header missing")
+        {
+            return true;
+        }
+    }
+    false
 }

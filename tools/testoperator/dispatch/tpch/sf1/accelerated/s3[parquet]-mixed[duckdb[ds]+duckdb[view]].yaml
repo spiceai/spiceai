@@ -2,14 +2,14 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/s3[parquet]-mixed[duckdb[ds]+duckdb[view]].yaml
     query_set: tpch
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     validate_results: true
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/s3[parquet]-mixed[duckdb[ds]+duckdb[view]].yaml
     query_set: tpch
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
   load:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/s3[parquet]-mixed[duckdb[ds]+duckdb[view]].yaml
     query_set: tpch
-    runner_type: spiceai-runners
+    runner_type: spiceai-dev-runners
     duration: 28800

@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-postgres
 datasets:
-  - from: s3://benchmarks/tpcds_sf1/catalog_sales/
+  - from: s3://benchmarks/tpcds_sf1/catalog_sales.parquet
     name: catalog_sales
     params: &s3_params
       file_format: parquet
@@ -15,101 +15,101 @@ datasets:
       enabled: true
       engine: postgres
       params:
-        pg_host: ${secrets:PG_BENCHMARK_PG_HOST}
-        pg_user: ${secrets:PG_BENCHMARK_PG_USER}
-        pg_pass: ${secrets:PG_BENCHMARK_PG_PASS}
-        pg_db: ${secrets:PG_BENCHMARK_ACC_PG_DBNAME}
-        pg_port: ${secrets:PG_BENCHMARK_PG_PORT}
-        pg_sslmode: ${secrets:PG_BENCHMARK_PG_SSLMODE}
-  - from: s3://benchmarks/tpcds_sf1/catalog_returns/
+        pg_host: ${secrets:POSTGRES_RW_HOST}
+        pg_user: postgres
+        pg_pass: ${secrets:POSTGRES_PASSWORD}
+        pg_db: tpch_s3_accelerated
+        pg_port: 5432
+        pg_sslmode: disable
+  - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
     name: catalog_returns
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/inventory/
+  - from: s3://benchmarks/tpcds_sf1/inventory.parquet
     name: inventory
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/store_sales/
+  - from: s3://benchmarks/tpcds_sf1/store_sales.parquet
     name: store_sales
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/store_returns/
+  - from: s3://benchmarks/tpcds_sf1/store_returns.parquet
     name: store_returns
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/web_sales/
+  - from: s3://benchmarks/tpcds_sf1/web_sales.parquet
     name: web_sales
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/web_returns/
+  - from: s3://benchmarks/tpcds_sf1/web_returns.parquet
     name: web_returns
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/customer/
+  - from: s3://benchmarks/tpcds_sf1/customer.parquet
     name: customer
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/customer_address/
+  - from: s3://benchmarks/tpcds_sf1/customer_address.parquet
     name: customer_address
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/customer_demographics/
+  - from: s3://benchmarks/tpcds_sf1/customer_demographics.parquet
     name: customer_demographics
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/date_dim/
+  - from: s3://benchmarks/tpcds_sf1/date_dim.parquet
     name: date_dim
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/household_demographics/
+  - from: s3://benchmarks/tpcds_sf1/household_demographics.parquet
     name: household_demographics
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/item/
+  - from: s3://benchmarks/tpcds_sf1/item.parquet
     name: item
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/promotion/
+  - from: s3://benchmarks/tpcds_sf1/promotion.parquet
     name: promotion
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/ship_mode/
+  - from: s3://benchmarks/tpcds_sf1/ship_mode.parquet
     name: ship_mode
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/store/
+  - from: s3://benchmarks/tpcds_sf1/store.parquet
     name: store
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/time_dim/
+  - from: s3://benchmarks/tpcds_sf1/time_dim.parquet
     name: time_dim
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/warehouse/
+  - from: s3://benchmarks/tpcds_sf1/warehouse.parquet
     name: warehouse
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/web_page/
+  - from: s3://benchmarks/tpcds_sf1/web_page.parquet
     name: web_page
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/web_site/
+  - from: s3://benchmarks/tpcds_sf1/web_site.parquet
     name: web_site
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/reason/
+  - from: s3://benchmarks/tpcds_sf1/reason.parquet
     name: reason
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/call_center/
+  - from: s3://benchmarks/tpcds_sf1/call_center.parquet
     name: call_center
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/income_band/
+  - from: s3://benchmarks/tpcds_sf1/income_band.parquet
     name: income_band
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpcds_sf1/catalog_page/
+  - from: s3://benchmarks/tpcds_sf1/catalog_page.parquet
     name: catalog_page
     params: *s3_params
     acceleration: *acceleration

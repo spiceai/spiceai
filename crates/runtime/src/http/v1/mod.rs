@@ -241,7 +241,10 @@ fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: CacheStat
         headers.insert("X-Cache", val);
     }
 
-    if let Some(val) = status_to_results_cache_value(results_cache_status) {
+    if let Some(val) = results_cache_status
+        .to_header_string()
+        .and_then(|v| v.parse().ok())
+    {
         headers.insert("Results-Cache-Status", val);
     }
 }
@@ -252,15 +255,6 @@ fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderVa
         CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
-    }
-}
-
-fn status_to_results_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
-    match results_cache_status {
-        CacheStatus::CacheHit => "HIT".parse().ok(),
-        CacheStatus::CacheMiss => "MISS".parse().ok(),
-        CacheStatus::CacheBypass => "BYPASS".parse().ok(),
-        CacheStatus::CacheDisabled => None,
     }
 }
 

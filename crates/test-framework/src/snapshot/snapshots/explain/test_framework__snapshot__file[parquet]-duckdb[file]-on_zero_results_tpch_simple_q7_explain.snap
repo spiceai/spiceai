@@ -14,10 +14,10 @@ description: "Query: tpch_simple_q7"
 |               |   CoalescePartitionsExec: fetch=10                                                  |
 |               |     BytesProcessedExec                                                              |
 |               |       SchemaCastScanExec                                                            |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1       |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
 |               |           FallbackOnZeroResultsScanExec                                             |
 |               |             CoalescePartitionsExec                                                  |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1 |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
 |               |                 DuckSqlExec sql= SELECT "o_orderkey" FROM orders  LIMIT 10          |
 |               |                                                                                     |
 +---------------+-------------------------------------------------------------------------------------+

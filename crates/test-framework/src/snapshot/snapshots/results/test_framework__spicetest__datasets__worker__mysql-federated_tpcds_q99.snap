@@ -5,14 +5,14 @@ description: "Query: tpcds_q99"
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
 | substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name       | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+
-|                                                       | EXPRESS   | Mid Atlantic  | 1208    | 1237       | 1216       | 0           | 0         |
-|                                                       | EXPRESS   | North Midwest | 1247    | 1324       | 1239       | 0           | 1         |
-|                                                       | EXPRESS   | NY Metro      | 1245    | 1301       | 1268       | 0           | 1         |
-|                                                       | LIBRARY   | Mid Atlantic  | 920     | 1003       | 929        | 0           | 0         |
-|                                                       | LIBRARY   | North Midwest | 916     | 926        | 1003       | 0           | 1         |
-|                                                       | LIBRARY   | NY Metro      | 967     | 946        | 917        | 0           | 0         |
-|                                                       | NEXT DAY  | Mid Atlantic  | 1215    | 1249       | 1241       | 0           | 1         |
-|                                                       | NEXT DAY  | North Midwest | 1202    | 1300       | 1253       | 0           | 3         |
-|                                                       | NEXT DAY  | NY Metro      | 1266    | 1257       | 1294       | 0           | 2         |
-|                                                       | OVERNIGHT | Mid Atlantic  | 950     | 927        | 924        | 0           | 0         |
+|                                                       | EXPRESS   | Mid Atlantic  | 1212    | 1223       | 1221       | 0           | 1         |
+|                                                       | EXPRESS   | North Midwest | 1207    | 1252       | 1268       | 0           | 0         |
+|                                                       | EXPRESS   | NY Metro      | 1243    | 1264       | 1305       | 0           | 0         |
+|                                                       | LIBRARY   | Mid Atlantic  | 917     | 979        | 945        | 0           | 2         |
+|                                                       | LIBRARY   | North Midwest | 921     | 954        | 1003       | 0           | 1         |
+|                                                       | LIBRARY   | NY Metro      | 948     | 936        | 923        | 0           | 1         |
+|                                                       | NEXT DAY  | Mid Atlantic  | 1264    | 1282       | 1317       | 0           | 3         |
+|                                                       | NEXT DAY  | North Midwest | 1274    | 1298       | 1279       | 0           | 1         |
+|                                                       | NEXT DAY  | NY Metro      | 1243    | 1284       | 1247       | 0           | 2         |
+|                                                       | OVERNIGHT | Mid Atlantic  | 952     | 906        | 936        | 0           | 3         |
 +-------------------------------------------------------+-----------+---------------+---------+------------+------------+-------------+-----------+

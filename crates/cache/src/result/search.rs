@@ -18,35 +18,35 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 
 use crate::Sizeable;
 
-use super::CacheStatus;
-
-// TODO: Move VectorSearchResult into the `search` crate to prevent circular dependency, to reuse here?
-// https://github.com/spiceai/spiceai/issues/6018
 #[derive(Clone)]
 pub struct CachedAggregationResult {
     pub records: Arc<Vec<RecordBatch>>,
-    pub primary_keys: Vec<Arc<str>>,
-    pub data_columns: Vec<Arc<str>>,
-    pub matches: Arc<HashMap<String, Vec<String>>>,
+    pub primary_keys: Vec<String>,
+    pub data_columns: Vec<String>,
+    pub matches: HashMap<String, Vec<String>>,
+    pub schema: SchemaRef,
 }
 
 impl CachedAggregationResult {
     #[must_use]
     pub fn new(
         records: Arc<Vec<RecordBatch>>,
-        primary_keys: Vec<Arc<str>>,
-        data_columns: Vec<Arc<str>>,
-        matches: Arc<HashMap<String, Vec<String>>>,
+        primary_keys: Vec<String>,
+        data_columns: Vec<String>,
+        matches: HashMap<String, Vec<String>>,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             records,
             primary_keys,
             data_columns,
             matches,
+            schema,
         }
     }
 }
@@ -54,7 +54,6 @@ impl CachedAggregationResult {
 #[derive(Clone)]
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
-    pub cache_status: CacheStatus,
 }
 
 impl Sizeable for CachedSearchResult {
@@ -67,8 +66,8 @@ impl Sizeable for CachedSearchResult {
                     .iter()
                     .map(arrow::array::RecordBatch::get_array_memory_size)
                     .sum::<usize>()
-                    + (result.primary_keys.len() * std::mem::size_of::<Arc<str>>())
-                    + (result.data_columns.len() * std::mem::size_of::<Arc<str>>())
+                    + (result.primary_keys.len() * std::mem::size_of::<String>())
+                    + (result.data_columns.len() * std::mem::size_of::<String>())
                     + result
                         .matches
                         .iter()

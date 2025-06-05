@@ -69,7 +69,7 @@ jobs:
       matrix:
         target:
           - name: 'Linux x64'
-            builder: 'spiceai-runners'
+            builder: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
           - name: 'macOS aarch64 (Apple Silicon)'
@@ -78,7 +78,7 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
