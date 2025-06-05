@@ -7,23 +7,22 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "multi_column_search",
+      "dataset": "hybrid_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032
+      "score": 0.016
     },
     {
-      "dataset": "multi_column_search",
+      "dataset": "hybrid_column_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": "Levels will attend ago general, basic ideas. Physical, "
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 3404
       },
       "score": 0.016
     }

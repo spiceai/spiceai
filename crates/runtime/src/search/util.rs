@@ -84,15 +84,22 @@ pub async fn parse_explicit_primary_keys(
         app.datasets
             .iter()
             .filter_map(|d| {
-                let primary_keys_from_embeddings: Option<Vec<String>> =
+                let pks_from_embeddings: Option<Vec<String>> =
                     d.embeddings.iter().find_map(|e| e.primary_keys.clone());
 
-                let primary_keys_from_columns: Option<Vec<String>> = d
+                let mut pks_from_columns: Option<Vec<String>> = d
                     .columns
                     .iter()
                     .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
 
-                let primary_keys = match (primary_keys_from_columns, primary_keys_from_embeddings) {
+                let pks_from_fts: Option<Vec<String>> = d
+                    .columns
+                    .iter()
+                    .find_map(|c| c.full_text_search.as_ref().map(|f| f.row_ids.clone()).flatten());
+
+                pks_from_columns = pks_from_columns.or(pks_from_fts);
+
+                let primary_keys = match (pks_from_columns, pks_from_embeddings) {
                     (Some(pks), None) | (None, Some(pks)) => pks,
                     (Some(pks), Some(_)) => {
                         tracing::warn!("Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.", d.name);

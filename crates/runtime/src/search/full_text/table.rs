@@ -19,10 +19,11 @@ use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{Expr, SessionContext};
+use datafusion::prelude::{Expr, SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
@@ -34,6 +35,7 @@ use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
 
 use crate::datafusion::query::write_to_json_string;
+use crate::object_store_registry::SpiceObjectStoreRegistry;
 use crate::search::util::get_primary_keys;
 
 #[derive(Clone)]
@@ -164,12 +166,21 @@ impl TableWithFullText {
         Self::create_and_init_index(base_table, schema).await
     }
 
+    fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
+        let env = RuntimeEnvBuilder::default()
+            .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+            .build()?;
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::default(), Arc::new(env));
+
+        Ok(Arc::new(ctx))
+    }
+
     async fn create_and_init_index(
         table: Arc<dyn TableProvider>,
         schema: tantivy::schema::Schema,
     ) -> Result<Arc<tantivy::Index>, Error> {
         let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
-        let ctx = SessionContext::new();
+        let ctx = Self::new_ctx().context(FailedToRetrieveDataFromSourceSnafu)?;
         let _ = ctx
             .register_table("temp_table", table)
             .context(FailedToRetrieveDataFromSourceSnafu)?;
@@ -216,11 +227,18 @@ impl TableWithFullText {
         )
         .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
-        Ok(Arc::new(PostApplyCandidateGeneration::new(
+        let post_apply = PostApplyCandidateGeneration::new(
             Arc::clone(&self.base_table),
             Arc::new(base),
             self.primary_key.clone(),
-        )))
+        )
+        .with_ctx(
+            Self::new_ctx()
+                .boxed()
+                .map_err(|source| search::generation::Error::InternalError { source })?,
+        );
+
+        Ok(Arc::new(post_apply))
     }
 }
 
