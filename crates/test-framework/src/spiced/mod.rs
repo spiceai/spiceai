@@ -21,8 +21,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use flight_client::{Credentials, FlightClient};
+use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
 use tempfile::TempDir;
@@ -199,6 +200,36 @@ impl SpicedInstance {
             FlightClient::try_new("http://localhost:50051".into(), credentials, Some(metadata))
                 .await?,
         )
+    }
+
+    /// Get a spice client for the spiced instance
+    ///
+    /// # Errors
+    ///
+    /// - If the spice client fails to be created
+    pub async fn spice_client(
+        &self,
+        api_key: Option<String>,
+        disable_caching: bool,
+    ) -> Result<SpiceClient> {
+        let mut spice_client = ClientBuilder::new();
+
+        if let Some(key) = api_key {
+            spice_client = spice_client.api_key(key.as_str());
+        }
+
+        if disable_caching {
+            spice_client = spice_client.cache_control("no-cache");
+        }
+
+        let spice_client = spice_client
+            .flight_url("http://localhost:50051")
+            .user_agent("spice-test-framework/1.0")
+            .build()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(spice_client)
     }
 
     /// Get an http client for the spiced instance

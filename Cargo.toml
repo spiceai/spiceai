@@ -171,6 +171,7 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 x509-certificate = "0.23.1"
+spiceai = { path = "../spice-rs" }
 
 [profile.release-lto]
 inherits = "release"

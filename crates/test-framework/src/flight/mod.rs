@@ -25,6 +25,8 @@ use arrow::{
 use arrow_flight::{decode::FlightRecordBatchStream, sql::client::FlightSqlServiceClient};
 use flight_client::FlightClient;
 use futures::StreamExt;
+use spiceai::Client as SpiceClient;
+use tokio::sync::Mutex;
 use tonic::{async_trait, transport::Channel};
 
 /// Query a flight client and return the result as a vector of record batches
@@ -33,11 +35,15 @@ use tonic::{async_trait, transport::Channel};
 ///
 /// - If the flight client fails to query
 pub async fn query_to_batches(
-    client: &FlightClient,
+    spice_client: Arc<Mutex<SpiceClient>>,
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = client.query_with_params(sql, params).await?;
+    let mut spice_client = spice_client.lock().await;
+    let mut stream = spice_client
+        .query_with_params(sql, params)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
         batches.push(batch?);

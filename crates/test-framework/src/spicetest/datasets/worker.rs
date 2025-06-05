@@ -21,14 +21,14 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::Result;
-use flight_client::FlightClient;
+use anyhow::{Result, anyhow};
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
+use spiceai::Client as SpiceClient;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::{
-    flight::ExtendedTestFlightClient,
     metrics::QueryStatus,
     queries::{
         Query,
@@ -43,13 +43,13 @@ pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
     end_condition: EndCondition,
-    flight_client: FlightClient,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
     name: String,
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
+    spice_client: Arc<Mutex<SpiceClient>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -88,14 +88,14 @@ impl SpiceTestQueryWorker {
         id: usize,
         query_set: Vec<Query>,
         end_condition: EndCondition,
-        flight_client: FlightClient,
+        spice_client: SpiceClient,
         name: String,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            flight_client,
+            spice_client: Arc::new(Mutex::new(spice_client)),
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
@@ -223,7 +223,7 @@ impl SpiceTestQueryWorker {
                         if self.explain_plan_snapshot && self.id == 0 {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                &self.flight_client,
+                                Arc::clone(&self.spice_client),
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -402,10 +402,11 @@ impl SpiceTestQueryWorker {
         validate: bool,
     ) -> Result<()> {
         let query_start = Instant::now();
-        let mut result_stream = self
-            .flight_client
+        let mut spice_client = self.spice_client.lock().await;
+        let mut result_stream = spice_client
             .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
-            .await?;
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];
