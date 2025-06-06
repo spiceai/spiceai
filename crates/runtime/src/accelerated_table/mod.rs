@@ -621,6 +621,7 @@ impl AcceleratedTable {
             interval_timer.tick().await;
 
             if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
+                println!("running retention check");
                 let ctx = SessionContext::new();
 
                 let start = SystemTime::now() - retention_period;
@@ -679,6 +680,7 @@ impl AcceleratedTable {
 
                             if num_records > 0 {
                                 if let Some(cache_provider) = caching.as_ref() {
+                                    println!("invalidating cache in retention check");
                                     if let Err(e) =
                                         cache_provider.invalidate_for_table(dataset_name.clone())
                                     {
@@ -705,6 +707,7 @@ impl AcceleratedTable {
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
         for handler in self.handlers.drain(..) {
+            println!("dropping handle for accelerated table");
             handler.abort();
         }
     }
