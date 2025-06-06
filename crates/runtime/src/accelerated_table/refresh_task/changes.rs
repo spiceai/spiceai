@@ -20,7 +20,7 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
-use cache::QueryResultsCacheProvider;
+use cache::{Caching, QueryResultsCacheProvider};
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
@@ -66,7 +66,7 @@ impl RefreshTask {
         &self,
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        cache_provider: Option<Arc<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {

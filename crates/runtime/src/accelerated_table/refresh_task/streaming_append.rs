@@ -20,7 +20,7 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::status;
 use async_stream::stream;
-use cache::QueryResultsCacheProvider;
+use cache::{Caching, QueryResultsCacheProvider};
 use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
@@ -32,7 +32,7 @@ use tokio::sync::{Notify, RwLock};
 impl RefreshTask {
     pub async fn start_streaming_append(
         &self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        cache_provider: Option<Arc<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         refresh: Arc<RwLock<Refresh>>,
         initial_load_completed: Arc<AtomicBool>,

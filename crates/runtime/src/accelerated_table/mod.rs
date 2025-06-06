@@ -28,7 +28,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::QueryResultsCacheProvider;
+use cache::{Caching, QueryResultsCacheProvider};
 use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::catalog::Session;
@@ -235,7 +235,7 @@ pub struct Builder {
     zero_results_action: ZeroResultsAction,
     refresh_on_startup: RefreshOnStartup,
     ready_state: ReadyState,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    cache_provider: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
@@ -296,10 +296,7 @@ impl Builder {
         self
     }
 
-    pub fn cache_provider(
-        &mut self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    ) -> &mut Self {
+    pub fn cache_provider(&mut self, cache_provider: Option<Arc<Caching>>) -> &mut Self {
         self.cache_provider = cache_provider;
         self
     }
@@ -586,7 +583,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        cache_provider: Option<Arc<Caching>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;

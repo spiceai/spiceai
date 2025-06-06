@@ -140,6 +140,14 @@ impl Caching {
         self.search = Some(search);
         self
     }
+
+    pub fn invalidate_for_table(&self, table: TableReference) -> Result<()> {
+        if let Some(results_cache) = &self.results {
+            results_cache.invalidate_for_table(table.clone())?;
+        }
+
+        Ok(())
+    }
 }
 
 trait QueryResultCache: CacheProvider<CachedQueryResult> + TableInvalidator {}

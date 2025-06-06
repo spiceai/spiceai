@@ -26,7 +26,7 @@ use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
-use cache::QueryResultsCacheProvider;
+use cache::{Caching, QueryResultsCacheProvider};
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -419,7 +419,7 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    cache_provider: Option<Arc<Caching>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -471,10 +471,7 @@ impl Refresher {
         }
     }
 
-    pub fn cache_provider(
-        &mut self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    ) -> &mut Self {
+    pub fn cache_provider(&mut self, cache_provider: Option<Arc<Caching>>) -> &mut Self {
         self.cache_provider = cache_provider;
         self
     }
