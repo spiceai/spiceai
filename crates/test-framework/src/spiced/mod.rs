@@ -22,7 +22,6 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use flight_client::{Credentials, FlightClient};
 use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
@@ -172,34 +171,6 @@ impl SpicedInstance {
     #[must_use]
     pub fn get_tempdir_path(&self) -> PathBuf {
         self.tempdir.path().to_path_buf()
-    }
-
-    /// Get a flight client for the spiced instance
-    ///
-    /// # Errors
-    ///
-    /// - If the flight client fails to be created
-    pub async fn flight_client(
-        &self,
-        api_key: Option<String>,
-        disable_caching: bool,
-    ) -> Result<FlightClient> {
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
-        if disable_caching {
-            metadata.insert("cache-control", "no-cache".parse()?);
-        }
-
-        let credentials = if let Some(api_key) = api_key {
-            Credentials::new("", api_key.into())
-        } else {
-            Credentials::new("", "".into())
-        };
-
-        Ok(
-            FlightClient::try_new("http://localhost:50051".into(), credentials, Some(metadata))
-                .await?,
-        )
     }
 
     /// Get a spice client for the spiced instance

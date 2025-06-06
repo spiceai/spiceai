@@ -17,19 +17,16 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::spicetest::datasets::{MAX_RETRIES, QueryError, is_transient_error};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use arrow::{
     array::ArrayRef,
     datatypes::{Field, FieldRef, Schema},
     record_batch::RecordBatch,
 };
-use arrow_flight::{
-    decode::FlightRecordBatchStream, error::FlightError, sql::client::FlightSqlServiceClient,
-};
+use arrow_flight::error::FlightError;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use spiceai::Client as SpiceClient;
-use tonic::{async_trait, transport::Channel};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -96,36 +93,6 @@ pub async fn put_batches(
     Ok(client.publish(dataset_path, batches).await?)
 }
 
-/// Query a prepared statement against a ``FlightSQL`` compatible server.
-///
-/// To construct `parameters` as a [`RecordBatch`], see [`create_param_batch`].
-pub async fn execute_prepared_statement(
-    client: &mut FlightSqlServiceClient<Channel>,
-    query: &str,
-    parameters: RecordBatch,
-) -> anyhow::Result<FlightRecordBatchStream> {
-    let mut prepared_stmt = client.prepare(query.to_string(), None).await?;
-
-    prepared_stmt.set_parameters(parameters)?;
-
-    let flight_info = prepared_stmt.execute().await?;
-
-    let endpoint = flight_info
-        .endpoint
-        .first()
-        .context("No endpoint in flight info")?;
-
-    let stream = client
-        .do_get(
-            endpoint
-                .ticket
-                .clone()
-                .context("No flight ticket in response")?,
-        )
-        .await?;
-    Ok(stream)
-}
-
 pub struct PreparedStatementParamColumn {
     name: String,
     dtype: arrow::datatypes::DataType,
@@ -184,29 +151,4 @@ pub fn create_param_batch(
         .unzip();
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(Into::into)
-}
-
-#[async_trait]
-pub trait ExtendedTestFlightClient {
-    async fn query_with_params(
-        &self,
-        query: &str,
-        params: Option<RecordBatch>,
-    ) -> anyhow::Result<FlightRecordBatchStream>;
-}
-
-#[async_trait]
-impl ExtendedTestFlightClient for FlightClient {
-    async fn query_with_params(
-        &self,
-        query: &str,
-        params: Option<RecordBatch>,
-    ) -> anyhow::Result<FlightRecordBatchStream> {
-        if let Some(params) = params {
-            let mut client = FlightSqlServiceClient::new_from_inner(self.client().clone());
-            Ok(execute_prepared_statement(&mut client, query, params).await?)
-        } else {
-            Ok(self.query(query).await?)
-        }
-    }
 }
