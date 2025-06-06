@@ -143,28 +143,9 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             ..Default::default()
         }),
         SearchBenchmarkConfiguration::new(
-            "quora_minilm-l6-v2_arrow_text",
+            "quora_arrow_text",
             "QuoraRetrieval",
             "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            None,
-            Some((
-                MTEB_COLUMN_NAME.to_string(),
-                FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["_id".to_string()]),
-                },
-            )),
-        )
-        .with_acceleration(Acceleration {
-            enabled: true,
-            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-            refresh_sql: Some("select * from data limit 20000".into()),
-            ..Default::default()
-        }),
-        SearchBenchmarkConfiguration::new(
-            "quora_openai-text-embedding-3-small_arrow_text",
-            "QuoraRetrieval",
-            "openai:text-embedding-3-small",
             None,
             Some((
                 MTEB_COLUMN_NAME.to_string(),

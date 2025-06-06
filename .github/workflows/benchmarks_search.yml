@@ -21,9 +21,8 @@ on:
         type: choice
         options:
           - 'quora_minilm-l6-v2_arrow'
-          - 'quora_minilm-l6-v2_arrow-text'
+          - 'quora_arrow_text'
           - 'quora_openai-text-embedding-3-small_arrow'
-          - 'quora_openai-text-embedding-3-small_arrow_text'
           - 'quora_openai-text-embedding-3-small_duckdb'
           - 'quora_openai-text-embedding-3-small_duckdb_chunking'
 
@@ -74,8 +73,8 @@ jobs:
         include:
           - cmd: '--configuration quora_minilm-l6-v2_arrow'
             name: 'quora_minilm-l6-v2_arrow'
-          - cmd: '--configuration quora_minilm-l6-v2_arrow_text'
-            name: 'quora_minilm-l6-v2_arrow_text'
+          - cmd: '--configuration quora_arrow_text'
+            name: 'quora_arrow_text'
           - cmd: '--configuration quora_openai-text-embedding-3-small_arrow_text'
             name: 'quora_openai-text-embedding-3-small_arrow_text'
           - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'
