@@ -12297,7 +12297,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "2.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=df953882dbb54e4c0d713fd87ed6ddf077406250#df953882dbb54e4c0d713fd87ed6ddf077406250"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=1579a895fa467a8d9f8eafd48219f9768e48524d#1579a895fa467a8d9f8eafd48219f9768e48524d"
 dependencies = [
  "arrow",
  "arrow-flight",
