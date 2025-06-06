@@ -73,7 +73,9 @@ impl RefreshTask {
                             }
                         }
 
-                        if let Some(_) = &search_cache_provider {}
+                        if let Some(cache) = &search_cache_provider {
+                            cache.invalidate_all();
+                        }
                     }
                 }
                 Err(e) => {

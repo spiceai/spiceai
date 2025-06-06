@@ -694,7 +694,9 @@ impl Refresher {
                                 }
                             }
 
-                            if let Some(_) = &search_cache_provider {}
+                            if let Some(cache) = &search_cache_provider {
+                                cache.invalidate_all();
+                            }
 
                             if let Some(checkpointer) = &checkpointer {
                                 if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
