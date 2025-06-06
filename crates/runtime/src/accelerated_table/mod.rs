@@ -28,7 +28,8 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::QueryResultsCacheProvider;
+use cache::result::search::CachedSearchResult;
+use cache::{CacheProvider, QueryResultsCacheProvider};
 use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::catalog::Session;
@@ -236,6 +237,7 @@ pub struct Builder {
     refresh_on_startup: RefreshOnStartup,
     ready_state: ReadyState,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    search_cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
@@ -266,6 +268,7 @@ impl Builder {
             refresh_on_startup: RefreshOnStartup::default(),
             ready_state: ReadyState::default(),
             cache_provider: None,
+            search_cache_provider: None,
             changes_stream: None,
             append_stream: None,
             checkpointer: None,
@@ -301,6 +304,14 @@ impl Builder {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
+        self
+    }
+
+    pub fn search_cache_provider(
+        &mut self,
+        search_cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> &mut Self {
+        self.search_cache_provider = search_cache_provider;
         self
     }
 
@@ -444,6 +455,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
+        refresher.search_cache_provider(self.search_cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
@@ -470,6 +482,7 @@ impl Builder {
                 Arc::clone(&self.accelerator),
                 retention,
                 self.cache_provider.clone(),
+                self.search_cache_provider.clone(),
             ));
             handlers.push(retention_check_handle);
         }
@@ -587,6 +600,7 @@ impl AcceleratedTable {
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        search_cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;
@@ -691,6 +705,8 @@ impl AcceleratedTable {
                                         );
                                     }
                                 }
+
+                                if let Some(_) = &search_cache_provider {}
                             }
                         }
                     },

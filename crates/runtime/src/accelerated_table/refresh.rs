@@ -26,7 +26,8 @@ use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
-use cache::QueryResultsCacheProvider;
+use cache::result::search::CachedSearchResult;
+use cache::{CacheProvider, QueryResultsCacheProvider};
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -420,6 +421,7 @@ pub struct Refresher {
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    search_cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -460,6 +462,7 @@ impl Refresher {
             refresh,
             accelerator,
             cache_provider: None,
+            search_cache_provider: None,
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
@@ -476,6 +479,14 @@ impl Refresher {
         cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
+        self
+    }
+
+    pub fn search_cache_provider(
+        &mut self,
+        search_cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    ) -> &mut Self {
+        self.search_cache_provider = search_cache_provider;
         self
     }
 
@@ -614,6 +625,7 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let search_cache_provider = self.search_cache_provider.clone();
         let checkpointer = self.checkpointer.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
@@ -681,6 +693,8 @@ impl Refresher {
                                     tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                 }
                             }
+
+                            if let Some(_) = &search_cache_provider {}
 
                             if let Some(checkpointer) = &checkpointer {
                                 if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
@@ -750,6 +764,7 @@ impl Refresher {
         let refresh_defaults = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
+        let search_cache_provider = self.search_cache_provider.clone();
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         let notifier = self.on_complete_notification.clone();
@@ -757,6 +772,7 @@ impl Refresher {
             if let Err(err) = refresh_task
                 .start_streaming_append(
                     cache_provider,
+                    search_cache_provider,
                     notifier,
                     refresh_defaults,
                     initial_load_completed,
@@ -785,6 +801,7 @@ impl Refresher {
         );
 
         let cache_provider = self.cache_provider.clone();
+        let search_cache_provider = self.search_cache_provider.clone();
         let refresh = Arc::clone(&self.refresh);
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
@@ -795,6 +812,7 @@ impl Refresher {
                     refresh,
                     changes_stream,
                     cache_provider,
+                    search_cache_provider,
                     notifier,
                     initial_load_completed,
                 )
