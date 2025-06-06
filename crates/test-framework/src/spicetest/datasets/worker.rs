@@ -22,6 +22,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use arrow_flight::error::FlightError;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use spiceai::Client as SpiceClient;
@@ -41,6 +42,32 @@ use crate::{
 use super::EndCondition;
 
 pub(crate) const MAX_RETRIES: usize = 5;
+
+#[derive(Debug)]
+pub enum QueryError {
+    Retryable { source: anyhow::Error },
+    NonRetryable { source: anyhow::Error },
+}
+
+impl QueryError {
+    pub fn retryable<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::Retryable {
+            source: error.into(),
+        }
+    }
+
+    pub fn nonretryable<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::NonRetryable {
+            source: error.into(),
+        }
+    }
+}
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
@@ -414,13 +441,10 @@ impl SpiceTestQueryWorker {
                 .await
             {
                 Ok((duration, row_count)) => Ok((duration, row_count)),
-                Err(e) => {
-                    if is_transient_error(&e) {
-                        Err(RetryError::transient(e))
-                    } else {
-                        Err(RetryError::permanent(e))
-                    }
-                }
+                Err(e) => match e {
+                    QueryError::Retryable { source } => Err(RetryError::transient(source)),
+                    QueryError::NonRetryable { source } => Err(RetryError::permanent(source)),
+                },
             }
         })
         .await
@@ -458,13 +482,19 @@ impl SpiceTestQueryWorker {
         query: &Query,
         results_snapshot: bool,
         validate: bool,
-    ) -> Result<(Duration, usize)> {
+    ) -> std::result::Result<(Duration, usize), QueryError> {
         let query_start = Instant::now();
         let mut result_stream = self
             .spice_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
+            .query_with_params(
+                &query.sql,
+                query
+                    .get_parameters_batch()
+                    .transpose()
+                    .map_err(QueryError::nonretryable)?,
+            )
             .await
-            .map_err(|e| anyhow!("{e}"))?;
+            .map_err(|e| QueryError::nonretryable(anyhow!(e)))?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];
@@ -473,9 +503,16 @@ impl SpiceTestQueryWorker {
             let batch = result_stream.try_next().await;
             match batch {
                 Ok(None) => break,
-                Err(e) => {
-                    return Err(e.into());
-                }
+                Err(e) => match e {
+                    FlightError::Tonic(e) => {
+                        if is_transient_error(&e) {
+                            return Err(QueryError::retryable(anyhow!("{e}")));
+                        }
+                    }
+                    _ => {
+                        return Err(QueryError::nonretryable(anyhow!("{e}")));
+                    }
+                },
                 Ok(Some(batch)) => {
                     if validate {
                         validation_records.push(batch.clone());
@@ -508,15 +545,16 @@ impl SpiceTestQueryWorker {
 
         if validate {
             // Validate the query results
-            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+            let validation_result = validation::validate_tpch_query(query, &validation_records)
+                .map_err(QueryError::nonretryable)?;
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
                     "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
                     self.id, query.name
                 );
-                return Err(anyhow::anyhow!(
+                return Err(QueryError::nonretryable(anyhow!(
                     "Query validation failed: {validation_reason:?}"
-                ));
+                )));
             }
         }
 
@@ -530,7 +568,9 @@ impl SpiceTestQueryWorker {
                 format!("{name}_{query_name}_sf{}", self.scale_factor)
             };
 
-            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
+            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
+                .map_err(QueryError::nonretryable)?
+                .to_string();
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
                     description => format!("Query: {query_name}"),
@@ -544,7 +584,7 @@ impl SpiceTestQueryWorker {
             if result.is_err() {
                 let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
                 eprintln!("{error_str}");
-                return Err(anyhow::anyhow!(error_str));
+                return Err(QueryError::nonretryable(anyhow!(error_str)));
             }
         }
 
@@ -553,8 +593,9 @@ impl SpiceTestQueryWorker {
     }
 }
 
-pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
-    e.to_string()
-        .to_lowercase()
-        .contains("connection is reset by the server. please retry the request.")
+pub(crate) fn is_transient_error(e: &tonic::Status) -> bool {
+    if e.metadata().get("spiceai-retryable").is_some() {
+        return true;
+    }
+    false
 }

@@ -16,14 +16,16 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::spicetest::datasets::{MAX_RETRIES, is_transient_error};
-use anyhow::{Context, Result};
+use crate::spicetest::datasets::{MAX_RETRIES, QueryError, is_transient_error};
+use anyhow::{Context, Result, anyhow};
 use arrow::{
     array::ArrayRef,
     datatypes::{Field, FieldRef, Schema},
     record_batch::RecordBatch,
 };
-use arrow_flight::{decode::FlightRecordBatchStream, sql::client::FlightSqlServiceClient};
+use arrow_flight::{
+    decode::FlightRecordBatchStream, error::FlightError, sql::client::FlightSqlServiceClient,
+};
 use flight_client::FlightClient;
 use futures::StreamExt;
 use spiceai::Client as SpiceClient;
@@ -48,30 +50,40 @@ pub async fn query_to_batches(
     retry(retry_strategy, || async {
         match query_to_batches_internal(Arc::clone(&spice_client), sql, params.clone()).await {
             Ok(batches) => Ok(batches),
-            Err(e) => {
-                if is_transient_error(&e) {
-                    Err(RetryError::transient(e))
-                } else {
-                    Err(RetryError::permanent(e))
-                }
-            }
+            Err(e) => match e {
+                QueryError::Retryable { source } => Err(RetryError::transient(source)),
+                QueryError::NonRetryable { source } => Err(RetryError::permanent(source)),
+            },
         }
     })
     .await
+    .map_err(|e| anyhow!(format!("{e}")))
 }
 
 pub async fn query_to_batches_internal(
     spice_client: Arc<SpiceClient>,
     sql: &str,
     params: Option<RecordBatch>,
-) -> Result<Vec<RecordBatch>> {
+) -> std::result::Result<Vec<RecordBatch>, QueryError> {
     let mut stream = spice_client
         .query_with_params(sql, params)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| QueryError::NonRetryable { source: anyhow!(e) })?;
+
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
-        batches.push(batch?);
+        match batch {
+            Ok(batch) => batches.push(batch),
+            Err(e) => match e {
+                FlightError::Tonic(ref status) => {
+                    if is_transient_error(status) {
+                        return Err(QueryError::Retryable { source: e.into() });
+                    }
+                    return Err(QueryError::NonRetryable { source: e.into() });
+                }
+                _ => return Err(QueryError::NonRetryable { source: e.into() }),
+            },
+        }
     }
     Ok(batches)
 }

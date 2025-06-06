@@ -524,7 +524,7 @@ fn query_to_stream(
                     match batch {
                         Ok(batch) => yield Ok(batch),
                         Err(error) => {
-                            yield Err(to_execution_error(map_connection_reset_error(error)));
+                            yield Err(map_query_stream_error(error));
                         }
                     }
                 }
@@ -538,8 +538,11 @@ fn query_to_stream(
 fn to_execution_error(e: Error) -> DataFusionError {
     match e {
         Error::Flight { source } => match source {
-            flight_client::Error::UnableToQuery { source } => {
-                DataFusionError::Execution(format!("{source}"))
+            flight_client::Error::UnableToQuery {
+                source: source_error,
+            } => DataFusionError::Execution(format!("{source_error}")),
+            flight_client::Error::ConnectionReset { source: _ } => {
+                DataFusionError::External(Box::new(source))
             }
             _ => DataFusionError::Execution(format!("{source}")),
         },
@@ -547,23 +550,27 @@ fn to_execution_error(e: Error) -> DataFusionError {
     }
 }
 
-fn map_connection_reset_error(error: FlightError) -> Error {
+fn map_query_stream_error(error: FlightError) -> DataFusionError {
     match error {
         FlightError::Tonic(ref source) => {
             let source_owned = *source.clone();
             if is_connection_reset_error(&source_owned) {
-                return Error::ArrowFlight {
-                    source: Box::new(FlightClientError::ConnectionReset {
-                        source: TonicStatusError::from(source_owned),
-                    }),
-                };
+                return DataFusionError::External(Box::new(FlightClientError::ConnectionReset {
+                    source: TonicStatusError::from(source_owned),
+                }));
             }
+            DataFusionError::Execution(format!(
+                "{}",
+                Error::ArrowFlight {
+                    source: Box::new(error),
+                }
+            ))
+        }
+        _ => DataFusionError::Execution(format!(
+            "{}",
             Error::ArrowFlight {
                 source: Box::new(error),
             }
-        }
-        _ => Error::ArrowFlight {
-            source: Box::new(error),
-        },
+        )),
     }
 }
