@@ -21,7 +21,9 @@ on:
         type: choice
         options:
           - 'quora_minilm-l6-v2_arrow'
+          - 'quora_minilm-l6-v2_arrow-text'
           - 'quora_openai-text-embedding-3-small_arrow'
+          - 'quora_openai-text-embedding-3-small_arrow_text'
           - 'quora_openai-text-embedding-3-small_duckdb'
           - 'quora_openai-text-embedding-3-small_duckdb_chunking'
 
