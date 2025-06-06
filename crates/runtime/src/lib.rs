@@ -920,7 +920,6 @@ impl Runtime {
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
-
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
         self.accelerator_engine_registry.unregister_all().await;
@@ -943,14 +942,6 @@ impl Runtime {
             .collect();
 
         join_all(shutdown_futures).await;
-
-        let df_strong_count = Arc::strong_count(&self.df);
-        unsafe {
-            let ptr = Arc::into_raw(Arc::clone(&self.df));
-            for _ in 0..(df_strong_count + 1) {
-                Arc::decrement_strong_count(ptr);
-            }
-        }
 
         tracing::debug!("Shutdown completed");
     }
