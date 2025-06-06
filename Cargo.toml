@@ -171,7 +171,7 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 x509-certificate = "0.23.1"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "3d0e679a98ca51d8df3fa593f3db8f3f7f2b2eae" }
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "df953882dbb54e4c0d713fd87ed6ddf077406250" }
 
 [profile.release-lto]
 inherits = "release"
