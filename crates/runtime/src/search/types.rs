@@ -233,6 +233,16 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
+    fn sort_result(v: Vec<HashMap<String, MatchType>>) -> Vec<Vec<(String, MatchType)>> {
+        v.into_iter()
+            .map(|x| {
+                x.into_iter()
+                    .sorted_by_key(|(a, b)| a.clone())
+                    .collect::<Vec<(String, MatchType)>>()
+            })
+            .collect::<Vec<_>>()
+    }
+
     #[test]
     fn test_transpose_and_convert_single_column() {
         let mut column_format = HashMap::new();
@@ -245,7 +255,7 @@ mod tests {
             ],
         );
 
-        assert_json_snapshot!(transpose_and_convert(column_format));
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
     }
 
     #[test]
@@ -268,7 +278,7 @@ mod tests {
             ],
         );
 
-        assert_json_snapshot!(transpose_and_convert(column_format));
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
     }
 
     #[test]
@@ -276,7 +286,7 @@ mod tests {
         let mut column_format = HashMap::new();
         column_format.insert("key1".to_string(), vec![vec![], vec![], vec![]]);
 
-        assert_json_snapshot!(transpose_and_convert(column_format));
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
     }
 
     #[test]
@@ -291,6 +301,6 @@ mod tests {
             ],
         );
 
-        assert_json_snapshot!(transpose_and_convert(column_format));
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
     }
 }
