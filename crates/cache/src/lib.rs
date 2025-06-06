@@ -172,6 +172,19 @@ impl Caching {
         }
         Ok(())
     }
+
+    /// Invalidates all configured caches
+    pub fn invalidate_all(&self) {
+        if let Some(results_cache) = &self.results {
+            results_cache.invalidate_all();
+        }
+        if let Some(plan_cache) = &self.plans {
+            plan_cache.invalidate_all();
+        }
+        if let Some(search_cache) = &self.search {
+            search_cache.invalidate_all();
+        }
+    }
 }
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
@@ -277,6 +290,10 @@ impl QueryResultsCacheProvider {
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
         self.cache.invalidate_for_table(table_name)
+    }
+
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
     }
 
     #[must_use]

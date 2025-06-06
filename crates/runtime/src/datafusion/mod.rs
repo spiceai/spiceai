@@ -1574,6 +1574,8 @@ impl DataFusion {
                 tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
             }
         }
+
+        self.caching.invalidate_all();
     }
 
     /// Create or get a logical plan from the query
