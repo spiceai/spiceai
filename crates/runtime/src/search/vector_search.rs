@@ -25,7 +25,8 @@ use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
     util::{
-        embedding_columns_from_table, find_concrete_table_provider, get_primary_keys_with_overrides,full_text_search_candidates
+        embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
+        get_primary_keys_with_overrides,
     },
 };
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};

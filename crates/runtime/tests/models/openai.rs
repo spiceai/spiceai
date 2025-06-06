@@ -35,10 +35,7 @@ use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
-use spicepod::component::{
-    embeddings::Embeddings,
-    model::Model,
-};
+use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use std::str::FromStr;
 use std::sync::Arc;

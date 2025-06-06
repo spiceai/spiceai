@@ -21,10 +21,7 @@ use std::time::Duration;
 use app::AppBuilder;
 use async_openai::types::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
-use spicepod::component::{
-    embeddings::Embeddings,
-    model::Model,
-};
+use spicepod::component::{embeddings::Embeddings, model::Model};
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
