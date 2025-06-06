@@ -146,7 +146,13 @@ impl FullTextSearch {
 
     fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
         // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
-        let q = QueryParser::for_index(&self.idx, vec![])
+        let default_field = self
+            .idx
+            .schema()
+            .find_field(self.field.as_str())
+            .map(|(f, _)| vec![f])
+            .unwrap_or_default();
+        let q = QueryParser::for_index(&self.idx, default_field)
             .parse_query(literal)
             // let q = QueryParser::for_index(&self.idx, vec![])
             //     .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
