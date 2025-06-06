@@ -165,10 +165,7 @@ impl Caching {
     /// If the cache invalidation fails for any of the caches.
     pub fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         if let Some(results_cache) = &self.results {
-            results_cache.invalidate_for_table(table_ref.clone())?;
-        }
-        if let Some(search_cache) = &self.search {
-            search_cache.invalidate_for_table(table_ref)?;
+            results_cache.invalidate_for_table(table_ref)?;
         }
         Ok(())
     }
@@ -177,12 +174,6 @@ impl Caching {
     pub fn invalidate_all(&self) {
         if let Some(results_cache) = &self.results {
             results_cache.invalidate_all();
-        }
-        if let Some(plan_cache) = &self.plans {
-            plan_cache.invalidate_all();
-        }
-        if let Some(search_cache) = &self.search {
-            search_cache.invalidate_all();
         }
     }
 }

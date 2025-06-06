@@ -678,26 +678,16 @@ impl AcceleratedTable {
                             }
 
                             if num_records > 0 {
-                                // if let Some(cache_provider) = caching.as_ref() {
-                                //     if let Err(e) =
-                                //         cache_provider.invalidate_for_table(dataset_name.clone())
-                                //     {
-                                //         tracing::error!(
-                                //             "Failed to invalidate cached results for dataset {}: {e}",
-                                //             &dataset_name
-                                //         );
-                                //     }
-                                // }
-
-                                // if let Some(checkpointer) = &checkpointer {
-                                //     if let Err(e) = checkpointer.checkpoint(&federated_schema).await
-                                //     {
-                                //         tracing::warn!(
-                                //             "Failed to checkpoint dataset {}: {e}",
-                                //             &dataset_name.to_string()
-                                //         );
-                                //     }
-                                // }
+                                if let Some(cache_provider) = caching.as_ref() {
+                                    if let Err(e) =
+                                        cache_provider.invalidate_for_table(dataset_name.clone())
+                                    {
+                                        tracing::error!(
+                                            "Failed to invalidate cached results for dataset {}: {e}",
+                                            &dataset_name
+                                        );
+                                    }
+                                }
                             }
                         }
                     },
