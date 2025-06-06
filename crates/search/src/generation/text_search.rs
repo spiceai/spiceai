@@ -152,21 +152,26 @@ impl FullTextSearch {
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
-        let q = QueryParser::for_index(&self.idx, default_field)
-            .parse_query(literal)
-            // let q = QueryParser::for_index(&self.idx, vec![])
-            //     .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
-            //         UserInputLiteral {
-            //             field_name: Some(self.field.clone()),
-            //             phrase: literal.to_string(),
-            //             delimiter: Delimiter::None,
-            //             slop: 0,
-            //             prefix: false,
-            //         },
-            //     ))))
-            .context(InvalidTextSearchQuerySnafu {
-                query: literal.to_string(),
-            })?;
+        let (q, err) =
+            QueryParser::for_index(&self.idx, default_field).parse_query_lenient(literal);
+        // let q = QueryParser::for_index(&self.idx, vec![])
+        //     .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
+        //         UserInputLiteral {
+        //             field_name: Some(self.field.clone()),
+        //             phrase: literal.to_string(),
+        //             delimiter: Delimiter::None,
+        //             slop: 0,
+        //             prefix: false,
+        //         },
+        //     ))))
+        // .context(InvalidTextSearchQuerySnafu {
+        //     query: literal.to_string(),
+        // })?;
+        if !err.is_empty() {
+            tracing::warn!(
+                "Invalid syntax in query cannot be recognised. Will be ignored. Parse errors: {err:?} "
+            );
+        }
 
         let schema = self.idx.schema();
         let searcher = self.index_searcher()?;
