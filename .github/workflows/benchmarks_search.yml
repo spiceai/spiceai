@@ -74,6 +74,10 @@ jobs:
         include:
           - cmd: '--configuration quora_minilm-l6-v2_arrow'
             name: 'quora_minilm-l6-v2_arrow'
+          - cmd: '--configuration quora_minilm-l6-v2_arrow_text'
+            name: 'quora_minilm-l6-v2_arrow_text'
+          - cmd: '--configuration quora_openai-text-embedding-3-small_arrow_text'
+            name: 'quora_openai-text-embedding-3-small_arrow_text'
           - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'
             name: 'quora_openai-text-embedding-3-small_arrow'
           - cmd: '--configuration quora_openai-text-embedding-3-small_duckdb'
