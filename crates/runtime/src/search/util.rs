@@ -240,7 +240,7 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
-    use std::{any::Any, sync::Arc};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_find_concrete_table_provider_direct_match() {

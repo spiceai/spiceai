@@ -237,7 +237,7 @@ mod tests {
         v.into_iter()
             .map(|x| {
                 x.into_iter()
-                    .sorted_by_key(|(a, b)| a.clone())
+                    .sorted_by_key(|(a, _)| a.clone())
                     .collect::<Vec<(String, MatchType)>>()
             })
             .collect::<Vec<_>>()
