@@ -671,13 +671,13 @@ impl Refresher {
                             notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            if let Some(cache_provider) = caching.as_ref() {
-                                if let Err(e) = cache_provider
-                                    .invalidate_for_table(dataset_name.clone())
-                                {
-                                    tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
-                                }
-                            }
+                            // if let Some(cache_provider) = caching.as_ref() {
+                            //     if let Err(e) = cache_provider
+                            //         .invalidate_for_table(dataset_name.clone())
+                            //     {
+                            //         tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                            //     }
+                            // }
 
                             if let Some(checkpointer) = &checkpointer {
                                 if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
