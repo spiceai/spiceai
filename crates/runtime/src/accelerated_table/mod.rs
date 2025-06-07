@@ -440,7 +440,7 @@ impl Builder {
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
-        refresher.caching(self.caching.clone());
+        refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);

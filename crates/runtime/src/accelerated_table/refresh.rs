@@ -472,7 +472,7 @@ impl Refresher {
         }
     }
 
-    pub fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
+    pub fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
         self.caching = caching.as_ref().map(Arc::downgrade);
         self
     }
