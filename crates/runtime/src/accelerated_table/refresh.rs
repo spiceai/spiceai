@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -419,7 +419,8 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
-    caching: Option<Arc<Caching>>,
+    // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
+    caching: Option<Weak<Caching>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -472,7 +473,7 @@ impl Refresher {
     }
 
     pub fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
-        self.caching = caching;
+        self.caching = caching.as_ref().map(Arc::downgrade);
         self
     }
 
@@ -671,11 +672,12 @@ impl Refresher {
                             notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            if let Some(cache_provider) = caching.as_ref() {
-                                if let Err(e) = cache_provider
-                                    .invalidate_for_table(dataset_name.clone())
-                                {
-                                    tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(cache_provider_ref) = caching.as_ref() {
+                                // No cache provider means runtime is shutting down and cache is already cleaned up
+                                if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                    if let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                        tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    }
                                 }
                             }
 
