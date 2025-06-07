@@ -167,6 +167,9 @@ impl Caching {
         if let Some(results_cache) = &self.results {
             results_cache.invalidate_for_table(table_ref.clone())?;
         }
+        if let Some(plans_cache) = &self.plans {
+            plans_cache.invalidate_for_table(table_ref.clone())?;
+        }
         if let Some(search_cache) = &self.search {
             search_cache.invalidate_for_table(table_ref)?;
         }
