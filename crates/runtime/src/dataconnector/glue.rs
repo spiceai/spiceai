@@ -164,8 +164,8 @@ impl DataConnector for GlueDataConnector {
                 message,
             }
         })? {
-            InputFormat::Parquet => {
-                create_parquet_provider(dataset.clone(), self.params.clone(), &table).await
+            input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
+                create_s3_provider(input_format, dataset.clone(), self.params.clone(), &table).await
             }
             InputFormat::Iceberg => {
                 let region = self.params.get("region").expose().ok().ok_or_else(|| {
@@ -182,14 +182,28 @@ impl DataConnector for GlueDataConnector {
     }
 }
 
-enum InputFormat {
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum InputFormat {
     // Avro,
-    // Csv,
+    Csv,
     // Json,
     // Xml,
     Parquet,
     // Orc,
     Iceberg,
+}
+
+impl InputFormat {
+    /// Return the file format of the [`InputFormat`]. For
+    /// [`InputFormat::Iceberg`], it's not a file format but we return a value
+    /// rather than have to use an `Option` return type for convenience.
+    fn file_format(self) -> &'static str {
+        match self {
+            InputFormat::Csv => "csv",
+            InputFormat::Parquet => "parquet",
+            InputFormat::Iceberg => "iceberg",
+        }
+    }
 }
 
 impl TryFrom<&Table> for InputFormat {
@@ -217,7 +231,8 @@ impl TryFrom<&Table> for InputFormat {
 
         Ok(match input_format {
             "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
-            input_format => return Err(format!("input format `{input_format} is not supported`")),
+            "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
+            input_format => return Err(format!("input format `{input_format}` is not supported")),
         })
     }
 }
@@ -268,7 +283,8 @@ async fn create_iceberg_provider(
     Ok(Arc::new(table_provider))
 }
 
-async fn create_parquet_provider(
+async fn create_s3_provider(
+    input_format: InputFormat,
     mut dataset: Dataset,
     mut params: Parameters,
     table: &Table,
@@ -281,7 +297,7 @@ async fn create_parquet_provider(
         });
     };
 
-    let Some(mut from) = storage_descriptor.location().map(String::from) else {
+    let Some(from) = storage_descriptor.location().map(String::from) else {
         return Err(super::DataConnectorError::InternalWithSource {
             dataconnector: PREFIX.to_string(),
             connector_component: (&dataset).into(),
@@ -293,19 +309,30 @@ async fn create_parquet_provider(
         });
     };
 
-    if !from.ends_with('/') {
-        from.push('/');
+    match input_format {
+        InputFormat::Csv => {
+            // If the table specifies a delimiter, pass it down to the data connector
+            // as a parameter
+            if let Some(delimiter) = table
+                .parameters()
+                .and_then(|params| params.get("delimiter"))
+            {
+                params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
+            }
+        }
+        InputFormat::Parquet => {
+            dataset
+                .params
+                .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+        }
+        InputFormat::Iceberg => {}
     }
 
     // Add required file_format parameter for S3
-    params.insert("file_format".into(), "parquet".into());
+    params.insert("file_format".into(), input_format.file_format().into());
     let s3 = S3 { params };
 
-    // Modify the dataset for S3 parquet
     dataset.from = from;
-    dataset
-        .params
-        .insert("hive_partitioning_enabled".to_string(), "true".to_string());
 
     s3.read_provider(&dataset).await
 }

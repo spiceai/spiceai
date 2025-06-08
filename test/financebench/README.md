@@ -9,7 +9,7 @@ Instructions to run the [FinanceBench](https://github.com/patronus-ai/financeben
 curl -XPOST "http://localhost:8090/v1/evals/financebench" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o"
+    "model": "gpt-4.1"
   }'
 [{"id":"a5a4ee4d40dfcfc81a050bc5e23135c9","created_at":"2025-03-24T22:28:14","completed_at":"2025-03-24T22:29:19","dataset":"financebench.evals","model":"gpt-4o","status":"Completed","scorers":["match"],"metrics":{"match/mean":0.0}}]%  
 ```

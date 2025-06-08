@@ -90,6 +90,7 @@ pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
+pub const SPICE_SCP_SCHEMA: &str = "scp";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -1519,6 +1520,7 @@ impl DataFusion {
                             .filter(|schema| {
                                 !(ctlg == SPICE_DEFAULT_CATALOG && *schema == SPICE_RUNTIME_SCHEMA
                                     || *schema == SPICE_METADATA_SCHEMA
+                                    || *schema == SPICE_SCP_SCHEMA
                                     || *schema == SPICE_EVAL_SCHEMA)
                             })
                             .flat_map(|schema| {
@@ -1628,6 +1630,7 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG
         && (schema == SPICE_RUNTIME_SCHEMA
             || schema == SPICE_METADATA_SCHEMA
+            || schema == SPICE_SCP_SCHEMA
             || schema == SPICE_EVAL_SCHEMA)
 }
 

@@ -40,6 +40,7 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
           - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
@@ -162,6 +163,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -221,6 +224,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}

@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{ConfigurationLoadingFailedSnafu, DatabaseName, TableType};
+use super::{ConfigurationLoadingFailedSnafu, DatabaseName};
+use crate::dataconnector::glue::InputFormat;
 use crate::dataconnector::parameters::aws::load_config;
 use crate::{Runtime, dataconnector::parameters::ConnectorParams};
 use aws_sdk_glue::Client;
@@ -72,44 +73,50 @@ impl GlueCatalogState {
     }
 
     pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let get_databases_output = self
-            .client
-            .get_databases()
-            .send()
-            .await
-            .context(super::GetDatabasesSnafu)?;
+        let mut paginator = self.client.get_databases().into_paginator().send();
 
         let mut databases = HashMap::new();
-        for db in get_databases_output.database_list {
-            if !database_might_match(&db.name, &self.orig_include) {
-                tracing::debug!("skipping database {}", &db.name);
-                continue;
+
+        while let Some(maybe_get_databases_output) = paginator.next().await {
+            let get_databases_output =
+                maybe_get_databases_output.context(super::GetDatabasesSnafu)?;
+            for db in get_databases_output.database_list {
+                if !database_might_match(&db.name, &self.orig_include) {
+                    tracing::debug!("skipping database {}", &db.name);
+                    continue;
+                }
+
+                let mut paginator = self
+                    .client
+                    .get_tables()
+                    .database_name(&db.name)
+                    .into_paginator()
+                    .send();
+
+                let mut tables = Vec::new();
+
+                while let Some(maybe_get_tables_output) = paginator.next().await {
+                    let get_tables_output =
+                        maybe_get_tables_output.map_err(|source| super::Error::GetTables {
+                            database: db.name.to_string(),
+                            source,
+                        })?;
+                    let some_tables = get_tables_output
+                        .table_list
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|t| {
+                            InputFormat::try_from(t).is_ok()
+                                && is_included(self.include.as_ref(), &db.name, t.name())
+                        })
+                        .collect::<Vec<_>>();
+
+                    tables.extend(some_tables);
+                }
+
+                databases.insert(db.name, tables);
             }
-
-            let get_tables_output = self
-                .client
-                .get_tables()
-                .database_name(&db.name)
-                .send()
-                .await
-                .map_err(|source| super::Error::GetTables {
-                    database: db.name.to_string(),
-                    source,
-                })?;
-
-            let table_names = get_tables_output
-                .table_list
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| {
-                    !matches!(TableType::from(t), TableType::Unsupported)
-                        && is_included(self.include.as_ref(), &db.name, t.name())
-                })
-                .collect::<Vec<_>>();
-
-            databases.insert(db.name, table_names);
         }
-
         let mut dbs = match self.databases.write() {
             Ok(dbs) => dbs,
             Err(poisoned) => poisoned.into_inner(),

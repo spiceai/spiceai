@@ -26,15 +26,7 @@ use serde::{Deserialize, Serialize};
 pub struct Management {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    pub api_key: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, String>,
-}
-
-impl Default for Management {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            params: HashMap::new(),
-        }
-    }
 }
