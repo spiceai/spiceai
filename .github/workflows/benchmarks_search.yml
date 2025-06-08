@@ -20,6 +20,7 @@ on:
         default: 'quora_minilm-l6-v2_arrow'
         type: choice
         options:
+          - 'quora_qwen3-0.6_arrow'
           - 'quora_minilm-l6-v2_arrow'
           - 'quora_openai-text-embedding-3-small_arrow'
           - 'quora_openai-text-embedding-3-small_duckdb'
@@ -70,6 +71,8 @@ jobs:
       max-parallel: 4
       matrix:
         include:
+          - cmd: '--configuration quora_qwen3-0.6_arrow'
+            name: 'quora_qwen3-0.6_arrow'
           - cmd: '--configuration quora_minilm-l6-v2_arrow'
             name: 'quora_minilm-l6-v2_arrow'
           - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'

@@ -118,6 +118,17 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
 
     vec![
         SearchBenchmarkConfiguration::new(
+            "quora_qwen3-0.6_arrow",
+            "QuoraRetrieval",
+            "huggingface:huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+            refresh_sql: Some("select * from data limit 20000".into()),
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
             "quora_minilm-l6-v2_arrow",
             "QuoraRetrieval",
             "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
