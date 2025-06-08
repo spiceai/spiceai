@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod candidate;
+pub mod full_text;
 pub mod request;
 pub mod types;
 pub mod util;
@@ -48,6 +49,9 @@ pub enum Error {
 
     #[snafu(display("Error occurred in search pipeline: {source}"))]
     SearchPipelineError { source: search::pipeline::Error },
+
+    #[snafu(display("Error occurred generating search candidates: {source}"))]
+    SearchGenerationError { source: search::generation::Error },
 
     #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
     SearchAggregationError { source: aggregation::Error },

@@ -13,8 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::accelerated_table::AcceleratedTable;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::DataConnectorError;
 use crate::model::EmbeddingModelStore;
 use async_trait::async_trait;
@@ -177,5 +179,19 @@ impl DataConnector for EmbeddingConnector {
 
     fn initialization(&self) -> ComponentInitialization {
         self.inner_connector.initialization()
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        self.inner_connector.metrics_provider()
+    }
+
+    async fn on_accelerated_table_registration(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: &mut AcceleratedTable,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerated_table_registration(dataset, accelerated_table)
+            .await
     }
 }

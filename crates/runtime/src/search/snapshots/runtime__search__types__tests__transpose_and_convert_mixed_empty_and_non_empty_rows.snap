@@ -1,0 +1,20 @@
+---
+source: crates/runtime/src/search/types.rs
+expression: sort_result(v)
+snapshot_kind: text
+---
+[
+  [
+    [
+      "key1",
+      "A"
+    ]
+  ],
+  [],
+  [
+    [
+      "key1",
+      "B"
+    ]
+  ]
+]

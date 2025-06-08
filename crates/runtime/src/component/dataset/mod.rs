@@ -583,6 +583,13 @@ impl Dataset {
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
+
+    #[must_use]
+    pub fn has_full_text_column(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+    }
 }
 
 impl AccelerationSource for Dataset {

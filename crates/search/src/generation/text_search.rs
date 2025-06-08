@@ -12,7 +12,7 @@ limitations under the License.
 */
 use std::{collections::HashMap, sync::Arc};
 
-use crate::SEARCH_SCORE_COLUMN_NAME;
+use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use arrow::error::ArrowError;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -162,6 +162,7 @@ impl FullTextSearch {
 
         let schema = self.idx.schema();
         let searcher = self.index_searcher()?;
+
         let top_docs = searcher
             .search(&q, &TopDocs::with_limit(limit))
             .context(TextSearchSnafu)?
@@ -170,10 +171,15 @@ impl FullTextSearch {
                 let doc: HashMap<Field, OwnedValue> =
                     searcher.doc(addr).context(TextSearchSnafu)?;
 
-                let doc_w_col_names = doc
+                let mut doc_w_col_names = doc
                     .into_iter()
                     .map(|(f, v)| (schema.get_field_name(f), v))
                     .collect::<HashMap<_, _>>();
+
+                // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
+                if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
+                    doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
+                }
 
                 let mut v =
                     serde_json::to_value(&doc_w_col_names).context(SerdeJsonConversionSnafu)?;
@@ -202,9 +208,16 @@ impl CandidateGeneration for FullTextSearch {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
 
-        if !addition_projection.is_empty() {
-            return Err(Error::UnsupportedAdditionalColumnsError)
-                .context(GenerationTextSearchSnafu)?;
+        let cols = self.all_columns();
+        for proj in addition_projection {
+            let is_supported = match proj {
+                Expr::Identifier(Ident { value, .. }) => cols.contains(value),
+                _ => false,
+            };
+            if !is_supported {
+                return Err(Error::UnsupportedAdditionalColumnsError)
+                    .context(GenerationTextSearchSnafu)?;
+            }
         }
 
         let hits = self

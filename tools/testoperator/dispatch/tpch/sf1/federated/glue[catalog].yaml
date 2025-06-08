@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/glue[catalog].yaml
+    query_set: tpch
+    query_overrides: glue-catalog
+    runner_type: spiceai-runners
+    validate_results: true

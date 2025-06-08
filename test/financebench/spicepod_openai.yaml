@@ -6,6 +6,10 @@ runtime:
   flight:
     max_message_size: 1G
 
+management:
+  enabled: true
+  api_key: ${ secrets:SPICEAI_FINANCEBENCH_API_KEY }
+
 model_system_prompt: &model_system_prompt |
     # Role and Objective
     You are a financial expert tasked with answering questions based solely on `financebench.data`. 

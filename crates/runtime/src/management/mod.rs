@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
-const TASK_HISTORY_SINK_TABLE: &str = "runtime.task_history_cloud";
+const TASK_HISTORY_SINK_TABLE: &str = "scp.task_history";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
 
 use std::{
@@ -36,8 +36,9 @@ use datafusion::{
     sql::TableReference,
 };
 use secrecy::{ExposeSecret, SecretString};
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu};
 use spicepod::component::management::Management as SpicepodManagement;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -49,6 +50,7 @@ use crate::{
     },
     dataupdate::{DataUpdate, UpdateType},
     get_params_with_secrets,
+    secrets::Secrets,
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
 
@@ -106,15 +108,21 @@ impl Management {
         config: &SpicepodManagement,
         runtime: Arc<Runtime>,
     ) -> Result<Self, Error> {
-        let params = get_params_with_secrets(runtime.secrets(), &config.params).await;
+        let secrets = runtime.secrets();
 
-        let api_key = params
-            .get("api_key")
-            .context(MissingRequiredSecretSnafu { name: "api_key" })?;
+        let api_key: SecretString = if config.api_key.is_empty() {
+            return Err(Error::MissingRequiredSecret {
+                name: "api_key".to_string(),
+            });
+        } else {
+            resolve_secret(&secrets, &config.api_key).await
+        };
+
+        let params = get_params_with_secrets(secrets, &config.params).await;
 
         Ok(Self {
-            api_key: api_key.clone(),
             runtime,
+            api_key,
             params,
         })
     }
@@ -184,7 +192,7 @@ impl Management {
             self.api_key.expose_secret().to_string(),
         );
 
-        if let Some(flight_endpoint) = self.params.get("flight_endpoint") {
+        if let Some(flight_endpoint) = self.params.get("data_endpoint") {
             params.insert(
                 "spiceai_endpoint".to_string(),
                 flight_endpoint.expose_secret().to_string(),
@@ -371,4 +379,14 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
         }
     }
     false
+}
+
+// Resolve a secret by key, returning the secret string if found, or the original key if not.
+async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretString {
+    let secrets = secrets.read().await;
+    if let Ok(Some(secret)) = secrets.get_secret(key).await {
+        secret
+    } else {
+        SecretString::new(key.to_string().into())
+    }
 }

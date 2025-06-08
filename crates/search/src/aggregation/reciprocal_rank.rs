@@ -72,13 +72,11 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let mut matches: HashMap<String, Vec<String>> = HashMap::new();
 
         // Inefficient, but collect each stream, convert to [`MemTable`].
-        for (
-            i,
-            VectorSearchGenerationResult {
-                data: stream,
-                derived_from,
-            },
-        ) in data.into_iter().enumerate()
+        let mut i = 0;
+        for VectorSearchGenerationResult {
+            data: stream,
+            derived_from,
+        } in data
         {
             let schema = stream.schema();
             additional_columns.extend(additional_columns_of_schema(
@@ -96,13 +94,20 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 });
 
             let data = collect_batches(stream).await.context(DatafusionSnafu)?;
-            let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
-            let table_name = format!("search_candidates_{i}");
-            table_names.insert(i, table_name.clone());
 
+            // If data is empty, don't use.
+            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
+                continue;
+            }
+
+            let table_name = format!("search_candidates_{i}");
+            table_names.push(table_name.clone());
+            let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
             let _ = ctx
                 .register_table(TableReference::bare(table_name), Arc::new(table))
                 .context(DatafusionSnafu)?;
+
+            i += 1;
         }
 
         let additional_columns = additional_columns.into_iter().collect::<Vec<_>>();
@@ -153,6 +158,10 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
     };
 
     for s in schemas {
+        if s.fields().is_empty() {
+            // Empty schema -> empty data
+            continue;
+        }
         if s.column_with_name(SEARCH_VALUE_COLUMN_NAME).is_none() {
             return Err(Error::CandidateMissingRequiredColumn {
                 col: SEARCH_VALUE_COLUMN_NAME.to_string(),

@@ -25,9 +25,9 @@ use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::dataset::Dataset;
-use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
+use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
-use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
+use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -116,11 +116,15 @@ pub(crate) fn item_tpch_dataset_w_embeddings(
     chunking: Option<EmbeddingChunkConfig>,
 ) -> Dataset {
     let mut ds_tpcds_item = get_tpcds_dataset("item", Some(ds_name), None);
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: model.to_string(),
-        primary_keys,
-        chunking,
+    ds_tpcds_item.columns = vec![Column {
+        name: "i_item_desc".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: model.to_string(),
+            row_ids: primary_keys,
+            chunking,
+        }],
+        description: None,
+        full_text_search: None,
     }];
 
     ds_tpcds_item
@@ -139,11 +143,15 @@ pub(crate) fn catalog_page_tpch_dataset_w_embeddings(
             "select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from {ds_name} limit 20"
         ).as_str()),
     );
-    ds_tpcds_cp.embeddings = vec![ColumnEmbeddingConfig {
-        column: "cp_description".to_string(),
-        model: model.to_string(),
-        primary_keys,
-        chunking,
+    ds_tpcds_cp.columns = vec![Column {
+        name: "cp_description".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: model.to_string(),
+            row_ids: primary_keys,
+            chunking,
+        }],
+        description: None,
+        full_text_search: None,
     }];
     ds_tpcds_cp
 }
@@ -192,7 +200,7 @@ pub(crate) async fn run_search(
 
 #[tokio::test]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
-    let mut chunked = catalog_page_tpch_dataset_w_embeddings(
+    let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_search",
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -203,15 +211,19 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
             trim_whitespace: false,
         }),
     );
-    chunked.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-        chunking: None,
+    ds.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: "hf_minilm".to_string(),
+            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
 
     let app = AppBuilder::new("search_app")
-        .with_dataset(chunked)
+        .with_dataset(ds)
         .with_embedding(get_huggingface_embeddings(
             "sentence-transformers/all-MiniLM-L6-v2",
             "hf_minilm",
@@ -261,11 +273,15 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
         Some(vec!["cp_catalog_page_sk".to_string()]),
         None,
     );
-    ds.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-        chunking: None,
+    ds.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: "hf_minilm".to_string(),
+            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
 
     let app = AppBuilder::new("search_app")
@@ -313,16 +329,19 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
+async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
-    chunked.embeddings.push(ColumnEmbeddingConfig {
-        column: "cp_department".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: None,
-        chunking: None,
+    chunked.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![ColumnLevelEmbeddingConfig {
+            model: "hf_minilm".to_string(),
+            row_ids: None,
+            chunking: None,
+        }],
+        description: None,
+        full_text_search: None,
     });
-
     let app = AppBuilder::new("search_app")
         .with_dataset(chunked)
         .with_embedding(get_huggingface_embeddings(
@@ -340,6 +359,223 @@ async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
                 "datasets": ["mulit_column_no_pks"]
             }),
         }],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
+    let mut ds = catalog_page_tpch_dataset_w_embeddings(
+        "hybrid_column_search",
+        "hf_minilm",
+        Some(vec!["cp_catalog_page_sk".to_string()]),
+        None,
+    );
+    let col: &mut Column = ds.columns.first_mut().expect("column to be defined");
+    col.full_text_search = Some(FullTextSearchConfig {
+        enabled: true,
+        row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+    });
+
+    let app = AppBuilder::new("search_app")
+        .with_dataset(ds)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .build();
+    run_search(
+        app,
+        vec![
+            SearchTestCase {
+                name: "hybrid_column_search_basic",
+                body: json!({
+                    "text": "basic",
+                    "limit": 2,
+                    "datasets": ["hybrid_column_search"]
+                }),
+            },
+            SearchTestCase {
+                name: "hybrid_column_search_additional",
+                body: json!({
+                    "text": "basic",
+                    "limit": 2,
+                    "datasets": ["hybrid_column_search"],
+                    "additional_columns": ["cp_catalog_number"],
+                }),
+            },
+            SearchTestCase {
+                name: "hybrid_column_search_where",
+                body: json!({
+                    "text": "basic",
+                    "datasets": ["hybrid_column_search"],
+                    "where": "cp_catalog_page_sk % 2 = 1"
+                }),
+            },
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
+    let mut ds = catalog_page_tpch_dataset_w_embeddings(
+        "multi_column_hybrid_search",
+        "hf_minilm",
+        Some(vec!["cp_catalog_page_sk".to_string()]),
+        Some(EmbeddingChunkConfig {
+            enabled: true,
+            target_chunk_size: 512,
+            overlap_size: 128,
+            trim_whitespace: false,
+        }),
+    );
+    ds.columns.push(Column {
+        name: "cp_department".to_string(),
+        embeddings: vec![],
+        description: None,
+        full_text_search: Some(FullTextSearchConfig {
+            enabled: true,
+            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+        }),
+    });
+
+    let app = AppBuilder::new("search_app")
+        .with_dataset(ds)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .build();
+    run_search(
+        app,
+        vec![
+            SearchTestCase {
+                name: "multi_column_hybrid_basic",
+                body: json!({
+                    "text": "department",
+                    "limit": 2,
+                    "datasets": ["multi_column_hybrid_search"]
+                }),
+            },
+            SearchTestCase {
+                name: "multi_column_hybrid_additional",
+                body: json!({
+                    "text": "patient",
+                    "limit": 2,
+                    "datasets": ["multi_column_hybrid_search"],
+                    "additional_columns": ["cp_catalog_number"],
+                }),
+            },
+            SearchTestCase {
+                name: "multi_column_hybrid_where",
+                body: json!({
+                    "text": "general",
+                    "datasets": ["multi_column_hybrid_search"],
+                    "where": "cp_catalog_page_sk % 2 = 1"
+                }),
+            },
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_text_search() -> Result<(), anyhow::Error> {
+    let mut ds = get_tpcds_dataset("item", Some("item"), None);
+    ds.columns = vec![Column {
+        name: "i_item_desc".to_string(),
+        embeddings: vec![],
+        description: None,
+        full_text_search: Some(FullTextSearchConfig {
+            enabled: true,
+            row_ids: Some(vec!["i_item_sk".to_string()]),
+        }),
+    }];
+
+    run_search(
+        AppBuilder::new("search_app").with_dataset(ds).build(),
+        vec![
+            SearchTestCase {
+                name: "text_search_basic",
+                body: json!({
+                    "text": "Patient",
+                    "limit": 2,
+                    "datasets": ["item"],
+                    "additional_columns": ["i_color", "i_item_id"],
+                }),
+            },
+            SearchTestCase {
+                name: "text_search_with_extra_columns_and_where",
+                body: json!({
+                    "text": "Patient",
+                    "datasets": ["item"],
+                    "additional_columns": ["i_color", "i_item_id"],
+                    "where": "i_color='smoke'",
+                    "limit": 1,
+                }),
+            },
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
+    let mut ds = get_tpcds_dataset(
+            "catalog_page",
+            Some("catalog_page"),
+            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20".to_string().as_str()),
+        );
+    ds.columns = vec![
+        Column {
+            name: "cp_description".to_string(),
+            embeddings: vec![],
+            description: None,
+            full_text_search: Some(FullTextSearchConfig {
+                enabled: true,
+                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            }),
+        },
+        Column {
+            name: "cp_department".to_string(),
+            embeddings: vec![],
+            description: None,
+            full_text_search: Some(FullTextSearchConfig {
+                enabled: true,
+                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
+            }),
+        },
+    ];
+    run_search(
+        AppBuilder::new("search_app").with_dataset(ds).build(),
+        vec![
+            SearchTestCase {
+                name: "multi_text_column_basic",
+                body: json!({
+                    "text": "general",
+                    "limit": 2,
+                    "datasets": ["catalog_page"]
+                }),
+            },
+            SearchTestCase {
+                name: "multi_text_column_additional",
+                body: json!({
+                    "text": "general",
+                    "limit": 2,
+                    "datasets": ["catalog_page"],
+                    "additional_columns": ["cp_catalog_number"],
+                }),
+            },
+            SearchTestCase {
+                name: "multi_text_column_where",
+                body: json!({
+                    "text": "patient",
+                    "datasets": ["catalog_page"],
+                    "where": "cp_department='DEPARTMENT'"
+                }),
+            },
+        ],
     )
     .await
 }
@@ -382,6 +618,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             description: Some(
                 "This column has an embedding in the underlying spice instance".to_string(),
             ),
+            full_text_search: None,
             embeddings: vec![ColumnLevelEmbeddingConfig {
                 model: "hf_minilm".to_string(),
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -391,6 +628,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
         Column {
             name: "cp_department".to_string(),
             description: Some("This column is newly embedded in this spice app".to_string()),
+            full_text_search: None,
             embeddings: vec![ColumnLevelEmbeddingConfig {
                 model: "hf_minilm".to_string(),
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),

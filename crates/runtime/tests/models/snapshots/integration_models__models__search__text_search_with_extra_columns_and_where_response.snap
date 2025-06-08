@@ -1,0 +1,24 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "data": {
+        "i_color": "smoke",
+        "i_item_id": "AAAAAAAADBAAAAAA"
+      },
+      "dataset": "item",
+      "matches": {
+        "i_item_desc": "Patient"
+      },
+      "primary_key": {
+        "i_item_sk": 19
+      },
+      "score": 10.071
+    }
+  ]
+}

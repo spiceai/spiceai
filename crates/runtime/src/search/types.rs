@@ -217,9 +217,90 @@ fn transpose_and_convert(
 
     for (key, vv) in column_format {
         for (i, row_values) in vv.into_iter().enumerate() {
-            rows[i].insert(key.clone(), row_values.into());
+            if !row_values.is_empty() {
+                rows[i].insert(key.clone(), row_values.into());
+            }
         }
     }
 
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use insta::assert_json_snapshot;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn sort_result(v: Vec<HashMap<String, MatchType>>) -> Vec<Vec<(String, MatchType)>> {
+        v.into_iter()
+            .map(|x| {
+                x.into_iter()
+                    .sorted_by_key(|(a, _)| a.clone())
+                    .collect::<Vec<(String, MatchType)>>()
+            })
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn test_transpose_and_convert_single_column() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![
+                vec![Value::String("A".into())],
+                vec![Value::String("B".into())],
+                vec![],
+            ],
+        );
+
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_multiple_columns() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![
+                vec![Value::String("A".into())],
+                vec![Value::String("B".into())],
+                vec![],
+            ],
+        );
+        column_format.insert(
+            "key2".to_string(),
+            vec![
+                vec![],
+                vec![Value::String("C".into())],
+                vec![Value::String("D".into())],
+            ],
+        );
+
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_all_rows_empty() {
+        let mut column_format = HashMap::new();
+        column_format.insert("key1".to_string(), vec![vec![], vec![], vec![]]);
+
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
+
+    #[test]
+    fn test_transpose_and_convert_mixed_empty_and_non_empty_rows() {
+        let mut column_format = HashMap::new();
+        column_format.insert(
+            "key1".to_string(),
+            vec![
+                vec![Value::String("A".into())],
+                vec![],
+                vec![Value::String("B".into())],
+            ],
+        );
+
+        assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
 }

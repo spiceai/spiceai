@@ -11159,6 +11159,7 @@ dependencies = [
  "ssh2",
  "strsim 0.11.1",
  "suppaftp",
+ "tantivy",
  "telemetry",
  "tera",
  "test-framework",

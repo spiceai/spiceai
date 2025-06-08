@@ -21,10 +21,7 @@ use std::time::Duration;
 use app::AppBuilder;
 use async_openai::types::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
-use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, Embeddings},
-    model::Model,
-};
+use spicepod::component::{embeddings::Embeddings, model::Model};
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
@@ -50,6 +47,7 @@ const HF_TEST_MODEL_REQUIRES_HF_API_KEY: bool = true;
 mod nsql {
 
     use serde_json::json;
+    use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 
     use crate::{
         models::nsql::{TestCase, run_nsql_test},
@@ -72,11 +70,15 @@ mod nsql {
             .scope(async {
 
                 let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
-                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "store_and_fwd_flag".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: None,
-                    chunking: None,
+                taxi_trips_with_embeddings.columns = vec![Column {
+                        name: "store_and_fwd_flag".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "hf_minilm".to_string(),
+                            row_ids: None,
+                            chunking: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
                 }];
 
                 let app = AppBuilder::new("text-to-sql")

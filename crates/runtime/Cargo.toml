@@ -137,6 +137,7 @@ spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 strsim = { version = "0.11.1", optional = true }
 suppaftp = { workspace = true, optional = true }
+tantivy.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }

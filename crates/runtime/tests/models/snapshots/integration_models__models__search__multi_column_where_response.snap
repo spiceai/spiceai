@@ -31,13 +31,12 @@ snapshot_kind: text
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Narrowly great dogs carry only by the events. Successful, able legs would no"
+        "cp_description": "Close customers might struggle away different mem"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 5
+        "cp_catalog_page_sk": 15
       },
-      "score": 0.031
+      "score": 0.015
     }
   ]
 }
