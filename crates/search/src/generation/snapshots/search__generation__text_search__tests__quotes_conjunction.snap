@@ -1,0 +1,43 @@
+---
+source: crates/search/src/generation/text_search.rs
+expression: "parse_query_literal(\"'foo and' bar\")"
+snapshot_kind: text
+---
+{
+  "type": "bool",
+  "clauses": [
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "foo",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "and",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "bar",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ]
+  ]
+}
