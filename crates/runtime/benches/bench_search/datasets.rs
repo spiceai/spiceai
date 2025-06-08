@@ -71,7 +71,7 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
         .ok_or("Failed to convert PathBuf to str")?;
 
     let mut ds_data = make_local_file_dataset(data_path_str, "data");
-    ds_data.acceleration = acceleration.clone();
+    ds_data.acceleration.clone_from(acceleration);
     if let Some(embedding) = embedding {
         ds_data.embeddings = vec![embedding.clone()];
     }

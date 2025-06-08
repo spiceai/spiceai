@@ -110,7 +110,7 @@ impl SearchBenchmarkConfiguration {
             embeddings_model,
             embedding,
             acceleration: None,
-            text_search: text_search,
+            text_search,
         }
     }
     #[must_use]
@@ -120,6 +120,7 @@ impl SearchBenchmarkConfiguration {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
     let args = BenchArgs::parse();
 
