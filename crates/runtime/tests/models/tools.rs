@@ -19,10 +19,9 @@ mod mcp {
 
     use crate::models::{http_get, sort_json_keys};
 
-    use crate::init_tracing_with_task_history;
     use crate::models::create_api_bindings_config;
+    use crate::utils::init_tracing_with_task_history;
 
-    use crate::Runtime;
     use crate::utils::runtime_ready_check;
     use app::AppBuilder;
     use http::{
@@ -32,6 +31,7 @@ mod mcp {
     use insta::{assert_json_snapshot, assert_snapshot};
     use runtime::auth::EndpointAuth;
 
+    use runtime::Runtime;
     use serde_json::Value;
     use spicepod::component::tool::Tool;
     use std::sync::Arc;

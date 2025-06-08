@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/management/mod.rs
+expression: pretty_format_batches(&exported_events)?
+---
++------------------------------------+------------------------+----------------------------------------------------------------------+
+| input                              | captured_output        | error_message                                                        |
++------------------------------------+------------------------+----------------------------------------------------------------------+
+| SELECT 12345 as test_event         | [{"test_event":12345}] |                                                                      |
+| SELECT invalid_query as test_event |                        | Failed to execute query: Schema error: No field named invalid_query. |
++------------------------------------+------------------------+----------------------------------------------------------------------+
