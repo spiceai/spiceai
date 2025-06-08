@@ -199,30 +199,35 @@ impl FullTextSearch {
 // A query, q, is interpreted as a space-delimited, OR-conjuncted set of string literals.
 //
 // Examples:
-//   - q="'foo and' bar" -> Returns any document containing at least one of ["foo", "and", "bar"].
+//  - q="'foo and' bar" -> ["foo", "and", "bar"]
+//  - q="title:sea^20 body:whale^70" -> ["title", "sea", "20", "body", "whale", "70"]
+//  - q="How much (in USD) don't I get?" -> ["how", "much", "in", "usd", "don", "t", "i", "get"]
 fn parse_query_literal(q: &str) -> UserInputAst {
     let mut literal = vec![];
     let mut tok = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(LowerCaser)
         .build();
+
     let mut s = tok.token_stream(q);
     while s.advance() {
-        let t = s.token();
-        literal.push(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
-            UserInputLiteral {
-                field_name: None,
-                phrase: t.text.clone(),
-                delimiter: Delimiter::None,
-                slop: 0,
-                prefix: false,
-            },
-        ))));
+        literal.push(s.token().text.clone());
     }
 
     UserInputAst::Clause(
         literal
             .into_iter()
-            .map(|l| (Some(Occur::Should), l))
+            .map(|phrase| {
+                (
+                    Some(Occur::Should),
+                    UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(UserInputLiteral {
+                        field_name: None,
+                        phrase,
+                        delimiter: Delimiter::None,
+                        slop: 0,
+                        prefix: false,
+                    }))),
+                )
+            })
             .collect(),
     )
 }
@@ -402,6 +407,10 @@ pub(crate) mod tests {
         insta::assert_json_snapshot!(
             "special_characters",
             parse_query_literal("title:sea^20 body:whale^70")
+        );
+        insta::assert_json_snapshot!(
+            "operators",
+            parse_query_literal("How much (in USD) don't I get?")
         );
     }
 
