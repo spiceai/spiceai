@@ -1,0 +1,76 @@
+---
+source: crates/search/src/generation/text_search.rs
+expression: "parse_query_literal(\"title:sea^20 body:whale^70\")"
+snapshot_kind: text
+---
+{
+  "type": "bool",
+  "clauses": [
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "title",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "sea",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "20",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "body",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "whale",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "70",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ]
+  ]
+}
