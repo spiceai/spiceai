@@ -282,6 +282,9 @@ mod tests {
 
         CachedSearchResult {
             results: Arc::new(results),
+            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+                table: Arc::from("test_table"),
+            }])),
         }
     }
 

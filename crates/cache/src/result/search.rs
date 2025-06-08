@@ -54,11 +54,12 @@ impl CachedAggregationResult {
 #[derive(Clone)]
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+    pub input_tables: Arc<HashSet<TableReference>>,
 }
 
 impl AsTableRefs for CachedSearchResult {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::new(self.results.keys().cloned().collect())
+        Arc::clone(&self.input_tables)
     }
 }
 
