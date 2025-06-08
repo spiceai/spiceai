@@ -162,6 +162,30 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             ..Default::default()
         }),
         SearchBenchmarkConfiguration::new(
+            "quora_minilm-l6-v2_hybrid_arrow",
+            "QuoraRetrieval",
+            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            Some((
+                MTEB_COLUMN_NAME.to_string(),
+                FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["_id".to_string()]),
+                },
+            )),
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+            refresh_sql: Some("select * from data limit 20000".into()),
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
             "quora_openai-text-embedding-3-small_arrow",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
@@ -172,6 +196,28 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 chunking: None,
             }),
             None,
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_openai-text-embedding-3-small_hybrid_arrow",
+            "QuoraRetrieval",
+            "openai:text-embedding-3-small",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            Some((
+                MTEB_COLUMN_NAME.to_string(),
+                FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["_id".to_string()]),
+                },
+            )),
         )
         .with_acceleration(Acceleration {
             enabled: true,
