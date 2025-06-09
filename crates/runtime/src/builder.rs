@@ -182,7 +182,7 @@ impl RuntimeBuilder {
             caching_config.sql_results = Some(results_cache.into());
         }
 
-        let caching = Runtime::init_caching(self.app.as_ref().map(|app| &app.runtime.caching));
+        let caching = Runtime::init_caching(Some(&caching_config));
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
