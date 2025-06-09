@@ -84,6 +84,13 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 primary_key.as_slice(),
             ));
 
+            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
+
+            // If data is empty, don't use.
+            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
+                continue;
+            }
+
             // Since we know what the `SEARCH_VALUE_COLUMN_NAME` column for the i'th column will be in the final schema,
             // we can add it to the `matches` map now.
             matches
@@ -93,13 +100,6 @@ impl CandidateAggregation for ReciprocalRankFusion {
                     matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
                 });
 
-            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
-
-            // If data is empty, don't use.
-            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
-                continue;
-            }
-
             let table_name = format!("search_candidates_{i}");
             table_names.push(table_name.clone());
             let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
@@ -108,6 +108,20 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 .context(DatafusionSnafu)?;
 
             i += 1;
+        }
+
+        // Now that we've filtered empty generation data, again check for <=1 inputs.
+        if table_names.len() <= 1 {
+            let tbl = table_names.pop().ok_or(Error::NoCandidatesGenerated)?;
+            let match_keys: Vec<_> = matches.keys().cloned().collect();
+
+            return result_from_table(
+                &ctx,
+                tbl.as_str(),
+                match_keys.first().ok_or(Error::NoCandidatesGenerated)?,
+                primary_key.as_slice(),
+            )
+            .await;
         }
 
         let additional_columns = additional_columns.into_iter().collect::<Vec<_>>();
@@ -133,6 +147,43 @@ impl CandidateAggregation for ReciprocalRankFusion {
     }
 }
 
+// Construct a [`AggregationResult`] from a single table in a [`SessionContext`].
+async fn result_from_table(
+    ctx: &SessionContext,
+    tbl: &str,
+    match_field: &str,
+    primary_key: &[String],
+) -> Result<AggregationResult> {
+    let df = ctx.table(tbl).await.context(DatafusionSnafu)?;
+    let data_columns = df
+        .schema()
+        .columns()
+        .iter()
+        .filter_map(|c| {
+            let name = c.name().to_string();
+            if primary_key.contains(&name) {
+                return None;
+            }
+            if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str()) {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    let data = df.execute_stream().await.context(DatafusionSnafu)?;
+
+    Ok(AggregationResult {
+        data,
+        primary_key: primary_key.to_vec(),
+        data_columns,
+        matches: [(
+            match_field.to_string(),
+            vec![SEARCH_VALUE_COLUMN_NAME.to_string()],
+        )]
+        .into(),
+    })
+}
+
 /// Returns a list of additional columns in the schema that are not part of the primary key or the expected
 /// search columns (i.e. score or underlying value).
 fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[String]) -> Vec<String> {
@@ -153,7 +204,7 @@ fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[String]) -> V
 
 /// Verifies that all streams have the same schema and contain the required columns: [`SEARCH_VALUE_COLUMN_NAME`], [`SEARCH_SCORE_COLUMN_NAME`].
 fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
-    let Some(schema) = schemas.first() else {
+    let Some(schema) = schemas.iter().find(|s| !s.fields.is_empty()) else {
         return Ok(());
     };
 

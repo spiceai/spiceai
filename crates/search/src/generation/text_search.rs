@@ -86,14 +86,24 @@ pub struct FullTextSearch {
     idx: Arc<Index>,
     field: String,
     primary_key: Vec<String>,
+
+    /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
+    /// This allows for the reuse of a generic `Index` in search.
+    additional_columns: Option<Vec<String>>,
 }
 
 impl FullTextSearch {
-    pub fn try_new(index: Arc<Index>, field: String, primary_key: Vec<String>) -> Result<Self> {
+    pub fn try_new(
+        index: Arc<Index>,
+        field: String,
+        primary_key: Vec<String>,
+        additional_columns: Option<Vec<String>>,
+    ) -> Result<Self> {
         let fts = Self {
             idx: index,
             field,
             primary_key,
+            additional_columns,
         };
 
         // Ensure that the index has the required primary key columns.
@@ -122,8 +132,12 @@ impl FullTextSearch {
     pub fn additional_columns(&self) -> Vec<String> {
         self.all_columns()
             .into_iter()
-            .filter(|name| *name != self.field && !self.primary_key.contains(name))
+            .filter(|name| !self.in_base_cols(name))
             .collect()
+    }
+
+    fn in_base_cols(&self, name: &String) -> bool {
+        *name == self.field || self.primary_key.contains(name)
     }
 
     #[must_use]
@@ -131,7 +145,21 @@ impl FullTextSearch {
         self.idx
             .schema()
             .fields()
-            .map(|(_, f)| f.name().to_string())
+            .filter_map(|(_, f)| {
+                let name = f.name().to_string();
+                if self.in_base_cols(&name) {
+                    Some(name)
+                } else if self
+                    // Filter based on [`self.additional_columns`].
+                    .additional_columns
+                    .as_ref()
+                    .is_some_and(|cols| !cols.contains(&name))
+                {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
             .collect()
     }
 
@@ -145,7 +173,14 @@ impl FullTextSearch {
             .searcher())
     }
 
-    fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
+    /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
+    fn search_query_literal(
+        &self,
+        literal: &str,
+        keep_search_field: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Value>> {
         // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
         let default_field = self
             .idx
@@ -162,8 +197,10 @@ impl FullTextSearch {
         let schema = self.idx.schema();
         let searcher = self.index_searcher()?;
 
+        let all_cols = self.all_columns();
+
         let top_docs = searcher
-            .search(&q, &TopDocs::with_limit(limit))
+            .search(&q, &TopDocs::with_limit(limit).and_offset(offset))
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
@@ -173,10 +210,14 @@ impl FullTextSearch {
                 let mut doc_w_col_names = doc
                     .into_iter()
                     .map(|(f, v)| (schema.get_field_name(f), v))
+                    .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
                     .collect::<HashMap<_, _>>();
 
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
+                    if keep_search_field {
+                        doc_w_col_names.insert(self.field.as_str(), value.clone());
+                    }
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 
@@ -245,10 +286,17 @@ impl CandidateGeneration for FullTextSearch {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
 
+        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
+        let mut keep_search_field = false;
         let cols = self.all_columns();
         for proj in addition_projection {
             let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => cols.contains(value),
+                Expr::Identifier(Ident { value, .. }) => {
+                    if *value == self.field {
+                        keep_search_field = true;
+                    }
+                    cols.contains(value)
+                }
                 _ => false,
             };
             if !is_supported {
@@ -258,7 +306,7 @@ impl CandidateGeneration for FullTextSearch {
         }
 
         let hits = self
-            .search_query_literal(query.as_str(), limit)
+            .search_query_literal(query.as_str(), keep_search_field, limit, 0)
             .context(GenerationTextSearchSnafu)?;
 
         let schema = Arc::new(
@@ -266,7 +314,6 @@ impl CandidateGeneration for FullTextSearch {
                 .context(ArrowSchemaSnafu)
                 .context(GenerationTextSearchSnafu)?,
         );
-
         let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema))
             .build_decoder()
             .context(ArrowSchemaSnafu)
@@ -416,9 +463,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let fts =
-            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
+        let fts = FullTextSearch::try_new(
+            Arc::new(create_basic_index()),
+            "body".to_string(),
+            vec![],
+            None,
+        )
+        .expect("failed to create FullTextSearch");
 
         let rb_as_value = validate_result(fts.search("fish".into(), &[], &[], 3).await).await;
 

@@ -41,33 +41,79 @@ impl FullTextConnector {
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let search_field_opt = dataset.columns.iter().find_map(|c| {
-            if c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled) {
-                let primary_key_overrides = c
-                    .full_text_search
-                    .as_ref()
-                    .and_then(|cfg| cfg.row_ids.clone());
-                Some((c.name.clone(), primary_key_overrides))
-            } else {
-                None
-            }
-        });
+        let (search_fields, primary_key_overrides): (Vec<_>, Vec<_>) = dataset
+            .columns
+            .iter()
+            .filter_map(|c| {
+                if c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled) {
+                    let primary_key_overrides = c
+                        .full_text_search
+                        .as_ref()
+                        .and_then(|cfg| cfg.row_ids.clone());
+                    Some((c.name.clone(), primary_key_overrides))
+                } else {
+                    None
+                }
+            })
+            .unzip();
 
-        let Some((search_field, primary_key_overrides)) = search_field_opt else {
+        if search_fields.is_empty() {
             return Ok(inner_table_provider);
-        };
+        }
 
-        let tbl =
-            TableWithFullText::try_new(inner_table_provider, search_field, primary_key_overrides)
-                .await
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
-                    dataconnector: dataset.source().to_string(),
-                    message: e.to_string(),
-                    connector_component: dataset.into(),
-                    source: Box::new(e),
-                })?;
+        let tbl = TableWithFullText::try_new(
+            inner_table_provider,
+            search_fields.clone(),
+            Self::warn_different_primary_keys(
+                dataset.name.to_string().as_str(),
+                primary_key_overrides,
+                search_fields.as_slice(),
+            ),
+        )
+        .await
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
+    }
+
+    // For all full text search columns, find the first with a non-null primary key override and
+    // if there are multiple, warn if they are different.
+    fn warn_different_primary_keys(
+        ds_name: &str,
+        sets: Vec<Option<Vec<String>>>,
+        fields: &[String],
+    ) -> Option<Vec<String>> {
+        let mut first: Option<Vec<String>> = None;
+        let cmp_idx = 0;
+        for (i, s) in sets.into_iter().enumerate() {
+            let Some(mut pks) = s else {
+                continue;
+            };
+            pks.sort();
+
+            // If not first primary key defined, check it matches previous. Otherwise set to be used for next comparison.
+            if let Some(ref f) = first {
+                if *pks != *f {
+                    tracing::warn!(
+                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
+                        ds_name,
+                        fields[cmp_idx],
+                        f.join(", "),
+                        fields[i],
+                        pks.join(", "),
+                    );
+                }
+            } else {
+                first = Some(pks.clone());
+            }
+        }
+
+        first
     }
 }
 

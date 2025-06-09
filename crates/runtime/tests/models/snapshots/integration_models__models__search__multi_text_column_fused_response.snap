@@ -7,24 +7,33 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "data": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+      },
       "dataset": "catalog_page",
       "matches": {
+        "cp_department": "DEPARTMENT",
         "cp_description": "In general basic characters welcome. Clearly lively friends conv"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 12.843
+      "score": 0.032
     },
     {
+      "data": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+      },
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Levels will attend ago general, basic ideas. Physical, "
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 3404
+        "cp_catalog_page_sk": 2
       },
-      "score": 10.345
+      "score": 0.016
     }
   ]
 }
