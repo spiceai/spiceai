@@ -61,3 +61,5 @@ data/
 !test/spicepods/
 !test/nsql_bench/spicepod.yaml
 !test/nsql_bench/data
+!crates/runtime/tests/acceleration/data
+!crates/runtime/tests/acceleration/spicepods

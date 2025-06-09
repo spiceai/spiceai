@@ -44,6 +44,32 @@ fn get_dataset(from: &str, name: &str, cron: &str) -> Dataset {
 
 const NAMES_CSV: &str = include_str!("data/names.csv");
 
+#[allow(clippy::expect_used)]
+async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name: Option<&str>) {
+    let result: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(
+            format!(
+                "SELECT id, name, age, city, score FROM {} ORDER BY id",
+                dataset_name.unwrap_or("names")
+            )
+            .as_str(),
+        )
+        .build()
+        .run()
+        .await
+        .expect("query is successful")
+        .data
+        .try_collect()
+        .await
+        .expect("collects results");
+
+    let pretty = arrow::util::pretty::pretty_format_batches(&result)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))
+        .expect("Should format batches");
+    insta::assert_snapshot!(name, pretty);
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
@@ -106,21 +132,7 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 "Expected schedule name to match dataset name"
             );
 
-            let result: Vec<RecordBatch> = rt
-                .datafusion()
-                .query_builder("SELECT * FROM names ORDER BY id")
-                .build()
-                .run()
-                .await
-                .expect("query is successful")
-                .data
-                .try_collect()
-                .await
-                .expect("collects results");
-
-            let pretty = arrow::util::pretty::pretty_format_batches(&result)
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!(pretty);
+            snapshot_names_from_runtime("test_cron_schedule_creates_before", &rt, None).await;
 
             // Append a new row to the CSV file
             let new_row = "11,Spaceman,29,LEO,100\n";
@@ -134,21 +146,7 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
             // wait for the next 30th second, and wait 10 seconds for the job to succeed
             tokio::time::sleep(time_till_second(30, Some(10))).await;
 
-            let result: Vec<RecordBatch> = rt
-                .datafusion()
-                .query_builder("SELECT * FROM names ORDER BY id")
-                .build()
-                .run()
-                .await
-                .expect("query is successful")
-                .data
-                .try_collect()
-                .await
-                .expect("collects results");
-
-            let pretty = arrow::util::pretty::pretty_format_batches(&result)
-                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!(pretty);
+            snapshot_names_from_runtime("test_cron_schedule_creates_after", &rt, None).await;
 
             rt.shutdown().await;
             drop(rt);
@@ -231,21 +229,12 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
             }
 
             for dataset_name in dataset_names.clone() {
-                let result: Vec<RecordBatch> = rt
-                    .datafusion()
-                    .query_builder(&format!("SELECT * FROM {dataset_name} ORDER BY id"))
-                    .build()
-                    .run()
-                    .await
-                    .expect("query is successful")
-                    .data
-                    .try_collect()
-                    .await
-                    .expect("collects results");
-
-                let pretty = arrow::util::pretty::pretty_format_batches(&result)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-                insta::assert_snapshot!(pretty);
+                snapshot_names_from_runtime(
+                    &format!("test_multiple_cron_schedule_creates_before_{dataset_name}"),
+                    &rt,
+                    Some(&dataset_name),
+                )
+                .await;
             }
 
             // Append a new row to the CSV file
@@ -261,21 +250,12 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
             tokio::time::sleep(time_till_second(30, Some(10))).await;
 
             for dataset_name in dataset_names.clone() {
-                let result: Vec<RecordBatch> = rt
-                    .datafusion()
-                    .query_builder(&format!("SELECT * FROM {dataset_name} ORDER BY id"))
-                    .build()
-                    .run()
-                    .await
-                    .expect("query is successful")
-                    .data
-                    .try_collect()
-                    .await
-                    .expect("collects results");
-
-                let pretty = arrow::util::pretty::pretty_format_batches(&result)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-                insta::assert_snapshot!(pretty);
+                snapshot_names_from_runtime(
+                    &format!("test_multiple_cron_schedule_creates_after_{dataset_name}"),
+                    &rt,
+                    Some(&dataset_name),
+                )
+                .await;
             }
 
             rt.shutdown().await;
@@ -452,6 +432,112 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
 
             // Clean up
             std::fs::remove_dir_all(&spicepod_dir).expect("Failed to remove spicepod directory");
+
+            Ok(())
+        })
+        .await
+}
+
+const NAMES_TIMESTAMPED_CSV: &str = include_str!("data/names_timestamped.csv");
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            std::fs::write("./test_append_cron_schedule.csv", NAMES_TIMESTAMPED_CSV)
+                .expect("write file");
+
+            let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
+                "./spicepods/test_append_cron_schedule.yaml"
+            ))
+            .expect("Should load app from spicepod string");
+
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await,
+            );
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // validate that a scheduler exists in the runtime
+            let schedulers_lock = Arc::clone(&rt).schedulers();
+            let schedulers = schedulers_lock.read().await;
+
+            // there should only be one `refresh_scheduler` with one schedule for the configured dataset
+            assert!(
+                schedulers.len() == 1,
+                "Expected exactly one scheduler, found: {}",
+                schedulers.len()
+            );
+            let refresh_scheduler = schedulers
+                .get("refresh_scheduler")
+                .expect("Expected a refresh scheduler to be present");
+            let mut rt_schedules = refresh_scheduler.schedules().await;
+            assert!(
+                rt_schedules.len() == 1,
+                "Expected exactly one schedule, found: {}",
+                rt_schedules.len()
+            );
+            let schedule = rt_schedules
+                .pop()
+                .expect("Expected a schedule to be present");
+            assert_eq!(
+                schedule.name(),
+                "names".into(),
+                "Expected schedule name to match dataset name"
+            );
+
+            snapshot_names_from_runtime("test_append_cron_schedule_before", &rt, None).await;
+
+            // Append a new row to the CSV file
+            let new_row = format!(
+                "11,Spaceman,29,LEO,100,{}\n",
+                chrono::Utc::now().to_rfc3339()
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open("./test_append_cron_schedule.csv")
+                .expect("open file")
+                .write_all(new_row.as_bytes())
+                .expect("append to file");
+
+            // wait for the next 30th second, and wait 10 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(15, Some(5))).await;
+            snapshot_names_from_runtime("test_append_cron_schedule_after_one", &rt, None).await;
+
+            // Append a new row to the CSV file
+            let new_row = format!(
+                "12,Cassian,33,Kenari,100,{}\n",
+                chrono::Utc::now().to_rfc3339()
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open("./test_append_cron_schedule.csv")
+                .expect("open file")
+                .write_all(new_row.as_bytes())
+                .expect("append to file");
+
+            // wait for the next 30th second, and wait 10 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(15, Some(5))).await;
+            snapshot_names_from_runtime("test_append_cron_schedule_after_two", &rt, None).await;
+
+            rt.shutdown().await;
+            drop(rt);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            std::fs::remove_file("./test_append_cron_schedule.csv").expect("remove file");
 
             Ok(())
         })

@@ -144,40 +144,49 @@ impl VectorSearch {
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
-            if matches!(cache_control, CacheControl::NoCache) {
-                tracing::trace!("Search cache bypassed");
-                return Ok((self.search(req).await?, CacheStatus::CacheBypass));
-            }
-
             let search_key = SearchKey::from(req.clone());
             let cache_key = CacheKey::Search(&search_key);
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
 
-            if let Some(cached_result) = cache_provider.get_raw_key(&raw_cache_key.as_u64()).await {
-                tracing::trace!("Search cache hit");
-                // each CachedAggregationResult needs to be re-mapped to an AggregationResult
-                let mut results = HashMap::new();
-                for (table_ref, cached_aggregation_result) in cached_result.results.iter() {
-                    let result = AggregationResult {
-                        data: Box::pin(CachedStream::new(
-                            Arc::clone(&cached_aggregation_result.records),
-                            Arc::clone(&cached_aggregation_result.schema),
-                        )),
-                        primary_key: cached_aggregation_result.primary_keys.clone(),
-                        data_columns: cached_aggregation_result.data_columns.clone(),
-                        matches: cached_aggregation_result.matches.clone(),
-                    };
-                    results.insert(table_ref.clone(), result);
+            match (
+                cache_control,
+                cache_provider.get_raw_key(&raw_cache_key.as_u64()).await,
+            ) {
+                (CacheControl::NoCache, _) => {
+                    tracing::trace!("Search cache bypass");
+                    let results = self.search(req).await?;
+                    (
+                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        CacheStatus::CacheBypass,
+                    )
                 }
+                (CacheControl::Cache(_), None) => {
+                    tracing::trace!("Search cache miss");
+                    let results = self.search(req).await?;
+                    (
+                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        CacheStatus::CacheMiss,
+                    )
+                }
+                (CacheControl::Cache(_), Some(cached_result)) => {
+                    tracing::trace!("Search cache hit");
+                    // each CachedAggregationResult needs to be re-mapped to an AggregationResult
+                    let mut results = HashMap::new();
+                    for (table_ref, cached_aggregation_result) in cached_result.results.iter() {
+                        let result = AggregationResult {
+                            data: Box::pin(CachedStream::new(
+                                Arc::clone(&cached_aggregation_result.records),
+                                Arc::clone(&cached_aggregation_result.schema),
+                            )),
+                            primary_key: cached_aggregation_result.primary_keys.clone(),
+                            data_columns: cached_aggregation_result.data_columns.clone(),
+                            matches: cached_aggregation_result.matches.clone(),
+                        };
+                        results.insert(table_ref.clone(), result);
+                    }
 
-                (results, CacheStatus::CacheHit)
-            } else {
-                tracing::trace!("Search cache miss");
-                let results = self.search(req).await?;
-                (
-                    wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
-                    CacheStatus::CacheMiss,
-                )
+                    (results, CacheStatus::CacheHit)
+                }
             }
         } else {
             tracing::trace!("Search cache is disabled");
