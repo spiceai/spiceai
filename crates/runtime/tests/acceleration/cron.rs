@@ -21,7 +21,7 @@ use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::{auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
-use spicepod::acceleration::{Acceleration, RefreshMode};
+use spicepod::acceleration::Acceleration;
 use spicepod::component::dataset::Dataset;
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,12 +44,13 @@ fn get_dataset(from: &str, name: &str, cron: &str) -> Dataset {
 
 const NAMES_CSV: &str = include_str!("data/names.csv");
 
+#[allow(clippy::expect_used)]
 async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name: Option<&str>) {
     let result: Vec<RecordBatch> = rt
         .datafusion()
         .query_builder(
             format!(
-                "SELECT * FROM {} ORDER BY id",
+                "SELECT id, name, age, city, score FROM {} ORDER BY id",
                 dataset_name.unwrap_or("names")
             )
             .as_str(),
@@ -449,22 +450,10 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
             std::fs::write("./test_append_cron_schedule.csv", NAMES_TIMESTAMPED_CSV)
                 .expect("write file");
 
-            let mut dataset = get_dataset(
-                "file:test_append_cron_schedule.csv",
-                "names",
-                "*/15 * * * * *", // every 30 seconds
-            );
-
-            dataset.acceleration = dataset.acceleration.map(|mut acc| {
-                acc.refresh_mode = Some(RefreshMode::Append);
-                acc
-            });
-
-            dataset.time_column = Some("updated_at".to_string());
-
-            let app = AppBuilder::new("test_append_cron_schedule")
-                .with_dataset(dataset)
-                .build();
+            let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
+                "./spicepods/test_append_cron_schedule.yaml"
+            ))
+            .expect("Should load app from spicepod string");
 
             let rt = Arc::new(
                 Runtime::builder()
