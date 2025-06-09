@@ -160,11 +160,11 @@ async fn result_from_table(
         .columns()
         .iter()
         .filter_map(|c| {
-            let name = c.flat_name();
+            let name = c.name().to_string();
             if primary_key.contains(&name) {
                 return None;
             }
-            if name == match_field {
+            if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str()) {
                 return None;
             }
             Some(name)
