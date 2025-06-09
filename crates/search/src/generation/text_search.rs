@@ -173,7 +173,13 @@ impl FullTextSearch {
             .searcher())
     }
 
-    fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
+    /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
+    fn search_query_literal(
+        &self,
+        literal: &str,
+        keep_search_field: bool,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
         // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
         let default_field = self
             .idx
@@ -208,6 +214,9 @@ impl FullTextSearch {
 
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
+                    if keep_search_field {
+                        doc_w_col_names.insert(self.field.as_str(), value.clone());
+                    }
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 
@@ -277,9 +286,15 @@ impl CandidateGeneration for FullTextSearch {
         }
 
         let cols = self.all_columns();
+        let mut keep_search_field = false;
         for proj in addition_projection {
             let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => cols.contains(value),
+                Expr::Identifier(Ident { value, .. }) => {
+                    if *value == self.field {
+                        keep_search_field = true;
+                    };
+                    cols.contains(value)
+                }
                 _ => false,
             };
             if !is_supported {
@@ -289,7 +304,7 @@ impl CandidateGeneration for FullTextSearch {
         }
 
         let hits = self
-            .search_query_literal(query.as_str(), limit)
+            .search_query_literal(query.as_str(), keep_search_field, limit)
             .context(GenerationTextSearchSnafu)?;
 
         let schema = Arc::new(

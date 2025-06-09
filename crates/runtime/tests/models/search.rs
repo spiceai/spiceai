@@ -560,6 +560,15 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 }),
             },
             SearchTestCase {
+                name: "multi_text_column_fused",
+                body: json!({
+                    "text": "general department",
+                    "limit": 2,
+                    "datasets": ["catalog_page"],
+                    "additional_columns": ["cp_department", "cp_description"]
+                }),
+            },
+            SearchTestCase {
                 name: "multi_text_column_additional",
                 body: json!({
                     "text": "general",
