@@ -25,12 +25,13 @@ use spicepod::component::{embeddings::Embeddings, model::Model};
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
-    init_tracing, init_tracing_with_task_history,
+    init_tracing,
     models::{
         create_api_bindings_config,
         embedding::{EmbeddingTestCase, run_embedding_tests},
         get_taxi_trips_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
+    utils::init_tracing_with_task_history,
     utils::{runtime_ready_check_with_timeout, test_request_context, verify_env_secret_exists},
 };
 
@@ -50,6 +51,7 @@ mod nsql {
     use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 
     use crate::{
+        DEFAULT_TRACING_MODELS,
         models::nsql::{TestCase, run_nsql_test},
         utils::{runtime_ready_check_with_timeout, verify_env_secret_exists},
     };
@@ -58,7 +60,7 @@ mod nsql {
 
     #[tokio::test]
     async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
+        let _tracing = init_tracing(DEFAULT_TRACING_MODELS);
 
         if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
             verify_env_secret_exists("SPICE_HF_TOKEN")
@@ -99,7 +101,7 @@ mod nsql {
 
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-                let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+                let (_tracing, trace_provider) = init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
 
                 let rt_ref_copy = Arc::clone(&rt);
                 tokio::spawn(async move {

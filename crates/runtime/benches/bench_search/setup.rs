@@ -27,13 +27,10 @@ use crate::{
 };
 
 use app::AppBuilder;
-use spicepod::{
-    acceleration::Acceleration,
-    component::{
-        caching::{CacheKeyType, HashingAlgorithm, ResultsCache},
-        dataset::{Dataset, Mode, replication::Replication},
-        embeddings::{EmbeddingChunkConfig, Embeddings},
-    },
+use spicepod::component::{
+    caching::{CacheKeyType, HashingAlgorithm, ResultsCache},
+    dataset::{Dataset, Mode, replication::Replication},
+    embeddings::Embeddings,
 };
 
 use super::SearchBenchmarkResultBuilder;
@@ -57,13 +54,7 @@ pub(crate) async fn setup_benchmark(
     let mut benchmark_result =
         SearchBenchmarkResultBuilder::new(get_commit_sha(), get_branch_name(), config.name);
 
-    let app_builder = build_bench_app(
-        config.test_dataset,
-        config.embeddings_model,
-        config.acceleration.as_ref(),
-        config.chunking.as_ref(),
-    )
-    .await?;
+    let app_builder = build_bench_app(config).await?;
 
     let app = match upload_results_dataset {
         Some(dataset_path) => app_builder
@@ -233,12 +224,7 @@ fn extract_query_relevance_from_batches(records: &[RecordBatch]) -> Result<Query
     Ok(query_relevance)
 }
 
-async fn build_bench_app(
-    test_dataset: &str,
-    embeddings_model: &str,
-    acceleration: Option<&Acceleration>,
-    chunking: Option<&EmbeddingChunkConfig>,
-) -> Result<AppBuilder, String> {
+async fn build_bench_app(config: &SearchBenchmarkConfiguration) -> Result<AppBuilder, String> {
     let app_builder = AppBuilder::new("vector_search_benchmark_test")
         .with_results_cache(ResultsCache {
             enabled: false,
@@ -248,29 +234,23 @@ async fn build_bench_app(
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
         })
-        .with_embedding(create_embeddings_model(embeddings_model));
+        .with_embedding(create_embeddings_model(config.embeddings_model));
 
-    add_benchmark_dataset(
-        app_builder,
-        test_dataset,
-        acceleration.cloned(),
-        chunking.cloned(),
-    )
-    .await
+    add_benchmark_dataset(app_builder, config).await
 }
 
 async fn add_benchmark_dataset(
     app_builder: AppBuilder,
-    dataset: &str,
-    acceleration: Option<Acceleration>,
-    chunking: Option<EmbeddingChunkConfig>,
+    config: &SearchBenchmarkConfiguration,
 ) -> Result<AppBuilder, String> {
-    match dataset.to_lowercase().as_str() {
+    match config.test_dataset.to_lowercase().as_str() {
         "quoraretrieval" => {
-            super::datasets::add_mtep_quora_retrieval_dataset(app_builder, acceleration, chunking)
-                .await
+            super::datasets::add_mtep_quora_retrieval_dataset(app_builder, config).await
         }
-        _ => Err(format!("Unknown benchmark dataset: {dataset}")),
+        _ => Err(format!(
+            "Unknown benchmark dataset: {}",
+            config.test_dataset
+        )),
     }
 }
 

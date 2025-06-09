@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -78,20 +78,35 @@ pub trait HashProvider {
     fn hasher(&self) -> Box<dyn Hasher>;
 }
 
+/// Trait for types that can be converted to a set of table references.
+pub trait AsTableRefs {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>>;
+}
+
+impl AsTableRefs for LogicalPlan {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::new(get_logical_plan_input_tables(self))
+    }
+}
+
 #[async_trait]
-pub trait CacheProvider<V: Clone + Send + Sync + 'static>: HashProvider + std::fmt::Debug {
+pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
+    HashProvider + std::fmt::Debug
+{
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
     fn invalidate_all(&self);
+
+    /// Invalidates all cache entries for the specified table.
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails.
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
-}
-
-pub trait TableInvalidator {
-    #[allow(clippy::missing_errors_doc)]
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
 }
 
 #[derive(Default)]
@@ -140,17 +155,31 @@ impl Caching {
         self.search = Some(search);
         self
     }
-}
 
-trait QueryResultCache: CacheProvider<CachedQueryResult> + TableInvalidator {}
-impl<T: BuildHasher + Clone + Send + Sync + 'static> QueryResultCache
-    for LruCache<CachedQueryResult, T>
-{
+    /// Invalidates all configured caches for the specified table.
+    ///
+    /// This is purposely eager, as an invalidated cache is better than a stale one.
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails for any of the caches.
+    pub fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        if let Some(results_cache) = &self.results {
+            results_cache.invalidate_for_table(table_ref.clone())?;
+        }
+        if let Some(plans_cache) = &self.plans {
+            plans_cache.invalidate_for_table(table_ref.clone())?;
+        }
+        if let Some(search_cache) = &self.search {
+            search_cache.invalidate_for_table(table_ref)?;
+        }
+        Ok(())
+    }
 }
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
-    cache: Arc<dyn QueryResultCache + Send + Sync>,
+    cache: Arc<dyn CacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
 

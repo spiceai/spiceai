@@ -20,7 +20,7 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
@@ -30,8 +30,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use snafu::{OptionExt, ResultExt};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Notify, RwLock};
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -66,7 +66,7 @@ impl RefreshTask {
         &self,
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
@@ -92,14 +92,17 @@ impl RefreshTask {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider) = &cache_provider {
-                                if let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                                {
-                                    tracing::error!(
-                                        "Failed to invalidate cached results for dataset {}: {e}",
-                                        &dataset_name.to_string()
-                                    );
+                            if let Some(cache_provider_ref) = caching.as_ref() {
+                                // No cache provider means runtime is shutting down and cache is already cleaned up
+                                if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                    if let Err(e) =
+                                        cache_provider.invalidate_for_table(dataset_name.clone())
+                                    {
+                                        tracing::error!(
+                                            "Failed to invalidate cached results for dataset {}: {e}",
+                                            &dataset_name.to_string()
+                                        );
+                                    }
                                 }
                             }
                         }

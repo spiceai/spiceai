@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,7 @@ use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -419,7 +419,8 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
+    caching: Option<Weak<Caching>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -459,7 +460,7 @@ impl Refresher {
             federated_source,
             refresh,
             accelerator,
-            cache_provider: None,
+            caching: None,
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
@@ -471,11 +472,8 @@ impl Refresher {
         }
     }
 
-    pub fn cache_provider(
-        &mut self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    ) -> &mut Self {
-        self.cache_provider = cache_provider;
+    pub fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
+        self.caching = caching.as_ref().map(Arc::downgrade);
         self
     }
 
@@ -613,7 +611,7 @@ impl Refresher {
         let notifier = self.on_complete_notification.clone();
         let refresh = Arc::clone(&self.refresh);
 
-        let cache_provider = self.cache_provider.clone();
+        let caching = self.caching.clone();
         let checkpointer = self.checkpointer.clone();
 
         let refresh_check_interval = self.refresh.read().await.check_interval;
@@ -674,11 +672,12 @@ impl Refresher {
                             notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            if let Some(cache_provider) = &cache_provider {
-                                if let Err(e) = cache_provider
-                                    .invalidate_for_table(dataset_name.clone())
-                                {
-                                    tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(cache_provider_ref) = caching.as_ref() {
+                                // No cache provider means runtime is shutting down and cache is already cleaned up
+                                if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                    if let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                        tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                    }
                                 }
                             }
 
@@ -749,18 +748,13 @@ impl Refresher {
 
         let refresh_defaults = Arc::clone(&self.refresh);
 
-        let cache_provider = self.cache_provider.clone();
+        let caching = self.caching.clone();
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         let notifier = self.on_complete_notification.clone();
         tokio::spawn(async move {
             if let Err(err) = refresh_task
-                .start_streaming_append(
-                    cache_provider,
-                    notifier,
-                    refresh_defaults,
-                    initial_load_completed,
-                )
+                .start_streaming_append(caching, notifier, refresh_defaults, initial_load_completed)
                 .await
             {
                 tracing::error!("Append refresh failed with error: {err}");
@@ -784,7 +778,7 @@ impl Refresher {
             .build(),
         );
 
-        let cache_provider = self.cache_provider.clone();
+        let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
@@ -794,7 +788,7 @@ impl Refresher {
                 .start_changes_stream(
                     refresh,
                     changes_stream,
-                    cache_provider,
+                    caching,
                     notifier,
                     initial_load_completed,
                 )

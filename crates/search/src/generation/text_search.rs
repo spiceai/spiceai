@@ -26,9 +26,10 @@ use snafu::{ResultExt, Snafu};
 use tantivy::{
     Index, ReloadPolicy, Searcher, TantivyError,
     collector::TopDocs,
-    query::{QueryParser, QueryParserError},
+    query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{Field, OwnedValue},
+    tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
 
 use super::{
@@ -146,16 +147,14 @@ impl FullTextSearch {
 
     fn search_query_literal(&self, literal: &str, limit: usize) -> Result<Vec<Value>> {
         // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
-        let q = QueryParser::for_index(&self.idx, vec![])
-            .build_query_from_user_input_ast(UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(
-                UserInputLiteral {
-                    field_name: Some(self.field.clone()),
-                    phrase: literal.to_string(),
-                    delimiter: Delimiter::None,
-                    slop: 0,
-                    prefix: false,
-                },
-            ))))
+        let default_field = self
+            .idx
+            .schema()
+            .find_field(self.field.as_str())
+            .map(|(f, _)| vec![f])
+            .unwrap_or_default();
+        let q = QueryParser::for_index(&self.idx, default_field)
+            .build_query_from_user_input_ast(parse_query_literal(literal))
             .context(InvalidTextSearchQuerySnafu {
                 query: literal.to_string(),
             })?;
@@ -193,6 +192,44 @@ impl FullTextSearch {
 
         Ok(top_docs)
     }
+}
+
+// Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
+//
+// A query, q, is interpreted as a space-delimited, OR-conjuncted set of string literals.
+//
+// Examples:
+//  - q="'foo and' bar" -> ["foo", "and", "bar"]
+//  - q="title:sea^20 body:whale^70" -> ["title", "sea", "20", "body", "whale", "70"]
+//  - q="How much (in USD) don't I get?" -> ["how", "much", "in", "usd", "don", "t", "i", "get"]
+fn parse_query_literal(q: &str) -> UserInputAst {
+    let mut literal = vec![];
+    let mut tok = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build();
+
+    let mut s = tok.token_stream(q);
+    while s.advance() {
+        literal.push(s.token().text.clone());
+    }
+
+    UserInputAst::Clause(
+        literal
+            .into_iter()
+            .map(|phrase| {
+                (
+                    Some(Occur::Should),
+                    UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(UserInputLiteral {
+                        field_name: None,
+                        phrase,
+                        delimiter: Delimiter::None,
+                        slop: 0,
+                        prefix: false,
+                    }))),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -296,7 +333,8 @@ pub(crate) mod tests {
     use crate::{
         aggregation::write_to_json_string,
         generation::{
-            CandidateGeneration, Result as GenerationResult, text_search::FullTextSearch,
+            CandidateGeneration, Result as GenerationResult,
+            text_search::{FullTextSearch, parse_query_literal},
         },
     };
 
@@ -360,6 +398,20 @@ pub(crate) mod tests {
         index_writer.commit().expect("failed to commit documents");
 
         index
+    }
+
+    #[test]
+    fn test_parse_query_literal() {
+        insta::assert_json_snapshot!("and_conjunction", parse_query_literal("foo and bar"));
+        insta::assert_json_snapshot!("quotes_conjunction", parse_query_literal("'foo and' bar"));
+        insta::assert_json_snapshot!(
+            "special_characters",
+            parse_query_literal("title:sea^20 body:whale^70")
+        );
+        insta::assert_json_snapshot!(
+            "operators",
+            parse_query_literal("How much (in USD) don't I get?")
+        );
     }
 
     #[tokio::test]
