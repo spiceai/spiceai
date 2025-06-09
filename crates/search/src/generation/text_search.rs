@@ -13,8 +13,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::{datatypes::Schema, error::ArrowError};
-use arrow_json::reader::Decoder;
+use arrow::error::ArrowError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -294,7 +293,7 @@ impl CandidateGeneration for FullTextSearch {
                 Expr::Identifier(Ident { value, .. }) => {
                     if *value == self.field {
                         keep_search_field = true;
-                    };
+                    }
                     cols.contains(value)
                 }
                 _ => false,

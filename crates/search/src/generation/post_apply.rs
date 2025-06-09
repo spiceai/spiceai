@@ -201,11 +201,10 @@ impl PostApplyCandidateGeneration {
                                     yield Ok(batch.slice(0, remaining_limit));
                                     remaining_limit = 0;
                                     break;
-                                } else {
-                                    yield Ok(batch);
-                                    remaining_limit = remaining_limit.saturating_sub(num_rows);
-                                };
-                            };
+                                }
+                                yield Ok(batch);
+                                remaining_limit = remaining_limit.saturating_sub(num_rows);
+                            }
                         }
                     }
                     Err(e) => {
@@ -397,7 +396,7 @@ mod tests {
         let fts = FullTextSearch::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
-            vec![],
+            vec!["title".to_string()],
             None,
         )
         .expect("failed to create FullTextSearch");
