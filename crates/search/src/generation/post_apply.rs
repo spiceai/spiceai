@@ -369,9 +369,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter() {
-        let fts =
-            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
+        let fts = FullTextSearch::try_new(
+            Arc::new(create_basic_index()),
+            "body".to_string(),
+            vec![],
+            None,
+        )
+        .expect("failed to create FullTextSearch");
 
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
@@ -391,9 +395,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_projection() {
-        let fts =
-            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
+        let fts = FullTextSearch::try_new(
+            Arc::new(create_basic_index()),
+            "body".to_string(),
+            vec![],
+            None,
+        )
+        .expect("failed to create FullTextSearch");
 
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
