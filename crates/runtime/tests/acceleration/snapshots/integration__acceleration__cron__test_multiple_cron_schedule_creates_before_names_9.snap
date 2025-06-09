@@ -1,6 +1,5 @@
 ---
 source: crates/runtime/tests/acceleration/cron.rs
-assertion_line: 128
 expression: pretty
 ---
 +----+--------------+-----+--------------+-------+
