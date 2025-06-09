@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use aws_sdk_glue::{Client, types::Table};
@@ -309,6 +309,8 @@ async fn create_s3_provider(
         });
     };
 
+    let from = ensure_s3_trailing_slash(&from);
+
     match input_format {
         InputFormat::Csv => {
             // If the table specifies a delimiter, pass it down to the data connector
@@ -337,6 +339,28 @@ async fn create_s3_provider(
     s3.read_provider(&dataset).await
 }
 
+fn ensure_s3_trailing_slash(s3_location: &str) -> String {
+    static PREFIX: &str = "s3://";
+
+    if !s3_location.starts_with(PREFIX) {
+        return s3_location.to_string();
+    }
+
+    let path_part = &s3_location[PREFIX.len()..];
+
+    if path_part.ends_with('/') {
+        return s3_location.to_string();
+    }
+
+    let path = Path::new(path_part);
+    if path.extension().is_some() {
+        return s3_location.to_string();
+    }
+
+    // Add the trailing slash
+    format!("{s3_location}/")
+}
+
 fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, String> {
     const METADATA_LOCATION: &str = "metadata_location";
     match parameters {
@@ -351,6 +375,24 @@ fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ensure_s3_trailing_slash() {
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer"),
+            "s3://spiceai-public-datasets/tpch/customer/"
+        );
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/"),
+            "s3://spiceai-public-datasets/tpch/customer/"
+        );
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/customer.csv"),
+            "s3://spiceai-public-datasets/tpch/customer/customer.csv"
+        );
+        assert_eq!(ensure_s3_trailing_slash(""), "");
+        assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
 
     #[test]
     fn get_metadata_location_success() {
