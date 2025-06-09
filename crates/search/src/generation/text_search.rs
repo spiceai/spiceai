@@ -286,8 +286,9 @@ impl CandidateGeneration for FullTextSearch {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
 
-        let cols = self.all_columns();
+        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
         let mut keep_search_field = false;
+        let cols = self.all_columns();
         for proj in addition_projection {
             let is_supported = match proj {
                 Expr::Identifier(Ident { value, .. }) => {
