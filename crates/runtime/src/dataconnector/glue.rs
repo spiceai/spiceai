@@ -14,13 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
+use aws_config::SdkConfig;
 use aws_sdk_glue::{Client, types::Table};
+use aws_sdk_sts::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
-use iceberg::{NamespaceIdent, TableIdent, io::S3_REGION};
-use iceberg_catalog_glue::{AWS_REGION_NAME, GlueCatalog, GlueCatalogConfig};
+use iceberg::{
+    NamespaceIdent, TableIdent,
+    io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
+};
+use iceberg_catalog_glue::{
+    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GlueCatalog,
+    GlueCatalogConfig,
+};
 use iceberg_datafusion::IcebergTableProvider;
 
 use crate::{
@@ -52,7 +60,7 @@ impl GlueDataConnector {
 }
 
 impl GlueDataConnector {
-    async fn client(&self) -> Result<Client, aws::Error> {
+    async fn config(&self) -> Result<SdkConfig, aws::Error> {
         let config = load_config(
             "GlueCatalogConnector",
             "region",
@@ -63,7 +71,7 @@ impl GlueDataConnector {
         )
         .await?;
 
-        Ok(Client::new(&config))
+        Ok(config)
     }
 }
 
@@ -128,13 +136,15 @@ impl DataConnector for GlueDataConnector {
                 })?;
         let table = path.table();
 
-        let client = self.client().await.map_err(|e| {
+        let config = self.config().await.map_err(|e| {
             super::DataConnectorError::UnableToConnectInternal {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 source: e.into(),
             }
         })?;
+
+        let client = Client::new(&config);
 
         let get_table_output = client
             .get_table()
@@ -168,15 +178,7 @@ impl DataConnector for GlueDataConnector {
                 create_s3_provider(input_format, dataset.clone(), self.params.clone(), &table).await
             }
             InputFormat::Iceberg => {
-                let region = self.params.get("region").expose().ok().ok_or_else(|| {
-                    super::DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: PREFIX.to_string(),
-                        connector_component: dataset.into(),
-                        message: "region not found".to_string(),
-                    }
-                })?;
-                create_iceberg_provider(dataset, region.to_string(), database.to_string(), &table)
-                    .await
+                create_iceberg_provider(dataset, &config, database.to_string(), &table).await
             }
         }
     }
@@ -239,10 +241,35 @@ impl TryFrom<&Table> for InputFormat {
 
 async fn create_iceberg_provider(
     dataset: &Dataset,
-    region: String,
+    config: &SdkConfig,
     database: String,
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    let region =
+        config
+            .region()
+            .ok_or_else(|| super::DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: "no region specified".to_string(),
+            })?;
+
+    let credentials = config
+        .credentials_provider()
+        .ok_or_else(|| super::DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: "problem getting credentials".to_string(),
+        })?
+        .provide_credentials()
+        .await
+        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: "credentials provided incorrectly".to_string(),
+            source: e.into(),
+        })?;
+
     let metadata_location =
         get_metadata_location(table.parameters.as_ref()).map_err(|message| {
             super::DataConnectorError::InternalWithSource {
@@ -252,10 +279,31 @@ async fn create_iceberg_provider(
             }
         })?;
 
-    let props = HashMap::from([
-        (AWS_REGION_NAME.to_string(), region.clone()),
-        (S3_REGION.to_string(), region),
+    let mut props = HashMap::from([
+        (
+            AWS_ACCESS_KEY_ID.to_string(),
+            credentials.access_key_id().to_string(),
+        ),
+        (
+            AWS_SECRET_ACCESS_KEY.to_string(),
+            credentials.secret_access_key().to_string(),
+        ),
+        (AWS_REGION_NAME.to_string(), region.to_string()),
+        (
+            S3_ACCESS_KEY_ID.to_string(),
+            credentials.access_key_id().to_string(),
+        ),
+        (
+            S3_SECRET_ACCESS_KEY.to_string(),
+            credentials.secret_access_key().to_string(),
+        ),
+        (S3_REGION.to_string(), region.to_string()),
     ]);
+
+    if let Some(session_token) = credentials.session_token() {
+        props.insert(AWS_SESSION_TOKEN.to_string(), session_token.to_string());
+        props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
+    }
 
     let config = GlueCatalogConfig::builder()
         .warehouse(metadata_location)
@@ -309,6 +357,8 @@ async fn create_s3_provider(
         });
     };
 
+    let from = ensure_s3_trailing_slash(&from);
+
     match input_format {
         InputFormat::Csv => {
             // If the table specifies a delimiter, pass it down to the data connector
@@ -337,6 +387,28 @@ async fn create_s3_provider(
     s3.read_provider(&dataset).await
 }
 
+fn ensure_s3_trailing_slash(s3_location: &str) -> String {
+    static PREFIX: &str = "s3://";
+
+    if !s3_location.starts_with(PREFIX) {
+        return s3_location.to_string();
+    }
+
+    let path_part = &s3_location[PREFIX.len()..];
+
+    if path_part.ends_with('/') {
+        return s3_location.to_string();
+    }
+
+    let path = Path::new(path_part);
+    if path.extension().is_some() {
+        return s3_location.to_string();
+    }
+
+    // Add the trailing slash
+    format!("{s3_location}/")
+}
+
 fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, String> {
     const METADATA_LOCATION: &str = "metadata_location";
     match parameters {
@@ -351,6 +423,24 @@ fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ensure_s3_trailing_slash() {
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer"),
+            "s3://spiceai-public-datasets/tpch/customer/"
+        );
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/"),
+            "s3://spiceai-public-datasets/tpch/customer/"
+        );
+        assert_eq!(
+            ensure_s3_trailing_slash("s3://spiceai-public-datasets/tpch/customer/customer.csv"),
+            "s3://spiceai-public-datasets/tpch/customer/customer.csv"
+        );
+        assert_eq!(ensure_s3_trailing_slash(""), "");
+        assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
+    }
 
     #[test]
     fn get_metadata_location_success() {

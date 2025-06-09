@@ -1,6 +1,5 @@
 ---
 source: crates/runtime/tests/acceleration/cron.rs
-assertion_line: 156
 expression: pretty
 ---
 +----+--------------+-----+--------------+-------+
@@ -17,4 +16,5 @@ expression: pretty
 | 9  | Chris Martin | 37  | Dallas       | 79    |
 | 10 | Anna Garcia  | 41  | San Jose     | 90    |
 | 11 | Spaceman     | 29  | LEO          | 100   |
+| 12 | Cassian      | 33  | Kenari       | 100   |
 +----+--------------+-----+--------------+-------+

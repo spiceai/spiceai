@@ -1,0 +1,11 @@
+id,name,age,city,score,updated_at
+1,John Doe,28,New York,85,2025-06-09T01:28:14+00:00
+2,Jane Smith,34,Los Angeles,92,2025-06-09T01:28:14+00:00
+3,Mike Johnson,45,Chicago,78,2025-06-09T01:28:14+00:00
+4,Emily Brown,31,Houston,89,2025-06-09T01:28:14+00:00
+5,David Lee,39,Phoenix,76,2025-06-09T01:28:14+00:00
+6,Sarah Wilson,26,Philadelphia,94,2025-06-09T01:28:14+00:00
+7,Tom Anderson,52,San Antonio,81,2025-06-09T01:28:14+00:00
+8,Lisa Taylor,29,San Diego,88,2025-06-09T01:28:14+00:00
+9,Chris Martin,37,Dallas,79,2025-06-09T01:28:14+00:00
+10,Anna Garcia,41,San Jose,90,2025-06-09T01:28:14+00:00
