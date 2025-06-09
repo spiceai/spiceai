@@ -21,13 +21,17 @@ use std::{
     time::Duration,
 };
 
+use opentelemetry::InstrumentationScope;
+use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
+use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
+use spicepod::component::runtime::TaskHistoryCapturedOutput;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
+
 use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
-use runtime::{
-    Runtime,
-    request::{Protocol, RequestContext, UserAgent},
-};
+use runtime::request::{Protocol, RequestContext, UserAgent};
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(
@@ -128,4 +132,44 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
 
     Ok(pretty)
+}
+
+pub(crate) fn init_tracing_with_task_history(
+    default_level: Option<&str>,
+    rt: &Runtime,
+) -> (DefaultGuard, TracerProvider) {
+    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
+        (_, Some(log)) => EnvFilter::new(log),
+        (Some(level), None) => EnvFilter::new(level),
+        _ => EnvFilter::new("runtime=debug,INFO"),
+    };
+
+    let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
+
+    let task_history_exporter =
+        TaskHistoryExporter::new(rt.datafusion(), TaskHistoryCapturedOutput::Truncated);
+
+    // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
+    let provider = TracerProvider::builder()
+        .with_batch_exporter(task_history_exporter, TokioCurrentThread)
+        .build();
+
+    let scope = InstrumentationScope::builder("task_history")
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
+
+    let task_history_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(filter::filter_fn(|metadata| {
+            metadata.target() == "task_history"
+        }));
+
+    let subscriber = tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(task_history_layer);
+
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    (guard, provider)
 }

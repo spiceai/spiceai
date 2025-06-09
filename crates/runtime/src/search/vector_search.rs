@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
@@ -282,7 +283,8 @@ fn wrap_cache_to_result(
     let mut wrapped_results = HashMap::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(TableReference, CachedAggregationResult)>(100);
     let tx = Arc::new(tx);
-    let expected_keys = aggregation_result.keys().cloned().collect::<Vec<_>>();
+    let expected_keys: HashSet<TableReference> =
+        aggregation_result.keys().cloned().collect::<HashSet<_>>();
 
     for (table_ref, aggregation_result) in aggregation_result {
         let tx = Arc::clone(&tx);
@@ -372,6 +374,7 @@ fn wrap_cache_to_result(
 
         let result = CachedSearchResult {
             results: Arc::new(results),
+            input_tables: Arc::new(expected_keys),
         };
 
         if result.get_memory_size() > cache_provider.max_size() {

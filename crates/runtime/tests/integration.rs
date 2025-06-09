@@ -85,6 +85,8 @@ mod sqlite;
 mod tls;
 mod utils;
 mod view;
+
+mod management;
 // MySQL is required for the rehydration tests
 mod podswatcher;
 #[cfg(all(feature = "mysql", feature = "duckdb"))]

@@ -28,6 +28,7 @@ use datafusion::sql::TableReference;
 use futures::Stream;
 use futures::task::{Context, Poll};
 
+use crate::AsTableRefs;
 use crate::Sizeable;
 
 use super::CacheStatus;
@@ -45,6 +46,12 @@ impl Sizeable for CachedQueryResult {
             .iter()
             .map(arrow::array::RecordBatch::get_array_memory_size)
             .sum()
+    }
+}
+
+impl AsTableRefs for CachedQueryResult {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::clone(&self.input_tables)
     }
 }
 

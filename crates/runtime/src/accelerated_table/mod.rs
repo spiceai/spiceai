@@ -28,7 +28,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::catalog::Session;
@@ -235,7 +235,7 @@ pub struct Builder {
     zero_results_action: ZeroResultsAction,
     refresh_on_startup: RefreshOnStartup,
     ready_state: ReadyState,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    caching: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
@@ -265,7 +265,7 @@ impl Builder {
             zero_results_action: ZeroResultsAction::default(),
             refresh_on_startup: RefreshOnStartup::default(),
             ready_state: ReadyState::default(),
-            cache_provider: None,
+            caching: None,
             changes_stream: None,
             append_stream: None,
             checkpointer: None,
@@ -296,11 +296,8 @@ impl Builder {
         self
     }
 
-    pub fn cache_provider(
-        &mut self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    ) -> &mut Self {
-        self.cache_provider = cache_provider;
+    pub fn caching(&mut self, caching: Option<Arc<Caching>>) -> &mut Self {
+        self.caching = caching;
         self
     }
 
@@ -443,7 +440,7 @@ impl Builder {
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
-        refresher.cache_provider(self.cache_provider.clone());
+        refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
@@ -469,7 +466,7 @@ impl Builder {
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
                 retention,
-                self.cache_provider.clone(),
+                self.caching.clone(),
             ));
             handlers.push(retention_check_handle);
         }
@@ -586,7 +583,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        caching: Option<Arc<Caching>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;
@@ -681,7 +678,7 @@ impl AcceleratedTable {
                             }
 
                             if num_records > 0 {
-                                if let Some(cache_provider) = &cache_provider {
+                                if let Some(cache_provider) = caching.as_ref() {
                                     if let Err(e) =
                                         cache_provider.invalidate_for_table(dataset_name.clone())
                                     {

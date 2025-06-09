@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::AsTableRefs;
 use crate::CacheProvider;
-use crate::CachedQueryResult;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
-use crate::TableInvalidator;
 use crate::current_time_secs;
 use crate::metrics::CacheMetrics;
 use async_trait::async_trait;
@@ -39,7 +38,7 @@ use std::time::Duration;
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
@@ -49,7 +48,7 @@ pub struct LruCache<
 }
 
 impl<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > std::fmt::Debug for LruCache<V, T>
 {
@@ -71,7 +70,9 @@ impl<
 ///
 /// - If the specified `max_size` cannot be parsed as a valid byte size.
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
-pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
+pub fn build_from_config<
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+>(
     cache_config: &CacheConfig,
 ) -> Result<Arc<dyn CacheProvider<V> + Send + Sync>> {
     let cache_max_size: u64 = match &cache_config.max_size {
@@ -103,7 +104,7 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
 }
 
 impl<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
@@ -141,7 +142,7 @@ impl<
 }
 
 impl<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > HashProvider for LruCache<V, T>
 {
@@ -150,27 +151,9 @@ impl<
     }
 }
 
-impl<T: BuildHasher + Clone + Send + Sync + 'static> TableInvalidator
-    for LruCache<CachedQueryResult, T>
-{
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name = Arc::clone(table_name);
-        self.cache
-            .invalidate_entries_if(move |_key, value| value.input_tables.contains(&table_ref))
-            .context(FailedToInvalidateCacheSnafu { table_name })?;
-
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl<
-    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > CacheProvider<V> for LruCache<V, T>
 {
@@ -212,6 +195,20 @@ impl<
         }
     }
 
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = match &table_ref {
+            TableReference::Bare { table }
+            | TableReference::Partial { table, .. }
+            | TableReference::Full { table, .. } => table,
+        };
+        let table_name = Arc::clone(table_name);
+        self.cache
+            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .context(FailedToInvalidateCacheSnafu { table_name })?;
+
+        Ok(())
+    }
+
     fn size_bytes(&self) -> u64 {
         self.cache.weighted_size()
     }
@@ -232,12 +229,14 @@ impl<
 #[cfg(test)]
 mod tests {
     use crate::CacheKey;
+    use crate::result::query::CachedQueryResult;
+    use crate::result::search::{CachedAggregationResult, CachedSearchResult};
 
     use super::*;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
     use std::time::Duration;
 
@@ -259,6 +258,33 @@ mod tests {
             records: Arc::new(vec![record_batch.clone()]),
             schema: Arc::new(record_batch.schema().as_ref().to_owned()),
             input_tables: Arc::new(input_tables),
+        }
+    }
+
+    fn create_test_cached_search_result() -> CachedSearchResult {
+        let mut results = HashMap::new();
+        let record_batch = create_test_record_batch();
+        let schema = record_batch.schema();
+        let cached_aggregation_result = CachedAggregationResult {
+            records: Arc::new(vec![record_batch]),
+            primary_keys: Vec::new(),
+            data_columns: Vec::new(),
+            matches: HashMap::new(),
+            schema,
+        };
+
+        results.insert(
+            TableReference::Bare {
+                table: Arc::from("test_table"),
+            },
+            cached_aggregation_result,
+        );
+
+        CachedSearchResult {
+            results: Arc::new(results),
+            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+                table: Arc::from("test_table"),
+            }])),
         }
     }
 
@@ -332,6 +358,41 @@ mod tests {
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[rstest]
+    #[case::siphash(RandomState::default())]
+    #[case::ahash(ahash::RandomState::default())]
+    #[tokio::test]
+    async fn test_search_cache_invalidate_for_table<
+        T: BuildHasher + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: LruCache<CachedSearchResult, _> =
+            LruCache::new(10, Duration::from_secs(60), hasher);
+        let table_ref = TableReference::Bare {
+            table: Arc::from("test_table"),
+        };
+        let result = create_test_cached_search_result();
+
+        let raw_cache_key = 123_456;
+
+        // Put a value in the cache
+        cache.put_raw_key(&raw_cache_key, result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&raw_cache_key).await;
+        assert!(retrieved.is_some());
+
+        // Invalidate the cache for the table
+        cache
+            .invalidate_for_table(table_ref)
+            .expect("should invalidate cache");
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&raw_cache_key).await;
         assert!(retrieved.is_none());
     }
 

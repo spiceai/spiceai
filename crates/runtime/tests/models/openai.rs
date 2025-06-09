@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
+use crate::DEFAULT_TRACING_MODELS;
 use crate::models::{sort_json_keys, sql_to_display, sql_to_json_values, sql_to_single_json_value};
 use crate::{
-    init_tracing, init_tracing_with_task_history,
+    init_tracing,
     models::{
         create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
         get_tpcds_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
+    utils::init_tracing_with_task_history,
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
@@ -83,7 +85,7 @@ mod nsql {
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+            let (_tracing, trace_provider) = init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
 
             let rt_ref_copy = Arc::clone(&rt);
             tokio::spawn(async move {
@@ -456,7 +458,8 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+            let (_tracing, trace_provider) =
+                init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

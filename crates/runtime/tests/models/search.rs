@@ -32,11 +32,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::DEFAULT_TRACING_MODELS;
 use crate::models::hf::get_huggingface_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, http_post};
 use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
-use crate::{init_tracing, init_tracing_with_task_history};
+use crate::{init_tracing, utils::init_tracing_with_task_history};
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
@@ -160,7 +161,7 @@ async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let _ = init_tracing_with_task_history(None, &rt);
+    let _ = init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
 
     let rt_ref_copy = Arc::clone(&rt);
     let api_config_clone = api_config.clone();

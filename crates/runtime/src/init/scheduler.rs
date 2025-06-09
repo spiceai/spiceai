@@ -28,7 +28,8 @@ use tokio::sync::RwLock;
 
 use crate::{
     Result, Runtime,
-    component::dataset::Dataset,
+    component::dataset::{Dataset, acceleration::RefreshMode},
+    dataaccelerator::AccelerationSource,
     scheduling::{
         dataset::DatasetRefreshTask,
         worker::{WorkerPromptTask, WorkerSqlTask},
@@ -43,13 +44,29 @@ pub(crate) type ScheduleRegistry = RwLock<HashMap<Arc<str>, Arc<Scheduler<Runnin
 
 impl Runtime {
     pub async fn create_dataset_schedule(self: Arc<Self>, dataset: Arc<Dataset>) -> Result<()> {
-        let Some(refresh_cron) = dataset.refresh_cron().clone() else {
+        let Some(acceleration) = dataset.acceleration() else {
+            tracing::debug!(
+                "Dataset '{}' has no acceleration source, skipping schedule creation",
+                dataset.name
+            );
+            return Ok(());
+        };
+
+        let Some(refresh_cron) = acceleration.refresh_cron.clone() else {
             tracing::debug!(
                 "Dataset '{}' has no refresh cron specified, skipping schedule creation",
                 dataset.name
             );
             return Ok(());
         };
+
+        if matches!(acceleration.refresh_mode, Some(RefreshMode::Changes)) {
+            tracing::warn!(
+                "Refresh schedule will not be set for the dataset '{}'.\nSpecifying a `refresh_cron` with `refresh_mode` set to `changes` is not supported.\nRemove the `refresh_cron` from the dataset, or use a different `refresh_mode`.",
+                dataset.name
+            );
+            return Ok(());
+        }
 
         tracing::debug!("Creating dataset scheduler for dataset: {}", dataset.name);
         let scheduler_lock = Arc::clone(&self.schedulers);

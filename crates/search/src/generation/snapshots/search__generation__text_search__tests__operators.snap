@@ -1,0 +1,98 @@
+---
+source: crates/search/src/generation/text_search.rs
+expression: "parse_query_literal(\"How much (in USD) don't I get?\")"
+snapshot_kind: text
+---
+{
+  "type": "bool",
+  "clauses": [
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "how",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "much",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "in",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "usd",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "don",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "t",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "i",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ],
+    [
+      "should",
+      {
+        "type": "literal",
+        "field_name": null,
+        "phrase": "get",
+        "delimiter": "none",
+        "slop": 0,
+        "prefix": false
+      }
+    ]
+  ]
+}

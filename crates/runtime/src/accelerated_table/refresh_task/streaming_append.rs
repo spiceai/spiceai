@@ -20,19 +20,19 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::status;
 use async_stream::stream;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 use tokio::sync::{Notify, RwLock};
 
 impl RefreshTask {
     pub async fn start_streaming_append(
         &self,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+        caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         refresh: Arc<RwLock<Refresh>>,
         initial_load_completed: Arc<AtomicBool>,
@@ -60,14 +60,17 @@ impl RefreshTask {
                         }
                         initial_load_completed.store(true, Ordering::Relaxed);
 
-                        if let Some(cache_provider) = &cache_provider {
-                            if let Err(e) =
-                                cache_provider.invalidate_for_table(dataset_name.clone())
-                            {
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name.to_string()
-                                );
+                        if let Some(cache_provider_ref) = caching.as_ref() {
+                            // No cache provider means runtime is shutting down and cache is already cleaned up
+                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                if let Err(e) =
+                                    cache_provider.invalidate_for_table(dataset_name.clone())
+                                {
+                                    tracing::error!(
+                                        "Failed to invalidate cached results for dataset {}: {e}",
+                                        &dataset_name.to_string()
+                                    );
+                                }
                             }
                         }
                     }
