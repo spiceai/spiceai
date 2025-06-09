@@ -9,28 +9,29 @@ snapshot_kind: text
     {
       "data": {
         "cp_department": "DEPARTMENT",
-        "cp_description": "General chairs reform much. Eyes would hide; consultants would imagine general, direct"
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
       },
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "General chairs reform much. Eyes would hide; consultants would imagine general, direct"
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 8905
+        "cp_catalog_page_sk": 1
       },
-      "score": 0.016
+      "score": 0.032
     },
     {
       "data": {
         "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Even democratic stairs would know happy investigations. Histo"
       },
       "dataset": "catalog_page",
       "matches": {
         "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 2
       },
       "score": 0.016
     }

@@ -13,7 +13,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::error::ArrowError;
+use arrow::{datatypes::Schema, error::ArrowError};
+use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -179,6 +180,7 @@ impl FullTextSearch {
         literal: &str,
         keep_search_field: bool,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<Value>> {
         // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
         let default_field = self
@@ -199,7 +201,7 @@ impl FullTextSearch {
         let all_cols = self.all_columns();
 
         let top_docs = searcher
-            .search(&q, &TopDocs::with_limit(limit))
+            .search(&q, &TopDocs::with_limit(limit).and_offset(offset))
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
@@ -304,7 +306,7 @@ impl CandidateGeneration for FullTextSearch {
         }
 
         let hits = self
-            .search_query_literal(query.as_str(), keep_search_field, limit)
+            .search_query_literal(query.as_str(), keep_search_field, limit, 0)
             .context(GenerationTextSearchSnafu)?;
 
         let schema = Arc::new(
