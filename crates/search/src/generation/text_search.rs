@@ -88,7 +88,7 @@ pub struct FullTextSearch {
     primary_key: Vec<String>,
 
     /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
-    /// This allows a more generic `Index` to be used in search.
+    /// This allows for the reuse of a generic `Index` in search.
     additional_columns: Option<Vec<String>>,
 }
 
