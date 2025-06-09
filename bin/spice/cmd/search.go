@@ -36,7 +36,8 @@ import (
 )
 
 const (
-	limitKeyFlag = "limit"
+	limitKeyFlag     = "limit"
+	cacheControlFlag = "cache-control"
 )
 
 type SearchRequest struct {
@@ -105,6 +106,17 @@ spice search --cloud
 			os.Exit(1)
 		}
 
+		cache_control, err := cmd.Flags().GetString(cacheControlFlag)
+		if err != nil {
+			slog.Error("could not get cache control flag", "error", err)
+			os.Exit(1)
+		}
+
+		if cache_control != "cache" && cache_control != "no-cache" {
+			slog.Error("invalid value for cache-control flag. Possible values: cache, no-cache")
+			os.Exit(1)
+		}
+
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer func() {
@@ -139,7 +151,7 @@ spice search --cloud
 					Text:     message,
 					Datasets: nil, // search across all datasets containing embeddings
 					Limit:    limit,
-				})
+				}, cache_control)
 				if err != nil {
 					slog.Error("failed to send search request to spiced", "error", err)
 					out <- nil
@@ -199,15 +211,16 @@ spice search --cloud
 	},
 }
 
-func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (*http.Response, error) {
+func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest, cache_control string) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling search request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+	return rtcontext.Do("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Cache-Control", cache_control)
 }
 
 func init() {
+	searchCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for searches. [possible values: cache, no-cache]")
 	searchCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 
