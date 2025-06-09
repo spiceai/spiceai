@@ -51,6 +51,9 @@ pub struct PostApplyCandidateGeneration {
 static TABLE_PROVIDER_TABLE_NAME: &str = "table_provider";
 static CANDIDATE_GENERATION_TABLE_NAME: &str = "candidate_generation";
 
+// Increase `LIMIT` clause by a multiple to allow for post-filtering.
+static MAX_LIMIT_MULTIPLIER: usize = 100;
+
 impl PostApplyCandidateGeneration {
     pub fn new(
         table: Arc<dyn TableProvider>,
@@ -260,7 +263,7 @@ impl CandidateGeneration for PostApplyCandidateGeneration {
         let need_post_apply = !unapplied_filters.is_empty() || !unapplied_projection.is_empty();
         let underlying_limit = if need_post_apply {
             // Will stream one batch at a time, so not going to full table scan underlying.
-            usize::MAX
+            MAX_LIMIT_MULTIPLIER * limit
         } else {
             limit
         };
