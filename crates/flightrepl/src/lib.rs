@@ -30,10 +30,7 @@ use arrow_flight::{
 use clap::Parser;
 use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::{MemTable, provider_as_source};
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::arrow::util::pretty::print_batches;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
@@ -450,20 +447,24 @@ async fn display_records(
     total_rows: usize,
     from_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = records[0].schema();
+    let mut limited_records = Vec::new();
+    let mut rows_collected = 0;
 
-    let ctx = SessionContext::new();
-    let provider = MemTable::try_new(schema, vec![records])?;
-    let df = DataFrame::new(
-        ctx.state(),
-        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
-            .limit(0, Some(500))?
-            .build()?,
-    );
+    for batch in &records {
+        if rows_collected >= 500 {
+            break;
+        }
 
-    let num_rows = df.clone().count().await?;
+        let rows_to_take = (500 - rows_collected).min(batch.num_rows());
+        if rows_to_take > 0 {
+            limited_records.push(batch.slice(0, rows_to_take));
+            rows_collected += rows_to_take;
+        }
+    }
 
-    if let Err(e) = df.show().await {
+    let num_rows = records.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+    if let Err(e) = print_batches(&limited_records) {
         println!("Error displaying results: {e}");
     }
     let elapsed = start_time.elapsed();
