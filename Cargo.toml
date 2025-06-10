@@ -207,3 +207,7 @@ iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", re
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" }   # spiceai-0.4.0-df-47
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
+
+# Override candle-core v0.8.x to use matching cudarc version 0.12.2 to satisfy candle-cublaslt requirement
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }  # spiceai-0.8.4-cudarc-0.12
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }  # spiceai-0.8.4-cudarc-0.12
