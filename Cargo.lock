@@ -3276,7 +3276,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "util 1.4.0-unstable",
+ "util",
  "uuid 1.17.0",
 ]
 
@@ -3947,7 +3947,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "util 1.4.0-unstable",
+ "util",
 ]
 
 [[package]]
@@ -11166,7 +11166,7 @@ dependencies = [
  "tracing-subscriber",
  "tract-core",
  "url",
- "util 1.4.0-unstable",
+ "util",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid 1.17.0",
@@ -12297,10 +12297,11 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "2.0.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=1579a895fa467a8d9f8eafd48219f9768e48524d#1579a895fa467a8d9f8eafd48219f9768e48524d"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=4e1b0394aeba7b03d61edfcad27562045c450b02#4e1b0394aeba7b03d61edfcad27562045c450b02"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "backoff",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -12308,16 +12309,16 @@ dependencies = [
  "futures",
  "prost 0.12.6",
  "prost-types 0.12.6",
+ "rand 0.9.1",
  "reqwest 0.12.15",
  "rustls 0.23.27",
- "rustls-native-certs 0.6.3",
+ "rustls-native-certs 0.8.1",
  "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
  "tokio",
  "tonic",
  "tracing",
- "util 1.4.0-unstable (git+https://github.com/spiceai/spiceai)",
  "winver",
 ]
 
@@ -13132,7 +13133,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
- "util 1.4.0-unstable",
+ "util",
  "uuid 1.17.0",
 ]
 
@@ -14566,19 +14567,6 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "util"
 version = "1.4.0-unstable"
-dependencies = [
- "backoff",
- "ctrlc",
- "humantime",
- "rand 0.9.1",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "util"
-version = "1.4.0-unstable"
-source = "git+https://github.com/spiceai/spiceai#76e2b0555c4b0e0036f951078a8f091be1cf5197"
 dependencies = [
  "backoff",
  "ctrlc",
