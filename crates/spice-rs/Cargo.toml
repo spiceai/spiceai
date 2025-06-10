@@ -24,9 +24,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.116"
 chrono = { version = "0.4.41", features = ["serde"] }
 dotenv = "0.15.0"
-arrow = "55.1.0"
-futures = "0.3.30"
+arrow = { version = "55.1.0", features = ["prettyprint"] }
+futures = "0.3.31"
 base64 = "0.22.0"
+tracing = "0.1.41"
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+rand = "0.9.1"
+
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

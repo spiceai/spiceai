@@ -3,6 +3,7 @@ use base64::{engine::general_purpose, Engine as _};
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::Once;
+
 use tonic::transport::channel::{ClientTlsConfig, Endpoint};
 use tonic::transport::Channel;
 
