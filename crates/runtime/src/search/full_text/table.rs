@@ -41,7 +41,7 @@ use crate::search::util::get_primary_keys;
 #[derive(Clone)]
 pub struct TableWithFullText {
     base_table: Arc<dyn TableProvider>,
-    search_field: String,
+    search_fields: Vec<String>,
     primary_key: Vec<String>,
     index: Arc<tantivy::Index>,
 }
@@ -80,7 +80,7 @@ pub enum Error {
 impl TableWithFullText {
     pub async fn try_new(
         inner: Arc<dyn TableProvider>,
-        search_field: String,
+        search_fields: Vec<String>,
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Self, Error> {
         // Use 'primary_key_override', fallback to underlying in table.
@@ -96,11 +96,12 @@ impl TableWithFullText {
         };
 
         let index =
-            Self::create_index(Arc::clone(&inner), search_field.as_str(), pks.as_slice()).await?;
+            Self::create_index(Arc::clone(&inner), search_fields.as_slice(), pks.as_slice())
+                .await?;
 
         Ok(Self {
             base_table: inner,
-            search_field,
+            search_fields,
             index,
             primary_key: pks,
         })
@@ -113,13 +114,13 @@ impl TableWithFullText {
 
     async fn create_index(
         base_table: Arc<dyn TableProvider>,
-        search_field: &str,
+        search_fields: &[String],
         primary_key: &[String],
     ) -> Result<Arc<tantivy::Index>, Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
         for p in primary_key {
-            if p == search_field {
+            if search_fields.contains(p) {
                 // Added below, tokenized.
                 continue;
             }
@@ -158,10 +159,9 @@ impl TableWithFullText {
             }
         }
 
-        schema_builder.add_text_field(
-            search_field,
-            tantivy::schema::TEXT | tantivy::schema::STORED,
-        );
+        for s in search_fields {
+            schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
+        }
         let schema = schema_builder.build();
         Self::create_and_init_index(base_table, schema).await
     }
@@ -217,28 +217,33 @@ impl TableWithFullText {
     }
 
     /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
-    pub fn as_candidate_generation(
+    pub fn as_candidate_generations(
         &self,
-    ) -> Result<Arc<dyn CandidateGeneration>, search::generation::Error> {
-        let base = FullTextSearch::try_new(
-            Arc::clone(&self.index),
-            self.search_field.clone(),
-            self.primary_key.clone(),
-        )
-        .map_err(|source| search::generation::Error::TextSearchError { source })?;
+    ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+        let mut generators = vec![];
+        for search_field in self.search_fields.as_slice() {
+            let base = FullTextSearch::try_new(
+                Arc::clone(&self.index),
+                search_field.clone(),
+                self.primary_key.clone(),
+                Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
+            )
+            .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
-        let post_apply = PostApplyCandidateGeneration::new(
-            Arc::clone(&self.base_table),
-            Arc::new(base),
-            self.primary_key.clone(),
-        )
-        .with_ctx(
-            Self::new_ctx()
-                .boxed()
-                .map_err(|source| search::generation::Error::InternalError { source })?,
-        );
+            let post_apply = PostApplyCandidateGeneration::new(
+                Arc::clone(&self.base_table),
+                Arc::new(base),
+                self.primary_key.clone(),
+            )
+            .with_ctx(
+                Self::new_ctx()
+                    .boxed()
+                    .map_err(|source| search::generation::Error::InternalError { source })?,
+            );
+            generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
+        }
 
-        Ok(Arc::new(post_apply))
+        Ok(generators)
     }
 }
 

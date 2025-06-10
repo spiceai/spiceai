@@ -51,6 +51,9 @@ pub struct PostApplyCandidateGeneration {
 static TABLE_PROVIDER_TABLE_NAME: &str = "table_provider";
 static CANDIDATE_GENERATION_TABLE_NAME: &str = "candidate_generation";
 
+// Increase `LIMIT` clause by a multiple to allow for post-filtering.
+static MAX_LIMIT_MULTIPLIER: usize = 100;
+
 impl PostApplyCandidateGeneration {
     pub fn new(
         table: Arc<dyn TableProvider>,
@@ -104,6 +107,7 @@ impl PostApplyCandidateGeneration {
         stream: SendableRecordBatchStream,
         remaining_filters: &[&Expr],
         remaining_projection: &[&Expr],
+        limit: usize,
     ) -> Result<SendableRecordBatchStream> {
         let ctx = self.ctx.clone().unwrap_or(Arc::new(SessionContext::new()));
         let _ = ctx
@@ -125,6 +129,7 @@ impl PostApplyCandidateGeneration {
                 .copied()
                 .map(Clone::clone)
                 .collect(),
+            limit,
         )
         .await;
 
@@ -138,11 +143,13 @@ impl PostApplyCandidateGeneration {
         primary_key: Vec<String>,
         remaining_filters: Vec<Expr>,
         remaining_projection: Vec<Expr>,
+        limit: usize,
     ) -> (
         Arc<Schema>,
         impl Stream<Item = Result<RecordBatch, DataFusionError>>,
     ) {
         let mut schema = stream.schema();
+        let mut remaining_limit = limit;
         let s = stream! {
             while let Some(item) = stream.next().await {
                 let batch = item?;
@@ -191,12 +198,25 @@ impl PostApplyCandidateGeneration {
                 match sql.collect().await {
                     Ok(batches) => {
                         for batch in batches {
-                            yield Ok(batch);
+                            if remaining_limit > 0 {
+                                let num_rows = batch.num_rows();
+                                if remaining_limit < num_rows {
+                                    yield Ok(batch.slice(0, remaining_limit));
+                                    remaining_limit = 0;
+                                    break;
+                                }
+                                yield Ok(batch);
+                                remaining_limit = remaining_limit.saturating_sub(num_rows);
+                            }
                         }
                     }
                     Err(e) => {
                         yield Err(e);
                     }
+                }
+                // Early exit on `LIMIT` clause
+                if remaining_limit == 0 {
+                    break;
                 }
             }
         };
@@ -229,30 +249,36 @@ impl CandidateGeneration for PostApplyCandidateGeneration {
         let underlying_filters = self.supported_underlying_filters(opt_filters)?;
         let underlying_projection = self.supported_underlying_projection(addition_projection)?;
 
-        let underlying = self
-            .inner
-            .search(
-                query,
-                underlying_filters.as_slice(),
-                underlying_projection.as_slice(),
-                limit,
-            )
-            .await?;
-
         let unapplied_filters: Vec<&Expr> = opt_filters
             .iter()
             .filter(|&&f| !underlying_filters.contains(&f))
             .copied()
             .collect::<Vec<_>>();
-
         let unapplied_projection: Vec<&Expr> = addition_projection
             .iter()
             .filter(|&&p| !underlying_projection.contains(&p))
             .copied()
             .collect::<Vec<_>>();
 
+        let need_post_apply = !unapplied_filters.is_empty() || !unapplied_projection.is_empty();
+        let underlying_limit = if need_post_apply {
+            // Will stream one batch at a time, so not going to full table scan underlying.
+            MAX_LIMIT_MULTIPLIER * limit
+        } else {
+            limit
+        };
+        let underlying = self
+            .inner
+            .search(
+                query,
+                underlying_filters.as_slice(),
+                underlying_projection.as_slice(),
+                underlying_limit,
+            )
+            .await?;
+
         // If there are no unapplied filters or projections, we can return the underlying stream directly.
-        if unapplied_filters.is_empty() && unapplied_projection.is_empty() {
+        if !need_post_apply {
             return Ok(underlying);
         }
 
@@ -260,6 +286,7 @@ impl CandidateGeneration for PostApplyCandidateGeneration {
             underlying,
             unapplied_filters.as_slice(),
             unapplied_projection.as_slice(),
+            limit,
         )
         .await
     }
@@ -369,9 +396,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter() {
-        let fts =
-            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
+        let fts = FullTextSearch::try_new(
+            Arc::new(create_basic_index()),
+            "body".to_string(),
+            vec!["title".to_string()],
+            None,
+        )
+        .expect("failed to create FullTextSearch");
 
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
@@ -391,9 +422,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_projection() {
-        let fts =
-            FullTextSearch::try_new(Arc::new(create_basic_index()), "body".to_string(), vec![])
-                .expect("failed to create FullTextSearch");
+        let fts = FullTextSearch::try_new(
+            Arc::new(create_basic_index()),
+            "body".to_string(),
+            vec![],
+            None,
+        )
+        .expect("failed to create FullTextSearch");
 
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
