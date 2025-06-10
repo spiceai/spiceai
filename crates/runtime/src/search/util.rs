@@ -227,11 +227,14 @@ pub async fn embedding_columns_from_table(
 pub async fn full_text_search_candidates(
     df: &Arc<DataFusion>,
     tbl: &TableReference,
-) -> Option<Result<Arc<dyn CandidateGeneration>>> {
+) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let table_provider = df.get_table(tbl).await?;
     let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
 
-    Some(fts.as_candidate_generation().context(SearchGenerationSnafu))
+    Some(
+        fts.as_candidate_generations()
+            .context(SearchGenerationSnafu),
+    )
 }
 
 #[cfg(test)]
@@ -269,7 +272,7 @@ mod tests {
             .expect("failed to make table"),
         );
         let wrapped_table = Arc::new(
-            TableWithFullText::try_new(base_table, "search_field".to_string(), vec![].into())
+            TableWithFullText::try_new(base_table, vec!["search_field".to_string()], vec![].into())
                 .await
                 .expect("cannot make full text table"),
         ) as Arc<dyn TableProvider>;
