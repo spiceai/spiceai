@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: glue[csv]-federated
+
+datasets:
+  - from: glue:tpch.customer_csv
+    name: customer
+    params: &glue_params
+      glue_region: us-east-1
+      glue_key: ${secrets:GLUE_AWS_KEY}
+      glue_secret: ${secrets:GLUE_AWS_SECRET}
+  - from: glue:tpch.lineitem_csv
+    name: lineitem
+    params: *glue_params
+  - from: glue:tpch.nation_csv
+    name: nation
+    params: *glue_params
+  - from: glue:tpch.orders_csv
+    name: orders
+    params: *glue_params
+  - from: glue:tpch.part_csv
+    name: part
+    params: *glue_params
+  - from: glue:tpch.partsupp_csv
+    name: partsupp
+    params: *glue_params
+  - from: glue:tpch.region_csv
+    name: region
+    params: *glue_params
+  - from: glue:tpch.supplier_csv
+    name: supplier
+    params: *glue_params

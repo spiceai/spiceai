@@ -9,32 +9,32 @@ snapshot_kind: text
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Still patient ministers ought to stand books. Toge"
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1780
+        "cp_catalog_page_sk": 1
       },
-      "score": 7.328
+      "score": 12.843
     },
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Smooth requirements would not see enough fresh, other patient"
+        "cp_description": "Great, available rules find in addition groups; broad, local circumstances wa"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 4372
+        "cp_catalog_page_sk": 23
       },
-      "score": 7.033
+      "score": 2.696
     },
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Bodies retain concentrations. Patient, nice perceptions eat now larg"
+        "cp_description": "Close times adopt only in a interests. Far strings might say slowly. Times go strictly cattle. Sign"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 6278
+        "cp_catalog_page_sk": 21
       },
-      "score": 7.033
+      "score": 2.205
     }
   ]
 }

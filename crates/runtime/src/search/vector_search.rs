@@ -246,8 +246,8 @@ impl VectorSearch {
                     };
 
                     // If the dataset is configured with full text search capabilities, add as generator.
-                    if let Some(fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
-                        generators.push(fts);
+                    if let Some(mut fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
+                        generators.append(&mut fts);
                     }
 
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
