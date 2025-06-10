@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: financebench
+name: financebench_hybrid
 
 runtime:
   flight:
