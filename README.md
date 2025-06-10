@@ -88,7 +88,7 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Primary deployment model**     | Sidecar                                | Cluster              | Cluster               | Cluster             | Cluster              |
 | **Federated Query Support**      | ✅                                     | ✅                   | ✅                    | ―                   | ―                    |
 | **Acceleration/Materialization** | ✅ (Arrow, SQLite, DuckDB, PostgreSQL) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog)            | ✅                   | ✅                    | ―                   | ―                    |
+| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                   | ✅                    | ―                   | ―                    |
 | **Query Result Caching**         | ✅                                     | ✅                   | ✅                    | ✅                  | Limited              |
 | **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                    |
 | **Change Data Capture (CDC)**    | ✅ (Debezium)                          | ―                    | ―                     | ―                   | ✅ (Debezium)        |
