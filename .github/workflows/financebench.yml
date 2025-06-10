@@ -145,18 +145,20 @@ jobs:
               }
             }
 
-            const model_option = context.payload.inputs.model_option;
-            if model_option=== 'hybrid' {
-              filtered = filtered.map((m) => {
-                  m.spicepod = "./test/financebench/spicepod_hybrid_openai.yaml";
-                  return m;
-              })
-            }
-            if model_option=== 'full_text' {
-              filtered = filtered.map((m) => {
-                  m.spicepod = "./test/financebench/spicepod_fts_openai.yaml";
-                  return m;
-              })
+            if (context.eventName !== 'schedule') {
+              const search_option = context.payload.inputs.search_option;
+              if (search_option=== 'hybrid') {
+                filtered = filtered.map((m) => {
+                    m.spicepod = "./test/financebench/spicepod_hybrid_openai.yaml";
+                    return m;
+                });
+              }
+              if (search_option === 'full_text') {
+                filtered = filtered.map((m) => {
+                    m.spicepod = "./test/financebench/spicepod_fts_openai.yaml";
+                    return m;
+                });
+              }
             }
 
             return filtered;
