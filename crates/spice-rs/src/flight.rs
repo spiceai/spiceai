@@ -153,7 +153,7 @@ impl SqlFlightClient {
                     .into_parts();
 
                 return Ok(FlightRecordBatchStream::new_from_flight_data(
-                    response_stream.map_err(FlightError::Tonic),
+                    response_stream.map_err(|e| FlightError::Tonic(Box::new(e))),
                 )
                 .with_headers(md));
             }

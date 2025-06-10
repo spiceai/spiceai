@@ -78,12 +78,12 @@ jobs:
           curl https://install.spiceai.org | /bin/bash
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
           $HOME/.spice/bin/spice install
-      
+
       - name: Install Spice (https://install.spiceai.org) (MacOS)
         if: matrix.os == 'macos-latest'
         run: |
           brew install spiceai/spiceai/spice
-          brew install spiceai/spiceai/spiced
+          spice install
 
       - name: install Spice (Windows)
         if: matrix.os == 'windows-latest'
