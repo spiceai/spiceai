@@ -156,14 +156,14 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     );
 
     let failed_tests = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
-    // json format is easier to read as table could be too wide
+    // JSON format is easier to read as table could be too wide
     println!("Failed tests:\n{}\n", arrow_to_json(&failed_tests)?);
 
     let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
-    // json format is easier to read as table could be too wide
+    // JSON format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
-    // Record benchamrk results
+    // Record benchmark results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
         KeyValue::new("type", "model_benchmark"),
@@ -216,14 +216,14 @@ async fn execute_sql(
  * Fetches key metrics for the latest evaluation run, including duration, evaluation score, task call counts, and errors.
  *
  * Output:
- * - `run_id`: Evaluation run ID  
- * - `model`: Model name  
- * - `status`: Run status  
+ * - `run_id`: Evaluation run ID
+ * - `model`: Model name
+ * - `status`: Run status
  * - `tests`: Number of tests performed
- * - `duration_seconds`: Eval duration (seconds)  
+ * - `duration_seconds`: Eval duration (seconds)
  * - `score`: Rounded average score
- * - `task_calls`: Total task invocations  
- * - `task_errors`: Task task errors  
+ * - `task_calls`: Total task invocations
+ * - `task_errors`: Task task errors
  *
  * Example:
  * +----------------------------------+-------------+-----------+-------+------------------+--------+------------+-------------+
@@ -245,11 +245,11 @@ score AS (
     GROUP BY run_id
 ),
 tool_stats AS (
-    SELECT 
+    SELECT
         COUNT(*) AS task_calls,
         COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS task_errors
     FROM runtime.task_history
-    WHERE 
+    WHERE
         task != 'test_connectivity'
         AND start_time BETWEEN (SELECT created_at FROM latest_run)
         AND COALESCE(end_time, NOW())
@@ -265,10 +265,10 @@ LEFT JOIN tool_stats ts ON 1 = 1;
  * Retrieves statistis on executed tasks/tools during the latest evaluation run.
  *
  * Output:
- * - `task`: Task name  
- * - `calls`: Total number of task calls  
- * - `failures`: Total number of task failures  
- * - `duration_ms`: Aggregated task duration in milliseconds  
+ * - `task`: Task name
+ * - `calls`: Total number of task calls
+ * - `failures`: Total number of task failures
+ * - `duration_ms`: Aggregated task duration in milliseconds
  *
  * Example:
  * +-------------------------+-------+----------+--------------------+
@@ -282,20 +282,20 @@ LEFT JOIN tool_stats ts ON 1 = 1;
  */
 static QUERY_EVAL_BENCHMARK_TASKS: &str = "
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
-  task, 
+SELECT
+  task,
   COUNT(*) AS calls,
   COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS failures,
   SUM(CAST((end_time - start_time) AS Float) /  1000000) AS duration_ms
 FROM runtime.task_history
-WHERE 
+WHERE
   task != 'test_connectivity'
-  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   COALESCE(end_time, NOW())
 GROUP BY task
 ORDER BY duration_ms DESC;
@@ -305,10 +305,10 @@ ORDER BY duration_ms DESC;
  * Fetches the top task errors for the latest evaluation run aggregated by associated task name, error message, and input
  *
  * Output:
- * - `task`: Task name  
- * - `count`: Number of error occurrences  
- * - `message`: Error message  
- * - `input`: Input causing the error  
+ * - `task`: Task name
+ * - `count`: Number of error occurrences
+ * - `message`: Error message
+ * - `input`: Input causing the error
  *
  * Example:
  * +---------------+-------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------+
@@ -319,25 +319,25 @@ ORDER BY duration_ms DESC;
  */
 static QUERY_EVAL_BENCHMARK_TOP_ERRORS: &str = "
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
+SELECT
     task,
     COUNT(*) AS count,
     error_message as message,
     input
-FROM 
+FROM
     runtime.task_history
-WHERE 
+WHERE
     error_message IS NOT NULL
-    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   	COALESCE(end_time, NOW())
-GROUP BY 
+GROUP BY
     task, input, message
-ORDER BY 
+ORDER BY
     count DESC
 LIMIT 20;
 ";
@@ -346,11 +346,11 @@ LIMIT 20;
  * Fetches the failed tests for the latest evaluation run.
  *
  * Output:
- * - `run_id`: Evaluation run ID  
- * - `input`: Test input query  
- * - `output`: Model response  
- * - `expected`: Expected response  
- * - `score`: Test score  
+ * - `run_id`: Evaluation run ID
+ * - `input`: Test input query
+ * - `output`: Model response
+ * - `expected`: Expected response
+ * - `score`: Test score
  *
  * Example:
  * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
