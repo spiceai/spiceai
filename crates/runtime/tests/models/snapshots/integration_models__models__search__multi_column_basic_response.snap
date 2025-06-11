@@ -20,12 +20,13 @@ snapshot_kind: text
     {
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_department": "DEPARTMENT",
+        "cp_description": "Even democratic stairs would know happy investigations. Hist"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 2
       },
-      "score": 0.016
+      "score": 0.032
     }
   ]
 }

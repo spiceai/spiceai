@@ -5,13 +5,11 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "results": [
+  "matches": [
     {
       "dataset": "catalog_page_with_chunking_no_pk",
-      "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
-      },
-      "score": 0.945
+      "score": 0.945,
+      "value": "In general basic characters welcome. Clearly lively friends con"
     }
   ]
 }

@@ -39,7 +39,6 @@ use crate::{
     error_spaced,
     federated_table::FederatedTable,
     metrics::{self, components::register_component_metric},
-    search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
     warn_spaced,
@@ -620,10 +619,6 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
             ));
-        }
-
-        if ds.has_full_text_column() {
-            data_connector = Arc::new(FullTextConnector::new(data_connector));
         }
 
         if data_connector.initialization().is_on_trigger() {
