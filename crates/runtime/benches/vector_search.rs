@@ -32,19 +32,13 @@ use runtime::{
         vector_search::{self, VectorSearch},
     },
 };
-use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
-use spicepod::{
-    acceleration::{self, Acceleration},
-    semantic::FullTextSearchConfig,
-};
+use spicepod::acceleration::{self, Acceleration};
+use spicepod::component::embeddings::EmbeddingChunkConfig;
 use tokio::time::Instant;
 use utils::runtime_ready_check;
 
 mod bench_search;
 mod utils;
-
-pub static EMBEDDING_MODEL_NAME: &str = "test_model";
-pub static MTEB_COLUMN_NAME: &str = "text";
 
 // Define command line arguments for running benchmark test
 #[derive(Parser, Debug)]
@@ -87,12 +81,9 @@ async fn main() -> Result<(), String> {
 pub struct SearchBenchmarkConfiguration {
     pub name: &'static str,
     pub test_dataset: &'static str,
-
-    // To be used in `from: embeddings_model`
     pub embeddings_model: &'static str,
     pub acceleration: Option<Acceleration>,
-    pub embedding: Option<ColumnEmbeddingConfig>,
-    pub text_search: Option<(String, FullTextSearchConfig)>,
+    pub chunking: Option<EmbeddingChunkConfig>,
 }
 
 impl SearchBenchmarkConfiguration {
@@ -101,16 +92,13 @@ impl SearchBenchmarkConfiguration {
         name: &'static str,
         test_dataset: &'static str,
         embeddings_model: &'static str,
-        embedding: Option<ColumnEmbeddingConfig>,
-        text_search: Option<(String, FullTextSearchConfig)>,
     ) -> Self {
         Self {
             name,
             test_dataset,
             embeddings_model,
-            embedding,
             acceleration: None,
-            text_search,
+            chunking: None,
         }
     }
     #[must_use]
@@ -118,9 +106,13 @@ impl SearchBenchmarkConfiguration {
         self.acceleration = Some(acceleration);
         self
     }
+    #[must_use]
+    fn with_chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
+        self.chunking = Some(chunking);
+        self
+    }
 }
 
-#[allow(clippy::too_many_lines)]
 fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
     let args = BenchArgs::parse();
 
@@ -129,56 +121,6 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_minilm-l6-v2_arrow",
             "QuoraRetrieval",
             "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: None,
-            }),
-            None,
-        )
-        .with_acceleration(Acceleration {
-            enabled: true,
-            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-            refresh_sql: Some("select * from data limit 20000".into()),
-            ..Default::default()
-        }),
-        SearchBenchmarkConfiguration::new(
-            "quora_text_arrow",
-            "QuoraRetrieval",
-            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            None,
-            Some((
-                MTEB_COLUMN_NAME.to_string(),
-                FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["_id".to_string()]),
-                },
-            )),
-        )
-        .with_acceleration(Acceleration {
-            enabled: true,
-            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-            refresh_sql: Some("select * from data limit 20000".into()),
-            ..Default::default()
-        }),
-        SearchBenchmarkConfiguration::new(
-            "quora_minilm-l6-v2_hybrid_arrow",
-            "QuoraRetrieval",
-            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: None,
-            }),
-            Some((
-                MTEB_COLUMN_NAME.to_string(),
-                FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["_id".to_string()]),
-                },
-            )),
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -190,35 +132,6 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_arrow",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: None,
-            }),
-            None,
-        )
-        .with_acceleration(Acceleration {
-            enabled: true,
-            ..Default::default()
-        }),
-        SearchBenchmarkConfiguration::new(
-            "quora_openai-text-embedding-3-small_hybrid_arrow",
-            "QuoraRetrieval",
-            "openai:text-embedding-3-small",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: None,
-            }),
-            Some((
-                MTEB_COLUMN_NAME.to_string(),
-                FullTextSearchConfig {
-                    enabled: true,
-                    row_ids: Some(vec!["_id".to_string()]),
-                },
-            )),
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -228,13 +141,6 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_duckdb",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: None,
-            }),
-            None,
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -246,24 +152,18 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_duckdb_chunking",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
-            Some(ColumnEmbeddingConfig {
-                column: MTEB_COLUMN_NAME.to_string(),
-                model: EMBEDDING_MODEL_NAME.to_string(),
-                primary_keys: Some(vec!["_id".to_string()]),
-                chunking: Some(EmbeddingChunkConfig {
-                    enabled: true,
-                    target_chunk_size: 512,
-                    overlap_size: 128,
-                    trim_whitespace: false,
-                }),
-            }),
-            None,
         )
         .with_acceleration(Acceleration {
             enabled: true,
             engine: Some("duckdb".into()),
             mode: acceleration::Mode::File,
             ..Default::default()
+        })
+        .with_chunking(EmbeddingChunkConfig {
+            enabled: true,
+            target_chunk_size: 512,
+            overlap_size: 128,
+            trim_whitespace: false,
         }),
     ]
     .into_iter()
