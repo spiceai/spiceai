@@ -120,7 +120,7 @@ jobs:
       - name: Run tests
         run: cargo test
         env:
-          API_KEY: ${{ secrets.TEST_API_KEY }}
+          API_KEY: ${{ secrets.SPICEAI_API_KEY }}
 
       - name: Stop spice and check logs
         working-directory: spice_qs
