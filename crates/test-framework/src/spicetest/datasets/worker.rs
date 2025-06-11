@@ -21,14 +21,16 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::Result;
-use flight_client::FlightClient;
+use anyhow::{Result, anyhow};
+use arrow_flight::error::FlightError;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
+use spiceai::Client as SpiceClient;
 use tokio::task::JoinHandle;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 use crate::{
-    flight::ExtendedTestFlightClient,
     metrics::QueryStatus,
     queries::{
         Query,
@@ -39,17 +41,45 @@ use crate::{
 
 use super::EndCondition;
 
+pub(crate) const MAX_RETRIES: usize = 5;
+
+#[derive(Debug)]
+pub enum QueryError {
+    Retryable { source: anyhow::Error },
+    NonRetryable { source: anyhow::Error },
+}
+
+impl QueryError {
+    pub fn retryable<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::Retryable {
+            source: error.into(),
+        }
+    }
+
+    pub fn nonretryable<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self::NonRetryable {
+            source: error.into(),
+        }
+    }
+}
+
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
     end_condition: EndCondition,
-    flight_client: FlightClient,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
     name: String,
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
+    spice_client: Arc<SpiceClient>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -88,14 +118,14 @@ impl SpiceTestQueryWorker {
         id: usize,
         query_set: Vec<Query>,
         end_condition: EndCondition,
-        flight_client: FlightClient,
+        spice_client: SpiceClient,
         name: String,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            flight_client,
+            spice_client: Arc::new(spice_client),
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
@@ -223,7 +253,7 @@ impl SpiceTestQueryWorker {
                         if self.explain_plan_snapshot && self.id == 0 {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                &self.flight_client,
+                                Arc::clone(&self.spice_client),
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -401,11 +431,70 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(MAX_RETRIES))
+            .build();
+
+        let (duration, row_count) = match retry(retry_strategy, || async {
+            match self
+                .execute_query_internal(query, results_snapshot, validate)
+                .await
+            {
+                Ok((duration, row_count)) => Ok((duration, row_count)),
+                Err(e) => match e {
+                    QueryError::Retryable { source } => Err(RetryError::transient(source)),
+                    QueryError::NonRetryable { source } => Err(RetryError::permanent(source)),
+                },
+            }
+        })
+        .await
+        {
+            Ok((duration, row_count)) => (duration, row_count),
+            Err(e) => {
+                eprintln!(
+                    "FAIL - Worker {} - Query '{}' failed: {}",
+                    self.id, query.name, e
+                );
+                query_durations.entry(Arc::clone(&query.name)).or_default();
+                return Err(e);
+            }
+        };
+
+        query_durations
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(duration);
+
+        row_counts
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(row_count);
+
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.inc(1);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_query_internal(
+        &self,
+        query: &Query,
+        results_snapshot: bool,
+        validate: bool,
+    ) -> std::result::Result<(Duration, usize), QueryError> {
         let query_start = Instant::now();
         let mut result_stream = self
-            .flight_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
-            .await?;
+            .spice_client
+            .query_with_params(
+                &query.sql,
+                query
+                    .get_parameters_batch()
+                    .transpose()
+                    .map_err(QueryError::nonretryable)?,
+            )
+            .await
+            .map_err(|e| QueryError::nonretryable(anyhow!(e)))?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];
@@ -414,14 +503,16 @@ impl SpiceTestQueryWorker {
             let batch = result_stream.try_next().await;
             match batch {
                 Ok(None) => break,
-                Err(e) => {
-                    eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.name, e
-                    );
-                    query_durations.entry(Arc::clone(&query.name)).or_default();
-                    return Err(e.into());
-                }
+                Err(e) => match e {
+                    FlightError::Tonic(e) => {
+                        if is_transient_error(&e) {
+                            return Err(QueryError::retryable(anyhow!("{e}")));
+                        }
+                    }
+                    _ => {
+                        return Err(QueryError::nonretryable(anyhow!("{e}")));
+                    }
+                },
                 Ok(Some(batch)) => {
                     if validate {
                         validation_records.push(batch.clone());
@@ -454,15 +545,16 @@ impl SpiceTestQueryWorker {
 
         if validate {
             // Validate the query results
-            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+            let validation_result = validation::validate_tpch_query(query, &validation_records)
+                .map_err(QueryError::nonretryable)?;
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
                     "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
                     self.id, query.name
                 );
-                return Err(anyhow::anyhow!(
+                return Err(QueryError::nonretryable(anyhow!(
                     "Query validation failed: {validation_reason:?}"
-                ));
+                )));
             }
         }
 
@@ -476,7 +568,8 @@ impl SpiceTestQueryWorker {
                 format!("{name}_{query_name}_sf{}", self.scale_factor)
             };
 
-            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
+            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
+                .map_err(QueryError::nonretryable)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
                     description => format!("Query: {query_name}"),
@@ -490,25 +583,18 @@ impl SpiceTestQueryWorker {
             if result.is_err() {
                 let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
                 eprintln!("{error_str}");
-                return Err(anyhow::anyhow!(error_str));
+                return Err(QueryError::nonretryable(anyhow!(error_str)));
             }
         }
 
         let duration = query_start.elapsed();
-        query_durations
-            .entry(Arc::clone(&query.name))
-            .or_default()
-            .push(duration);
-
-        row_counts
-            .entry(Arc::clone(&query.name))
-            .or_default()
-            .push(row_count);
-
-        if let Some(pb) = self.progress_bar.as_ref() {
-            pb.inc(1);
-        }
-
-        Ok(())
+        Ok((duration, row_count))
     }
+}
+
+pub(crate) fn is_transient_error(e: &tonic::Status) -> bool {
+    if e.metadata().get("spiceai-retryable").is_some() {
+        return true;
+    }
+    false
 }

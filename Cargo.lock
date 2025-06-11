@@ -4227,6 +4227,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenv"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+
+[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "git+https://github.com/spiceai/dotenvy.git?rev=e5cef1871b08003198949dfe2da988633eaad78f#e5cef1871b08003198949dfe2da988633eaad78f"
@@ -12183,6 +12189,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiceai"
+version = "2.0.0"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=4e1b0394aeba7b03d61edfcad27562045c450b02#4e1b0394aeba7b03d61edfcad27562045c450b02"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "backoff",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "dotenv",
+ "futures",
+ "prost 0.12.6",
+ "prost-types 0.12.6",
+ "rand 0.9.1",
+ "reqwest 0.12.15",
+ "rustls 0.23.27",
+ "rustls-native-certs 0.8.1",
+ "rustls-pemfile 1.0.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "winver",
+]
+
+[[package]]
 name = "spiced"
 version = "1.4.0"
 dependencies = [
@@ -12971,6 +13005,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "spiceai",
  "spicepod",
  "sysinfo 0.33.1",
  "telemetry",
@@ -12978,6 +13013,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
+ "util",
  "uuid 1.17.0",
 ]
 
@@ -12991,6 +13027,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "spiceai",
  "test-framework",
  "tokio",
 ]
