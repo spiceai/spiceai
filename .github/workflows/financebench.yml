@@ -110,27 +110,27 @@ jobs:
               {
                 name: "gpt-4o",
                 run_on_schedule: false,
-                spicepod: "./test/spicepods/financebench/embedding_openai.yaml"
+                spicepod: "./test/spicepods/financebench/embedding[openai].yaml"
               },
               {
                 name: "gpt-4.1",
                 run_on_schedule: true,
-                spicepod: "./test/spicepods/financebench/embedding_openai.yaml"
+                spicepod: "./test/spicepods/financebench/embedding[openai].yaml"
               },
               {
                 name: "o1",
                 run_on_schedule: false,
-                spicepod: "./test/spicepods/financebench/embedding_openai.yaml"
+                spicepod: "./test/spicepods/financebench/embedding[openai].yaml"
               },
               {
                 name: "o3-mini",
                 run_on_schedule: false,
-                spicepod: "./test/spicepods/financebench/embedding_openai.yaml"
+                spicepod: "./test/spicepods/financebench/embedding[openai].yaml"
               },
               {
                 name: "o4-mini",
                 run_on_schedule: true,
-                spicepod: "./test/spicepods/financebench/embedding_openai.yaml"
+                spicepod: "./test/spicepods/financebench/embedding[openai].yaml"
               }
             ];
 
@@ -149,13 +149,13 @@ jobs:
               const search_option = context.payload.inputs.search_option;
               if (search_option=== 'hybrid') {
                 filtered = filtered.map((m) => {
-                    m.spicepod = "./test/spicepods/financebench/hybrid_openai.yaml";
+                    m.spicepod = "./test/spicepods/financebench/hybrid[openai].yaml";
                     return m;
                 });
               }
               if (search_option === 'full_text') {
                 filtered = filtered.map((m) => {
-                    m.spicepod = "./test/spicepods/financebench/fts_openai.yaml";
+                    m.spicepod = "./test/spicepods/financebench/fts[openai].yaml";
                     return m;
                 });
               }
