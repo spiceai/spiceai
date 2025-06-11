@@ -128,7 +128,7 @@ pub async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        component.get_openai_request_overrides(),
+        component.get_openai_request_overrides(&prefix),
     );
 
     if let Some(Value::String(s)) = component.params.get("parameterized_prompt") {
