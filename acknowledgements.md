@@ -1,4 +1,4 @@
-# Open Source Acknowledgements 
+# Open Source Acknowledgements
 
 Spice.ai acknowledges the following open source projects for making this project possible:
 
