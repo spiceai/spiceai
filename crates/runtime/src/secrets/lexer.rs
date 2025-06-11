@@ -19,6 +19,7 @@ use logos::Logos;
 pub struct ReplacementMatch {
     pub store_name: String,
     pub key: String,
+    pub default_value: Option<String>,
     pub span: std::ops::Range<usize>,
 }
 
@@ -33,6 +34,9 @@ enum SecretReplacementToken {
 
     #[token(":")]
     Colon,
+
+    #[token("||")]
+    Or,
 
     #[token("}")]
     End,
@@ -59,11 +63,9 @@ impl Iterator for SecretReplacementMatcher<'_> {
             let Ok(token) = token_result else {
                 continue;
             };
-
             let SecretReplacementToken::Start = token else {
                 continue;
             };
-
             let start_span = self.lexer.span().start;
 
             let SecretReplacementToken::Identifier(store_name) = self.lexer.next()?.ok()? else {
@@ -78,18 +80,37 @@ impl Iterator for SecretReplacementMatcher<'_> {
                 continue;
             };
 
-            if self.lexer.next()?.ok()? != SecretReplacementToken::End {
-                continue;
+            let mut default_value = None;
+            match self.lexer.next()?.ok()? {
+                SecretReplacementToken::Or => {
+                    // after || we expect one more identifier
+                    let SecretReplacementToken::Identifier(d) = self.lexer.next()?.ok()? else {
+                        continue;
+                    };
+                    default_value = Some(d);
+
+                    // now require the closing "}"
+                    if self.lexer.next()?.ok()? != SecretReplacementToken::End {
+                        continue;
+                    }
+                }
+                SecretReplacementToken::End => {
+                    // no default, this is the normal close
+                }
+                _ => {
+                    // neither default nor closing brace
+                    continue;
+                }
             }
 
             let end_span = self.lexer.span().end;
             return Some(ReplacementMatch {
                 store_name,
                 key,
+                default_value,
                 span: start_span..end_span,
             });
         }
-
         None
     }
 }
@@ -149,12 +170,13 @@ mod tests {
     #[test]
     fn test_secret_lexer_invalid_formats() {
         let inputs = vec![
-            "Hello ${secret:} world",              // Missing key
-            "Hello ${:my_secret} world",           // Missing store name
-            "Hello ${ secret my_secret } world",   // Missing colon
-            "Hello ${ secret: my secret } world",  // Invalid key format
-            "Hello ${secret} world",               // Missing colon and key
-            "Hello ${{ secret:my_secret }} world", // Invalid style
+            "Hello ${secret:} world",                 // Missing key
+            "Hello ${:my_secret} world",              // Missing store name
+            "Hello ${ secret my_secret } world",      // Missing colon
+            "Hello ${ secret: my secret } world",     // Invalid key format
+            "Hello ${secret} world",                  // Missing colon and key
+            "Hello ${{ secret:my_secret }} world",    // Invalid style
+            "Hello ${{ secret:my_secret || }} world", // Default operator without default value
         ];
 
         for input in inputs {
@@ -183,10 +205,23 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].store_name, "env");
         assert_eq!(matches[0].key, "USER");
+        assert_eq!(matches[0].default_value, None);
         assert_eq!(matches[0].span, 8..19);
 
         assert_eq!(matches[1].store_name, "env");
         assert_eq!(matches[1].key, "PASSWORD");
+        assert_eq!(matches[1].default_value, None);
         assert_eq!(matches[1].span, 20..35);
+    }
+
+    #[test]
+    fn test_with_default() {
+        let input = "Value: ${env:FOO || bar} end";
+        let mut it = SecretReplacementMatcher::new(input);
+        let m = it.next().unwrap();
+        assert_eq!(m.store_name, "env");
+        assert_eq!(m.key, "FOO");
+        assert_eq!(m.default_value, Some("bar".into()));
+        assert_eq!(m.span, 7..24);
     }
 }
