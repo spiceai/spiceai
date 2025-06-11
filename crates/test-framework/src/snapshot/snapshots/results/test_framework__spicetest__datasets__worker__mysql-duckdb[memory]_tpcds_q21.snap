@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q21"
+---
++------------------+------------------+------------+-----------+
+| w_warehouse_name | i_item_id        | inv_before | inv_after |
++------------------+------------------+------------+-----------+
+|                  | AAAAAAAAAABDAAAA | 1696       | 1891      |
+|                  | AAAAAAAAAACDAAAA | 2208       | 2222      |
+|                  | AAAAAAAAAAHDAAAA | 2196       | 2495      |
+|                  | AAAAAAAAACHCAAAA | 1419       | 1635      |
+|                  | AAAAAAAAACLDAAAA | 2091       | 2700      |
+|                  | AAAAAAAAADKBAAAA | 1724       | 1870      |
+|                  | AAAAAAAAAFADAAAA | 2668       | 2691      |
+|                  | AAAAAAAAAIMCAAAA | 2050       | 2813      |
+|                  | AAAAAAAAAJCAAAAA | 2058       | 2492      |
+|                  | AAAAAAAAALBEAAAA | 2538       | 2606      |
++------------------+------------------+------------+-----------+
