@@ -21,10 +21,10 @@ use std::{
 };
 
 use app::AppBuilder;
-use azure_core::sleep;
 use rand::Rng;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
+use tokio::time::sleep;
 
 use crate::{
     configure_test_datafusion, init_tracing,
