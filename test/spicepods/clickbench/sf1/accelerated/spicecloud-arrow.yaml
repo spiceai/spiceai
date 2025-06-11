@@ -1,0 +1,11 @@
+version: v1
+kind: Spicepod
+name: spicecloud-arrow
+datasets:
+  - from: spice.ai:spiceai/benchmarks-clickbench/datasets/clickbench.hits
+    name: hits
+    acceleration:
+      enabled: true
+      engine: arrow
+    params:
+      spiceai_api_key: ${secrets:SPICEAI_CLICKBENCH_API_KEY}
