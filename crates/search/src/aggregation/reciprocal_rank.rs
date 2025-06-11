@@ -102,7 +102,6 @@ impl CandidateAggregation for ReciprocalRankFusion {
                     matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
                 });
 
-            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
             let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
             let table_name = format!("search_candidates_{i}");
             table_names.insert(i, table_name.clone());

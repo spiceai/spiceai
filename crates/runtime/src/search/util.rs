@@ -27,6 +27,44 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 
+/// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
+pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
+    tbl: &Arc<dyn TableProvider>,
+) -> Option<Arc<T>> {
+    let mut current_tbl = Arc::clone(tbl);
+
+    // For the many possible wrapping [`TableProvider`], attempt to find the concrete `impl TableProvider`.
+    // Also avoids having to [`Box::pin`] for recursive `async fn`.
+    loop {
+        // Attempt to downcast the current table to the desired type.
+        if let Some(found_table) = current_tbl.as_any().downcast_ref::<T>() {
+            return Some(Arc::new(found_table.clone()));
+        }
+
+        if let Some(adaptor) = current_tbl
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            if let Some(adapted_tbl) = adaptor.table_provider.clone() {
+                current_tbl = adapted_tbl;
+                continue;
+            }
+        }
+
+        if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
+            let federated_table = accelerated_table
+                .get_federated_table()
+                .table_provider()
+                .await;
+            current_tbl = Arc::clone(&federated_table);
+            continue;
+        }
+
+        // Exit if no further wrapping is found.
+        return None;
+    }
+}
+
 /// If a [`TableProvider`] is an [`EmbeddingTable`], return the [`EmbeddingTable`].
 /// This includes if the [`TableProvider`] is an [`AcceleratedTable`] with a [`EmbeddingTable`] underneath.
 pub(super) async fn get_embedding_table(
@@ -186,27 +224,12 @@ pub async fn embedding_columns_from_table(
             data_source: vec![tbl.clone()],
         })?;
 
-    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider).await?;
-    Some(embedding_table.get_embedding_columns())
-}
-
-/// Returns a full text search [`CandidateGeneration`] if the [`TableReference`] has the appropriate index(es) defined in [`DataFusion`].
-///
-/// Returns:
-///   None:
-///     - `tbl` does not exist
-///     - `tbl` does not have relevant full text search support.
-pub async fn full_text_search_candidates(
-    df: &Arc<DataFusion>,
-    tbl: &TableReference,
-) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
-    let table_provider = df.get_table(tbl).await?;
-    let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
-
-    Some(
-        fts.as_candidate_generations()
-            .context(SearchGenerationSnafu),
-    )
+    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider)
+        .await
+        .ok_or(super::Error::NoEmbeddingColumns {
+            data_source: tbl.clone(),
+        })?;
+    Ok(embedding_table.get_embedding_columns())
 }
 
 #[cfg(test)]
