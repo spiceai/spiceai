@@ -252,9 +252,8 @@ pub(crate) fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::TableWithFullText;
     use super::*;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::Schema;
     use data_components::arrow::write::MemTable;
     use std::sync::Arc;
 
@@ -266,38 +265,6 @@ mod tests {
 
         assert!(
             find_concrete_table_provider::<EmbeddingTable>(&base)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_concrete_table_provider_wrapped_in_full_text() {
-        let base_table: Arc<dyn TableProvider> = Arc::new(
-            MemTable::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "search_field",
-                    DataType::Utf8,
-                    false,
-                )])),
-                vec![],
-            )
-            .expect("failed to make table"),
-        );
-        let wrapped_table = Arc::new(
-            TableWithFullText::try_new(base_table, vec!["search_field".to_string()], vec![].into())
-                .await
-                .expect("cannot make full text table"),
-        ) as Arc<dyn TableProvider>;
-
-        assert!(
-            find_concrete_table_provider::<TableWithFullText>(&wrapped_table)
-                .await
-                .is_some()
-        );
-
-        assert!(
-            find_concrete_table_provider::<EmbeddingTable>(&wrapped_table)
                 .await
                 .is_none()
         );

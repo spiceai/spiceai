@@ -236,7 +236,7 @@ impl VectorSearch {
                             data_source: tbl.clone(),
                             num_embeddings: embedding_columns.len(),
                         });
-                    };
+                    }
                     let mut generators: Vec<Box<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {
