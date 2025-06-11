@@ -11,7 +11,7 @@ version.workspace = true
 byte-unit.workspace = true
 fundu.workspace = true
 regex.workspace = true
-schemars = { version = "0.8.22", optional = true }
+schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde-value = "0.7.0"
 serde_json.workspace = true
