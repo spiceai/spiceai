@@ -211,3 +211,20 @@ cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40
 # Override candle-core v0.8.x to use matching cudarc version 0.12.2 to satisfy candle-cublaslt requirement
 candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }  # spiceai-0.8.4-cudarc-0.12
 candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }  # spiceai-0.8.4-cudarc-0.12
+
+# Use patched arrow-rs 55.1 untill next release
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }        # spiceai-55.1
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }  # spiceai-55.1
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }  # spiceai-55.1
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }   # spiceai-55.1
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }    # spiceai-55.1
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }   # spiceai-55.1
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }    # spiceai-55.1
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }   # spiceai-55.1
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }    # spiceai-55.1
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" }    # spiceai-55.1
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
