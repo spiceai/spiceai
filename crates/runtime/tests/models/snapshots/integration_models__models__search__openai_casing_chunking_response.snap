@@ -5,20 +5,16 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "results": [
+  "matches": [
     {
       "dataset": "clickbench_chunking",
-      "matches": {
-        "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
-      },
-      "score": 0.786
+      "score": 0.786,
+      "value": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
     },
     {
       "dataset": "clickbench_chunking",
-      "matches": {
-        "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
-      },
-      "score": 0.786
+      "score": 0.786,
+      "value": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
     }
   ]
 }

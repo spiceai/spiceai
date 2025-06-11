@@ -1,7 +1,6 @@
 ---
 source: crates/search/src/generation/post_apply.rs
 expression: rb_as_value
-snapshot_kind: text
 ---
 [
   {

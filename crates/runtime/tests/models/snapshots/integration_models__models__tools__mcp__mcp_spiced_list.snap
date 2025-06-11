@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/tools.rs
 expression: tools_list
+snapshot_kind: text
 ---
 [
   {
@@ -11,7 +12,7 @@ expression: tools_list
       "properties": {
         "additional_columns": {
           "default": [],
-          "description": "Additional columns to return from the dataset.",
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be returned within the response under `.primary_key`, not `.data`.",
           "items": {
             "type": "string"
           },
@@ -102,7 +103,7 @@ expression: tools_list
       "properties": {
         "additional_columns": {
           "default": [],
-          "description": "Additional columns to return from the dataset.",
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be returned within the response under `.primary_key`, not `.data`.",
           "items": {
             "type": "string"
           },

@@ -5,34 +5,30 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "results": [
+  "matches": [
     {
-      "data": {
+      "dataset": "item",
+      "metadata": {
         "i_color": "smoke",
         "i_item_id": "AAAAAAAADBAAAAAA"
-      },
-      "dataset": "item",
-      "matches": {
-        "i_item_desc": "Patient"
       },
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 0.99
+      "score": 0.99,
+      "value": "Patient"
     },
     {
-      "data": {
+      "dataset": "item",
+      "metadata": {
         "i_color": "spring",
         "i_item_id": "AAAAAAAAHAAAAAAA"
-      },
-      "dataset": "item",
-      "matches": {
-        "i_item_desc": "New"
       },
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.983
+      "score": 0.983,
+      "value": "New"
     }
   ]
 }

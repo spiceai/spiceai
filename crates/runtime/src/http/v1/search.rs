@@ -35,7 +35,7 @@ use std::{sync::Arc, time::Instant};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct SearchResponse {
     /// List of matches that were found in the datasets
-    pub results: Vec<Match>,
+    pub matches: Vec<Match>,
 
     /// Total time taken to execute the search, in milliseconds
     pub duration_ms: u128,
@@ -71,34 +71,24 @@ struct SearchResponse {
         (status = 200, description = "Search completed successfully", content((
             SearchResponse = "application/json",
                 example = json!({
-                    "results": [
+                    "matches": [
                         {
-                            "matches": {
-                                "message": "I booked use some tickets"
-                            },
+                            "value": "I booked use some tickets",
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
-                            "data": { "timestamp": 1_724_716_542 },
-                            "score": 0.914_321
+                            "metadata": { "timestamp": 1_724_716_542 }
                         },
                         {
-                            "matches": {
-                                "message": "direct to Narata"
-                            },
+                            "value": "direct to Narata",
                             "dataset": "app_messages",
                             "primary_key": { "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b" },
-                            "data": { "timestamp": 1_724_715_881 },
-                            "score": 0.83221
+                            "metadata": { "timestamp": 1_724_715_881 }
                         },
                         {
-                            "matches": {
-                                "message": "Yes, we're sitting together"
-                            },
+                            "value": "Yes, we're sitting together",
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
-                            "data": { "timestamp": 1_724_716_123 },
-                            "score": 0.787_654_321
-
+                            "metadata": { "timestamp": 1_724_716_123 }
                         }
                     ],
                     "duration_ms": 42
@@ -167,7 +157,7 @@ pub(crate) async fn post(
                     StatusCode::OK,
                     headers,
                     Json(SearchResponse {
-                        results: m,
+                        matches: m,
                         duration_ms: start_time.elapsed().as_millis(),
                     }),
                 )

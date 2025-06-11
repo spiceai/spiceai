@@ -16,24 +16,22 @@ limitations under the License.
 
 use app::AppBuilder;
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
-use spicepod::{component::dataset::Dataset, semantic::Column};
-
-use crate::SearchBenchmarkConfiguration;
+use spicepod::{
+    acceleration::Acceleration,
+    component::{
+        dataset::Dataset,
+        embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig},
+    },
+};
 
 /// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.
 /// It consists of 177,163 rows and 1000 test queries.
 /// `https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/`
 pub(crate) async fn add_mtep_quora_retrieval_dataset(
     app_builder: AppBuilder,
-    config: &SearchBenchmarkConfiguration,
+    acceleration: Option<Acceleration>,
+    chunking: Option<EmbeddingChunkConfig>,
 ) -> Result<AppBuilder, String> {
-    let SearchBenchmarkConfiguration {
-        acceleration,
-        embedding,
-        text_search,
-        ..
-    } = config;
-
     let hf_api = ApiBuilder::new()
         .with_progress(false)
         .build()
@@ -71,18 +69,13 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
         .ok_or("Failed to convert PathBuf to str")?;
 
     let mut ds_data = make_local_file_dataset(data_path_str, "data");
-    ds_data.acceleration.clone_from(acceleration);
-    if let Some(embedding) = embedding {
-        ds_data.embeddings = vec![embedding.clone()];
-    }
-    if let Some((column, fts_config)) = text_search {
-        ds_data.columns.push(Column {
-            name: column.clone(),
-            description: None,
-            embeddings: vec![], // Defined on `.dataset[].embeddings`.
-            full_text_search: Some(fts_config.clone()),
-        });
-    }
+    ds_data.acceleration = acceleration;
+    ds_data.embeddings = vec![ColumnEmbeddingConfig {
+        column: "text".to_string(),
+        model: "test_model".to_string(),
+        primary_keys: Some(vec!["_id".to_string()]),
+        chunking,
+    }];
 
     Ok(app_builder
         .with_dataset(ds_data)

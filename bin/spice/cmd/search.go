@@ -49,16 +49,15 @@ type SearchRequest struct {
 }
 
 type SearchMatch struct {
-	Matches    map[string]string      `json:"matches"`
+	Value      string                 `json:"value"`
 	Score      float64                `json:"score"`
 	Dataset    string                 `json:"dataset"`
 	PrimaryKey map[string]interface{} `json:"primary_key"`
 	Metadata   map[string]interface{} `json:"metadata"`
-	Data       map[string]interface{} `json:"data"`
 }
 
 type SearchResponse struct {
-	Results    []SearchMatch `json:"results"`
+	Matches    []SearchMatch `json:"matches"`
 	DurationMs uint64        `json:"duration_ms"`
 }
 
@@ -185,28 +184,18 @@ spice search --cloud
 				continue
 			}
 
-			for i, match := range searchResponse.Results {
+			for i, match := range searchResponse.Matches {
 				cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
 				if len(match.PrimaryKey) > 0 {
 					for key, value := range match.PrimaryKey {
 						cmd.Printf(" %s=%v", key, value)
 					}
 				}
-				if len(match.Matches) == 1 {
-					// This will only print a single line.
-					for _, value := range match.Matches {
-						cmd.Printf("\n%s", value)
-					}
-				} else {
-					for col, value := range match.Matches {
-						cmd.Printf("\n%s: %s", col, value)
-					}
-				}
-				cmd.Print("\n\n")
+				cmd.Printf("\n%s\n\n", match.Value)
 			}
 
-			matches[message] = append(matches[message], searchResponse.Results...)
-			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Results))
+			matches[message] = append(matches[message], searchResponse.Matches...)
+			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
 		}
 	},
 }

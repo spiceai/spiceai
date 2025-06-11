@@ -5,26 +5,22 @@ snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
-  "results": [
+  "matches": [
     {
       "dataset": "spice.public.item",
-      "matches": {
-        "i_item_desc": "Patient"
-      },
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 0.99
+      "score": 0.99,
+      "value": "Patient"
     },
     {
       "dataset": "spice.public.item",
-      "matches": {
-        "i_item_desc": "New"
-      },
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.983
+      "score": 0.983,
+      "value": "New"
     }
   ]
 }
