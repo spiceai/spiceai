@@ -188,7 +188,10 @@ impl VectorSearch {
         })
     }
 
-    pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
+    pub async fn search(
+        &self,
+        req: &SearchRequest,
+    ) -> Result<HashMap<TableReference, AggregationResult>> {
         let SearchRequest {
             text: query,
             datasets: data_source_opt,
@@ -228,6 +231,12 @@ impl VectorSearch {
 
                 async move {
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
+                    if embedding_columns.len() != 1 {
+                        return Err(Error::IncorrectNumberOfEmbeddingColumns {
+                            data_source: tbl.clone(),
+                            num_embeddings: embedding_columns.len(),
+                        });
+                    };
                     let mut generators: Vec<Box<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {

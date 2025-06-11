@@ -30,7 +30,7 @@ use snafu::ResultExt;
 use crate::datafusion::DataFusion;
 
 // Distance column name for the vector search query.
-// static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
+pub(crate) static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 // Surrogate unique identifier name to use when no primary keys are provided.
 static VSS_TEMP_GEN_ID_COLUMN: &str = "vss_temp_gen_id";
 // Temporary table name to provide surrogate unique id for vector search query when no primary keys are provided.

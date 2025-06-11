@@ -27,7 +27,7 @@ use runtime::{
     request::{Protocol, RequestContext, UserAgent},
     search::{
         request::SearchRequest,
-        types::{VectorSearchResult, to_matches},
+        types::VectorSearchResult,
         util::parse_explicit_primary_keys,
         vector_search::{self, VectorSearch},
     },
@@ -453,7 +453,7 @@ async fn to_search_result(result: VectorSearchResult) -> Result<HashMap<String, 
     let mut output = HashMap::new();
 
     for (table_ref, agg_result) in result {
-        match to_matches(&table_ref, agg_result).await {
+        match agg_result.to_matches(&table_ref).await {
             Ok(matches) => {
                 for m in matches {
                     let id = m.primary_key().get("_id").ok_or_else(|| {

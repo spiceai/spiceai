@@ -17,8 +17,11 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
+use arrow_schema::SchemaRef;
+use datafusion::common::utils::quote_identifier;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use itertools::Itertools;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -230,6 +233,21 @@ pub async fn embedding_columns_from_table(
             data_source: tbl.clone(),
         })?;
     Ok(embedding_table.get_embedding_columns())
+}
+
+/// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
+pub(crate) fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec<usize> {
+    tracing::trace!("vector search result schema: {schema:?}");
+    tracing::trace!("vector search projection column names: {column_names:?}");
+    column_names
+        .iter()
+        .filter_map(|name| {
+            schema
+                .index_of(quote_identifier(name).to_string().as_str())
+                .ok()
+                .or(schema.index_of(name.as_str()).ok())
+        })
+        .collect_vec()
 }
 
 #[cfg(test)]

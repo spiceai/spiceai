@@ -88,7 +88,7 @@ fn normalize_search_response(mut json: Value) -> String {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
-    if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
+    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
         for m in matches {
             if let Some(obj) = m.as_object_mut() {
                 if let Some(Value::Number(n)) = obj.get("score") {
@@ -192,6 +192,7 @@ pub(crate) async fn run_search(
 }
 
 #[tokio::test]
+#[ignore = "Multi column search not support."]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut chunked = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_search",
@@ -252,6 +253,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore = "Multi column search not support."]
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
         .await
@@ -347,6 +349,7 @@ async fn test_multi_column_search_no_pk() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
+#[ignore = "Multi column search not support."]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     let api_config = start_app(
         AppBuilder::new("search_app")
