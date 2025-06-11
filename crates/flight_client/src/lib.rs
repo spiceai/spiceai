@@ -652,14 +652,19 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
 }
 
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
-    if error.code() == tonic::Code::Internal {
-        let error_message = error.message().to_lowercase();
-        if error_message.contains("operation was canceled")
-            || error_message.contains("http2 error")
-            || error_message.contains("grpc-status header missing")
-        {
-            return true;
+    match error.code() {
+        tonic::Code::Internal | tonic::Code::Cancelled => {
+            let error_message = error.message().to_lowercase();
+            if error_message.contains("operation was canceled")
+                || error_message.contains("http2 error")
+                || error_message.contains("grpc-status header missing")
+                || error_message.contains("received message with invalid compression flag")
+                || error_message.contains("error reading a body from connection")
+            {
+                return true;
+            }
+            false
         }
+        _ => false,
     }
-    false
 }

@@ -42,11 +42,11 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
         "name": "document_similarity",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "additional_columns": {
               "default": [],
-              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be returned within the response under `.primary_key`, not `.data`.",
+              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
               "items": {
                 "type": "string"
               },
@@ -64,7 +64,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               ]
             },
             "keywords": {
-              "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words. Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition. Keywords should not contain column names, special characters, or other operators.",
+              "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words.\n Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.\n Keywords should not contain column names, special characters, or other operators.",
               "items": {
                 "type": "string"
               },
@@ -74,7 +74,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "default": null,
               "description": "Number of documents to return for each dataset",
               "format": "uint",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": [
                 "integer",
                 "null"
@@ -94,8 +94,8 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             }
           },
           "required": [
-            "keywords",
-            "text"
+            "text",
+            "keywords"
           ],
           "title": "SearchRequestAIJson",
           "type": "object"
@@ -122,7 +122,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Get a random sample of rows from a Spice.ai dataset",
         "name": "random_sample",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "dataset": {
               "description": "The SQL dataset to sample data from.",
@@ -131,7 +131,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             "limit": {
               "description": "The number of rows, each with distinct values per column, to sample.",
               "format": "uint",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
@@ -150,7 +150,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Sample distinct column values from a Spice.ai dataset",
         "name": "sample_distinct_columns",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "cols": {
               "description": "The columns to sample distinct values from. If None, all columns are sampled.",
@@ -169,7 +169,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             "limit": {
               "description": "The number of rows, each with distinct values per column, to sample.",
               "format": "uint",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
@@ -188,7 +188,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
         "name": "sql",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "query": {
               "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
@@ -209,8 +209,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Get the schema of the Spice.ai dataset",
         "name": "table_schema",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
-          "definitions": {
+          "$defs": {
             "OutputType": {
               "enum": [
                 "full",
@@ -219,14 +218,11 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "type": "string"
             }
           },
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "description": "A tool to retrieve the schema of one or more available SQL tables.",
           "properties": {
             "output": {
-              "allOf": [
-                {
-                  "$ref": "#/definitions/OutputType"
-                }
-              ],
+              "$ref": "#/$defs/OutputType",
               "default": "full",
               "description": "If `full` return metadata and semantic details about the columns."
             },
@@ -252,7 +248,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
         "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
         "name": "top_n_sample",
         "parameters": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
           "properties": {
             "dataset": {
               "description": "The SQL dataset to sample data from.",
@@ -261,7 +257,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             "limit": {
               "description": "The number of rows, each with distinct values per column, to sample.",
               "format": "uint",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "order_by": {

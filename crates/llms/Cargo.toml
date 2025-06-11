@@ -22,7 +22,7 @@ insta = { workspace = true, features = ["filters"] }
 regex = "1.10.4"
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
-schemars = "0.8.22"
+schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

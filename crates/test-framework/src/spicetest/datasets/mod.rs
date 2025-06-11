@@ -34,7 +34,9 @@ use tokio::task::JoinHandle;
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod worker;
-pub(crate) use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
+pub(crate) use worker::{
+    MAX_RETRIES, QueryError, SpiceTestQueryWorker, SpiceTestQueryWorkerResult, is_transient_error,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum EndCondition {
@@ -175,17 +177,18 @@ impl SpiceTest<NotStarted> {
             None
         };
 
-        let flight_client = self
+        let spice_client = self
             .get_spiced()?
-            .flight_client(self.api_key.clone(), self.state.disable_caching)
+            .spice_client(self.api_key.clone(), self.state.disable_caching)
             .await?;
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.query_set.clone(),
                     self.state.end_condition,
-                    flight_client.clone(),
+                    spice_client.clone(),
                     self.name.clone(),
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)

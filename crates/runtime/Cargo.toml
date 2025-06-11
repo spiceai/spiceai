@@ -126,7 +126,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 scheduler = { path = "../scheduler" }
-schemars = "0.8.22"
+schemars.workspace = true
 search = { path = "../search" }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -171,7 +171,7 @@ x509-certificate.workspace = true
 anyhow = "1.0.86"
 async-graphql = "7.0.16"
 async-graphql-axum = "7.0.16"
-azure_core = "0.22.0"
+azure_core = "0.25.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"

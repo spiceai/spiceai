@@ -21,8 +21,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
-use flight_client::{Credentials, FlightClient};
+use anyhow::{Result, anyhow};
+use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
 use tempfile::TempDir;
@@ -173,32 +173,34 @@ impl SpicedInstance {
         self.tempdir.path().to_path_buf()
     }
 
-    /// Get a flight client for the spiced instance
+    /// Get a spice client for the spiced instance
     ///
     /// # Errors
     ///
-    /// - If the flight client fails to be created
-    pub async fn flight_client(
+    /// - If the spice client fails to be created
+    pub async fn spice_client(
         &self,
         api_key: Option<String>,
         disable_caching: bool,
-    ) -> Result<FlightClient> {
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
-        if disable_caching {
-            metadata.insert("cache-control", "no-cache".parse()?);
+    ) -> Result<SpiceClient> {
+        let mut spice_client = ClientBuilder::new();
+
+        if let Some(key) = api_key {
+            spice_client = spice_client.api_key(key.as_str());
         }
 
-        let credentials = if let Some(api_key) = api_key {
-            Credentials::new("", api_key.into())
-        } else {
-            Credentials::new("", "".into())
-        };
+        if disable_caching {
+            spice_client = spice_client.cache_control("no-cache");
+        }
 
-        Ok(
-            FlightClient::try_new("http://localhost:50051".into(), credentials, Some(metadata))
-                .await?,
-        )
+        let spice_client = spice_client
+            .flight_url("http://localhost:50051")
+            .user_agent("spice-test-framework/1.0")
+            .build()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(spice_client)
     }
 
     /// Get an http client for the spiced instance

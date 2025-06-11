@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::borrow::Cow;
 use std::error::Error;
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,10 +31,7 @@ use arrow_flight::{
 use clap::Parser;
 use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::{MemTable, provider_as_source};
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
@@ -335,7 +333,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
             Ok((records, total_rows, from_cache)) => {
-                display_records(records, start_time, total_rows, from_cache).await?;
+                display_records(&records, start_time, total_rows, from_cache)?;
             }
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
@@ -444,43 +442,52 @@ fn add_api_key<T>(mut request: tonic::Request<T>, api_key: Option<&String>) -> t
 /// # Errors
 ///
 /// Returns an error if the record batches cannot be loaded into Datafusion.
-async fn display_records(
-    records: Vec<RecordBatch>,
+fn display_records(
+    records: &[RecordBatch],
     start_time: Instant,
     total_rows: usize,
     from_cache: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = records[0].schema();
+) -> Result<impl Display, Box<dyn std::error::Error>> {
+    let mut limited_records = Vec::new();
+    let mut rows_collected = 0;
 
-    let ctx = SessionContext::new();
-    let provider = MemTable::try_new(schema, vec![records])?;
-    let df = DataFrame::new(
-        ctx.state(),
-        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
-            .limit(0, Some(500))?
-            .build()?,
-    );
+    for batch in records {
+        if rows_collected >= 500 {
+            break;
+        }
 
-    let num_rows = df.clone().count().await?;
-
-    if let Err(e) = df.show().await {
-        println!("Error displaying results: {e}");
+        let rows_to_take = (500 - rows_collected).min(batch.num_rows());
+        if rows_to_take > 0 {
+            limited_records.push(batch.slice(0, rows_to_take));
+            rows_collected += rows_to_take;
+        }
     }
+
+    let pretty_batches = match pretty_format_batches(&limited_records) {
+        Ok(pretty) => pretty,
+        Err(e) => {
+            println!("Error displaying results: {e}");
+            return Err(Box::new(e));
+        }
+    };
+
+    println!("{pretty_batches}");
+
     let elapsed = start_time.elapsed();
-    if num_rows == total_rows {
+    if rows_collected == total_rows {
         println!(
-            "\nTime: {} seconds. {num_rows} rows{}.",
+            "\nTime: {} seconds. {rows_collected} rows{}.",
             elapsed.as_secs_f64(),
             if from_cache { " (cached)" } else { "" }
         );
     } else {
         println!(
-            "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed{}.",
+            "\nTime: {} seconds. {rows_collected}/{total_rows} rows displayed{}.",
             elapsed.as_secs_f64(),
             if from_cache { " (cached)" } else { "" }
         );
     }
-    Ok(())
+    Ok(pretty_batches)
 }
 
 /// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
@@ -514,7 +521,7 @@ async fn get_and_display_nql_records(
         .reduce(|x, y| x + y)
         .unwrap_or(0) as usize;
 
-    display_records(records, start_time, total_rows, false).await?;
+    display_records(&records, start_time, total_rows, false)?;
 
     Ok(())
 }
@@ -609,4 +616,92 @@ fn display_grpc_error(err: &Status) {
         "{} {user_err_msg}",
         Colour::Red.paint(format!("{error_type}:"))
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    fn create_test_batch(num_rows: usize, batch_id: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let id_array = Int32Array::from(
+            (0..num_rows)
+                .map(|i| {
+                    batch_id * 1000 + i32::try_from(i).expect("Failed to convert usize to i32")
+                })
+                .collect::<Vec<_>>(),
+        );
+        let name_array = StringArray::from(
+            (0..num_rows)
+                .map(|i| {
+                    format!(
+                        "name_{}",
+                        batch_id * 1000 + i32::try_from(i).expect("Failed to convert usize to i32")
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
+            .expect("Failed to create RecordBatch")
+    }
+
+    #[test]
+    fn test_display_records() {
+        let test_cases = vec![
+            (
+                vec![
+                    create_test_batch(100, 1),
+                    create_test_batch(100, 2),
+                    create_test_batch(100, 3),
+                ],
+                300,
+                "multiple_batches_under_500_rows",
+            ),
+            (
+                vec![
+                    create_test_batch(200, 1),
+                    create_test_batch(200, 2),
+                    create_test_batch(200, 3),
+                ],
+                600,
+                "multiple_batches_over_500_rows",
+            ),
+            (
+                vec![create_test_batch(250, 1), create_test_batch(250, 2)],
+                500,
+                "multiple_batches_exactly_500_rows",
+            ),
+            (
+                vec![create_test_batch(700, 1)],
+                700,
+                "single_batch_over_500_rows",
+            ),
+            (vec![], 0, "single_empty_batch"),
+        ];
+
+        for (records, total_rows, test_name) in test_cases {
+            run_single_test_display_records(&records, total_rows, test_name);
+        }
+    }
+
+    fn run_single_test_display_records(
+        records: &[RecordBatch],
+        total_rows: usize,
+        test_name: &str,
+    ) {
+        let start_time = Instant::now();
+        let from_cache = false;
+
+        let result = display_records(records, start_time, total_rows, from_cache)
+            .expect("Failed to display records");
+
+        insta::assert_snapshot!(test_name, result);
+    }
 }

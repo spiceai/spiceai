@@ -18,6 +18,7 @@ use crate::args::EvalsTestArgs;
 
 use super::get_app_and_start_request;
 use serde_json::json;
+use spiceai::Client as SpiceClient;
 use std::time::{Duration, SystemTime};
 use test_framework::{
     anyhow,
@@ -25,7 +26,6 @@ use test_framework::{
         array::{Float64Array, RecordBatch, StringArray},
         util::pretty::pretty_format_batches,
     },
-    flight_client::FlightClient,
     futures::TryStreamExt,
     git,
     opentelemetry::KeyValue,
@@ -140,27 +140,27 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     println!("Retrieving results...");
 
-    let mut flight_client = spiced_instance.flight_client(None, false).await?;
+    let mut spice_client = spiced_instance.spice_client(None, false).await?;
 
-    let eval_result = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
+    let eval_result = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
 
     // Extract metrics from the evaluation result. If the evaluation run was not successful (EvalStatus::Failed),
     // we will return an error at the end after printing statistics and cleaning up.
     let metrics = EvalMetrics::from_record_batch(&eval_result)?;
 
-    let tasks_calls = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
+    let tasks_calls = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
     println!(
         "Executed tasks:\n{}\n",
         pretty_format_batches(&tasks_calls)?
     );
 
-    let failed_tests = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
-    // JSON format is easier to read as table could be too wide
+    let failed_tests = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
+    // json format is easier to read as table could be too wide
     println!("Failed tests:\n{}\n", arrow_to_json(&failed_tests)?);
 
-    let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
-    // JSON format is easier to read as table could be too wide
+    let top_errors = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
+    // json format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
     // Record benchmark results
@@ -201,12 +201,13 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 }
 
 async fn execute_sql(
-    flight_client: &mut FlightClient,
+    spice_client: &mut SpiceClient,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let res = flight_client
+    let res = spice_client
         .query(sql)
-        .await?
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .try_collect::<Vec<RecordBatch>>()
         .await?;
     Ok(res)
