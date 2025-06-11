@@ -4717,6 +4717,7 @@ dependencies = [
  "datafusion",
  "flight_client",
  "futures",
+ "insta",
  "llms",
  "prost 0.13.5",
  "regex",

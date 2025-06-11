@@ -30,3 +30,4 @@ winver = "1.0.0"
 
 [dev-dependencies]
 regex.workspace = true
+insta.workspace = true

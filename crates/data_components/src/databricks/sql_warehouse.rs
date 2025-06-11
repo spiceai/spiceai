@@ -203,8 +203,16 @@ impl SqlWarehouseApi {
         let token = self.token_provider.get_token();
         let initial_external_link = Self::extract_external_links(result_object)?;
 
+        // If no external link, return an empty stream
+        if initial_external_link.is_none() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                Box::pin(stream::empty()),
+            )));
+        }
+
         let token = token.to_string();
-        let stream = stream::unfold(Some(initial_external_link), move |current_link| {
+        let stream = stream::unfold(initial_external_link, move |current_link| {
             let api = Arc::clone(&self);
             let token = token.clone();
             async move {
@@ -245,7 +253,7 @@ impl SqlWarehouseApi {
                                 .context(JsonParsingFailedSnafu)
                                 .and_then(Self::extract_external_links)
                             {
-                                Ok(next) => Some(next),
+                                Ok(next) => next,
                                 Err(e) => return Some((Err(e), None)),
                             },
                             Err(e) => return Some((Err(e), None)),
@@ -289,17 +297,11 @@ impl SqlWarehouseApi {
         )))
     }
 
-    /// Deserializes the first [`ExternalLink`] in the `external_links` array
-    fn extract_external_links(mut response: Value) -> Result<ExternalLink, Error> {
-        let links = response
-            .get_mut("external_links")
-            .map(Value::take)
-            .ok_or_else(|| {
-                MissingJsonFieldSnafu {
-                    field: "external_links",
-                }
-                .build()
-            })?;
+    /// Deserializes the first [`ExternalLink`] in the `external_links` array, or None if missing or empty
+    fn extract_external_links(mut response: Value) -> Result<Option<ExternalLink>, Error> {
+        let Some(links) = response.get_mut("external_links").map(Value::take) else {
+            return Ok(None);
+        };
 
         let Value::Array(mut links) = links else {
             return Err(Error::InvalidJsonArray {
@@ -307,12 +309,14 @@ impl SqlWarehouseApi {
             });
         };
 
-        // Only ever returns 1 external link in the array
-        let link = links.pop().ok_or_else(|| Error::InvalidJsonArray {
-            field: "external_links".into(),
-        })?;
+        // Return None if the array is empty
+        let Some(link) = links.pop() else {
+            return Ok(None);
+        };
 
-        serde_json::from_value(link).context(DeserializeExternalLinkFailedSnafu)
+        serde_json::from_value(link)
+            .context(DeserializeExternalLinkFailedSnafu)
+            .map(Some)
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {

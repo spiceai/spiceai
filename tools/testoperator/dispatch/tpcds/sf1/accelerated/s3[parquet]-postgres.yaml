@@ -1,0 +1,20 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/s3[parquet]-postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    ready_wait: 1200
+    runner_type: spiceai-dev-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/s3[parquet]-postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    ready_wait: 1200
+    runner_type: spiceai-dev-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/s3[parquet]-postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    ready_wait: 1200
+    runner_type: spiceai-dev-runners
+    duration: 28800
