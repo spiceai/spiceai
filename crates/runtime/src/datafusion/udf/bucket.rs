@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::num::TryFromIntError;
 use std::sync::Arc;
 
 use ahash::RandomState;
@@ -26,7 +27,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
-use snafu::Snafu;
+use snafu::{ResultExt as _, Snafu};
 
 const NULL_BUCKET: i32 = -1;
 
@@ -51,11 +52,17 @@ pub enum BucketError {
 
     #[snafu(display("First argument must be a positive Int64, got {value}"))]
     InvalidFirstArgType { value: ColumnarValue },
+
+    #[snafu(display("Bucket value is larger than the storage type: {source}"))]
+    BucketLargerThanType {
+        #[snafu(source)]
+        source: TryFromIntError,
+    },
 }
 
-impl Into<DataFusionError> for BucketError {
-    fn into(self) -> DataFusionError {
-        DataFusionError::External(self.to_string().into())
+impl From<BucketError> for DataFusionError {
+    fn from(val: BucketError) -> Self {
+        DataFusionError::External(val.to_string().into())
     }
 }
 
@@ -64,7 +71,14 @@ pub struct Bucket {
     signature: Signature,
 }
 
+impl Default for Bucket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Bucket {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             signature: Signature::any(2, Volatility::Immutable),
@@ -77,7 +91,7 @@ impl ScalarUDFImpl for Bucket {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "bucket"
     }
 
@@ -119,11 +133,11 @@ impl ScalarUDFImpl for Bucket {
 
         match &args[1] {
             ColumnarValue::Scalar(scalar) => {
-                let bucket = compute_bucket(&scalar, num_buckets)?;
+                let bucket = compute_bucket(scalar, num_buckets)?;
                 Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))))
             }
             ColumnarValue::Array(array) => {
-                let buckets = compute_bucket_array(Arc::clone(array), num_buckets)?;
+                let buckets = compute_bucket_array(array, num_buckets)?;
                 Ok(ColumnarValue::Array(Arc::new(buckets)))
             }
         }
@@ -138,21 +152,25 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<i32, DataFus
     let mut hashes = vec![0; 1];
     let random_state = RandomState::new();
     create_hashes(&[array], &random_state, &mut hashes)?;
-    Ok((hashes[0] % num_buckets as u64) as i32)
+    Ok(u64::try_from(num_buckets)
+        .and_then(|n| i32::try_from(hashes[0] % n))
+        .context(BucketLargerThanTypeSnafu)?)
 }
 
-fn compute_bucket_array(array: ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
+fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
     let mut hashes = vec![0; array.len()];
     let random_state = RandomState::new();
     let capacity = array.len();
-    create_hashes(&[Arc::clone(&array)], &random_state, &mut hashes)?;
+    create_hashes(&[Arc::clone(array)], &random_state, &mut hashes)?;
 
     let mut builder = Int32Array::builder(capacity);
-    for i in 0..capacity {
+    for (i, hash) in hashes.iter().enumerate().take(capacity) {
         let bucket = if array.is_null(i) {
             NULL_BUCKET
         } else {
-            (hashes[i] % num_buckets as u64) as i32
+            u64::try_from(num_buckets)
+                .and_then(|n| i32::try_from(hash % n))
+                .context(BucketLargerThanTypeSnafu)?
         };
         builder.append_value(bucket);
     }
@@ -177,7 +195,7 @@ mod tests {
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
-            assert!(bucket >= 0 && bucket < 10, "Bucket out of range: {bucket}",);
+            assert!((0..10).contains(&bucket), "Bucket out of range: {bucket}",);
         } else {
             panic!("Expected Int32 scalar");
         }
@@ -203,7 +221,7 @@ mod tests {
             assert_eq!(int_array.len(), 3);
             for i in 0..3 {
                 let bucket = int_array.value(i);
-                assert!(bucket >= 0 && bucket < 5, "Bucket out of range: {bucket}",);
+                assert!((0..5).contains(&bucket), "Bucket out of range: {bucket}",);
             }
         } else {
             panic!("Expected Int32 array");
@@ -272,7 +290,7 @@ mod tests {
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
-            assert!(bucket >= 0 && bucket < 10);
+            assert!((0..10).contains(&bucket), "Bucket out of range: {bucket}");
         } else {
             panic!("Expected Int32 scalar");
         }

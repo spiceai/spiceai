@@ -26,7 +26,7 @@ pub mod bucket;
 pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(CosineDistance::new().into());
     ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
-    ctx.register_udf(bucket::Bucket::new().into())
+    ctx.register_udf(bucket::Bucket::new().into());
 }
 
 #[cfg(test)]
