@@ -569,8 +569,7 @@ impl SpiceTestQueryWorker {
             };
 
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
-                .map_err(QueryError::nonretryable)?
-                .to_string();
+                .map_err(QueryError::nonretryable)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
                     description => format!("Query: {query_name}"),

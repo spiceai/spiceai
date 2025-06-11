@@ -538,10 +538,10 @@ fn query_to_stream(
 fn to_execution_error(e: Error) -> DataFusionError {
     match e {
         Error::Flight { source } => match source {
-            flight_client::Error::UnableToQuery {
-                source: source_error,
-            } => DataFusionError::Execution(format!("{source_error}")),
-            flight_client::Error::ConnectionReset { source: _ } => {
+            flight_client::Error::UnableToQuery { source } => {
+                DataFusionError::Execution(format!("{source}"))
+            }
+            flight_client::Error::ConnectionReset { .. } => {
                 DataFusionError::External(Box::new(source))
             }
             _ => DataFusionError::Execution(format!("{source}")),
@@ -559,18 +559,18 @@ fn map_query_stream_error(error: FlightError) -> DataFusionError {
                     source: TonicStatusError::from(source_owned),
                 }));
             }
-            DataFusionError::Execution(format!(
-                "{}",
+            DataFusionError::Execution(
                 Error::ArrowFlight {
                     source: Box::new(error),
                 }
-            ))
+                .to_string(),
+            )
         }
-        _ => DataFusionError::Execution(format!(
-            "{}",
+        _ => DataFusionError::Execution(
             Error::ArrowFlight {
                 source: Box::new(error),
             }
-        )),
+            .to_string(),
+        ),
     }
 }
