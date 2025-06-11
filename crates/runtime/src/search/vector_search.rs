@@ -18,17 +18,13 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
-use super::util::user_tables_with_embeddings;
+use super::util::{get_embedding_table, user_tables_with_embeddings};
 use super::{Error, Result};
-use crate::embeddings::table::EmbeddingTable;
 use crate::request::CacheControl;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
-    util::{
-        embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
-        get_primary_keys_with_overrides,
-    },
+    util::{embedding_columns_from_table, get_primary_keys_with_overrides},
 };
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 use arrow::array::RecordBatch;
@@ -95,9 +91,7 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let Some(embedding_table) =
-            find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
-        else {
+        let Some(embedding_table) = get_embedding_table(&table_provider).await else {
             return Err(Error::CannotVectorSearchDataset {
                 data_source: tbl.clone(),
             });
@@ -233,11 +227,11 @@ impl VectorSearch {
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
-                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
-                    let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
+                    let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await?;
+                    let mut generators: Vec<Box<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
 
                     for (i, col) in embedding_columns.iter().enumerate() {
-                        generators.insert(i, Arc::new(self.vector_search_generator(
+                        generators.insert(i, Box::new(self.vector_search_generator(
                                 &tbl,
                                 col.as_str(),
                                 primary_keys,
@@ -245,18 +239,13 @@ impl VectorSearch {
                         );
                     };
 
-                    // If the dataset is configured with full text search capabilities, add as generator.
-                    if let Some(mut fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
-                        generators.append(&mut fts);
-                    }
-
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
-                        query.clone(),
-                        where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                        additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),
-                        primary_keys.to_vec(),
-                        keywords,
-                        *limit
+                         query.clone(),
+                         where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
+                          additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),
+                          primary_keys.to_vec(),
+                          keywords,
+                          *limit
                     ).await.context(SearchPipelineSnafu)?;
 
                     Ok((tbl.clone(), agg_result))

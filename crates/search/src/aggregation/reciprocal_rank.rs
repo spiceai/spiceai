@@ -72,11 +72,13 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let mut matches: HashMap<String, Vec<String>> = HashMap::new();
 
         // Inefficient, but collect each stream, convert to [`MemTable`].
-        let mut i = 0;
-        for VectorSearchGenerationResult {
-            data: stream,
-            derived_from,
-        } in data
+        for (
+            i,
+            VectorSearchGenerationResult {
+                data: stream,
+                derived_from,
+            },
+        ) in data.into_iter().enumerate()
         {
             let schema = stream.schema();
             additional_columns.extend(additional_columns_of_schema(
@@ -100,14 +102,14 @@ impl CandidateAggregation for ReciprocalRankFusion {
                     matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
                 });
 
-            let table_name = format!("search_candidates_{i}");
-            table_names.push(table_name.clone());
+            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
             let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
+            let table_name = format!("search_candidates_{i}");
+            table_names.insert(i, table_name.clone());
+
             let _ = ctx
                 .register_table(TableReference::bare(table_name), Arc::new(table))
                 .context(DatafusionSnafu)?;
-
-            i += 1;
         }
 
         // Now that we've filtered empty generation data, again check for <=1 inputs.
@@ -209,10 +211,6 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
     };
 
     for s in schemas {
-        if s.fields().is_empty() {
-            // Empty schema -> empty data
-            continue;
-        }
         if s.column_with_name(SEARCH_VALUE_COLUMN_NAME).is_none() {
             return Err(Error::CandidateMissingRequiredColumn {
                 col: SEARCH_VALUE_COLUMN_NAME.to_string(),

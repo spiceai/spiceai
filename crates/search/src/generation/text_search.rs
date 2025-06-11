@@ -12,7 +12,7 @@ limitations under the License.
 */
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
+use crate::SEARCH_SCORE_COLUMN_NAME;
 use arrow::error::ArrowError;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -207,7 +207,7 @@ impl FullTextSearch {
                 let doc: HashMap<Field, OwnedValue> =
                     searcher.doc(addr).context(TextSearchSnafu)?;
 
-                let mut doc_w_col_names = doc
+                let doc_w_col_names = doc
                     .into_iter()
                     .map(|(f, v)| (schema.get_field_name(f), v))
                     .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
