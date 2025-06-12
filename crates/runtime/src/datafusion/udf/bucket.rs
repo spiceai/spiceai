@@ -101,10 +101,10 @@ impl ScalarUDFImpl for Bucket {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
         if arg_types.len() != 2 {
-            return Err(DataFusionError::Plan(format!(
-                "Expected exactly two arguments, got {}",
-                arg_types.len()
-            )));
+            return Err(BucketError::InvalidArgumentCount {
+                count: arg_types.len(),
+            }
+            .into());
         }
         Ok(DataType::Int32)
     }
