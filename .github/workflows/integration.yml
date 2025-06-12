@@ -22,7 +22,6 @@ on:
       - 'LICENSE'
       - '.github/**'
       - 'version.txt'
-      - '.schema/**'
       - '.vscode/**'
       - 'deploy/**'
       - 'install/**'
