@@ -45,7 +45,8 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
         .scope(async {
             let mut db_catalog =
                 Catalog::new(format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"), "ice_glue".to_string());
-
+            // `params.include` not supported: https://github.com/spiceai/spiceai/issues/5314
+            // db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
             db_catalog.params = Some(get_params());
 
             let app = AppBuilder::new("glue_iceberg_integration_test_catalog")
