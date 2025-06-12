@@ -4,4 +4,4 @@ tests:
     query_set: clickbench
     query_overrides: duckdb
     runner_type: spiceai-dev-large-runners
-    ready_wait: 1800
+    ready_wait: 3600

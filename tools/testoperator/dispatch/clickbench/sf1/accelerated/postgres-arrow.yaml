@@ -3,4 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/clickbench/sf1/accelerated/postgres-arrow.yaml
     query_set: clickbench
     runner_type: spiceai-dev-large-runners
-    ready_wait: 1800
+    ready_wait: 3600
