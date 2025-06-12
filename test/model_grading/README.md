@@ -3,16 +3,17 @@
 This repository include the eval datasets, test scripts, and sample spicepod config for grading models.
 
 ## Evaluate model's ability to follow structured output
-
-Follow the [structured output eval sample spicepod](./structured_output/structured_output.yaml), replace model provider with the model to be tested. Run evals against the model using the following command, which will run the structured output eval using the [structured_output.jsonl](./structured_output/structured_output.jsonl) dataset.
-
+Use the [testoperator](tools/testoperator/README.md) to evaluate a model's performance at returning structured output.
 ```bash
-curl -XPOST http://localhost:8090/v1/evals/structured_output \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test_model"
-  }'
+./testoperator run evals \
+   --data-dir test/model_grading/ \
+   -p ./test/spicepods/models/structured_output.yaml \
+   --model o3-mini \
+   --metrics
 ```
+ - To test a **different model**: Use (or define) a new model component in the spicepod at `./test/spicepods/models/structured_output.yaml`.
+ - To use **different test data**: Set the `--data-dir` to a directory where a `structured_output.jsonl` is present.
+
 
 ## Evaluate whether model's enters a recursion loop through any means (tool use, chat completions, etc)
 
@@ -20,14 +21,8 @@ Follow the [recursion test sample spicepod](./test_recursion/test_recursion.yaml
 
 ## Evaluate model's ability to produce valid and correct sql queries
 
-Follow the [nsql eval sample spicepod](../nsql_bench/spicepod.yaml), replace model provider with the model to be tested. Run evals against the model using the following command, which will run the structured output eval using the [tpch_nsql.jsonl](../nsql_bench/tpch_nsql.jsonl) dataset.
+See [nsql_bench](../nsql_bench/README.md).
 
-```bash
-curl -XPOST http://localhost:8090/v1/evals/tpch_nsql \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test_model"
-  }'
-```
+---
 
 For details about model grading criteria, refer to the [grading criteria](../../docs/criteria/models/grading.md) docs.

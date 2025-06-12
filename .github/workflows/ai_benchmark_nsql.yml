@@ -5,21 +5,21 @@ on:
   workflow_dispatch:
     inputs:
       model_option:
-        description: 'Which model do you want to test? (Default is ALL)'
+        description: "Which model do you want to test? (Default is ALL)"
         required: false
         type: choice
         options:
-          - 'all'
-          - 'gpt-4o'
-          - 'gpt-4o-mini'
-          - 'o1'
-          - 'o3_mini'
-          - 'llama3-3B-Instruct'
-          - 'claude-3-5-sonnet'
-          - 'grok2'
-        default: 'all'
+          - "all"
+          - "gpt-4o"
+          - "gpt-4o-mini"
+          - "o1"
+          - "o3_mini"
+          - "llama3-3B-Instruct"
+          - "claude-3-5-sonnet"
+          - "grok2"
+        default: "all"
   schedule:
-    - cron: '0 1 * * 2,5' # Every Monday and Thursday at 5pm PST (1am UTC next day)
+    - cron: "0 1 * * 2,5" # Every Monday and Thursday at 5pm PST (1am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -29,14 +29,14 @@ concurrency:
 jobs:
   build-testoperator:
     name: Build testoperator
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'darwin'
+          os: "darwin"
 
       - name: Build the testoperator
         run: |
@@ -55,7 +55,7 @@ jobs:
 
   build-spiced:
     name: Build spiced
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     steps:
       - uses: actions/checkout@v4
 
@@ -99,41 +99,13 @@ jobs:
         with:
           script: |
             const matrix = [
-              {
-                name: "gpt-4o",
-                spicepod: "./test/nsql_bench/spicepod_gpt-4o.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "gpt-4o-mini",
-                spicepod: "./test/nsql_bench/spicepod_gpt-4o-mini.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "o1",
-                spicepod: "./test/nsql_bench/spicepod_o1.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "o3_mini",
-                spicepod: "./test/nsql_bench/spicepod_o3_mini.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "llama3-3B-Instruct",
-                spicepod: "./test/nsql_bench/spicepod_llama3-3b.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "claude-3-5-sonnet",
-                spicepod: "./test/nsql_bench/spicepod_claude-3-5-sonnet.yaml",
-                data: "./test/nsql_bench/data"
-              },
-              {
-                name: "grok2",
-                spicepod: "./test/nsql_bench/spicepod_grok2.yaml",
-                data: "./test/nsql_bench/data"
-              },
+              { name: "gpt-4o" },
+              { name: "gpt-4o-mini" },
+              { name: "o1" },
+              { name: "o3_mini" },
+              { name: "llama3-3B-Instruct" },
+              { name: "claude-3-5-sonnet"},
+              { name: "grok2" },
             ];
 
             const model_option = context.payload.inputs?.model_option || 'all';
@@ -151,7 +123,7 @@ jobs:
       - build-testoperator
       - build-spiced
       - setup-matrix
-    runs-on: 'spiceai-macos'
+    runs-on: "spiceai-macos"
     strategy:
       fail-fast: false
       matrix:
@@ -184,7 +156,7 @@ jobs:
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
-            -p ${{ matrix.target.spicepod }} \
-            -d $GITHUB_WORKSPACE/${{ matrix.target.data }} \
+            -p test/spicepods/models/nsql_bench.yaml \
+            -d $GITHUB_WORKSPACE/test/nsql_bench/data \
             --ready-wait 180 \
             --metrics

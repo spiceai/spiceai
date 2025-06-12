@@ -1,18 +1,15 @@
 # Text to SQL Benchmark
 
 Instructions to run the benchmark:
-
-1. Run Spice
-1. Run `tpch_nsql` eval dataset
-
 ```bash
-curl -XPOST "http://localhost:8090/v1/evals/tpch_nsql" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o-mini"
-  }'
-[{"id":"d846dcc0a0dd9df94b8d4f72c874aa90","created_at":"2025-02-04T23:10:29","dataset":"tpch_nsql","model":"gpt-4o-mini","status":"Completed","scorers":["json_match"],"metrics":{"json_match/mean":0.6363636}}]
+./testoperator run evals \
+   --data-dir test/nsql_bench/data \
+   -p ./test/spicepods/models/nsql_bench.yaml \
+   --model <model_name> \
+   --metrics
 ```
+ - To use **different test data**: Set the `--data-dir` to a directory where a `structured_output.jsonl` is present.
+
 
 To review model answers and score details:
 
@@ -44,11 +41,11 @@ score AS (
     GROUP BY run_id
 ),
 tool_stats AS (
-    SELECT 
+    SELECT
         COUNT(*) AS task_calls,
         COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS task_errors
     FROM runtime.task_history
-    WHERE 
+    WHERE
         task != 'test_connectivity'
         AND start_time BETWEEN (SELECT created_at FROM latest_run)
         AND COALESCE(end_time, NOW())
@@ -64,20 +61,20 @@ LEFT JOIN tool_stats ts ON 1 = 1;
 
 ```sql
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
-  task, 
+SELECT
+  task,
   COUNT(*) AS calls,
   COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS failures,
   SUM(CAST((end_time - start_time) AS Float) /  1000000) AS duration_ms
 FROM runtime.task_history
-WHERE 
+WHERE
   task != 'test_connectivity'
-  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   COALESCE(end_time, NOW())
 GROUP BY task
 ORDER BY duration_ms DESC;
@@ -87,25 +84,25 @@ ORDER BY duration_ms DESC;
 
 ```sql
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
+SELECT
     task,
     COUNT(*) AS count,
     error_message as message,
     input
-FROM 
+FROM
     runtime.task_history
-WHERE 
+WHERE
     error_message IS NOT NULL
-    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   	COALESCE(end_time, NOW())
-GROUP BY 
+GROUP BY
     task, input, message
-ORDER BY 
+ORDER BY
     count DESC
 LIMIT 20;
 ```
@@ -115,18 +112,18 @@ LIMIT 20;
 ```shell
 Use the following context for TPC-H Database:
 Schema Overview:
-- PART: Information about products, including identifiers, names, types, and retail prices  
-- SUPPLIER: Details about product suppliers, including location and account balance  
-- PARTSUPP: Part-supplier relationships with supply costs and availability  
-- CUSTOMER: Information about customers, such as their market segment and account balance  
-- ORDERS: Records of customer orders with total price and order priority  
-- LINEITEM: Detailed information for each order line, including ship dates, discounts, and taxes  
-- NATION: Countries and their relationships to regions  
-- REGION: Definitions of geographical regions  
+- PART: Information about products, including identifiers, names, types, and retail prices
+- SUPPLIER: Details about product suppliers, including location and account balance
+- PARTSUPP: Part-supplier relationships with supply costs and availability
+- CUSTOMER: Information about customers, such as their market segment and account balance
+- ORDERS: Records of customer orders with total price and order priority
+- LINEITEM: Detailed information for each order line, including ship dates, discounts, and taxes
+- NATION: Countries and their relationships to regions
+- REGION: Definitions of geographical regions
 Table Relationships:
-- PARTSUPP references PART and SUPPLIER  
-- LINEITEM references ORDERS, PART, and SUPPLIER  
-- CUSTOMER connects to ORDERS  
+- PARTSUPP references PART and SUPPLIER
+- LINEITEM references ORDERS, PART, and SUPPLIER
+- CUSTOMER connects to ORDERS
 - NATION references REGION and connects to CUSTOMER and SUPPLIER
 
 "partsupp": [
@@ -208,19 +205,19 @@ Table Relationships:
 ],
 
 Task:
-Generate 10 natural language questions that a user might ask when querying this database for the following areas:  
-- Simple select  
+Generate 10 natural language questions that a user might ask when querying this database for the following areas:
+- Simple select
 - Simple aggregation involved single table
-- Filtering  
+- Filtering
 - Advanced aggregatioins and multi-table joins
 
-Example:  
+Example:
 - find part brand for part key 3
 - what is total number of orders
 - what is customer Customer#000000001 nation
 - how many customers reside in each nation. Return top 3 ordered by nation name
 
-Return the response as a jsonl structured as follows:  
+Return the response as a jsonl structured as follows:
 {"category": "select", "level": "basic", "input": "find part brand for part with key 3.  Fields: part_brand", "ideal": "{\"part_brand\": \"Brand#42\"}", "sql": "select p_brand from part where p_partkey = 3;"}
 {"category": "aggregation", "level": "basic", "input": "what is total number of orders. Fields: total_orders", "ideal": "{\"total_orders\": 1500000}", "sql": "select count(*) as total_orders from orders;"}
 {"category": "join", "level": "basic", "input": "what is customer Customer#000000001 nation. Fields: nation", "ideal": "{\"nation\": \"MOROCCO\"}", "sql": "select n_name as nation from customer c, nation n where c.c_name = 'Customer#000000001' and c.c_nationkey = n.n_nationkey;"}
