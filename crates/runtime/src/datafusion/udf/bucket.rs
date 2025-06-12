@@ -18,7 +18,8 @@ use std::num::TryFromIntError;
 use std::sync::Arc;
 
 use ahash::RandomState;
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, UInt64Array};
+use arrow::compute::binary;
 use datafusion::arrow::array::{Array, Int32Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
@@ -157,26 +158,39 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
     )))
 }
 
-fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
-    let mut hashes = vec![0; array.len()];
+#[allow(clippy::missing_panics_doc)]
+pub fn compute_bucket_array(
+    array: &ArrayRef,
+    num_buckets: i64,
+) -> Result<Int32Array, DataFusionError> {
+    let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
+
+    let mut hashes = vec![0u64; array.len()];
     let random_state = RandomState::new();
-    let capacity = array.len();
     create_hashes(&[Arc::clone(array)], &random_state, &mut hashes)?;
 
-    let mut builder = Int32Array::builder(capacity);
-    for (i, hash) in hashes.iter().enumerate().take(capacity) {
-        let bucket = if array.is_null(i) {
-            None
-        } else {
-            Some(
-                u64::try_from(num_buckets)
-                    .and_then(|n| i32::try_from(hash % n))
-                    .context(BucketLargerThanTypeSnafu)?,
-            )
-        };
-        builder.append_option(bucket);
-    }
-    Ok(builder.finish())
+    let hash_array = UInt64Array::from(hashes);
+
+    let bucket_array: Int32Array = binary(
+        &hash_array,
+        &Int32Array::from_value(num_buckets, array.len()),
+        |hash, n| {
+            const _: () = assert!(
+                MAX_NUM_BUCKETS <= i32::MAX as i64,
+                "MAX_NUM_BUCKETS exceeds i32::MAX"
+            );
+            #[allow(clippy::expect_used)]
+            // SAFETY: unwrap is safe because we restrict MAX_NUM_BUCKETS at compile time
+            u64::try_from(n)
+                .and_then(|n| i32::try_from(hash % n))
+                .expect("MAX_NUM_BUCKETS smaller than i32 positive maximum")
+        },
+    )
+    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+
+    let result = Int32Array::new(bucket_array.values().clone(), array.nulls().cloned());
+
+    Ok(result)
 }
 
 #[cfg(test)]
