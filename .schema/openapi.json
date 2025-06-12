@@ -7,7 +7,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.4.0-unstable"
+    "version": "1.4.0-rc.1"
   },
   "servers": [
     {
@@ -1294,45 +1294,36 @@
                   "$ref": "#/components/schemas/SearchResponse"
                 },
                 "example": {
-                  "results": [
+                  "matches": [
                     {
-                      "matches": {
-                        "message": "I booked use some tickets"
-                      },
+                      "value": "I booked use some tickets",
                       "dataset": "app_messages",
                       "primary_key": {
                         "id": "6fd5a215-0881-421d-ace0-b293b83452b5"
                       },
-                      "data": {
+                      "metadata": {
                         "timestamp": 1724716542
-                      },
-                      "score": 0.914321
+                      }
                     },
                     {
-                      "matches": {
-                        "message": "direct to Narata"
-                      },
+                      "value": "direct to Narata",
                       "dataset": "app_messages",
                       "primary_key": {
                         "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b"
                       },
-                      "data": {
+                      "metadata": {
                         "timestamp": 1724715881
-                      },
-                      "score": 0.83221
+                      }
                     },
                     {
-                      "matches": {
-                        "message": "Yes, we're sitting together"
-                      },
+                      "value": "Yes, we're sitting together",
                       "dataset": "app_messages",
                       "primary_key": {
                         "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0"
                       },
-                      "data": {
+                      "metadata": {
                         "timestamp": 1724716123
-                      },
-                      "score": 0.787654321
+                      }
                     }
                   ],
                   "duration_ms": 42
@@ -3859,35 +3850,18 @@
       "Match": {
         "type": "object",
         "required": [
-          "matches",
+          "value",
           "score",
           "dataset"
         ],
         "properties": {
-          "data": {
-            "type": "object",
-            "description": "Addditional data from the `dataset` requested by the user.",
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            }
-          },
           "dataset": {
             "type": "string",
             "description": "The name of the dataset where the match was found"
           },
-          "matches": {
-            "type": "object",
-            "description": "The matches for this result",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/MatchType"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
           "metadata": {
             "type": "object",
+            "description": "Additional metadata for the match, requested explicitly by the user.",
             "additionalProperties": {},
             "propertyNames": {
               "type": "string"
@@ -3905,17 +3879,12 @@
             "type": "number",
             "format": "double",
             "description": "The similarity of the match to the query"
+          },
+          "value": {
+            "type": "string",
+            "description": "The value of the match (e.g., document snippet, identifier, etc.)"
           }
         }
-      },
-      "MatchType": {
-        "oneOf": [
-          {},
-          {
-            "type": "array",
-            "items": {}
-          }
-        ]
       },
       "MessageResponse": {
         "type": "object",
@@ -4402,7 +4371,7 @@
       "SearchResponse": {
         "type": "object",
         "required": [
-          "results",
+          "matches",
           "duration_ms"
         ],
         "properties": {
@@ -4411,7 +4380,7 @@
             "description": "Total time taken to execute the search, in milliseconds",
             "minimum": 0
           },
-          "results": {
+          "matches": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Match"
