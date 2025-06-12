@@ -232,7 +232,8 @@ pub async fn full_text_search_candidates(
     let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
 
     Some(
-        fts.as_candidate_generations()
+        fts.with_new_base(table_provider)
+            .as_candidate_generations()
             .context(SearchGenerationSnafu),
     )
 }
