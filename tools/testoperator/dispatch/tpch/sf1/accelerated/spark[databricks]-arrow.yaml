@@ -8,9 +8,11 @@ tests:
   throughput:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/spark[databricks]-arrow.yaml
     query_set: tpch
+    ready_wait: 600
     runner_type: spiceai-dev-large-runners
   load:
     spicepod_path: ./test/spicepods/tpch/sf1/accelerated/spark[databricks]-arrow.yaml
     query_set: tpch
+    ready_wait: 600
     runner_type: spiceai-dev-large-runners
     duration: 28800

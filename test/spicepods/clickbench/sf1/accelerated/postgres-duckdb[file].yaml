@@ -8,6 +8,8 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
+      params:
+        duckdb_memory_limit: 50gb
     params:
       pg_host: ${secrets:POSTGRES_HOST}
       pg_port: 5432
