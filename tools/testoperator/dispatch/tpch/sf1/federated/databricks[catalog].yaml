@@ -1,0 +1,18 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[catalog].yaml
+    query_set: tpch
+    query_overrides: databricks-catalog
+    runner_type: spiceai-dev-runners
+    validate_results: true
+  throughput:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[catalog].yaml
+    query_set: tpch
+    query_overrides: databricks-catalog
+    runner_type: spiceai-dev-large-runners
+  load:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[catalog].yaml
+    query_set: tpch
+    query_overrides: databricks-catalog
+    runner_type: spiceai-dev-large-runners
+    duration: 28800
