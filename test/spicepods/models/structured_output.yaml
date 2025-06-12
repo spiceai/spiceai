@@ -15,10 +15,10 @@ evals:
 
 models:
   - from: openai:o3-mini
-    name: test_model
+    name: o3-mini
     params:
       openai_api_key: ${ secrets:OPENAI_API_KEY }
-      openai_response_format:
+      openai_response_format: &math_reasoning_structured_response_format
         type: json_schema
         json_schema:
           name: math_reasoning
@@ -34,3 +34,9 @@ models:
               - final_answer
             additionalProperties: false
           strict: true
+
+  - from: openai:gpt-4.1
+    name: gpt-4.1
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+      openai_response_format: *math_reasoning_structured_response_format

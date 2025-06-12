@@ -34,22 +34,22 @@ use crate::metrics;
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ComponentStatus {
     /// The component is initializing and not yet ready
-    Initializing,
+    Initializing = 0,
 
     /// The component is ready to accept connections
-    Ready,
+    Ready = 1,
 
     /// The component is disabled and not running
-    Disabled,
+    Disabled = 2,
 
     /// An error occurred in the component
-    Error,
+    Error = 3,
 
     /// The component is in the process of refreshing its state
-    Refreshing,
+    Refreshing = 4,
 
     /// The component is in the process of shutting down
-    ShuttingDown,
+    ShuttingDown = 5,
 }
 
 impl Display for ComponentStatus {
