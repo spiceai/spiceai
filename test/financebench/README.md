@@ -2,7 +2,7 @@
 
 Instructions to run the [FinanceBench](https://github.com/patronus-ai/financebench) tests:
 
-1. Run Spice
+1. Run Spice (spicepods found [here](../spicepods/financebench))
 1. Run `financebench` eval
 
 ```bash
@@ -11,7 +11,24 @@ curl -XPOST "http://localhost:8090/v1/evals/financebench" \
   -d '{
     "model": "gpt-4.1"
   }'
-[{"id":"a5a4ee4d40dfcfc81a050bc5e23135c9","created_at":"2025-03-24T22:28:14","completed_at":"2025-03-24T22:29:19","dataset":"financebench.evals","model":"gpt-4o","status":"Completed","scorers":["match"],"metrics":{"match/mean":0.0}}]%  
+```
+```json
+[
+  {
+    "id":"a5a4ee4d40dfcfc81a050bc5e23135c9",
+    "created_at":"2025-03-24T22:28:14",
+    "completed_at":"2025-03-24T22:29:19",
+    "dataset":"financebench.evals",
+    "model":"gpt-4o",
+    "status":"Completed",
+    "scorers":[
+      "match"
+    ],
+    "metrics": {
+      "match/mean":0.0
+    }
+  }
+]
 ```
 
 To review model answers and score details:

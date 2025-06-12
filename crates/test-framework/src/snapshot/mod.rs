@@ -16,16 +16,15 @@ limitations under the License.
 
 use std::{panic, sync::Arc};
 
-use flight_client::FlightClient;
-
 use crate::{flight::query_to_batches, queries::Query};
+use spiceai::Client as SpiceClient;
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
 }
 
 pub async fn record_explain_plan(
-    client: &FlightClient,
+    spice_client: Arc<SpiceClient>,
     name: &str,
     query: &Query,
     scale_factor: f64,
@@ -34,7 +33,7 @@ pub async fn record_explain_plan(
     let sql = Arc::clone(&query.sql);
     let query_name = Arc::clone(&query.name);
     let parameters = query.get_parameters_batch().transpose()?;
-    let plan_results = query_to_batches(client, &format!("EXPLAIN {sql}"), parameters)
+    let plan_results = query_to_batches(spice_client, &format!("EXPLAIN {sql}"), parameters)
         .await
         .map_err(|e| anyhow::anyhow!("query `{query_name}` to plan: {e}"))?;
 

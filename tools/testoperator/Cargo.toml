@@ -17,6 +17,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 arrow-json.workspace = true
+spiceai.workspace = true
 
 [features]
 anonymous_telemetry = []

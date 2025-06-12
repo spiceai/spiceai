@@ -15,17 +15,17 @@ expression: req_str
     "json_schema": {
       "name": "sql_mode",
       "schema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "StructuredNsqlOutput",
         "type": "object",
-        "required": [
-          "sql"
-        ],
         "properties": {
           "sql": {
             "type": "string"
           }
         },
+        "required": [
+          "sql"
+        ],
         "additionalProperties": false
       },
       "strict": true
