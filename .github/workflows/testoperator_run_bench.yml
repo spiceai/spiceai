@@ -41,6 +41,7 @@ on:
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
           - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
