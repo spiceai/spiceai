@@ -103,16 +103,6 @@ jobs:
             echo "Excluding extended_tests"
           fi
 
-          echo "Event name: ${{ github.event_name }}"
-          echo "GitHub ref: ${{ github.ref }}"
-          echo "GitHub ref_name: ${{ github.ref_name }}"
-          echo "PR base ref: ${{ github.event.pull_request.base.ref }}"
-          echo "PR head ref: ${{ github.event.pull_request.head.ref }}"
-          echo "Is PR event: ${{ github.event_name == 'pull_request' }}"
-          echo "Base starts with 'release': ${{ startsWith(github.event.pull_request.base.ref, 'release') }}"
-          echo "Full condition result: ${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release') }}"
-
-
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
 
       # Upload the test archive as an artifact
