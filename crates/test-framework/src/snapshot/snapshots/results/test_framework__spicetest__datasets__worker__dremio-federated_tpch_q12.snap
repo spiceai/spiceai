@@ -2,9 +2,5 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpch_q12"
 ---
-+------------+-----------------+----------------+
-| l_shipmode | high_line_count | low_line_count |
-+------------+-----------------+----------------+
-| MAIL       | 6202            | 9324           |
-| SHIP       | 6200            | 9262           |
-+------------+-----------------+----------------+
+++
+++

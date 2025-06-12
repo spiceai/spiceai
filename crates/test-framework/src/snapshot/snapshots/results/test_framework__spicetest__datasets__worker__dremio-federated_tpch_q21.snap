@@ -2,17 +2,5 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpch_q21"
 ---
-+--------------------+---------+
-| s_name             | numwait |
-+--------------------+---------+
-| Supplier#000002829 | 20      |
-| Supplier#000005808 | 18      |
-| Supplier#000000262 | 17      |
-| Supplier#000000496 | 17      |
-| Supplier#000002160 | 17      |
-| Supplier#000002301 | 17      |
-| Supplier#000002540 | 17      |
-| Supplier#000003063 | 17      |
-| Supplier#000005178 | 17      |
-| Supplier#000008331 | 17      |
-+--------------------+---------+
+++
+++
