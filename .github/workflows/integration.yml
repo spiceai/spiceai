@@ -96,7 +96,7 @@ jobs:
             CARGO_INCREMENTAL: 0
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]] || [[ "${{ github.event_name }}" == "pull_request" && "${{ github.base_ref }}" == "release"* ]]; then
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]] || [[ (github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release')) ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
           else
