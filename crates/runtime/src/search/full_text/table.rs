@@ -115,6 +115,7 @@ impl TableWithFullText {
     /// Construct a new [`TableWithFullText`] with an updated [`TableProvider`].
     ///
     /// No Checks are done to confirm compatibility between the current index and the provider [`TableProvider`].
+    #[must_use]
     pub fn with_new_base(&self, base_table: Arc<dyn TableProvider>) -> Self {
         Self {
             search_fields: self.search_fields.clone(),
