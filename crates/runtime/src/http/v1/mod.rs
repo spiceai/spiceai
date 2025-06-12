@@ -136,7 +136,7 @@ impl ResponseMimeType {
             ResponseMimeType::Plain => "text/plain",
             ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
             ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
-        }
+        };
         HeaderValue::from_str(media_type).ok()
     }
 
