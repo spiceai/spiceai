@@ -163,7 +163,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     // json format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
-    // Record benchamrk results
+    // Record benchmark results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
         KeyValue::new("type", "model_benchmark"),
