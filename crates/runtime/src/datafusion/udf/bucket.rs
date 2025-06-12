@@ -29,8 +29,6 @@ use datafusion::logical_expr::{
 use datafusion::scalar::ScalarValue;
 use snafu::{ResultExt as _, Snafu};
 
-const NULL_BUCKET: i32 = -1;
-
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
@@ -134,7 +132,7 @@ impl ScalarUDFImpl for Bucket {
         match &args[1] {
             ColumnarValue::Scalar(scalar) => {
                 let bucket = compute_bucket(scalar, num_buckets)?;
-                Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))))
+                Ok(ColumnarValue::Scalar(bucket))
             }
             ColumnarValue::Array(array) => {
                 let buckets = compute_bucket_array(array, num_buckets)?;
@@ -144,17 +142,19 @@ impl ScalarUDFImpl for Bucket {
     }
 }
 
-fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<i32, DataFusionError> {
+fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue, DataFusionError> {
     if scalar.is_null() {
-        return Ok(NULL_BUCKET);
+        return Ok(ScalarValue::Int32(None));
     }
     let array = scalar.to_array()?;
     let mut hashes = vec![0; 1];
     let random_state = RandomState::new();
     create_hashes(&[array], &random_state, &mut hashes)?;
-    Ok(u64::try_from(num_buckets)
-        .and_then(|n| i32::try_from(hashes[0] % n))
-        .context(BucketLargerThanTypeSnafu)?)
+    Ok(ScalarValue::Int32(Some(
+        u64::try_from(num_buckets)
+            .and_then(|n| i32::try_from(hashes[0] % n))
+            .context(BucketLargerThanTypeSnafu)?,
+    )))
 }
 
 fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
@@ -166,13 +166,15 @@ fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array
     let mut builder = Int32Array::builder(capacity);
     for (i, hash) in hashes.iter().enumerate().take(capacity) {
         let bucket = if array.is_null(i) {
-            NULL_BUCKET
+            None
         } else {
-            u64::try_from(num_buckets)
-                .and_then(|n| i32::try_from(hash % n))
-                .context(BucketLargerThanTypeSnafu)?
+            Some(
+                u64::try_from(num_buckets)
+                    .and_then(|n| i32::try_from(hash % n))
+                    .context(BucketLargerThanTypeSnafu)?,
+            )
         };
-        builder.append_value(bucket);
+        builder.append_option(bucket);
     }
     Ok(builder.finish())
 }
@@ -270,10 +272,10 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
-        if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
-            assert_eq!(bucket, NULL_BUCKET);
+        if let ColumnarValue::Scalar(ScalarValue::Int32(None)) = result {
+            // Expected: NULL input returns NULL
         } else {
-            panic!("Expected Int32 scalar");
+            panic!("Expected NULL Int32 scalar");
         }
     }
 
@@ -316,6 +318,40 @@ mod tests {
             assert_eq!(int_array.len(), 0);
         } else {
             panic!("Expected empty Int32 array");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_array_input() {
+        let udf = Bucket::new();
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(5))),
+                ColumnarValue::Array(Arc::new(StringArray::from(vec![
+                    None::<String>,
+                    Some("a".to_string()),
+                    None::<String>,
+                ]))),
+            ],
+            number_rows: 3,
+            return_type: &DataType::Int32,
+        };
+        let result = udf.invoke_with_args(args).expect("invoke udf");
+        if let ColumnarValue::Array(array) = result {
+            let int_array = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("downcast to Int32Array");
+            assert_eq!(int_array.len(), 3);
+            assert!(int_array.is_null(0), "Expected NULL at index 0");
+            assert!(!int_array.is_null(1), "Expected non-NULL at index 1");
+            assert!(
+                int_array.value(1) >= 0 && int_array.value(1) < 5,
+                "Bucket out of range"
+            );
+            assert!(int_array.is_null(2), "Expected NULL at index 2");
+        } else {
+            panic!("Expected Int32 array");
         }
     }
 }
