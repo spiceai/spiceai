@@ -184,8 +184,8 @@ mod tests {
     use super::*;
     use arrow::array::StringArray;
 
-    #[tokio::test]
-    async fn test_bucket_scalar() {
+    #[test]
+    fn test_bucket_scalar() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -203,8 +203,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_bucket_array() {
+    #[test]
+    fn test_bucket_array() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -230,8 +230,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_invalid_num_buckets() {
+    #[test]
+    fn test_invalid_num_buckets() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -245,8 +245,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_max_buckets() {
+    #[test]
+    fn test_max_buckets() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -260,8 +260,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_null_input() {
+    #[test]
+    fn test_null_input() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -279,8 +279,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_decimal_input() {
+    #[test]
+    fn test_decimal_input() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -298,8 +298,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_empty_array() {
+    #[test]
+    fn test_empty_array() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
@@ -321,8 +321,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_null_array_input() {
+    #[test]
+    fn test_null_array_input() {
         let udf = Bucket::new();
         let args = ScalarFunctionArgs {
             args: vec![
