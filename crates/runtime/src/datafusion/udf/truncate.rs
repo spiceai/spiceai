@@ -30,6 +30,26 @@ use datafusion::logical_expr::{
 use datafusion::scalar::ScalarValue;
 use snafu::{OptionExt, Snafu};
 
+macro_rules! truncate_numeric_array {
+    ($array:expr, $width:expr, $array_type:ty, $cast_type:ty, $output_type:ty) => {{
+        let casted_array = $array
+            .as_any()
+            .downcast_ref::<$array_type>()
+            .context(DowncastFailedSnafu)?;
+        let width_array = <$array_type>::from_value($width as $cast_type, $array.len());
+        let result: $array_type = binary(casted_array, &width_array, |v, w| {
+            let v = i64::from(v);
+            let w = i64::from(w);
+            (v - (((v % w) + w) % w)) as $output_type
+        })
+        .map_err(|e| DataFusionError::ArrowError(e, None))?;
+        Ok(Arc::new(<$array_type>::new(
+            result.values().clone(),
+            $array.nulls().cloned(),
+        )))
+    }};
+}
+
 /// Maximum truncation width or length, chosen to prevent overflow or excessive memory usage.
 const MAX_TRUNCATE_WIDTH: i64 = i64::MAX / 2;
 
@@ -274,122 +294,13 @@ fn compute_truncate_scalar(
 
 fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
     match array.data_type() {
-        DataType::Int8 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = Int8Array::from_value(width as i8, array.len());
-            let result: Int8Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as i8
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(Int8Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::Int16 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = Int16Array::from_value(width as i16, array.len());
-            let result: Int16Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as i16
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(Int16Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::Int32 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = Int32Array::from_value(width as i32, array.len());
-            let result: Int32Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as i32
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(Int32Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::Int64 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = Int64Array::from_value(width, array.len());
-            let result: Int64Array =
-                binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(Int64Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::UInt8 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = UInt8Array::from_value(width as u8, array.len());
-            let result: UInt8Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as u8
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(UInt8Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::UInt16 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = UInt16Array::from_value(width as u16, array.len());
-            let result: UInt16Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as u16
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(UInt16Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
-        DataType::UInt32 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .context(DowncastFailedSnafu)?;
-            let width_array = UInt32Array::from_value(width as u32, array.len());
-            let result: UInt32Array = binary(casted_array, &width_array, |v, w| {
-                let v = i64::from(v);
-                let w = i64::from(w);
-                (v - (((v % w) + w) % w)) as u32
-            })
-            .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(UInt32Array::new(
-                result.values().clone(),
-                array.nulls().cloned(),
-            )))
-        }
+        DataType::Int8 => truncate_numeric_array!(array, width, Int8Array, i8, i8),
+        DataType::Int16 => truncate_numeric_array!(array, width, Int16Array, i16, i16),
+        DataType::Int32 => truncate_numeric_array!(array, width, Int32Array, i32, i32),
+        DataType::Int64 => truncate_numeric_array!(array, width, Int64Array, i64, i64),
+        DataType::UInt8 => truncate_numeric_array!(array, width, UInt8Array, u8, u8),
+        DataType::UInt16 => truncate_numeric_array!(array, width, UInt16Array, u16, u16),
+        DataType::UInt32 => truncate_numeric_array!(array, width, UInt32Array, u32, u32),
         DataType::UInt64 => {
             let casted_array = array
                 .as_any()
@@ -441,12 +352,7 @@ fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, Data
                 array.nulls().cloned(),
             )))
         }
-        DataType::Utf8 => {
-            let result = substring(array, 0, Some(width as u64))
-                .map_err(|e| DataFusionError::ArrowError(e, None))?;
-            Ok(Arc::new(result))
-        }
-        DataType::Binary => {
+        DataType::Utf8 | DataType::Binary => {
             let result = substring(array, 0, Some(width as u64))
                 .map_err(|e| DataFusionError::ArrowError(e, None))?;
             Ok(Arc::new(result))
