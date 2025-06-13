@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::num::TryFromIntError;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use ahash::RandomState;
 use arrow::array::{ArrayRef, UInt64Array};
@@ -32,6 +32,12 @@ use snafu::{ResultExt as _, Snafu};
 
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
+
+/// Fixed seed for deterministic hashing.
+const HASH_SEED: usize = 0x53_50_49_43_45;
+
+/// Static `RandomState` for deterministic hashing.
+static RANDOM_STATE: LazyLock<RandomState> = LazyLock::new(|| RandomState::with_seed(HASH_SEED));
 
 #[derive(Debug, Snafu)]
 pub enum BucketError {
@@ -149,8 +155,7 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
     }
     let array = scalar.to_array()?;
     let mut hashes = vec![0; 1];
-    let random_state = RandomState::new();
-    create_hashes(&[array], &random_state, &mut hashes)?;
+    create_hashes(&[array], &RANDOM_STATE, &mut hashes)?;
     Ok(ScalarValue::Int32(Some(
         u64::try_from(num_buckets)
             .and_then(|n| i32::try_from(hashes[0] % n))
@@ -166,8 +171,7 @@ pub fn compute_bucket_array(
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
-    let random_state = RandomState::new();
-    create_hashes(&[Arc::clone(array)], &random_state, &mut hashes)?;
+    create_hashes(&[Arc::clone(array)], &RANDOM_STATE, &mut hashes)?;
 
     let hash_array = UInt64Array::from(hashes);
 
@@ -241,6 +245,95 @@ mod tests {
             }
         } else {
             panic!("Expected Int32 array");
+        }
+    }
+
+    #[test]
+    fn test_bucket_determinism_scalar() {
+        let udf = Bucket::new();
+
+        // Run the UDF multiple times (10) to ensure determinism
+        let results: Vec<_> = (0..10)
+            .map(|i| {
+                let args = ScalarFunctionArgs {
+                    args: vec![
+                        ColumnarValue::Scalar(ScalarValue::Int64(Some(10))),
+                        ColumnarValue::Scalar(ScalarValue::Utf8(Some("test".to_string()))),
+                    ],
+                    number_rows: 1,
+                    return_type: &DataType::Int32,
+                };
+                udf.invoke_with_args(args)
+                    .unwrap_or_else(|_| panic!("invoke UDF {i}"))
+            })
+            .collect();
+
+        // Verify all results are identical to the first
+        if let ColumnarValue::Scalar(ScalarValue::Int32(Some(first_bucket))) = results[0] {
+            for (i, result) in results.iter().enumerate().skip(1) {
+                if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
+                    assert_eq!(
+                        first_bucket, *bucket,
+                        "Non-deterministic bucket for scalar at invocation {i}"
+                    );
+                } else {
+                    panic!("Expected Int32 scalar at invocation {i}");
+                }
+            }
+        } else {
+            panic!("Expected Int32 scalar for first invocation");
+        }
+    }
+
+    #[test]
+    fn test_bucket_determinism_array() {
+        let udf = Bucket::new();
+
+        // Run the UDF multiple times (10) to ensure determinism
+        let results: Vec<_> = (0..10)
+            .map(|i| {
+                let args = ScalarFunctionArgs {
+                    args: vec![
+                        ColumnarValue::Scalar(ScalarValue::Int64(Some(5))),
+                        ColumnarValue::Array(Arc::new(StringArray::from(vec!["a", "b", "c"]))),
+                    ],
+                    number_rows: 3,
+                    return_type: &DataType::Int32,
+                };
+                udf.invoke_with_args(args)
+                    .unwrap_or_else(|_| panic!("invoke UDF {i}"))
+            })
+            .collect();
+
+        // Verify all results are identical to the first
+        if let ColumnarValue::Array(first_array) = &results[0] {
+            let first_int_array = first_array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("downcast to Int32Array for first invocation");
+            assert_eq!(first_int_array.len(), 3);
+
+            for (i, result) in results.iter().enumerate().skip(1) {
+                if let ColumnarValue::Array(array) = result {
+                    let int_array = array
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap_or_else(|| panic!("downcast to Int32Array for invocation {i}"));
+                    assert_eq!(int_array.len(), 3);
+                    for j in 0..3 {
+                        let bucket = int_array.value(j);
+                        let first_bucket = first_int_array.value(j);
+                        assert_eq!(
+                            first_bucket, bucket,
+                            "Non-deterministic bucket at index {j} for invocation {i}: {first_bucket} != {bucket}"
+                        );
+                    }
+                } else {
+                    panic!("Expected Int32 array for invocation {i}");
+                }
+            }
+        } else {
+            panic!("Expected Int32 array for first invocation");
         }
     }
 
