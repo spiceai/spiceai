@@ -751,4 +751,42 @@ mod tests {
             "Expected error for invalid second argument type"
         );
     }
+
+    #[test]
+    fn test_truncate_scalar_int64() {
+        let udf = Truncate::new();
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(1000))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(1234))),
+            ],
+            number_rows: 1,
+            return_type: &DataType::Int64,
+        };
+        let result = udf.invoke_with_args(args).expect("invoke UDF");
+        if let ColumnarValue::Scalar(ScalarValue::Int64(Some(value))) = result {
+            assert_eq!(value, 1000, "Expected truncate(1000, 1234) = 1000");
+        } else {
+            panic!("Expected Int64 scalar");
+        }
+    }
+
+    #[test]
+    fn test_truncate_scalar_utf8() {
+        let udf = Truncate::new();
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(3))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("iceberg".to_string()))),
+            ],
+            number_rows: 1,
+            return_type: &DataType::Utf8,
+        };
+        let result = udf.invoke_with_args(args).expect("invoke UDF");
+        if let ColumnarValue::Scalar(ScalarValue::Utf8(Some(value))) = result {
+            assert_eq!(value, "ice", "Expected truncate(3, 'iceberg') = 'ice'");
+        } else {
+            panic!("Expected Utf8 scalar");
+        }
+    }
 }
