@@ -261,11 +261,11 @@ impl CandidateGeneration for PostApplyCandidateGeneration {
             .collect::<Vec<_>>();
 
         let need_post_apply = !unapplied_filters.is_empty() || !unapplied_projection.is_empty();
-        let underlying_limit = if need_post_apply {
+        let underlying_limit = if unapplied_filters.is_empty() {
+            limit
+        } else {
             // Will stream one batch at a time, so not going to full table scan underlying.
             MAX_LIMIT_MULTIPLIER * limit
-        } else {
-            limit
         };
         let underlying = self
             .inner

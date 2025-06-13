@@ -112,6 +112,19 @@ impl TableWithFullText {
         Arc::clone(&self.base_table)
     }
 
+    /// Construct a new [`TableWithFullText`] with an updated [`TableProvider`].
+    ///
+    /// No Checks are done to confirm compatibility between the current index and the provided [`TableProvider`].
+    #[must_use]
+    pub fn with_new_base(&self, base_table: Arc<dyn TableProvider>) -> Self {
+        Self {
+            search_fields: self.search_fields.clone(),
+            primary_key: self.primary_key.clone(),
+            index: Arc::clone(&self.index),
+            base_table,
+        }
+    }
+
     async fn create_index(
         base_table: Arc<dyn TableProvider>,
         search_fields: &[String],
