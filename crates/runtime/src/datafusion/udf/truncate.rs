@@ -147,26 +147,23 @@ impl ScalarUDFImpl for Truncate {
         let (first, second) = match (args_iter.next(), args_iter.next(), args_iter.next()) {
             (Some(first), Some(second), None) => (first, second),
             _ => {
-                tracing::error!("Invalid argument count: expected 2, got {count}");
                 return Err(TruncateError::InvalidArgumentCount { count }.into());
             }
         };
 
         let width = if let ColumnarValue::Scalar(ScalarValue::Int64(Some(w))) = &first {
             if *w <= 0 || *w > MAX_TRUNCATE_WIDTH {
-                tracing::error!("Invalid width: {}", w);
                 return Err(TruncateError::InvalidWidth { width: *w }.into());
             }
             *w
         } else {
-            tracing::error!("Invalid first argument type: {:?}", first);
             return Err(TruncateError::InvalidFirstArgType {
                 value: first.clone(),
             }
             .into());
         };
 
-        tracing::trace!("Computing truncate with width: {}", width);
+        tracing::trace!("Computing truncate with width: {width}");
 
         match second {
             ColumnarValue::Scalar(scalar) => {
@@ -213,9 +210,10 @@ fn compute_truncate_scalar(
             v.floor() as i64,
             width,
         )? as f64))),
-        ScalarValue::Utf8(Some(v)) => Ok(ScalarValue::Utf8(Some(
-            v.chars().take(width as usize).collect::<String>(),
-        ))),
+        ScalarValue::Utf8(Some(mut v)) => {
+            v.truncate(width as usize);
+            Ok(ScalarValue::Utf8(Some(v)))
+        }
         ScalarValue::Binary(Some(v)) => {
             let truncated = v.iter().take(width as usize).copied().collect::<Vec<u8>>();
             Ok(ScalarValue::Binary(Some(truncated)))
