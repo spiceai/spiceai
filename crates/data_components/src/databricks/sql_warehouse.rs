@@ -163,14 +163,16 @@ impl SqlWarehouseApi {
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
-        let sql = format!("DESCRIBE TABLE {table}");
-        let payload = self.create_schema_payload(table, &sql)?;
-
+        let payload = self.create_schema_payload(table)?;
         let response = self.execute_request(&token, &payload).await?;
         schema_from_json(&response)
     }
 
-    fn create_schema_payload(&self, table: &TableReference, sql: &str) -> Result<Value, Error> {
+    fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
+        let sql = format!(
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns where table_name = '{}'",
+            table.table()
+        );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table.catalog().ok_or_else(|| Error::FullyQualifiedPath{ reason: "missing catalog".into() })?,
@@ -372,9 +374,11 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
                 reason: format!("data_array[{i}] is not an array"),
             })?;
 
-        if row_array.len() < 2 {
+        if row_array.len() < 3 {
             return Err(Error::UnableToRetrieveSchema {
-                reason: format!("data_array[{i}] lacks col_name or data_type"),
+                reason: format!(
+                    "data_array[{i}] lacks column_name or full_data_type or is_nullable"
+                ),
             });
         }
 
@@ -399,7 +403,15 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
         let data_type = datatypes::Parser::new(data_type_str)
             .parse()
             .map_err(|reason| Error::ParseError { reason })?;
-        let field: Field = Field::new(col_name, data_type, false);
+
+        let nullable = row_array[2]
+            .as_str()
+            .map(|s| s.to_lowercase() == "yes")
+            .ok_or_else(|| Error::UnableToRetrieveSchema {
+                reason: format!("data_array[{i}][2] is not a boolean"),
+            })?;
+
+        let field: Field = Field::new(col_name, data_type, nullable);
 
         fields.push(field);
     }
