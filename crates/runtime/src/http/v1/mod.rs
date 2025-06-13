@@ -244,7 +244,7 @@ pub async fn to_http_response(
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
-    };
+    }
 
     attach_cache_headers(&mut headers, cache_status);
 
