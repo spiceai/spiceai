@@ -179,98 +179,33 @@ fn compute_truncate_scalar(
     width: i64,
 ) -> Result<ScalarValue, DataFusionError> {
     if scalar.is_null() {
-        return match scalar {
-            ScalarValue::Int8(_) => Ok(ScalarValue::Int8(None)),
-            ScalarValue::Int16(_) => Ok(ScalarValue::Int16(None)),
-            ScalarValue::Int32(_) => Ok(ScalarValue::Int32(None)),
-            ScalarValue::Int64(_) => Ok(ScalarValue::Int64(None)),
-            ScalarValue::UInt8(_) => Ok(ScalarValue::UInt8(None)),
-            ScalarValue::UInt16(_) => Ok(ScalarValue::UInt16(None)),
-            ScalarValue::UInt32(_) => Ok(ScalarValue::UInt32(None)),
-            ScalarValue::UInt64(_) => Ok(ScalarValue::UInt64(None)),
-            ScalarValue::Float32(_) => Ok(ScalarValue::Float32(None)),
-            ScalarValue::Float64(_) => Ok(ScalarValue::Float64(None)),
-            ScalarValue::Utf8(_) => Ok(ScalarValue::Utf8(None)),
-            ScalarValue::Binary(_) => Ok(ScalarValue::Binary(None)),
-            _ => Err(TruncateError::InvalidSecondArgType {
-                value: ColumnarValue::Scalar(scalar.clone()),
-            }
-            .into()),
-        };
+        return Ok(scalar.clone());
     }
 
     match scalar {
-        ScalarValue::Int8(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Int8(Some(result.try_into().map_err(
-                |_| DataFusionError::Execution(format!("Value out of range for Int8: {}", result)),
-            )?)))
-        }
-        ScalarValue::Int16(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Int16(Some(result.try_into().map_err(
-                |_| DataFusionError::Execution(format!("Value out of range for Int16: {}", result)),
-            )?)))
-        }
-        ScalarValue::Int32(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Int32(Some(result.try_into().map_err(
-                |_| DataFusionError::Execution(format!("Value out of range for Int32: {}", result)),
-            )?)))
-        }
-        ScalarValue::Int64(Some(v)) => {
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Int64(Some(result)))
-        }
-        ScalarValue::UInt8(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::UInt8(Some(result.try_into().map_err(
-                |_| DataFusionError::Execution(format!("Value out of range for UInt8: {}", result)),
-            )?)))
-        }
-        ScalarValue::UInt16(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::UInt16(Some(result.try_into().map_err(
-                |_| {
-                    DataFusionError::Execution(format!("Value out of range for UInt16: {}", result))
-                },
-            )?)))
-        }
-        ScalarValue::UInt32(Some(v)) => {
-            let v = i64::from(*v);
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::UInt32(Some(result.try_into().map_err(
-                |_| {
-                    DataFusionError::Execution(format!("Value out of range for UInt32: {}", result))
-                },
-            )?)))
-        }
+        ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::UInt8(Some(v)) => Ok(ScalarValue::UInt8(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::UInt16(Some(v)) => Ok(ScalarValue::UInt16(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::UInt32(Some(v)) => Ok(ScalarValue::UInt32(Some(truncate_numeric(*v, width)?))),
         ScalarValue::UInt64(Some(v)) => {
             let v = i64::try_from(*v).map_err(|_| {
-                DataFusionError::Execution(format!("Value too large for Int64: {}", v))
+                DataFusionError::Execution(format!("Value too large for Int64: {v}"))
             })?;
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::UInt64(Some(result.try_into().map_err(
-                |_| {
-                    DataFusionError::Execution(format!("Value out of range for UInt64: {}", result))
-                },
-            )?)))
+            Ok(ScalarValue::UInt64(
+                Some(truncate_numeric(v, width)? as u64),
+            ))
         }
-        ScalarValue::Float32(Some(v)) => {
-            let v = v.floor() as i64;
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Float32(Some(result as f32)))
-        }
-        ScalarValue::Float64(Some(v)) => {
-            let v = v.floor() as i64;
-            let result = v - (((v % width) + width) % width);
-            Ok(ScalarValue::Float64(Some(result as f64)))
-        }
+        ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(truncate_numeric(
+            v.floor() as i64,
+            width,
+        )? as f32))),
+        ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(truncate_numeric(
+            v.floor() as i64,
+            width,
+        )? as f64))),
         ScalarValue::Utf8(Some(v)) => Ok(ScalarValue::Utf8(Some(
             v.chars().take(width as usize).collect::<String>(),
         ))),
@@ -283,6 +218,14 @@ fn compute_truncate_scalar(
         }
         .into()),
     }
+}
+
+fn truncate_numeric<T: Into<i64> + TryFrom<i64>>(v: T, width: i64) -> Result<T, DataFusionError> {
+    let v = v.into();
+    let result = v - (((v % width) + width) % width);
+    result
+        .try_into()
+        .map_err(|_| DataFusionError::Execution(format!("Value out of range: {result}")))
 }
 
 fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
