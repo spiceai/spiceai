@@ -53,9 +53,6 @@ pub enum TruncateError {
 
     #[snafu(display("Failed to downcast array"))]
     DowncastFailed,
-
-    #[snafu(display("DataFusion error: {source}"))]
-    DataFusion { source: DataFusionError },
 }
 
 impl From<TruncateError> for DataFusionError {
