@@ -25,7 +25,7 @@ use arrow::compute::kernels::substring::substring;
 use arrow::datatypes::DataType;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use snafu::{OptionExt, Snafu};
@@ -96,7 +96,23 @@ impl Truncate {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::any(2, Volatility::Immutable),
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Int8]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Int16]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Int32]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::UInt8]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::UInt16]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::UInt32]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::UInt64]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Float32]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Float64]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
+                    TypeSignature::Exact(vec![DataType::Int64, DataType::Binary]),
+                ],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -121,30 +137,7 @@ impl ScalarUDFImpl for Truncate {
             }
             .into());
         }
-        if !matches!(arg_types[0], DataType::Int64) {
-            return Err(TruncateError::InvalidFirstArgType {
-                value: ColumnarValue::Scalar(ScalarValue::try_from(&arg_types[0])?),
-            }
-            .into());
-        }
-        match &arg_types[1] {
-            DataType::Int8 => Ok(DataType::Int8),
-            DataType::Int16 => Ok(DataType::Int16),
-            DataType::Int32 => Ok(DataType::Int32),
-            DataType::Int64 => Ok(DataType::Int64),
-            DataType::UInt8 => Ok(DataType::UInt8),
-            DataType::UInt16 => Ok(DataType::UInt16),
-            DataType::UInt32 => Ok(DataType::UInt32),
-            DataType::UInt64 => Ok(DataType::UInt64),
-            DataType::Float32 => Ok(DataType::Float32),
-            DataType::Float64 => Ok(DataType::Float64),
-            DataType::Utf8 => Ok(DataType::Utf8),
-            DataType::Binary => Ok(DataType::Binary),
-            _ => Err(TruncateError::InvalidSecondArgType {
-                value: ColumnarValue::Scalar(ScalarValue::try_from(&arg_types[1])?),
-            }
-            .into()),
-        }
+        Ok(arg_types[1].clone())
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
