@@ -82,7 +82,7 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -96,7 +96,7 @@ jobs:
             CARGO_INCREMENTAL: 0
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]] || [[ "${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release') }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
           else
@@ -136,7 +136,7 @@ jobs:
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-        
+
       - name: Login to ACR
         uses: docker/login-action@v3
         # This will fail for forks, so we only run it for the main repo

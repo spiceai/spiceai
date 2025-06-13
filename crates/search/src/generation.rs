@@ -40,6 +40,13 @@ impl Error {
             Error::TextSearchError { source } if source.is_user_error()
         )
     }
+
+    #[must_use]
+    pub fn internal(msg: &str) -> Self {
+        Self::InternalError {
+            source: Box::from(msg),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
