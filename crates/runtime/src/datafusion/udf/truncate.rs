@@ -142,26 +142,33 @@ impl ScalarUDFImpl for Truncate {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
         let args = args.args;
-        if args.len() != 2 {
-            tracing::debug!("Invalid argument count: {}", args.len());
-            return Err(TruncateError::InvalidArgumentCount { count: args.len() }.into());
-        }
+        let count = args.len();
+        let mut args_iter = args.into_iter();
+        let (first, second) = match (args_iter.next(), args_iter.next(), args_iter.next()) {
+            (Some(first), Some(second), None) => (first, second),
+            _ => {
+                tracing::error!("Invalid argument count: expected 2, got {count}");
+                return Err(TruncateError::InvalidArgumentCount { count }.into());
+            }
+        };
 
-        let width = match &args[0] {
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(w))) => {
-                if *w <= 0 || *w > MAX_TRUNCATE_WIDTH {
-                    return Err(TruncateError::InvalidWidth { width: *w }.into());
-                }
-                *w
+        let width = if let ColumnarValue::Scalar(ScalarValue::Int64(Some(w))) = &first {
+            if *w <= 0 || *w > MAX_TRUNCATE_WIDTH {
+                tracing::error!("Invalid width: {}", w);
+                return Err(TruncateError::InvalidWidth { width: *w }.into());
             }
-            arg => {
-                return Err(TruncateError::InvalidFirstArgType { value: arg.clone() }.into());
+            *w
+        } else {
+            tracing::error!("Invalid first argument type: {:?}", first);
+            return Err(TruncateError::InvalidFirstArgType {
+                value: first.clone(),
             }
+            .into());
         };
 
         tracing::trace!("Computing truncate with width: {}", width);
 
-        match &args[1] {
+        match second {
             ColumnarValue::Scalar(scalar) => {
                 let result = compute_truncate_scalar(scalar, width)?;
                 Ok(ColumnarValue::Scalar(result))
@@ -175,7 +182,7 @@ impl ScalarUDFImpl for Truncate {
 }
 
 fn compute_truncate_scalar(
-    scalar: &ScalarValue,
+    scalar: ScalarValue,
     width: i64,
 ) -> Result<ScalarValue, DataFusionError> {
     if scalar.is_null() {
@@ -183,15 +190,15 @@ fn compute_truncate_scalar(
     }
 
     match scalar {
-        ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::UInt8(Some(v)) => Ok(ScalarValue::UInt8(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::UInt16(Some(v)) => Ok(ScalarValue::UInt16(Some(truncate_numeric(*v, width)?))),
-        ScalarValue::UInt32(Some(v)) => Ok(ScalarValue::UInt32(Some(truncate_numeric(*v, width)?))),
+        ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt8(Some(v)) => Ok(ScalarValue::UInt8(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt16(Some(v)) => Ok(ScalarValue::UInt16(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt32(Some(v)) => Ok(ScalarValue::UInt32(Some(truncate_numeric(v, width)?))),
         ScalarValue::UInt64(Some(v)) => {
-            let v = i64::try_from(*v).map_err(|_| {
+            let v = i64::try_from(v).map_err(|_| {
                 DataFusionError::Execution(format!("Value too large for Int64: {v}"))
             })?;
             Ok(ScalarValue::UInt64(
@@ -228,7 +235,7 @@ fn truncate_numeric<T: Into<i64> + TryFrom<i64>>(v: T, width: i64) -> Result<T, 
         .map_err(|_| DataFusionError::Execution(format!("Value out of range: {result}")))
 }
 
-fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
+fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
     match array.data_type() {
         DataType::Int8 => truncate_numeric_array!(array, width, Int8Array, i8, i8),
         DataType::Int16 => truncate_numeric_array!(array, width, Int16Array, i16, i16),
@@ -289,12 +296,12 @@ fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, Data
             )))
         }
         DataType::Utf8 | DataType::Binary => {
-            let result = substring(array, 0, Some(width as u64))
+            let result = substring(&array, 0, Some(width as u64))
                 .map_err(|e| DataFusionError::ArrowError(e, None))?;
             Ok(Arc::new(result))
         }
         _ => Err(TruncateError::InvalidSecondArgType {
-            value: ColumnarValue::Array(Arc::clone(array)),
+            value: ColumnarValue::Array(Arc::clone(&array)),
         }
         .into()),
     }
