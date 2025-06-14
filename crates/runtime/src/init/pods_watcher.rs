@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use app::AppBuilder;
+
 use crate::Runtime;
 
 impl Runtime {
@@ -26,7 +28,17 @@ impl Runtime {
         };
         let mut rx = pods_watcher.watch()?;
 
-        while let Some(new_app) = rx.recv().await {
+        while let Some(new_app_path) = rx.recv().await {
+            let new_app = match AppBuilder::build_from_filesystem_path(new_app_path).await {
+                Ok(app) => app,
+                Err(e) => {
+                    tracing::warn!(
+                        "Invalid app state detected, unable to load pods information: {e}"
+                    );
+                    continue;
+                }
+            };
+
             // It is safe to operate by read lock until we actually need to update the app state
             // as there is no other logic that can update the app, so write lock is not needed
             let app_read_lock = self.app.read().await;

@@ -19,6 +19,7 @@ use std::io::{self, Cursor};
 use std::path::PathBuf;
 
 use app::{App, AppBuilder};
+use async_trait::async_trait;
 use spicepod::reader::ReadableYaml;
 use spicepod::{
     Spicepod,
@@ -46,6 +47,7 @@ impl ReadablePath for SpicepodString {
 
 impl ReadableYaml for SpicepodString {}
 
+#[allow(clippy::missing_panics_doc)]
 pub async fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
     let spicepod_str = SpicepodString::new(Cow::Borrowed(spicepod_str));
     let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))
@@ -61,8 +63,8 @@ pub async fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<Ap
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_load_app_from_spicepod_str() {
+    #[tokio::test]
+    async fn test_load_app_from_spicepod_str() {
         let spicepod_str = "version: v1
 kind: Spicepod
 name: iceberg-ai-demo
@@ -78,7 +80,9 @@ datasets:
       pg_db: ${ secrets:PG_DB }
       pg_sslmode: require
         ";
-        let app = load_app_from_spicepod_str(spicepod_str).expect("should be able to load app");
+        let app = load_app_from_spicepod_str(spicepod_str)
+            .await
+            .expect("should be able to load app");
         assert_eq!(app.name, "iceberg-ai-demo");
         assert_eq!(app.datasets.len(), 1);
         assert_eq!(app.datasets[0].name, "user_roles");
