@@ -26,7 +26,7 @@ impl Runtime {
         let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
         };
-        let mut rx = pods_watcher.watch()?;
+        let mut rx = pods_watcher.watch().await?;
 
         while let Some(new_app_path) = rx.recv().await {
             let new_app = match AppBuilder::build_from_filesystem_path(new_app_path).await {

@@ -36,7 +36,7 @@ impl PodsWatcher {
         }
     }
 
-    pub fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
+    pub async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
         let root_path = self.root_path.clone();
 
         let (tx, rx) = channel(100);
@@ -46,7 +46,7 @@ impl PodsWatcher {
             root_path.join("spicepod.yml"),
         ];
 
-        let mut watch_paths = get_watch_paths(&root_path);
+        let mut watch_paths = get_watch_paths(&root_path).await;
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
@@ -91,7 +91,7 @@ macro_rules! enable_watch_for_component {
     };
 }
 
-fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
+async fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
     let root_dir: PathBuf = app_path.into();
 
     let mut dirs = vec![
@@ -99,7 +99,7 @@ fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
         root_dir.join("spicepod.yml"),
     ];
 
-    if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir) {
+    if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir).await {
         for dep in spicepod.dependencies {
             let dep_path = root_dir.join("spicepods").join(dep);
             dirs.push(dep_path);
