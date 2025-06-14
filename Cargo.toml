@@ -175,7 +175,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "59b0aeb82ab4eb44bc3b2c311eee572649e154e0" }
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "70e041b173bdb7b4e6ccd7da82c51b829fe30388" }
 
 [profile.release-lto]
 inherits = "release"
