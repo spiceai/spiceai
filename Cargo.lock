@@ -9183,6 +9183,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "parsley"
+version = "1.4.0-unstable"
+dependencies = [
+ "bytes",
+ "clap",
+ "document_parse",
+ "llms",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
