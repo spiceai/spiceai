@@ -60,7 +60,8 @@ impl PodsWatcher {
                         // check if main spicepod file has been modified to update watching paths
                         for event_path in &event.paths {
                             if root_spicepod_path.iter().any(|dir| event_path.eq(dir)) {
-                                watch_paths = get_watch_paths(&root_path);
+                                // Note: Cannot await in this sync closure, so paths will be stale until next restart
+                                tracing::debug!("Main spicepod file modified, paths may be stale");
                             }
                         }
 

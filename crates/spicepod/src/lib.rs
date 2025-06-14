@@ -156,7 +156,7 @@ impl Spicepod {
 
     async fn load_from_rdr(
         fs: &(impl reader::ReadableYaml + Send + Sync),
-        spicepod_rdr: Box<dyn std::io::Read>,
+        spicepod_rdr: Box<dyn std::io::Read + Send + Sync>,
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
         let path = path.into();
