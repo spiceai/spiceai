@@ -599,7 +599,7 @@ impl FlightClient {
             .parse()
             .context(InvalidMetadataSnafu)?;
         req.metadata_mut().insert("authorization", val);
-        let resp = self
+        let mut resp = self
             .flight_client
             .clone()
             .handshake(req)
@@ -615,6 +615,8 @@ impl FlightClient {
                     }
                 }
             })?;
+
+        // First Check Headers
         let mut token: Option<Token> = None;
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
@@ -622,6 +624,29 @@ impl FlightClient {
                 .context(UnableToConvertMetadataToStringSnafu)?;
             token = Some(Token::new(&auth["Bearer ".len()..], true));
         }
+
+        // If no token is found in headers, check trailers
+        if token.is_none() {
+            let stream = resp.get_mut();
+
+            match stream.trailers().await {
+                Ok(Some(trailers)) => {
+                    if let Some(auth) = trailers.get("authorization") {
+                        let auth = auth
+                            .to_str()
+                            .context(UnableToConvertMetadataToStringSnafu)?;
+                        token = Some(Token::new(&auth["Bearer ".len()..], true));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(Error::UnableToPerformHandshake {
+                        source: TonicStatusError::from(e),
+                    });
+                }
+            }
+        }
+
         Ok(token)
     }
 
