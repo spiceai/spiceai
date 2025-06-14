@@ -590,7 +590,9 @@ impl FlightClient {
             protocol_version: 0,
             payload: Bytes::default(),
         };
-        let mut req = tonic::Request::new(stream::iter(vec![cmd]));
+
+        let once_req = stream::once(async { cmd });
+        let mut req = tonic::Request::new(once_req);
         let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
 
         let val = format!("Basic {val}")
