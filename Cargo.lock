@@ -12257,8 +12257,11 @@ dependencies = [
 name = "spicepod"
 version = "1.4.0-unstable"
 dependencies = [
+ "async-trait",
  "byte-unit",
  "fundu",
+ "futures",
+ "object_store",
  "regex",
  "schemars 0.9.0",
  "serde",
@@ -12266,7 +12269,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "snafu",
+ "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

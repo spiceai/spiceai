@@ -37,18 +37,23 @@ impl SpicepodString {
     }
 }
 
+#[async_trait]
 impl ReadablePath for SpicepodString {
-    fn open(&self, _path: impl Into<PathBuf>) -> reader::Result<Box<dyn io::Read>> {
+    async fn open(&self, _path: PathBuf) -> reader::Result<Box<dyn io::Read + Send + Sync>> {
         Ok(Box::new(Cursor::new(self.spicepod_str.clone())))
     }
 }
 
 impl ReadableYaml for SpicepodString {}
 
-pub fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
+pub async fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
     let spicepod_str = SpicepodString::new(Cow::Borrowed(spicepod_str));
-    let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))?;
-    let app = AppBuilder::build_from_spicepod(spicepod, PathBuf::from("."))?;
+    let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))
+        .await
+        .expect("should be able to load spicepod");
+    let app = AppBuilder::build_from_spicepod(spicepod, PathBuf::from("."))
+        .await
+        .expect("should be able to build app");
     Ok(app)
 }
 

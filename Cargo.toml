@@ -109,7 +109,7 @@ logos = "0.15.0"
 mailparse = "0.15.0"
 moka = { version = "0.12", features = ["future"] }
 mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
-object_store = { version = "0.12" }
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
 odbc-api = { version = "13" }
 opentelemetry = { version = "0.27", default-features = false, features = [
     "metrics",
@@ -172,6 +172,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+url = "2.5"
 uuid = "1"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
