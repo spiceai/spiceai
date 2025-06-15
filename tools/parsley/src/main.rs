@@ -15,10 +15,13 @@ limitations under the License.
 */
 use bytes::Bytes;
 use clap::Parser;
+use spicepod::component::model::ModelSource;
 use std::{path::PathBuf, str::from_utf8, sync::Arc};
+use tiktoken_rs::{get_bpe_from_tokenizer, tokenizer::get_tokenizer};
+use tokenizers::Tokenizer;
 
 use document_parse::{DocumentParser, DocxParser, PdfParser};
-use llms::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+use llms::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper};
 
 use crate::output::StructuredOutput;
 
@@ -48,6 +51,10 @@ pub struct Args {
     /// If set, return the parsed document within a JSON structure.
     #[arg(long, help = "Output in JSON format")]
     json: bool,
+
+    /// The name of the embedding model to use when sizing tokens during chunking.
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 impl Args {
@@ -59,20 +66,56 @@ impl Args {
         }
     }
 
-    fn chunker(&self) -> Option<Arc<dyn Chunker>> {
+    fn chunker(&self) -> Result<Option<Arc<dyn Chunker>>, String> {
         if self.target_chunk_size == 0 && self.overlap_size == 0 && !self.trim_whitespace {
-            return None;
+            return Ok(None);
         };
-        // TODO use openai or tokenizer sizer.
-        let chunker = RecursiveSplittingChunker::with_character_sizer(&ChunkingConfig {
+        let cfg = ChunkingConfig {
             target_chunk_size: self.target_chunk_size,
             trim_whitespace: self.trim_whitespace,
             overlap_size: self.overlap_size,
             file_format: self.file.extension().and_then(|s| s.to_str()),
-        })
-        .unwrap();
+        };
 
-        Some(Arc::new(chunker))
+        // From user-provided `model`, ensure it's in valid `from: ` spicepod format and get chunker for OpenAI or HF models.
+        let source_and_model_id: Option<(Result<ModelSource, &str>, Option<String>)> = self
+            .model
+            .as_ref()
+            .map(|from| match ModelSource::try_from(from.as_str()) {
+                Ok(source) => (Ok(source.clone()), source.parse_from(from.as_str())),
+                Err(e) => (Err(e), None),
+            });
+
+        let chunker: Arc<dyn Chunker> = match source_and_model_id {
+            Some((Ok(ModelSource::HuggingFace), Some(model_id))) => {
+                let sizer = TokenizerWrapper::from(Arc::new(
+                    Tokenizer::from_pretrained(model_id, None).map_err(|e| e.to_string())?,
+                ));
+                Arc::new(
+                    RecursiveSplittingChunker::try_new(&cfg, sizer).map_err(|e| e.to_string())?,
+                )
+            }
+            Some((Ok(ModelSource::OpenAi), Some(model_id))) => {
+                let Some(tok) = get_tokenizer(model_id.as_str()) else {
+                    return Err(format!(
+                        "Could not get tokenizer for OpenAI model: '{model_id}'"
+                    ));
+                };
+                let bpe = get_bpe_from_tokenizer(tok)
+                    .map_err(|e| format!("Could not create BPE tokenizer: {e:?}"))?;
+                Arc::new(RecursiveSplittingChunker::try_new(&cfg, bpe).map_err(|e| e.to_string())?)
+            }
+            None => Arc::new(
+                RecursiveSplittingChunker::with_character_sizer(&cfg).map_err(|e| e.to_string())?,
+            ),
+            Some((Ok(model_source), _)) => {
+                return Err(format!(
+                    "Cannot specify model from '{model_source}' as source of tokenizer"
+                ));
+            }
+            Some((Err(e), _)) => return Err(e.to_string()),
+        };
+        Ok(Some(chunker))
     }
 }
 
@@ -118,13 +161,19 @@ fn main() {
         }
     };
 
-    let result = if let Some(chunker) = args.chunker() {
-        StructuredOutput::from_chunks(
+    let result = match args.chunker() {
+        Ok(Some(chunker)) => StructuredOutput::from_chunks(
             args.file.to_string_lossy(),
             chunker.chunks(content.as_str()).collect(),
-        )
-    } else {
-        StructuredOutput::from_content(args.file.to_string_lossy(), content.as_str())
+        ),
+        Ok(None) => StructuredOutput::from_content(args.file.to_string_lossy(), content.as_str()),
+        Err(e) => {
+            eprintln!(
+                "Error preparing tokenizer model '{}' for use in chunking. Error: {e}",
+                args.model.unwrap_or_default()
+            );
+            return;
+        }
     };
 
     // Output dependent on return type.

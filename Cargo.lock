@@ -9192,6 +9192,10 @@ dependencies = [
  "llms",
  "serde",
  "serde_json",
+ "spicepod",
+ "text-splitter",
+ "tiktoken-rs",
+ "tokenizers",
 ]
 
 [[package]]
@@ -13354,6 +13358,7 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.2.16",
+ "hf-hub 0.4.2",
  "indicatif",
  "itertools 0.13.0",
  "lazy_static",
