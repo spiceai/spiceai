@@ -57,12 +57,6 @@ pub enum Error {
     #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
     DuplicateComponent { component: String, name: String },
 
-    #[snafu(display("Unable to load spicepod from {}: {source}", path.display()))]
-    SpicepodLoadFailed {
-        source: Box<dyn std::error::Error>,
-        path: PathBuf,
-    },
-
     #[snafu(display("Unable to create tokio runtime: {source}"))]
     UnableToCreateTokioRuntime { source: std::io::Error },
 
@@ -137,7 +131,12 @@ impl Spicepod {
         let path_str = path.to_string_lossy();
 
         match url::Url::parse(&path_str) {
-            Ok(url) if matches!(url.scheme(), "s3" | "gs" | "azure" | "abfs" | "abfss") => {
+            Ok(url)
+                if matches!(
+                    url.scheme(),
+                    "s3" | "gs" | "azure" | "abfs" | "abfss" | "http" | "https"
+                ) =>
+            {
                 Self::load_from_object_store(url).await
             }
             _ => Self::load_from(&reader::StdFileSystem, path).await,

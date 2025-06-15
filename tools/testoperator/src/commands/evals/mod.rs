@@ -92,7 +92,7 @@ impl EvalMetrics {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     let eval = args

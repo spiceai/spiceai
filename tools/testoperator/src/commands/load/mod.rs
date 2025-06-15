@@ -43,7 +43,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance

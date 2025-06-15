@@ -177,19 +177,19 @@ pub async fn run(args: Args) -> Result<()> {
         .spicepod
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
-    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(spicepod_path.clone())
-    {
-        Ok(mut app) => {
-            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-            Some(Arc::new(app))
-        }
-        Err(e) => {
-            in_tracing_context(|| {
-                tracing::warn!("{e}");
-            });
-            None
-        }
-    };
+    let app: Option<Arc<App>> =
+        match AppBuilder::build_from_filesystem_path(spicepod_path.clone()).await {
+            Ok(mut app) => {
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                Some(Arc::new(app))
+            }
+            Err(e) => {
+                in_tracing_context(|| {
+                    tracing::warn!("{e}");
+                });
+                None
+            }
+        };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {

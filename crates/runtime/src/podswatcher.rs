@@ -46,7 +46,7 @@ impl PodsWatcher {
             root_path.join("spicepod.yml"),
         ];
 
-        let mut watch_paths = get_watch_paths(&root_path).await;
+        let watch_paths = get_watch_paths(&root_path).await;
 
         let mut watcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {

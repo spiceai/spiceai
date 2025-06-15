@@ -35,7 +35,7 @@ async fn iceberg_integration_test_audit_log_query() -> Result<(), anyhow::Error>
         .scope(async {
             let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
                 "audit_log.yaml"
-            ))?;
+            )).await?;
 
             let rt = Runtime::builder()
                 .with_app(app)

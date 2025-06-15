@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 ..
             }),
         ) => {
-            commands::env_export(&common)?;
+            commands::env_export(&common).await?;
         }
         Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
         Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
@@ -81,13 +81,13 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "append")]
         Commands::Export(TestCommands::Append(args)) => {
-            commands::env_export(&args.common)?;
+            commands::env_export(&args.common).await?;
         }
         Commands::Run(TestCommands::VectorSearch(args)) => {
             commands::vector_search::run(&args).await?;
         }
         Commands::Export(TestCommands::VectorSearch(args)) => {
-            commands::env_export(&args)?;
+            commands::env_export(&args).await?;
         }
     }
 
