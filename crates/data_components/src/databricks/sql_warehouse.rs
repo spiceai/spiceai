@@ -89,6 +89,11 @@ pub enum Error {
 
     #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
     ParseError { reason: String },
+
+    #[snafu(display(
+        "Failed to execute the query.\n{message}\nVerify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
+    ))]
+    QueryFailure { message: String },
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -471,11 +476,32 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
 
         let mut response = self.api.execute_request(&token, &payload).await?;
 
-        // Get the result object
-        let result_object = response
-            .get_mut("result")
-            .map(Value::take)
-            .ok_or_else(|| MissingJsonFieldSnafu { field: "result" }.build())?;
+        // Check if the response indicates a query failure
+        if let Some(status) = response.get("status").and_then(|s| s.get("state")) {
+            if status == "FAILED" {
+                let message = response
+                    .get("status")
+                    .and_then(|s| s.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        MissingJsonFieldSnafu {
+                            field: "status.error.message".to_string(),
+                        }
+                        .build()
+                    })?;
+                return Err(Error::QueryFailure { message }.into());
+            }
+        }
+
+        // Get the result object if no error
+        let result_object = response.get_mut("result").map(Value::take).ok_or_else(|| {
+            MissingJsonFieldSnafu {
+                field: "result".to_string(),
+            }
+            .build()
+        })?;
 
         Ok(SqlWarehouseApi::fetch_external_links(Arc::clone(&self.api), result_object).await?)
     }
