@@ -1,0 +1,28 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q15"
+---
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                         |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                           |
+|               |   Projection: hits.SearchEngineID, hits.SearchPhrase, count(Int64(1)) AS c                                                                   |
+|               |     Aggregate: groupBy=[[hits.SearchEngineID, hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                                  |
+|               |       BytesProcessedNode                                                                                                                     |
+|               |         Filter: hits.SearchPhrase != LargeUtf8("")                                                                                           |
+|               |           TableScan: hits projection=[SearchEngineID, SearchPhrase]                                                                          |
+| physical_plan | SortPreservingMergeExec: [c@2 DESC], fetch=10                                                                                                |
+|               |   SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]                                                                    |
+|               |     ProjectionExec: expr=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase, count(Int64(1))@2 as c]                        |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                          |
+|               |           RepartitionExec: partitioning=Hash([SearchEngineID@0, SearchPhrase@1], 16), input_partitions=16                                    |
+|               |             AggregateExec: mode=Partial, gby=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))]    |
+|               |               BytesProcessedExec                                                                                                             |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                  |
+|               |                   FilterExec: SearchPhrase@1 !=                                                                                              |
+|               |                     SchemaCastScanExec                                                                                                       |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                  |
+|               |                         DataSourceExec: partitions=1, partition_sizes=[24415]                                                                |
+|               |                                                                                                                                              |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------+
