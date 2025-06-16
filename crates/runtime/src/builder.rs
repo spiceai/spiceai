@@ -25,6 +25,7 @@ use crate::{
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
+    search::full_text::udtf::TextSearchTableFunc,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -204,6 +205,15 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
+
+        // UDF that require a reference to the DataFusion instance defined here.
+
+        df.ctx
+            .register_udtf("text_search", TextSearchTableFunc::new(Arc::clone(&df)))
+            .await
+            .map_err(|e| {
+                tracing::warn!("Failed to register 'text_search' function: {e}");
+            });
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self

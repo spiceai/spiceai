@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Ok;
 use app::App;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
@@ -229,7 +230,11 @@ pub async fn full_text_search_candidates(
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let table_provider = df.get_table(tbl).await?;
-    let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
+
+    // If the table exists, but does not have full text search support, return no candidates.
+    let Some(fts) = find_concrete_table_provider::<TableWithFullText>(&table_provider).await else {
+        return Some(Ok(vec![]));
+    };
 
     Some(
         fts.with_new_base(table_provider)

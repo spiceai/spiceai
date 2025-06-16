@@ -10,16 +10,25 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{cmp::min, collections::HashMap, sync::Arc};
+use std::{any::Any, cmp::min, collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::{array::RecordBatch, datatypes::Schema, error::ArrowError};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+    error::ArrowError,
+};
 use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
-    logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
+    catalog::{Session, TableProvider},
+    common::Constraints,
+    datasource::TableType,
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::SendableRecordBatchStream,
+    logical_expr::{Expr as LogicalExpr, TableProviderFilterPushDown, sqlparser::ast::Expr},
+    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     sql::sqlparser::ast::Ident,
 };
 
@@ -88,7 +97,7 @@ impl Error {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FullTextSearch {
     idx: Arc<Index>,
     field: String,
@@ -404,6 +413,49 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
     decoder.serialize(hits)?;
 
     Ok(decoder)
+}
+
+/// An implementation of [`TableProvider`] based on a known query on a [`FullTextSearch`] index.
+#[derive(Debug)]
+pub struct FullTextSearchTable {
+    index: FullTextSearch,
+    query: String,
+}
+
+#[async_trait]
+impl TableProvider for FullTextSearchTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[LogicalExpr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Internal(format!("food")))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        _filters: &[&LogicalExpr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]
