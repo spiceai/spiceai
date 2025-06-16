@@ -30,10 +30,10 @@ pub fn get_glue_dataset(s3_uri: &str, name: &str) -> Dataset {
     dataset.params = Some(Params::from_string_map(
         vec![
             ("glue_region".to_string(), "ap-northeast-2".to_string()),
-            ("glue_key".to_string(), "${ env:GLUE_AWS_KEY }".to_string()),
+            ("glue_key".to_string(), "${ env:AWS_GLUE_KEY }".to_string()),
             (
                 "glue_secret".to_string(),
-                "${ env:GLUE_AWS_SECRET }".to_string(),
+                "${ env:AWS_GLUE_SECRET }".to_string(),
             ),
         ]
         .into_iter()
