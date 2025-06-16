@@ -183,6 +183,8 @@ jobs:
           AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
           AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
