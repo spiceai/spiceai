@@ -20,6 +20,6 @@ description: "Query: clickbench_q25"
 |               |             FilterExec: SearchPhrase@1 !=                                                                   |
 |               |               SchemaCastScanExec                                                                            |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
-|               |                   DataSourceExec: partitions=1, partition_sizes=[6108]                                      |
+|               |                   DataSourceExec: partitions=1, partition_sizes=[6109]                                      |
 |               |                                                                                                             |
 +---------------+-------------------------------------------------------------------------------------------------------------+

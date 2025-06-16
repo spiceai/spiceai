@@ -23,6 +23,6 @@ description: "Query: clickbench_q22"
 |               |                   FilterExec: URL@0 LIKE %google% AND SearchPhrase@1 !=                                                 |
 |               |                     SchemaCastScanExec                                                                                  |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                             |
-|               |                         DataSourceExec: partitions=1, partition_sizes=[6108]                                            |
+|               |                         DataSourceExec: partitions=1, partition_sizes=[6109]                                            |
 |               |                                                                                                                         |
 +---------------+-------------------------------------------------------------------------------------------------------------------------+
