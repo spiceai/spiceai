@@ -69,7 +69,7 @@ impl Args {
     fn chunker(&self) -> Result<Option<Arc<dyn Chunker>>, String> {
         if self.target_chunk_size == 0 && self.overlap_size == 0 && !self.trim_whitespace {
             return Ok(None);
-        };
+        }
         let cfg = ChunkingConfig {
             target_chunk_size: self.target_chunk_size,
             trim_whitespace: self.trim_whitespace,
@@ -182,10 +182,9 @@ fn main() {
             Ok(s) => println!("{s}"),
             Err(e) => {
                 eprintln!("Cannot parse output to JSON: {e}");
-                return;
             }
         }
     } else {
-        println!("{result}")
+        println!("{result}");
     }
 }

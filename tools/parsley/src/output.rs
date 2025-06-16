@@ -47,7 +47,7 @@ impl std::fmt::Display for StructuredOutput<'_> {
                 }
             }
             OutputContent::Full(content) => f.write_fmt(format_args!("{content}---\n"))?,
-        };
+        }
         Ok(())
     }
 }
