@@ -90,7 +90,7 @@ pub enum Error {
     #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
     ParseError { reason: String },
 
-    #[snafu(display("Query failure: {message}"))]
+    #[snafu(display("Failed to execute the query.\n{message}\nVerify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"))]
     QueryFailure { message: String },
 }
 
