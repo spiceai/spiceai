@@ -174,14 +174,22 @@ impl SqlWarehouseApi {
     }
 
     fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
+        let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing schema".into(),
+        })?;
+        let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing catalog".into(),
+        })?;
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns where table_name = '{}'",
-            table.table()
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}' AND table_catalog = '{}'",
+            table.table(),
+            table_schema,
+            table_catalog
         );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
-            "catalog": table.catalog().ok_or_else(|| Error::FullyQualifiedPath{ reason: "missing catalog".into() })?,
-            "schema": table.schema().ok_or_else(|| Error::FullyQualifiedPath{ reason: "missing schema".into() })?,
+            "catalog": table_catalog,
+            "schema": table_schema,
             "statement": sql,
         }))
     }

@@ -64,7 +64,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
 
             tokio::select! {
                 // `params.include` not supported and full catalog is loaded: https://github.com/spiceai/spiceai/issues/5314
-                () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(1200)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
