@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q97"
+---
++------------+--------------+-------------------+
+| store_only | catalog_only | store_and_catalog |
++------------+--------------+-------------------+
+| 539411     | 285420       | 633               |
++------------+--------------+-------------------+

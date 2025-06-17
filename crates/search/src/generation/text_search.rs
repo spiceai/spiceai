@@ -10,10 +10,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::error::ArrowError;
+use arrow::{array::RecordBatch, datatypes::Schema, error::ArrowError};
+use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -21,6 +22,8 @@ use datafusion::{
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
     sql::sqlparser::ast::Ident,
 };
+
+use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
@@ -33,8 +36,11 @@ use tantivy::{
 };
 
 use super::{
-    CandidateGeneration, Result as GenerationResult, TextSearchSnafu as GenerationTextSearchSnafu,
+    CandidateGeneration, Error as GenerationError, Result as GenerationResult,
+    TextSearchSnafu as GenerationTextSearchSnafu,
 };
+
+static DEFAULT_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -59,7 +65,7 @@ pub enum Error {
     ArrowSchemaError { source: ArrowError },
 
     #[snafu(display("Failed to convert JSON values to Arrow format. Error: {source}"))]
-    ArrowConversionError { source: ArrowError },
+    ArrowConversionError { source: DataFusionError },
 
     #[snafu(display("Failed to convert underlying search data into JSON format. Error: {source}"))]
     SerdeJsonConversionError { source: serde_json::Error },
@@ -82,6 +88,7 @@ impl Error {
     }
 }
 
+#[derive(Clone)]
 pub struct FullTextSearch {
     idx: Arc<Index>,
     field: String,
@@ -305,35 +312,19 @@ impl CandidateGeneration for FullTextSearch {
             }
         }
 
-        let hits = self
-            .search_query_literal(query.as_str(), keep_search_field, limit, 0)
-            .context(GenerationTextSearchSnafu)?;
-
-        let schema = Arc::new(
-            arrow_json::reader::infer_json_schema_from_iterator(hits.iter().map(Ok))
-                .context(ArrowSchemaSnafu)
-                .context(GenerationTextSearchSnafu)?,
-        );
-        let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema))
-            .build_decoder()
-            .context(ArrowSchemaSnafu)
-            .context(GenerationTextSearchSnafu)?;
-
-        decoder
-            .serialize(hits.as_slice())
-            .context(ArrowConversionSnafu)
-            .context(GenerationTextSearchSnafu)?;
-
-        let strm = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream! {
-                match decoder.flush() {
-                    Ok(Some(rb)) => yield Ok(rb),
-                    Ok(None) => {},
-                    Err(e) => yield Err(DataFusionError::ArrowError(e, None))
-                }
-            },
-        )) as SendableRecordBatchStream;
+        let strm = make_stream(self.clone(), query, keep_search_field, limit);
+        let mut strm = Box::pin(strm.peekable());
+        let schema = match strm.as_mut().peek().await {
+            None => Arc::new(Schema::empty()),
+            Some(Ok(rb)) => rb.schema(),
+            Some(Err(e)) => {
+                return Err(GenerationError::internal(
+                    format!("Failed to parse schema of full text search results: {e}").as_str(),
+                ));
+            }
+        };
+        let strm =
+            Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream;
 
         Ok(strm)
     }
@@ -364,6 +355,55 @@ impl CandidateGeneration for FullTextSearch {
     fn value_derived_from(&self) -> String {
         self.field.clone()
     }
+}
+
+fn make_stream(
+    fts: FullTextSearch,
+    query: String,
+    keep_search_field: bool,
+    limit: usize,
+) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
+    stream! {
+        let mut remaining_limit = limit;
+        let mut offset = 0;
+        while remaining_limit > 0 {
+            let limit = min(remaining_limit, DEFAULT_BATCH_SIZE);
+            let hits = match fts
+                .search_query_literal(query.as_str(), keep_search_field, limit, offset)
+                .map_err(|e| DataFusionError::Internal(e.to_string())) {
+                    Ok(h) => h,
+                    Err(e) => {yield Err(e); return}
+                };
+            offset += limit;
+            remaining_limit -= limit;
+
+            let mut decoder = match tantivy_json_to_arrow_decoder(hits.as_slice())
+                .map_err(|e| DataFusionError::ArrowError(e, None)) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        yield Err(e);
+                        return
+                    }
+                };
+
+            match decoder.flush() {
+                Ok(Some(rb)) => yield Ok(rb),
+                Ok(None) => {},
+                Err(e) => yield Err(DataFusionError::ArrowError(e, None))
+            }
+        }
+    }
+}
+
+fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder, ArrowError> {
+    let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
+        hits.iter().map(Ok),
+    )?);
+    let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+
+    decoder.serialize(hits)?;
+
+    Ok(decoder)
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     TOOLS_METER
         .u64_gauge("tool_load_state")
         .with_description(
-            "Status of the LLM tools. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
+            "Status of the LLM tools. 0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown.",
         )
         .build()
 });

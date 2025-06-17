@@ -40,6 +40,7 @@ use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::parser::ParserError;
+use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
@@ -301,6 +302,15 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
                     }
+                }
+            } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
+                match err {
+                    FlightClientError::ConnectionReset { source } => {
+                        let mut error = Status::invalid_argument(format!("{source}"));
+                        error.metadata_mut().insert("spiceai-retryable", 1.into());
+                        error
+                    }
+                    _ => to_tonic_err(e),
                 }
             } else {
                 to_tonic_err(e)

@@ -17,29 +17,35 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ### v1.4 (June 2025)
 
+- Upgrade to DataFusion v47.
+- Cron for dataset refresh and workers
+
+- **Catalog Connectors**
+
+  - AWS Glue Catalog Connector (Beta).
+
+- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
+
+### v1.5 (July 2025)
+
 **Focus:** Search
 
-- Upgrade to DataFusion v47.
 - Upgrade to DuckDB v1.3.x.
 - [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
 - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
-- **Catalog Connectors**
-  - AWS Glue Catalog Connector (Beta).
-- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
 
-### v1.5 (July 2025)
+### v1.6 (August 2025)
 
 **Focus:** Advanced Ingestion - Expanded write capabilities for modern data lakehouse architectures.
 
 - Hash partitioning for improved query distribution and performance.
 - **Ingestion**:
+
   - Support write operations to Spice Cloud.
   - Delta Lake write support for transactional data lakes.
   - Apache Iceberg write support for scalable table formats.
   - PostgreSQL write support for relational database integration.
-
-### v1.6 (August 2025)
 
 - **Model Providers**:
   - HuggingFace (Release Candidate).

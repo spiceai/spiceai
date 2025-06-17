@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/databricks[delta_lake]-arrow.yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-runners
+    ready_wait: 300
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/databricks[delta_lake]-arrow.yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 300
+  load:
+    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/databricks[delta_lake]-arrow.yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 300
+    duration: 28800
