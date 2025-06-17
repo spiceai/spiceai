@@ -22,12 +22,10 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
-    common::Constraints,
-    datasource::TableType,
-    error::{DataFusionError, Result as DataFusionResult},
+    catalog::TableProvider,
+    error::DataFusionError,
     execution::SendableRecordBatchStream,
-    logical_expr::{Expr as LogicalExpr, TableProviderFilterPushDown, sqlparser::ast::Expr},
+    logical_expr::sqlparser::ast::Expr,
     physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
     sql::sqlparser::ast::Ident,
 };
@@ -420,6 +418,23 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
 pub struct FullTextSearchTable {
     index: FullTextSearch,
     query: String,
+
+    // If minimal, return only primary key and score.
+    minimal: bool,
+}
+impl FullTextSearchTable {
+    pub fn new(index: FullTextSearch, query: String) -> Self {
+        Self {
+            index,
+            query,
+            minimal: false,
+        }
+    }
+
+    pub fn minimal_schema(mut self) -> Self {
+        self.minimal = true;
+        self
+    }
 }
 
 #[async_trait]
@@ -429,6 +444,19 @@ impl TableProvider for FullTextSearchTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        let tantivy_schema = self.index.idx.schema();
+
+        if self.minimal {
+            let pks = self.index.primary_key.iter().filter_map(|pk| {
+                let f = tantivy_schema.get_field(field_name).ok()?;
+                let entry = tantivy_schema.get_field_entry(&f);
+                entry.field_type()
+
+            });
+            self.index.idx.schema()
+
+        }
+        self.index.primary_key
         Arc::new(Schema::empty())
     }
 

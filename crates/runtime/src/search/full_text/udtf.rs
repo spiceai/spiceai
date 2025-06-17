@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
+use arrow_schema::SchemaRef;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -18,13 +19,20 @@ limitations under the License.
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
+    datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::TableProviderFilterPushDown,
+    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
+use search::generation::text_search::FullTextSearchTable;
 
-use crate::datafusion::DataFusion;
+use crate::{
+    datafusion::DataFusion,
+    search::{full_text::table::TableWithFullText, util::find_concrete_table_provider},
+};
 
 // fn text_search(tbl: TableReference, query: &str, col: Option<str>, limit: Option<usize>, include_score: Option<bool>)
 // ```
@@ -40,6 +48,9 @@ use crate::datafusion::DataFusion;
 pub struct TextSearchTableFuncArgs {
     tbl: TableReference,
     query: String,
+
+    // For now: force user to specify
+    primary_key: String,
     column: Option<String>,
     limit: Option<usize>,
     include_score: Option<bool>,
@@ -68,16 +79,28 @@ impl TextSearchTableFunc {
             ..
         })) = tbl
         else {
-            return DataFusionError::Plan(format!(
+            return Err(DataFusionError::Plan(format!(
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
-            ));
+            )));
         };
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
-            return DataFusionError::Plan(format!(
+            return Err(DataFusionError::Plan(format!(
                 "Second argument must be a query string, but got {query:?}."
-            ));
+            )));
+        };
+
+        let pk = args.next();
+        let Some(Expr::Column(Column {
+            relation: None,
+            name: pk,
+            ..
+        })) = pk
+        else {
+            return Err(DataFusionError::Plan(format!(
+                "Third argument (for now) must be the primary key, but got a different expression: {tbl:?}."
+            )));
         };
 
         let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
@@ -92,7 +115,7 @@ impl TextSearchTableFunc {
                 (None, Some(*limit as usize), Some(true))
             }
             (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))), None, None) => {
-                (None, None, Some(include_score))
+                (None, None, Some(*include_score))
             }
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
@@ -110,7 +133,7 @@ impl TextSearchTableFunc {
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
-            ) => (None, Some(*limit as usize), Some(include_score)),
+            ) => (None, Some(*limit as usize), Some(*include_score)),
 
             // All three arguments provided
             (
@@ -129,6 +152,7 @@ impl TextSearchTableFunc {
         Ok(TextSearchTableFuncArgs {
             tbl: table_name.into(),
             query: q.to_string(),
+            primary_key: pk.clone(),
             column,
             limit,
             include_score,
@@ -143,18 +167,96 @@ impl TableFunctionImpl for TextSearchTableFunc {
         if !self.df.table_exists(args.tbl.clone()) {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl
+                args.tbl.clone()
             )));
         };
 
-        // Perform the full text search and return the results.
-        let results = tbl.full_text_search(
-            &args.query,
-            args.column.as_deref(),
-            args.limit,
-            args.include_score.unwrap_or(true),
-        )?;
+        Ok(Arc::new(TextSearchTableProvider {
+            df: self.df.clone(),
+            args,
+        }))
+    }
+}
 
-        Ok(results)
+#[derive(Debug)]
+struct TextSearchTableProvider {
+    df: Arc<DataFusion>,
+    args: TextSearchTableFuncArgs,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for TextSearchTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let TextSearchTableFuncArgs {
+            tbl,
+            query,
+            primary_key,
+            column,
+            limit: args_limit,
+            include_score,
+        } = self.args;
+        let Some(table_provider) = self.df.get_table(&tbl).await else {
+            return Err(DataFusionError::Internal(format!(
+                "TODO, need to return empty exec instead"
+            )));
+        };
+
+        let Some(fts) = find_concrete_table_provider::<TableWithFullText>(&table_provider).await
+        else {
+            return Err(DataFusionError::Internal(format!(
+                "TODO, need to return empty exec instead"
+            )));
+        };
+        let col: String = if let Some(col) = column {
+            if !fts.search_fields.contains(&col) {
+                return Err(DataFusionError::Internal(format!(
+                    "TODO, need to return empty exec instead"
+                )));
+            };
+            col
+        } else {
+            let fields = fts.search_fields.iter();
+            let z = match (fields.next(), fields.next()) {
+                (Some(field), None) => field.clone(),
+                (Some(_), Some(_)) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "TODO, need to return empty exec instead"
+                    )));
+                }
+                _ => {
+                    return Err(DataFusionError::Internal(format!(
+                        "TODO, need to return empty exec instead"
+                    )));
+                };
+            };
+            z
+        };
+        let Some(index) = fts.index_as_full_text(col.as_str()).ok() else {
+            return Err(DataFusionError::Internal(format!(
+                "TODO, need to return empty exec instead"
+            )));
+        };
+
+        let tbl = FullTextSearchTable::new(index, query).minimal_schema();
+        tbl.scan(state, projection, filters, limit.or(args_limit))
+            .await
     }
 }

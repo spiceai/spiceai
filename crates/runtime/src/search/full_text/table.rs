@@ -40,9 +40,9 @@ use crate::search::util::get_primary_keys;
 
 #[derive(Clone)]
 pub struct TableWithFullText {
+    pub search_fields: Vec<String>,
+    pub primary_key: Vec<String>,
     base_table: Arc<dyn TableProvider>,
-    search_fields: Vec<String>,
-    primary_key: Vec<String>,
     index: Arc<tantivy::Index>,
 }
 
@@ -229,19 +229,27 @@ impl TableWithFullText {
         Ok(Arc::new(index))
     }
 
+    pub fn index_as_full_text(
+        &self,
+        search_field: &str,
+    ) -> Result<FullTextSearch, search::generation::text_search::Error> {
+        FullTextSearch::try_new(
+            Arc::clone(&self.index),
+            search_field.to_string(),
+            self.primary_key.clone(),
+            Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
+        )
+    }
+
     /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
     pub fn as_candidate_generations(
         &self,
     ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
-            let base = FullTextSearch::try_new(
-                Arc::clone(&self.index),
-                search_field.clone(),
-                self.primary_key.clone(),
-                Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
-            )
-            .map_err(|source| search::generation::Error::TextSearchError { source })?;
+            let base = self
+                .index_as_full_text(search_field.as_str())
+                .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
             let post_apply = PostApplyCandidateGeneration::new(
                 Arc::clone(&self.base_table),
