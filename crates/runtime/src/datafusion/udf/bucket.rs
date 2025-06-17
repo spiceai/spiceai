@@ -201,6 +201,7 @@ pub fn compute_bucket_array(
 mod tests {
     use super::*;
     use arrow::array::StringArray;
+    use insta::assert_snapshot;
 
     #[test]
     fn test_bucket_scalar() {
@@ -214,11 +215,7 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
-        if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
-            assert!((0..10).contains(&bucket), "Bucket out of range: {bucket}",);
-        } else {
-            panic!("Expected Int32 scalar");
-        }
+        assert_snapshot!("bucket_scalar", result);
     }
 
     #[test]
@@ -233,19 +230,7 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
-        if let ColumnarValue::Array(array) = result {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("downcast to Int32Array");
-            assert_eq!(int_array.len(), 3);
-            for i in 0..3 {
-                let bucket = int_array.value(i);
-                assert!((0..5).contains(&bucket), "Bucket out of range: {bucket}",);
-            }
-        } else {
-            panic!("Expected Int32 array");
-        }
+        assert_snapshot!("bucket_array", result);
     }
 
     #[test]
@@ -379,11 +364,7 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
-        if let ColumnarValue::Scalar(ScalarValue::Int32(None)) = result {
-            // Expected: NULL input returns NULL
-        } else {
-            panic!("Expected NULL Int32 scalar");
-        }
+        assert_snapshot!("null_input", result);
     }
 
     #[test]
@@ -398,11 +379,7 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
-        if let ColumnarValue::Scalar(ScalarValue::Int32(Some(bucket))) = result {
-            assert!((0..10).contains(&bucket), "Bucket out of range: {bucket}");
-        } else {
-            panic!("Expected Int32 scalar");
-        }
+        assert_snapshot!("decimal_input", result);
     }
 
     #[test]
@@ -417,15 +394,7 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
-        if let ColumnarValue::Array(array) = result {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("downcast_ref");
-            assert_eq!(int_array.len(), 0);
-        } else {
-            panic!("Expected empty Int32 array");
-        }
+        assert_snapshot!("empty_array", result);
     }
 
     #[test]
@@ -444,21 +413,6 @@ mod tests {
             return_type: &DataType::Int32,
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
-        if let ColumnarValue::Array(array) = result {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("downcast to Int32Array");
-            assert_eq!(int_array.len(), 3);
-            assert!(int_array.is_null(0), "Expected NULL at index 0");
-            assert!(!int_array.is_null(1), "Expected non-NULL at index 1");
-            assert!(
-                int_array.value(1) >= 0 && int_array.value(1) < 5,
-                "Bucket out of range"
-            );
-            assert!(int_array.is_null(2), "Expected NULL at index 2");
-        } else {
-            panic!("Expected Int32 array");
-        }
+        assert_snapshot!("null_array_input", result);
     }
 }
