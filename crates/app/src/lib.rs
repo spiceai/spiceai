@@ -278,7 +278,7 @@ impl AppBuilder {
         }
     }
 
-    pub async fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
+    pub async fn build_from_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let spicepod_root = Spicepod::load(&path)
             .await

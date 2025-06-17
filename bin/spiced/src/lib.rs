@@ -162,7 +162,7 @@ pub struct Args {
     pub very_verbose: bool,
 
     /// Path to the Spicepod directory or file. Supports local paths and remote URLs (s3://, gs://, etc.)
-    #[arg(long, value_name = "PATH")]
+    #[arg(value_name = "PATH")]
     pub spicepod: Option<PathBuf>,
 
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
@@ -177,19 +177,18 @@ pub async fn run(args: Args) -> Result<()> {
         .spicepod
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
-    let app: Option<Arc<App>> =
-        match AppBuilder::build_from_filesystem_path(spicepod_path.clone()).await {
-            Ok(mut app) => {
-                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-                Some(Arc::new(app))
-            }
-            Err(e) => {
-                in_tracing_context(|| {
-                    tracing::warn!("{e}");
-                });
-                None
-            }
-        };
+    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
+        Err(e) => {
+            in_tracing_context(|| {
+                tracing::warn!("{e}");
+            });
+            None
+        }
+    };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {
