@@ -33,11 +33,9 @@ use snafu::{ResultExt as _, Snafu};
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
-/// Fixed seed for deterministic hashing.
-const HASH_SEED: usize = 0x53_50_49_43_45;
-
 /// Static `RandomState` for deterministic hashing.
-static RANDOM_STATE: LazyLock<RandomState> = LazyLock::new(|| RandomState::with_seed(HASH_SEED));
+static RANDOM_STATE: LazyLock<RandomState> =
+    LazyLock::new(|| RandomState::with_seeds(0x53, 0x50, 0x49, 0x43_45));
 
 #[derive(Debug, Snafu)]
 pub enum BucketError {
