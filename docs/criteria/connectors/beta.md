@@ -19,6 +19,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | FTP/SFTP                         | ➖           |                 |
 | GraphQL                          | ➖           |                 |
 | GitHub                           | ✅           | @peasee         |
+| Glue                             | ✅           | @kczimm         |
 | HTTP/HTTPS                       | ➖           |                 |
 | IMAP                             | ➖           |                 |
 | Localpod                         | ➖           |                 |
@@ -55,6 +56,7 @@ This table defines the required features and/or tests for each connector:
 | FTP/SFTP                         | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | GraphQL                          | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
+| Glue                             | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | HTTP/HTTPS                       | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | IMAP                             | ➖                    | ➖             | ☑️                | ➖                       | ✅                  | ☑️                         |
 | Iceberg                          | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
