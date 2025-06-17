@@ -172,12 +172,12 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `glue`                             | [AWS Glue][glue]                      | Beta              | Iceberg, Parquet, CSV        |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
+| `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
@@ -239,7 +239,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
 | `spice.ai`      | Spice.ai Cloud Platform | Beta        | Arrow Flight                 |
-| `glue`          | AWS Glue                | Beta        | CSV, Parquet, Iceberg        |
+| `glue`          | AWS Glue                | Alpha       | CSV, Parquet, Iceberg        |
 
 ## ⚡️ Quickstart (Local Machine)
 

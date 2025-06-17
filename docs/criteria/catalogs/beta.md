@@ -12,7 +12,6 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 | Iceberg       | ✅           | @phillipleblanc |
 | Spice.ai      | ✅           | @peasee         |
 | Unity Catalog | ✅           | @Sevenannn      |
-| Glue          | ✅           | @kczimm         |
 
 ## Beta Release Criteria
 
