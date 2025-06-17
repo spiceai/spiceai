@@ -17,6 +17,7 @@ limitations under the License.
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
+use arrow_schema::{DataType, Schema};
 use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
@@ -88,12 +89,14 @@ pub(crate) async fn do_get(
 
                 let table_type = table_type_name(table_provider.table_type());
 
+                let schema = with_native_types_metadata(table_provider.schema().as_ref());
+
                 builder.append(
                     &catalog_name,
                     &schema_name,
                     &table_name,
                     table_type,
-                    table_provider.schema().as_ref(),
+                    &schema,
                 )?;
             }
         }
@@ -114,5 +117,74 @@ pub(crate) fn table_type_name(table_type: TableType) -> &'static str {
         TableType::Base => "BASE TABLE",
         TableType::View => "VIEW",
         TableType::Temporary => "LOCAL TEMPORARY",
+    }
+}
+
+/// Duplicate Arrow types as data source-specific names for the data type, which is required by some of the clients using Arrow Flight SQL.
+/// See `<https://github.com/apache/arrow-rs/blob/639b5bb93e5a152a437b93a25ead8095a3866a9b/arrow-flight/src/sql/arrow.flight.protocol.sql.rs#L172>`
+fn with_native_types_metadata(schema: &Schema) -> Schema {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let mut field = f.as_ref().clone();
+            // There is no in-place mutation for field metadata, so we need to clone and then modify it.
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                "ARROW:FLIGHT:SQL:TYPE_NAME".to_string(),
+                to_source_native_type_name(field.data_type()).to_string(),
+            );
+            field = field.with_metadata(metadata);
+            field
+        })
+        .collect::<Vec<_>>();
+    Schema::new(fields)
+}
+
+/// Returns data source-specific name for the data type.
+/// As we are using `DataFusion` that is based on Arrow, we use the Arrow data types directly.
+pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
+    // For non-complex types, `to_string()` can be used to return type information, but for consistency and control over naming,
+    // explicit matching and type names are used.
+    match data_type {
+        DataType::Null => "NULL",
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 => "INT8",
+        DataType::Int16 => "INT16",
+        DataType::Int32 => "INT32",
+        DataType::Int64 => "INT64",
+        DataType::UInt8 => "UINT8",
+        DataType::UInt16 => "UINT16",
+        DataType::UInt32 => "UINT32",
+        DataType::UInt64 => "UINT64",
+        DataType::Float16 => "FLOAT16",
+        DataType::Float32 => "FLOAT32",
+        DataType::Float64 => "FLOAT64",
+        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Date32 => "DATE32",
+        DataType::Date64 => "DATE64",
+        DataType::Time32(_) => "TIME32",
+        DataType::Time64(_) => "TIME64",
+        DataType::Duration(_) => "DURATION",
+        DataType::Interval(_) => "INTERVAL",
+        DataType::Binary => "BINARY",
+        DataType::FixedSizeBinary(_) => "FIXED_SIZE_BINARY",
+        DataType::LargeBinary => "LARGE_BINARY",
+        DataType::Utf8 => "UTF8",
+        DataType::LargeUtf8 => "LARGE_UTF8",
+        DataType::List(_) => "LIST",
+        DataType::FixedSizeList(_, _) => "FIXED_SIZE_LIST",
+        DataType::LargeList(_) => "LARGE_LIST",
+        DataType::Struct(_) => "STRUCT",
+        DataType::Union(_, _) => "UNION",
+        DataType::Dictionary(_, _) => "DICTIONARY",
+        DataType::Decimal128(_, _) => "DECIMAL128",
+        DataType::Decimal256(_, _) => "DECIMAL256",
+        DataType::Map(_, _) => "MAP",
+        DataType::RunEndEncoded(_, _) => "RUN_END_ENCODED",
+        DataType::BinaryView => "BINARY_VIEW",
+        DataType::Utf8View => "UTF8_VIEW",
+        DataType::ListView(_) => "LIST_VIEW",
+        DataType::LargeListView(_) => "LARGE_LIST_VIEW",
     }
 }
