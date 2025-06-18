@@ -284,7 +284,9 @@ impl Spicepod {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let spicepod_rdr = if file_stem == "spicepod" {
+        let is_file = path.is_file() || path.extension().is_some();
+
+        let spicepod_rdr = if file_stem == "spicepod" && is_file {
             fs.open_exact_yaml(path.clone())
                 .await
                 .map_err(Box::new)
