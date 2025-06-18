@@ -12273,6 +12273,7 @@ dependencies = [
  "byte-unit",
  "fundu",
  "futures",
+ "object-store-aws-sdk",
  "object_store",
  "regex",
  "schemars 0.9.0",
