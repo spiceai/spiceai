@@ -44,7 +44,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Unable to parse bucket name from URL
 /// - Unable to build S3 client with provided configuration
 /// - Unable to get credentials from environment
-pub async fn from_s3_url(url: &url::Url) -> Result<Arc<dyn ObjectStore>> {
+pub async fn from_s3_url(url: &url::Url) -> Result<Box<dyn ObjectStore>> {
     if url.scheme() != "s3" {
         return Err(Error::NotAnS3Url {
             url: url.to_string(),
@@ -61,7 +61,7 @@ pub async fn from_s3_url(url: &url::Url) -> Result<Arc<dyn ObjectStore>> {
 
     builder = builder.with_credentials(Arc::new(credential_provider));
 
-    Ok(Arc::new(builder.build()?))
+    Ok(Box::new(builder.build()?))
 }
 
 fn get_bucket_name(url: &Url) -> Result<&str> {
