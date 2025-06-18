@@ -80,22 +80,21 @@ impl Truncate {
 
 impl Truncate {
     fn validate_args(args: Vec<ColumnarValue>) -> Result<(i64, ColumnarValue), TruncateError> {
-        let num_args = args.len();
-
-        let mut args = args.into_iter();
-        match (args.next(), args.next()) {
-            (Some(ColumnarValue::Scalar(ScalarValue::Int64(Some(width)))), Some(arg)) => {
-                ensure!(
-                    width > 0 && width <= MAX_TRUNCATE_WIDTH,
-                    InvalidWidthValueSnafu { width }
-                );
-                Ok((width, arg))
-            }
-            (Some(width), Some(_)) => {
-                let width_datatype = width.data_type();
-                Err(TruncateError::InvalidWidthDataType { width_datatype })
-            }
-            _ => Err(TruncateError::InvalidArgumentCount { count: num_args }),
+        if args.len() != 2 {
+            return Err(TruncateError::InvalidArgumentCount { count: args.len() });
+        }
+        if let (ColumnarValue::Scalar(ScalarValue::Int64(Some(width))), arg) =
+            (args[0].clone(), args[1].clone())
+        {
+            ensure!(
+                width > 0 && width <= MAX_TRUNCATE_WIDTH,
+                InvalidWidthValueSnafu { width }
+            );
+            Ok((width, arg))
+        } else {
+            Err(TruncateError::InvalidWidthDataType {
+                width_datatype: args[0].data_type(),
+            })
         }
     }
 }
