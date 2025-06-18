@@ -33,6 +33,7 @@ var runCmd = &cobra.Command{
 	Short: "Run Spice.ai - starts the Spice.ai runtime, installing if necessary",
 	Example: `
 spice run
+spice run /path/to/spicepod.yaml
 
 # See more at: https://spiceai.org/docs/
 `,
