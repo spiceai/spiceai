@@ -8574,6 +8574,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "object-store-aws-sdk"
+version = "1.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "object_store",
+ "snafu",
+ "url",
+]
+
+[[package]]
 name = "object_store"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
