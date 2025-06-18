@@ -47,9 +47,9 @@ pub enum TruncateError {
     InvalidArgumentCount { count: usize },
 
     #[snafu(display(
-        "Second argument must be Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Decimal128, Decimal256, Utf8, or Binary, got {value}"
+        "Second argument must be Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Decimal128, Decimal256, Utf8, or Binary, got {data_type}"
     ))]
-    InvalidSecondArgType { value: ColumnarValue },
+    InvalidSecondArgType { data_type: DataType },
 }
 
 impl From<TruncateError> for DataFusionError {
@@ -138,7 +138,7 @@ impl ScalarUDFImpl for Truncate {
             | DataType::Utf8
             | DataType::Binary => Ok(arg_types[1].clone()),
             _ => Err(TruncateError::InvalidSecondArgType {
-                value: ColumnarValue::Scalar(ScalarValue::try_from(&arg_types[1])?),
+                data_type: arg_types[1].clone(),
             }
             .into()),
         }
@@ -231,7 +231,7 @@ fn compute_truncate_scalar(
             Ok(ScalarValue::Binary(Some(truncated)))
         }
         _ => Err(TruncateError::InvalidSecondArgType {
-            value: ColumnarValue::Scalar(scalar.clone()),
+            data_type: scalar.data_type(),
         }
         .into()),
     }
@@ -372,7 +372,7 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(Arc::new(result))
         }
         _ => Err(TruncateError::InvalidSecondArgType {
-            value: ColumnarValue::Array(array),
+            data_type: array.data_type().clone(),
         }
         .into()),
     }
