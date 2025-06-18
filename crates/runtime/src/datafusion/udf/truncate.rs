@@ -29,6 +29,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use snafu::{Snafu, ensure};
+use tract_core::num_traits::Num;
 
 /// Maximum truncation width or length, chosen to prevent overflow or excessive memory usage.
 const MAX_TRUNCATE_WIDTH: i64 = i64::MAX / 2;
@@ -171,47 +172,47 @@ fn compute_truncate_scalar(
 
     match scalar {
         ScalarValue::Int8(Some(v)) => {
-            let width = width as i8;
-            let result = v - (((v % width) + width) % width);
+            let w = width as i8;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::Int8(Some(result)))
         }
         ScalarValue::Int16(Some(v)) => {
-            let width = width as i16;
-            let result = v - (((v % width) + width) % width);
+            let w = width as i16;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::Int16(Some(result)))
         }
         ScalarValue::Int32(Some(v)) => {
-            let width = width as i32;
-            let result = v - (((v % width) + width) % width);
+            let w = width as i32;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::Int32(Some(result)))
         }
         ScalarValue::Int64(Some(v)) => {
-            let result = v - (((v % width) + width) % width);
+            let result = truncate_numeric(v, width);
             Ok(ScalarValue::Int64(Some(result)))
         }
         ScalarValue::UInt8(Some(v)) => {
-            let width = width as u8;
-            let result = v - (((v % width) + width) % width);
+            let w = width as u8;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::UInt8(Some(result)))
         }
         ScalarValue::UInt16(Some(v)) => {
-            let width = width as u16;
-            let result = v - (((v % width) + width) % width);
+            let w = width as u16;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::UInt16(Some(result)))
         }
         ScalarValue::UInt32(Some(v)) => {
-            let width = width as u32;
-            let result = v - (((v % width) + width) % width);
+            let w = width as u32;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::UInt32(Some(result)))
         }
         ScalarValue::UInt64(Some(v)) => {
-            let width = width as u64;
-            let result = v - (((v % width) + width) % width);
+            let w = width as u64;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::UInt64(Some(result)))
         }
         ScalarValue::Decimal128(Some(v), p, s) => {
-            let width = width as i128;
-            let result = v - (((v % width) + width) % width);
+            let w = width as i128;
+            let result = truncate_numeric(v, w);
             Ok(ScalarValue::Decimal128(Some(result), p, s))
         }
         ScalarValue::Decimal256(Some(v), p, s) => {
@@ -236,13 +237,16 @@ fn compute_truncate_scalar(
     }
 }
 
+fn truncate_numeric<T: Num + Copy>(v: T, w: T) -> T {
+    v - (((v % w) + w) % w)
+}
+
 fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
     match array.data_type() {
         DataType::Int8 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .expect("cast success");
+            let casted_array = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                DataFusionError::Internal("Failed to downcast to Int8Array".into())
+            })?;
             let width = width as i8;
             let width_array = Int8Array::from_value(width, array.len());
             let result: Int8Array =
@@ -251,10 +255,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(Arc::new(result))
         }
         DataType::Int16 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .expect("cast success");
+            let casted_array = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                DataFusionError::Internal("Failed to downcast to Int16Array".into())
+            })?;
             let width = width as i16;
             let width_array = Int16Array::from_value(width, array.len());
             let result: Int16Array =
@@ -263,10 +266,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(Arc::new(result))
         }
         DataType::Int32 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("cast success");
+            let casted_array = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                DataFusionError::Internal("Failed to downcast to Int32Array".into())
+            })?;
             let width = width as i32;
             let width_array = Int32Array::from_value(width, array.len());
             let result: Int32Array =
@@ -275,10 +277,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(Arc::new(result))
         }
         DataType::Int64 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("cast success");
+            let casted_array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                DataFusionError::Internal("Failed to downcast to Int64Array".into())
+            })?;
             let width_array = Int64Array::from_value(width, array.len());
             let result: Int64Array =
                 binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))
@@ -286,10 +287,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(Arc::new(result))
         }
         DataType::UInt8 => {
-            let casted_array = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .expect("cast success");
+            let casted_array = array.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
+                DataFusionError::Internal("Failed to downcast to UInt8Array".into())
+            })?;
             let width = width as u8;
             let width_array = UInt8Array::from_value(width, array.len());
             let result: UInt8Array =
@@ -301,7 +301,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             let casted_array = array
                 .as_any()
                 .downcast_ref::<UInt16Array>()
-                .expect("cast success");
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to UInt16Array".into())
+                })?;
             let width = width as u16;
             let width_array = UInt16Array::from_value(width, array.len());
             let result: UInt16Array =
@@ -313,7 +315,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             let casted_array = array
                 .as_any()
                 .downcast_ref::<UInt32Array>()
-                .expect("cast success");
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to UInt32Array".into())
+                })?;
             let width = width as u32;
             let width_array = UInt32Array::from_value(width, array.len());
             let result: UInt32Array =
@@ -325,7 +329,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             let casted_array = array
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .expect("cast success");
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to UInt64Array".into())
+                })?;
             let width = width as u64;
             let width_array = UInt64Array::from_value(width, array.len());
             let result: UInt64Array =
@@ -337,7 +343,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             let casted_array = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .expect("cast success");
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to Decimal128Array".into())
+                })?;
             let width = width as i128;
             let width_array = Decimal128Array::from_value(width, array.len());
             let result: Decimal128Array =
@@ -349,7 +357,9 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             let casted_array = array
                 .as_any()
                 .downcast_ref::<Decimal256Array>()
-                .expect("cast success");
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to Decimal256Array".into())
+                })?;
             let width = i256::from_i128(width as i128);
             let width_array = Decimal256Array::from_value(width, array.len());
             let result: Decimal256Array =
@@ -364,7 +374,12 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
             Ok(result)
         }
         DataType::Utf8 => {
-            let casted_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let casted_array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Failed to downcast to StringArray".into())
+                })?;
             let width = width as u64;
             let result = substring_by_char(casted_array, 0, Some(width))
                 .map_err(|e| DataFusionError::ArrowError(e, None))?;
