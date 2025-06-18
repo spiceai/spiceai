@@ -56,6 +56,7 @@ mod endpoint_auth;
 mod file;
 mod flight;
 mod github;
+mod glue;
 mod graphql;
 mod iceberg;
 mod iceberg_api;

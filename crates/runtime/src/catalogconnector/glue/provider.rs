@@ -261,6 +261,10 @@ impl SchemaProvider for GlueSchemaProvider {
 }
 
 fn database_might_match(database: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+
     patterns.iter().any(|pattern| {
         pattern == database
             || pattern.starts_with(&format!("{database}."))
@@ -318,7 +322,7 @@ mod tests {
     #[test]
     fn database_might_match_empty_patterns() {
         let patterns: Vec<String> = vec![];
-        assert!(!database_might_match("mydb", &patterns));
+        assert!(database_might_match("mydb", &patterns));
     }
 
     #[test]

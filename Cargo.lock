@@ -3933,9 +3933,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "547318d6ee083b99d0e1daef01c3873b8c9e2f832bbbf1c5fa2f248051046cbf"
+checksum = "de0b553d03fce69da6bedd91ec7e2348d52af2783a95d2dc91970df0cb614783"
 dependencies = [
  "arrow",
  "bytes",
@@ -3962,9 +3962,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5acac3d1b207020f0754cbc827c1d71fb342b78bcf8ab0a8e3cf79d264f22d54"
+checksum = "deacb882456b0a3e7a5bf22a708190758cc8f572e02cd34954931e24286a4509"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6978,9 +6978,9 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.42"
+version = "0.1.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec9d6fac27761dabcd4ee73571cdb06b7022dc99089acbe5435691edffaac0f4"
+checksum = "bf88cd67e9de251c1781dbe2f641a1a3ad66eaae831b8a2c38fbdc5ddae16d4d"
 dependencies = [
  "cc",
  "libc",
@@ -7577,9 +7577,9 @@ dependencies = [
 
 [[package]]
 name = "mimalloc"
-version = "0.1.46"
+version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "995942f432bbb4822a7e9c3faa87a695185b0d09273ba85f097b54f4e458f2af"
+checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -9192,6 +9192,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f2a05b18d44e2957b88f96ba460715e295bc1d7510468a2f3d3b44535d26c24"
 dependencies = [
  "regex",
+]
+
+[[package]]
+name = "parsley"
+version = "1.4.0-unstable"
+dependencies = [
+ "bytes",
+ "clap",
+ "document_parse",
+ "llms",
+ "serde",
+ "serde_json",
+ "spicepod",
+ "text-splitter",
+ "tiktoken-rs",
+ "tokenizers",
 ]
 
 [[package]]
@@ -11343,9 +11359,9 @@ checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
 
 [[package]]
 name = "rustyline"
-version = "15.0.0"
+version = "16.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee1e066dc922e513bda599c6ccb5f3bb2b0ea5870a579448f2622993f0a9a2f"
+checksum = "62fd9ca5ebc709e8535e8ef7c658eb51457987e48c98ead2be482172accc408d"
 dependencies = [
  "bitflags 2.9.1",
  "cfg-if",
@@ -11355,7 +11371,7 @@ dependencies = [
  "libc",
  "log",
  "memchr",
- "nix 0.29.0",
+ "nix 0.30.1",
  "radix_trie",
  "rustyline-derive",
  "unicode-segmentation",
@@ -12038,18 +12054,18 @@ dependencies = [
 
 [[package]]
 name = "snafu"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "223891c85e2a29c3fe8fb900c1fae5e69c2e42415e3177752e8718475efa5019"
+checksum = "320b01e011bf8d5d7a4a4a4be966d9160968935849c83b918827f6a435e7f627"
 dependencies = [
  "snafu-derive",
 ]
 
 [[package]]
 name = "snafu-derive"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03c3c6b7927ffe7ecaa769ee0e3994da3b8cafc8f444578982c83ecb161af917"
+checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -13360,6 +13376,7 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.2.16",
+ "hf-hub 0.4.2",
  "indicatif",
  "itertools 0.13.0",
  "lazy_static",
