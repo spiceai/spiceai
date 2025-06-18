@@ -17,13 +17,6 @@ The AWS SDK, on the other hand, implements the full suite of credential discover
 
 ## Example
 
-TODO
-
 ```rust
-use object_store_aws_sdk::ObjectStoreBuilder;
-
-let object_store = ObjectStoreBuilder::new()
-    .with_region("us-west-2")
-    .build()
-    .await?;
+let (store, path) = object_store_aws_sdk::from_s3_url(&url).await.expect("Failed to parse S3 URL");
 ```
