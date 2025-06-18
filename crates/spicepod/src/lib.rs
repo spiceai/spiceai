@@ -71,6 +71,12 @@ pub enum Error {
         source: Box<reader::Error>,
         path: PathBuf,
     },
+
+    #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
+    UnableToParseS3Url {
+        source: object_store_aws_sdk::Error,
+        path: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -134,7 +140,7 @@ impl Spicepod {
             Ok(url)
                 if matches!(
                     url.scheme(),
-                    "s3" | "gs" | "azure" | "abfs" | "abfss" | "http" | "https"
+                    "s3" | "gs" | "azure" | "abfs" | "abfss" | "https"
                 ) =>
             {
                 Self::load_from_object_store(url).await
@@ -144,9 +150,20 @@ impl Spicepod {
     }
 
     pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
-        let (store, path) = object_store::parse_url(&url).context(UnableToParseUrlSnafu {
-            path: url.to_string(),
-        })?;
+        let (store, path) = match (url.scheme(), url.path()) {
+            ("s3", path) => {
+                let store = object_store_aws_sdk::from_s3_url(&url).await.context(
+                    UnableToParseS3UrlSnafu {
+                        path: url.to_string(),
+                    },
+                )?;
+                let path = object_store::path::Path::from(path);
+                (store, path)
+            }
+            _ => object_store::parse_url(&url).context(UnableToParseUrlSnafu {
+                path: url.to_string(),
+            })?,
+        };
 
         let object_fs = reader::ObjectStoreFilesystem::new(Arc::new(store));
 

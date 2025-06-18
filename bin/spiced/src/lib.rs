@@ -161,7 +161,9 @@ pub struct Args {
     #[arg(long)]
     pub very_verbose: bool,
 
-    /// Path to the Spicepod directory or file. Supports local paths and remote URLs (s3://, gs://, etc.)
+    /// Path to the Spicepod directory or file. Supports local paths and remote URLs (i.e. `s3://my_bucket/spicepod.yaml`)
+    ///
+    /// When specified, the behavior to automatically reload changes to the Spicepod is disabled.
     #[arg(value_name = "PATH")]
     pub spicepod: Option<PathBuf>,
 
@@ -221,7 +223,7 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
 
-    if args.pods_watcher_enabled {
+    if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
         builder = builder.with_pods_watcher(pods_watcher);
     }
