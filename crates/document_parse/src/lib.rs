@@ -28,6 +28,8 @@ use tokio::sync::Mutex;
 
 mod docx;
 mod pdf;
+pub use docx::DocxParser;
+pub use pdf::PdfParser;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -44,7 +44,7 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
+use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{ExpressionRef, Predicate};
@@ -374,9 +374,9 @@ impl TableProvider for DeltaTable {
                 let scan = scan_builder
                     .build()
                     .map_err(map_delta_error_to_datafusion_err)?;
-                let scan_state = scan.global_scan_state();
 
-                let mut scan_context = ScanContext::new(scan_state, Arc::clone(&engine));
+                let table_root = scan.table_root();
+                let mut scan_context = ScanContext::new(Arc::clone(&engine), table_root.clone());
 
                 let scan_iter = scan
                     .scan_metadata(engine.as_ref())
@@ -523,20 +523,17 @@ impl TableProvider for DeltaTable {
 struct ScanContext {
     pub errs: Vec<datafusion::error::DataFusionError>,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    scan_state: GlobalScanState,
     pub files: Vec<PartitionFileContext>,
+    table_root: Url,
 }
 
 impl ScanContext {
-    fn new(
-        scan_state: GlobalScanState,
-        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    ) -> Self {
+    fn new(engine: Arc<DefaultEngine<TokioBackgroundExecutor>>, table_root: Url) -> Self {
         Self {
-            scan_state,
             engine,
             errs: Vec::new(),
             files: Vec::new(),
+            table_root,
         }
     }
 }
@@ -586,17 +583,7 @@ fn handle_scan_file(
     transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
-    let root_url = match Url::parse(&scan_context.scan_state.table_root) {
-        Ok(url) => url,
-        Err(e) => {
-            scan_context
-                .errs
-                .push(datafusion::error::DataFusionError::Execution(format!(
-                    "Error parsing table root URL: {e}",
-                )));
-            return;
-        }
-    };
+    let root_url = &scan_context.table_root;
 
     let path = if root_url.path().ends_with('/') {
         format!("{}{}", root_url.path(), path)
@@ -630,7 +617,7 @@ fn handle_scan_file(
 
     // Get the selection vector (i.e. inverse deletion vector)
     let selection_vector =
-        match dv_info.get_selection_vector(scan_context.engine.as_ref(), &root_url) {
+        match dv_info.get_selection_vector(scan_context.engine.as_ref(), root_url) {
             Ok(selection_vector) => selection_vector,
             Err(e) => {
                 scan_context

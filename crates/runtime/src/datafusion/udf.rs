@@ -14,7 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
+use datafusion::{functions::math::random::RandomFunc, prelude::SessionContext};
+
+use crate::embeddings::cosine_distance::CosineDistance;
+
 pub mod alias;
+pub mod bucket;
+
+pub fn register_udfs(ctx: &SessionContext) {
+    ctx.register_udf(CosineDistance::new().into());
+    ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
+    ctx.register_udf(bucket::Bucket::new().into());
+}
 
 #[cfg(test)]
 mod tests {
