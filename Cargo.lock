@@ -8575,7 +8575,7 @@ dependencies = [
 
 [[package]]
 name = "object-store-aws-sdk"
-version = "1.4.0-unstable"
+version = "1.5.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
