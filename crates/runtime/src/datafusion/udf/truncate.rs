@@ -84,18 +84,22 @@ impl Truncate {
         if args.len() != 2 {
             return Err(TruncateError::InvalidArgumentCount { count: args.len() });
         }
-        if let (ColumnarValue::Scalar(ScalarValue::Int64(Some(width))), arg) =
-            (args[0].clone(), args[1].clone())
-        {
-            ensure!(
-                width > 0 && width <= MAX_TRUNCATE_WIDTH,
-                InvalidWidthValueSnafu { width }
-            );
-            Ok((width, arg))
-        } else {
-            Err(TruncateError::InvalidWidthDataType {
-                width_datatype: args[0].data_type(),
-            })
+
+        let count = args.len();
+        let mut args = args.into_iter();
+        match (args.next(), args.next()) {
+            (Some(ColumnarValue::Scalar(ScalarValue::Int64(Some(width)))), Some(arg)) => {
+                ensure!(
+                    width > 0 && width <= MAX_TRUNCATE_WIDTH,
+                    InvalidWidthValueSnafu { width }
+                );
+                Ok((width, arg))
+            }
+            (Some(width), Some(_)) => {
+                let width_datatype = width.data_type();
+                Err(TruncateError::InvalidWidthDataType { width_datatype })
+            }
+            _ => Err(TruncateError::InvalidArgumentCount { count }),
         }
     }
 }
@@ -155,13 +159,14 @@ impl ScalarUDFImpl for Truncate {
                 Ok(ColumnarValue::Scalar(result))
             }
             ColumnarValue::Array(array) => {
-                let result = compute_truncate_array(array, width)?;
+                let result = compute_truncate_array(&array, width)?;
                 Ok(ColumnarValue::Array(result))
             }
         }
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compute_truncate_scalar(
     scalar: ScalarValue,
     width: i64,
@@ -211,12 +216,12 @@ fn compute_truncate_scalar(
             Ok(ScalarValue::UInt64(Some(result)))
         }
         ScalarValue::Decimal128(Some(v), p, s) => {
-            let w = width as i128;
+            let w = i128::from(width);
             let result = truncate_numeric(v, w);
             Ok(ScalarValue::Decimal128(Some(result), p, s))
         }
         ScalarValue::Decimal256(Some(v), p, s) => {
-            let width = i256::from_i128(width as i128);
+            let width = i256::from_i128(i128::from(width));
             let result = v - (((v % width) + width) % width);
             Ok(ScalarValue::Decimal256(Some(result), p, s))
         }
@@ -238,10 +243,14 @@ fn compute_truncate_scalar(
 }
 
 fn truncate_numeric<T: Num + Copy>(v: T, w: T) -> T {
+    if w == T::zero() {
+        return v;
+    }
     v - (((v % w) + w) % w)
 }
 
-fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
     match array.data_type() {
         DataType::Int8 => {
             let casted_array = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
@@ -346,7 +355,7 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
                 .ok_or_else(|| {
                     DataFusionError::Internal("Failed to downcast to Decimal128Array".into())
                 })?;
-            let width = width as i128;
+            let width = i128::from(width);
             let width_array = Decimal128Array::from_value(width, array.len());
             let result: Decimal128Array =
                 binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))
@@ -360,7 +369,7 @@ fn compute_truncate_array(array: ArrayRef, width: i64) -> Result<ArrayRef, DataF
                 .ok_or_else(|| {
                     DataFusionError::Internal("Failed to downcast to Decimal256Array".into())
                 })?;
-            let width = i256::from_i128(width as i128);
+            let width = i256::from_i128(i128::from(width));
             let width_array = Decimal256Array::from_value(width, array.len());
             let result: Decimal256Array =
                 binary(casted_array, &width_array, |v, w| v - (((v % w) + w) % w))
