@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::num::TryFromIntError;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -28,7 +29,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
-use snafu::{Snafu, ensure};
+use snafu::{ResultExt, Snafu, ensure};
 use tract_core::num_traits::Num;
 
 // Maximum truncation width or length, chosen to prevent overflow or excessive memory usage.
@@ -51,6 +52,9 @@ pub enum TruncateError {
         "Second argument must be Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Decimal128, Decimal256, Utf8, or Binary, got {data_type}"
     ))]
     InvalidSecondArgType { data_type: DataType },
+
+    #[snafu(display("Failed to cast the width argument: {source}"))]
+    WidthCastingFailed { source: TryFromIntError },
 }
 
 impl From<TruncateError> for DataFusionError {
@@ -166,22 +170,6 @@ impl ScalarUDFImpl for Truncate {
     }
 }
 
-macro_rules! truncate_numeric_scalar {
-    ($SCALAR:expr, $WIDTH:expr, $TYPE:ty, $SCALAR_TYPE:ident) => {
-        match $SCALAR {
-            ScalarValue::$SCALAR_TYPE(Some(v)) => {
-                let w = $WIDTH as $TYPE;
-                let result = truncate_numeric(v, w);
-                Ok(ScalarValue::$SCALAR_TYPE(Some(result)))
-            }
-            _ => Err(TruncateError::InvalidSecondArgType {
-                data_type: $SCALAR.data_type(),
-            }
-            .into()),
-        }
-    };
-}
-
 macro_rules! truncate_numeric_array {
     ($ARRAY:expr, $WIDTH:expr, $ARRAY_TYPE:ty, $SCALAR_TYPE:ty) => {{
         let casted_array = $ARRAY
@@ -202,7 +190,6 @@ macro_rules! truncate_numeric_array {
     }};
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compute_truncate_scalar(
     scalar: ScalarValue,
     width: i64,
@@ -212,17 +199,20 @@ fn compute_truncate_scalar(
     }
 
     match scalar {
-        ScalarValue::Int8(_) => truncate_numeric_scalar!(scalar, width, i8, Int8),
-        ScalarValue::Int16(_) => truncate_numeric_scalar!(scalar, width, i16, Int16),
-        ScalarValue::Int32(_) => truncate_numeric_scalar!(scalar, width, i32, Int32),
-        ScalarValue::Int64(_) => truncate_numeric_scalar!(scalar, width, i64, Int64),
-        ScalarValue::UInt8(_) => truncate_numeric_scalar!(scalar, width, u8, UInt8),
-        ScalarValue::UInt16(_) => truncate_numeric_scalar!(scalar, width, u16, UInt16),
-        ScalarValue::UInt32(_) => truncate_numeric_scalar!(scalar, width, u32, UInt32),
-        ScalarValue::UInt64(_) => truncate_numeric_scalar!(scalar, width, u64, UInt64),
+        ScalarValue::Int8(Some(v)) => Ok(ScalarValue::Int8(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int16(Some(v)) => Ok(ScalarValue::Int16(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(truncate_numeric(v, width)?))),
+        ScalarValue::Int64(Some(v)) => {
+            let result = v - (((v % width) + width) % width);
+            Ok(ScalarValue::Int64(Some(result)))
+        }
+        ScalarValue::UInt8(Some(v)) => Ok(ScalarValue::UInt8(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt16(Some(v)) => Ok(ScalarValue::UInt16(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt32(Some(v)) => Ok(ScalarValue::UInt32(Some(truncate_numeric(v, width)?))),
+        ScalarValue::UInt64(Some(v)) => Ok(ScalarValue::UInt64(Some(truncate_numeric(v, width)?))),
         ScalarValue::Decimal128(Some(v), p, s) => {
-            let w = i128::from(width);
-            let result = truncate_numeric(v, w);
+            let width = i128::from(width);
+            let result = v - (((v % width) + width) % width);
             Ok(ScalarValue::Decimal128(Some(result), p, s))
         }
         ScalarValue::Decimal256(Some(v), p, s) => {
@@ -247,14 +237,14 @@ fn compute_truncate_scalar(
     }
 }
 
-fn truncate_numeric<T: Num + Copy>(v: T, w: T) -> T {
-    if w == T::zero() {
-        return v;
-    }
-    v - (((v % w) + w) % w)
+fn truncate_numeric<V, W>(v: V, w: W) -> Result<V, TruncateError>
+where
+    V: Num + Copy + TryFrom<W, Error = TryFromIntError>,
+{
+    let w = V::try_from(w).context(WidthCastingFailedSnafu)?;
+    Ok(v - (((v % w) + w) % w))
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn compute_truncate_array(array: &ArrayRef, width: i64) -> Result<ArrayRef, DataFusionError> {
     match array.data_type() {
         DataType::Int8 => truncate_numeric_array!(array, width, Int8Array, i8),
