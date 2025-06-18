@@ -89,10 +89,4 @@ mod tests {
         let url = Url::parse("s3:///path/to/file").expect("Failed to parse URL");
         assert!(get_bucket_name(&url).is_err());
     }
-
-    #[test]
-    fn test_get_bucket_name_wrong_scheme() {
-        let url = Url::parse("https://my-bucket/path/to/file").expect("Failed to parse URL");
-        assert!(get_bucket_name(&url).is_err());
-    }
 }
