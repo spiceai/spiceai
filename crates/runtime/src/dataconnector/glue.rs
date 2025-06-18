@@ -51,7 +51,7 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 enum Error {
     #[snafu(display(
-        "Unable to get the table `{table}` from database `{database}`. Do the database and table exist?"
+        "Could not retrieve table '{table}' from database '{database}'. Verify that both the database and table exist and are accessible."
     ))]
     GetTable { database: String, table: String },
     #[snafu(display("Unable to load the AWS configuration.\n{source}"))]
