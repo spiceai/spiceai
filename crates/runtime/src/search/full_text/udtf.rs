@@ -1,6 +1,6 @@
 use std::{any::Any, sync::Arc};
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{Field, Schema, SchemaRef};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -21,13 +21,12 @@ use datafusion::{
     common::Column,
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::TableProviderFilterPushDown,
     physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
-use search::generation::text_search::FullTextSearchTable;
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::text_search::FullTextSearchTable};
 
 use crate::{
     datafusion::DataFusion,
@@ -109,7 +108,7 @@ impl TextSearchTableFunc {
 
             // Single argument cases
             (Some(Expr::Literal(ScalarValue::Utf8(Some(col)))), None, None) => {
-                (Some(col), None, Some(true))
+                (Some(col.clone()), None, Some(true))
             }
             (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
                 (None, Some(*limit as usize), Some(true))
@@ -123,12 +122,12 @@ impl TextSearchTableFunc {
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 None,
-            ) => (Some(col), Some(*limit as usize), Some(true)),
+            ) => (Some(col.clone()), Some(*limit as usize), Some(true)),
             (
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
-            ) => (Some(col), None, Some(include_score)),
+            ) => (Some(col.clone()), None, Some(*include_score)),
             (
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
@@ -140,7 +139,11 @@ impl TextSearchTableFunc {
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
-            ) => (Some(col), Some(*limit as usize), Some(include_score)),
+            ) => (
+                Some(col.clone()),
+                Some(*limit as usize),
+                Some(*include_score),
+            ),
 
             // Invalid argument combinations
             (a, b, c) => {
@@ -191,7 +194,19 @@ impl TableProvider for TextSearchTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        // This is a simplification for now.
+        Arc::new(Schema::new(vec![
+            Field::new(
+                self.args.primary_key.clone(),
+                arrow_schema::DataType::Utf8,
+                false,
+            ),
+            Field::new(
+                SEARCH_SCORE_COLUMN_NAME.to_string(),
+                arrow_schema::DataType::Float64,
+                false,
+            ),
+        ]))
     }
 
     fn table_type(&self) -> TableType {
@@ -212,7 +227,7 @@ impl TableProvider for TextSearchTableProvider {
             column,
             limit: args_limit,
             include_score,
-        } = self.args;
+        } = &self.args;
         let Some(table_provider) = self.df.get_table(&tbl).await else {
             return Err(DataFusionError::Internal(format!(
                 "TODO, need to return empty exec instead"
@@ -226,14 +241,14 @@ impl TableProvider for TextSearchTableProvider {
             )));
         };
         let col: String = if let Some(col) = column {
-            if !fts.search_fields.contains(&col) {
+            if !fts.search_fields.contains(col) {
                 return Err(DataFusionError::Internal(format!(
                     "TODO, need to return empty exec instead"
                 )));
             };
-            col
+            col.clone()
         } else {
-            let fields = fts.search_fields.iter();
+            let mut fields = fts.search_fields.iter();
             let z = match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
@@ -245,7 +260,7 @@ impl TableProvider for TextSearchTableProvider {
                     return Err(DataFusionError::Internal(format!(
                         "TODO, need to return empty exec instead"
                     )));
-                };
+                }
             };
             z
         };
@@ -255,8 +270,8 @@ impl TableProvider for TextSearchTableProvider {
             )));
         };
 
-        let tbl = FullTextSearchTable::new(index, query).minimal_schema();
-        tbl.scan(state, projection, filters, limit.or(args_limit))
+        let tbl = FullTextSearchTable::new(index, query.clone()).minimal_schema();
+        tbl.scan(state, projection, filters, limit.or(*args_limit))
             .await
     }
 }

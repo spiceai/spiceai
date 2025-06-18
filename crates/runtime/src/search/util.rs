@@ -17,7 +17,6 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::Ok;
 use app::App;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;

@@ -10,23 +10,31 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, cmp::min, collections::HashMap, sync::Arc};
+use std::{any::Any, cmp::min, collections::HashMap, fmt::Formatter, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use arrow::{
     array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
+    datatypes::{Field, Schema, SchemaRef},
     error::ArrowError,
 };
 use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::TableProvider,
-    error::DataFusionError,
+    catalog::{Session, TableProvider},
+    common::Constraints,
+    datasource::TableType,
+    error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
-    logical_expr::sqlparser::ast::Expr,
-    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
+    logical_expr::{TableProviderFilterPushDown, sqlparser::ast::Expr},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
+    prelude::Expr as LogicalExpr,
     sql::sqlparser::ast::Ident,
 };
 
@@ -38,7 +46,7 @@ use tantivy::{
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
-    schema::{Field, OwnedValue},
+    schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
 
@@ -218,7 +226,7 @@ impl FullTextSearch {
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
-                let doc: HashMap<Field, OwnedValue> =
+                let doc: HashMap<tantivy::schema::Field, OwnedValue> =
                     searcher.doc(addr).context(TextSearchSnafu)?;
 
                 let mut doc_w_col_names = doc
@@ -406,6 +414,26 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
     let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
         hits.iter().map(Ok),
     )?);
+
+    // Ensure `SEARCH_SCORE_COLUMN_NAME` is f64 not f32 or other numeric.
+    let schema = Arc::new(Schema::new(
+        schema
+            .fields()
+            .into_iter()
+            .map(|f| {
+                if f.name() == SEARCH_SCORE_COLUMN_NAME {
+                    Arc::new(Field::new(
+                        f.name(),
+                        arrow::datatypes::DataType::Float64,
+                        f.is_nullable(),
+                    ))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+
     let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
 
     decoder.serialize(hits)?;
@@ -414,29 +442,40 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
 }
 
 /// An implementation of [`TableProvider`] based on a known query on a [`FullTextSearch`] index.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FullTextSearchTable {
     index: FullTextSearch,
     query: String,
 
     // If minimal, return only primary key and score.
     minimal: bool,
+
+    default_limit: usize,
 }
+
 impl FullTextSearchTable {
+    #[must_use]
     pub fn new(index: FullTextSearch, query: String) -> Self {
         Self {
             index,
             query,
             minimal: false,
+            default_limit: DEFAULT_BATCH_SIZE,
         }
     }
 
+    #[must_use]
     pub fn minimal_schema(mut self) -> Self {
         self.minimal = true;
         self
     }
-}
 
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.default_limit = limit;
+        self
+    }
+}
 #[async_trait]
 impl TableProvider for FullTextSearchTable {
     fn as_any(&self) -> &dyn Any {
@@ -446,21 +485,54 @@ impl TableProvider for FullTextSearchTable {
     fn schema(&self) -> SchemaRef {
         let tantivy_schema = self.index.idx.schema();
 
-        if self.minimal {
-            let pks = self.index.primary_key.iter().filter_map(|pk| {
-                let f = tantivy_schema.get_field(field_name).ok()?;
-                let entry = tantivy_schema.get_field_entry(&f);
-                entry.field_type()
+        let fields = if self.minimal {
+            let mut fields = self
+                .index
+                .primary_key
+                .iter()
+                .filter_map(|pk| {
+                    let f = tantivy_schema.get_field(pk).ok()?;
+                    let entry = tantivy_schema.get_field_entry(f);
+                    let data_type = tantivy_to_arrow_type(entry.field_type())?;
+                    Some(Field::new(pk, data_type, false))
+                })
+                .collect::<Vec<_>>();
+            fields.push(Field::new(
+                SEARCH_SCORE_COLUMN_NAME,
+                arrow::datatypes::DataType::Float64,
+                false,
+            ));
+            fields
+        } else {
+            self.index
+                .all_columns()
+                .iter()
+                .filter_map(|field_name| {
+                    let f = tantivy_schema.get_field(field_name).ok()?;
+                    let entry = tantivy_schema.get_field_entry(f);
+                    let data_type = tantivy_to_arrow_type(entry.field_type())?;
+                    Some(Field::new(field_name, data_type, false))
+                })
+                .chain([
+                    Field::new(
+                        SEARCH_SCORE_COLUMN_NAME,
+                        arrow::datatypes::DataType::Float64,
+                        false,
+                    ),
+                    Field::new(
+                        SEARCH_VALUE_COLUMN_NAME,
+                        arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
+                ])
+                .collect::<Vec<_>>()
+        };
 
-            });
-            self.index.idx.schema()
-
-        }
-        self.index.primary_key
-        Arc::new(Schema::empty())
+        Arc::new(Schema::new(fields))
     }
 
     fn constraints(&self) -> Option<&Constraints> {
+        // TODO primary keys
         None
     }
 
@@ -475,7 +547,15 @@ impl TableProvider for FullTextSearchTable {
         filters: &[LogicalExpr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(format!("food")))
+        Ok(Arc::new(
+            FullTextSearchTableExec::try_new(
+                self.clone(),
+                projection,
+                filters.to_vec(),
+                limit.unwrap_or(self.default_limit),
+            )
+            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+        ))
     }
 
     fn supports_filters_pushdown(
@@ -483,6 +563,139 @@ impl TableProvider for FullTextSearchTable {
         _filters: &[&LogicalExpr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         Ok(vec![])
+    }
+}
+
+pub struct FullTextSearchTableExec {
+    tbl: FullTextSearchTable,
+    filters: Vec<LogicalExpr>,
+    limit: usize,
+    plan_properties: PlanProperties,
+}
+
+impl FullTextSearchTableExec {
+    pub fn try_new(
+        tbl: FullTextSearchTable,
+        projection: Option<&Vec<usize>>,
+        filters: Vec<LogicalExpr>,
+        limit: usize,
+    ) -> Result<Self, ArrowError> {
+        let schema = match projection {
+            Some(proj) => Arc::new(tbl.schema().project(proj.as_slice())?),
+            None => Arc::clone(&tbl.schema()),
+        };
+
+        Ok(Self {
+            tbl,
+            filters,
+            limit,
+            plan_properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ),
+        })
+    }
+}
+
+impl std::fmt::Debug for FullTextSearchTableExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextSearchTableExec")
+            .field("tbl", &self.tbl)
+            .field("filters", &self.filters)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+impl DisplayAs for FullTextSearchTableExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "FullTextSearchTableExec q={}", self.tbl.query)
+    }
+}
+
+impl ExecutionPlan for FullTextSearchTableExec {
+    fn name(&self) -> &'static str {
+        "FullTextSearchTableExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::clone(&self) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let idx = self.tbl.index.clone();
+        let schema = self.schema();
+        let limit = self.limit;
+        let query = self.tbl.query.clone();
+        let s = stream! {
+        // TODO: Support filters.
+            match idx
+                .search(query, &[], &[], limit)
+                .await
+                .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
+                Ok(mut stream) => {
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Err(e) => yield Err(e),
+                            Ok(rb) => {
+                                // Apply projection, as per `self.schema()`, to record batch from FTS.
+                                let proj = rb.schema().fields().iter().enumerate().filter_map(|(i, f)| {
+                                    if schema.column_with_name(f.name()).is_some() {
+                                        Some(i)
+                                    } else {
+                                        None
+                                    }
+                                }).collect::<Vec<_>>();
+                                yield rb.project(proj.as_slice()).map_err(|e| {
+                                    DataFusionError::ArrowError(
+                                        e,
+                                        None,
+                                    )
+                                })
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            }
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), s)))
+    }
+}
+
+fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
+    match t {
+        FieldType::Str(_) => Some(arrow::datatypes::DataType::Utf8),
+        FieldType::I64(_) => Some(arrow::datatypes::DataType::Int64),
+        FieldType::U64(_) => Some(arrow::datatypes::DataType::UInt64),
+        FieldType::F64(_) => Some(arrow::datatypes::DataType::Float64),
+        FieldType::Date(_) => Some(arrow::datatypes::DataType::Date32),
+        FieldType::Bool(_) => Some(arrow::datatypes::DataType::Boolean),
+        FieldType::Bytes(_) => Some(arrow::datatypes::DataType::Binary),
+        _ => None,
     }
 }
 

@@ -208,12 +208,10 @@ impl RuntimeBuilder {
 
         // UDF that require a reference to the DataFusion instance defined here.
 
-        df.ctx
-            .register_udtf("text_search", TextSearchTableFunc::new(Arc::clone(&df)))
-            .await
-            .map_err(|e| {
-                tracing::warn!("Failed to register 'text_search' function: {e}");
-            });
+        df.ctx.register_udtf(
+            "text_search",
+            Arc::new(TextSearchTableFunc::new(Arc::clone(&df))),
+        );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
