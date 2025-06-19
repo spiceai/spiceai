@@ -117,13 +117,7 @@ impl SpiceCloudPlatformCatalog {
             .params
             .get("http_endpoint")
             .expose()
-            .unwrap_or_else(|_| {
-                if cfg!(feature = "dev") {
-                    "https://dev.spiceai.io".into()
-                } else {
-                    "https://spiceai.io".into()
-                }
-            });
+            .unwrap_or_else(|_| "https://spiceai.io".into());
 
         let mut props = HashMap::new();
         if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
