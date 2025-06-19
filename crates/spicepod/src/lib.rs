@@ -22,6 +22,7 @@ use reader::ReadableYaml;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::path::Path;
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
 use component::{
@@ -286,18 +287,22 @@ impl Spicepod {
 
         let is_file = path.is_file() || path.extension().is_some();
 
-        let spicepod_rdr = if file_stem == "spicepod" && is_file {
-            fs.open_exact_yaml(path.clone())
+        let (spicepod_rdr, base_path) = if file_stem == "spicepod" && is_file {
+            let spicepod_rdr = fs
+                .open_exact_yaml(path.clone())
                 .await
                 .map_err(Box::new)
-                .context(UnableToOpenSpicepodSnafu { path: path.clone() })?
+                .context(UnableToOpenSpicepodSnafu { path: path.clone() })?;
+            (spicepod_rdr, path.parent().unwrap_or(Path::new(".")))
         } else {
-            fs.open_yaml(path.clone(), "spicepod")
+            let spicepod_rdr = fs
+                .open_yaml(path.clone(), "spicepod")
                 .await
-                .context(SpicepodNotFoundSnafu { path: path.clone() })?
+                .context(SpicepodNotFoundSnafu { path: path.clone() })?;
+            (spicepod_rdr, path.as_ref())
         };
 
-        Self::load_from_rdr(fs, spicepod_rdr, path).await
+        Self::load_from_rdr(fs, spicepod_rdr, base_path).await
     }
 
     pub async fn load_definition(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {
@@ -319,6 +324,15 @@ impl Spicepod {
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
+    }
+
+    #[must_use]
+    pub fn base_path(path: &Path) -> &Path {
+        if path.is_file() || path.extension().is_some() {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path
+        }
     }
 }
 

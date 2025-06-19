@@ -283,7 +283,7 @@ impl AppBuilder {
         let spicepod_root = Spicepod::load(&path)
             .await
             .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        Self::build_from_spicepod(spicepod_root, path).await
+        Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
     #[allow(clippy::too_many_lines)]
