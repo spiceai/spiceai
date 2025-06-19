@@ -404,7 +404,8 @@ impl SpiceTestQueryWorker {
         let query_start = Instant::now();
         let mut result_stream = self
             .spice_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?);
+            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
+            .await?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];

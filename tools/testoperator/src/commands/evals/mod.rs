@@ -206,6 +206,7 @@ async fn execute_sql(
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let res = spice_client
         .query(sql)
+        .await?
         .try_collect::<Vec<RecordBatch>>()
         .await?;
     Ok(res)
