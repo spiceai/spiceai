@@ -661,7 +661,7 @@ impl Runtime {
                 )
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
+                    data_connector: source.clone(),
                     connector_component: ConnectorComponent::from(&ds),
                 })?;
 
@@ -672,7 +672,10 @@ impl Runtime {
                 if let Some(provider) = self.datafusion().get_table(ds.name()).await {
                     self.datafusion()
                         .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
-                        .await;
+                        .context(UnableToAttachDataConnectorSnafu {
+                            data_connector: source,
+                            connector_component: ConnectorComponent::from(&ds),
+                        })?;
                 }
             }
             return Ok(());
@@ -714,7 +717,7 @@ impl Runtime {
             )
             .await
             .context(UnableToAttachDataConnectorSnafu {
-                data_connector: source,
+                data_connector: source.clone(),
                 connector_component: ConnectorComponent::from(&ds),
             })?;
 
@@ -728,22 +731,27 @@ impl Runtime {
                 if ds.has_full_text_column() {
                     let df = Arc::clone(&runtime).datafusion();
                     if let Some(provider) = df.get_table(ds.name()).await {
-                        df.register_table_index(ds.name().clone(), FullTextIndex::from(provider))
-                            .await;
+                        if let Err(e) = df
+                            .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                        {
+                            tracing::error!(
+                                "Failed to register full text index for dataset '{dataset_name}': {e}"
+                            );
+                        }
                     }
                 }
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
-                    tracing::error!(
-                        "Failed to create dataset schedule for '{}': {e}",
-                        dataset_name
-                    );
+                    tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
             });
         } else if ds.has_full_text_column() {
             if let Some(provider) = self.datafusion().get_table(ds.name()).await {
                 self.datafusion()
                     .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
-                    .await;
+                    .context(UnableToAttachDataConnectorSnafu {
+                        data_connector: source,
+                        connector_component: ConnectorComponent::from(&ds),
+                    })?;
             }
         }
 

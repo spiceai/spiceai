@@ -113,7 +113,7 @@ impl TextSearchTableFunc {
                 (Some(col.clone()), None, Some(true))
             }
             (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
-                (None, Some(*limit as usize), Some(true))
+                (None, Some(*limit), Some(true))
             }
             (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))), None, None) => {
                 (None, None, Some(*include_score))
@@ -124,7 +124,7 @@ impl TextSearchTableFunc {
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 None,
-            ) => (Some(col.clone()), Some(*limit as usize), Some(true)),
+            ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
@@ -134,18 +134,14 @@ impl TextSearchTableFunc {
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
-            ) => (None, Some(*limit as usize), Some(*include_score)),
+            ) => (None, Some(*limit), Some(*include_score)),
 
             // All three arguments provided
             (
                 Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
-            ) => (
-                Some(col.clone()),
-                Some(*limit as usize),
-                Some(*include_score),
-            ),
+            ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
 
             // Invalid argument combinations
             (a, b, c) => {
@@ -159,7 +155,7 @@ impl TextSearchTableFunc {
             query: q.to_string(),
             primary_key: pk.clone(),
             column,
-            limit,
+            limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
         })
     }
@@ -175,11 +171,19 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.tbl.clone()
             )));
         }
-        let Some(fts_index) = self.df.get_full_text_index(&args.tbl) else {
-            return Err(DataFusionError::Plan(format!(
-                "UDTF {TEXT_SEARCH_UDTF_NAME} requires the table '{}' to have a full text search index, but it does not.",
-                args.tbl
-            )));
+        let fts_index = match self.df.get_full_text_index(&args.tbl) {
+            Ok(Some(fts_index)) => fts_index,
+            Ok(None) => {
+                return Err(DataFusionError::Plan(format!(
+                    "UDTF {TEXT_SEARCH_UDTF_NAME} requires the table '{}' to have a full text search index, but it does not.",
+                    args.tbl
+                )));
+            }
+            Err(e) => {
+                return Err(DataFusionError::Internal(
+                    "An internal issue occurred retrieving the text search".into(),
+                ));
+            }
         };
 
         Ok(Arc::new(TextSearchTableProvider {
@@ -281,7 +285,7 @@ impl TableProvider for TextSearchTableProvider {
                 let fields: Vec<_> = self
                     .schema()
                     .project(proj.as_slice())
-                    .map_err(|e| DataFusionError::ArrowError(e, None))?
+                    .map_err(DataFusionError::from)?
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())

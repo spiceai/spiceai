@@ -26,6 +26,12 @@ impl Index {
     pub fn is_full_text(&self) -> bool {
         matches!(self, Self::FullText(_))
     }
+
+    pub fn index_type(&self) -> &str {
+        match self {
+            Self::FullText(_) => "full_text",
+        }
+    }
 }
 
 impl From<FullTextIndex> for Index {

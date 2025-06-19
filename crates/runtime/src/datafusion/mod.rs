@@ -247,6 +247,17 @@ pub enum Error {
         dataset_name: String,
         source: AcceleratedTableBuilderError,
     },
+    #[snafu(display("Failed register a '{index_type}' index for the table '{dataset_name}'"))]
+    UnableToRegisterTableIndex {
+        dataset_name: String,
+        index_type: String,
+    },
+
+    #[snafu(display("Failed get the '{index_type}' index for the table '{dataset_name}'"))]
+    UnableToGetTableIndex {
+        dataset_name: String,
+        index_type: String,
+    },
 }
 
 pub enum Table {
@@ -501,30 +512,50 @@ impl DataFusion {
         Ok(is_ready)
     }
 
-    pub async fn register_table_index(
+    pub fn register_table_index(
         &self,
         table_ref: impl Into<TableReference>,
         index: impl Into<Index>,
-    ) {
+    ) -> Result<()> {
         let tbl = table_ref.into();
-        tracing::warn!("register_table_index: {:?}", tbl.clone());
-        let mut index_ref = self.indexes.write().unwrap();
+        let idx: Index = index.into();
+
+        let mut index_ref =
+            self.indexes
+                .write()
+                .map_err(|_| Error::UnableToRegisterTableIndex {
+                    dataset_name: tbl.to_string(),
+                    index_type: idx.index_type().to_string(),
+                })?;
         if let Some(existing_indexes) = index_ref.get_mut(&tbl) {
-            existing_indexes.push(index.into());
+            existing_indexes.push(idx);
         } else {
-            index_ref.insert(tbl, vec![index.into()]);
+            index_ref.insert(tbl, vec![idx]);
         }
+        Ok(())
     }
 
-    pub(crate) fn get_full_text_index(&self, tbl: &TableReference) -> Option<FullTextIndex> {
-        let indexes = self.indexes.read().unwrap();
-        let idxs = indexes.get(tbl)?;
-        idxs.iter()
+    pub(crate) fn get_full_text_index(
+        &self,
+        tbl: &TableReference,
+    ) -> Result<Option<FullTextIndex>> {
+        let Ok(indexes) = self.indexes.read() else {
+            return Err(Error::UnableToGetTableIndex {
+                dataset_name: tbl.to_string(),
+                index_type: "full_text".to_string(),
+            });
+        };
+
+        let Some(idxs) = indexes.get(tbl) else {
+            return Ok(None);
+        };
+        Ok(idxs
+            .iter()
             .find_map(|i| match i {
                 Index::FullText(t) => Some(t),
                 _ => None,
             })
-            .cloned()
+            .cloned())
     }
 
     #[must_use]

@@ -75,7 +75,7 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                 else {
                     return Ok(Transformed::no(plan));
                 };
-                let underlying = default_source.table_provider.clone();
+                let underlying = Arc::clone(&default_source.table_provider);
                 let Some(text_search_udtf) = underlying
                     .as_any()
                     .downcast_ref::<TextSearchTableProvider>()
