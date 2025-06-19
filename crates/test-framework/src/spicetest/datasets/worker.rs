@@ -379,8 +379,11 @@ impl SpiceTestQueryWorker {
                     })
                 } else {
                     eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.name, e
+                        "{} FAIL - Worker {} - Query '{}' failed: {}",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name,
+                        e
                     );
                     query_durations.entry(Arc::clone(&query.name)).or_default();
                     Ok(QueryRunResult {
@@ -422,8 +425,11 @@ impl SpiceTestQueryWorker {
                         validation_records.clear();
                     } else {
                         eprintln!(
-                            "FAIL - Worker {} - Query '{}' failed: {}",
-                            self.id, query.name, e
+                            "{} FAIL - Worker {} - Query '{}' failed: {}",
+                            chrono::Utc::now(),
+                            self.id,
+                            query.name,
+                            e
                         );
                         query_durations.entry(Arc::clone(&query.name)).or_default();
                         return Err(e.into());
@@ -460,8 +466,10 @@ impl SpiceTestQueryWorker {
             let validation_result = validation::validate_tpch_query(query, &validation_records)?;
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
-                    self.id, query.name
+                    "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    chrono::Utc::now(),
+                    self.id,
+                    query.name
                 );
                 return Err(anyhow::anyhow!(
                     "Query validation failed: {validation_reason:?}"
