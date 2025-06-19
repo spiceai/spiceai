@@ -8574,6 +8574,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "object-store-aws-sdk"
+version = "1.5.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "object_store",
+ "snafu",
+ "url",
+]
+
+[[package]]
 name = "object_store"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12273,8 +12285,12 @@ dependencies = [
 name = "spicepod"
 version = "1.5.0-unstable"
 dependencies = [
+ "async-trait",
  "byte-unit",
  "fundu",
+ "futures",
+ "object-store-aws-sdk",
+ "object_store",
  "regex",
  "schemars 0.9.0",
  "serde",
@@ -12282,7 +12298,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "snafu",
+ "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

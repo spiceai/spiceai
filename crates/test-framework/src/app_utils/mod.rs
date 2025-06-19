@@ -19,6 +19,7 @@ use std::io::{self, Cursor};
 use std::path::PathBuf;
 
 use app::{App, AppBuilder};
+use async_trait::async_trait;
 use spicepod::reader::ReadableYaml;
 use spicepod::{
     Spicepod,
@@ -37,18 +38,25 @@ impl SpicepodString {
     }
 }
 
+#[async_trait]
 impl ReadablePath for SpicepodString {
-    fn open(&self, _path: impl Into<PathBuf>) -> reader::Result<Box<dyn io::Read>> {
+    async fn open(&self, _path: PathBuf) -> reader::Result<Box<dyn io::Read + Send + Sync>> {
         Ok(Box::new(Cursor::new(self.spicepod_str.clone())))
     }
 }
 
 impl ReadableYaml for SpicepodString {}
 
-pub fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
+#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::expect_used)]
+pub async fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
     let spicepod_str = SpicepodString::new(Cow::Borrowed(spicepod_str));
-    let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))?;
-    let app = AppBuilder::build_from_spicepod(spicepod, PathBuf::from("."))?;
+    let spicepod = Spicepod::load_from(&spicepod_str, PathBuf::from("."))
+        .await
+        .expect("should be able to load spicepod");
+    let app = AppBuilder::build_from_spicepod(spicepod, PathBuf::from("."))
+        .await
+        .expect("should be able to build app");
     Ok(app)
 }
 
@@ -56,8 +64,8 @@ pub fn load_app_from_spicepod_str(spicepod_str: &str) -> anyhow::Result<App> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_load_app_from_spicepod_str() {
+    #[tokio::test]
+    async fn test_load_app_from_spicepod_str() {
         let spicepod_str = "version: v1
 kind: Spicepod
 name: iceberg-ai-demo
@@ -73,7 +81,9 @@ datasets:
       pg_db: ${ secrets:PG_DB }
       pg_sslmode: require
         ";
-        let app = load_app_from_spicepod_str(spicepod_str).expect("should be able to load app");
+        let app = load_app_from_spicepod_str(spicepod_str)
+            .await
+            .expect("should be able to load app");
         assert_eq!(app.name, "iceberg-ai-demo");
         assert_eq!(app.datasets.len(), 1);
         assert_eq!(app.datasets[0].name, "user_roles");

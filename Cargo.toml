@@ -14,6 +14,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
+    "crates/object-store-aws-sdk",
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
@@ -66,6 +67,8 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "2137319
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.86"
+aws-config = "1.6.1"
+aws-credential-types = "1.2"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
@@ -109,7 +112,7 @@ logos = "0.15.0"
 mailparse = "0.15.0"
 moka = { version = "0.12", features = ["future"] }
 mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
-object_store = { version = "0.12" }
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
 odbc-api = { version = "13" }
 opentelemetry = { version = "0.27", default-features = false, features = [
     "metrics",
@@ -172,6 +175,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+url = "2.5"
 uuid = "1"
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released

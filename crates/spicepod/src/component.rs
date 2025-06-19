@@ -129,8 +129,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn resolve_component_references<ComponentType>(
-    fs: &impl reader::ReadableYaml,
+pub async fn resolve_component_references<ComponentType>(
+    fs: &(impl reader::ReadableYaml + Send + Sync),
     base_path: impl Into<PathBuf>,
     items: &[ComponentOrReference<ComponentType>],
     component_name: &str,
@@ -139,33 +139,40 @@ where
     ComponentType: Clone + DeserializeOwned + Debug + WithDependsOn<ComponentType>,
 {
     let base_path: PathBuf = base_path.into();
-    items
+    let futures = items
         .iter()
-        .map(|item| match item {
-            ComponentOrReference::Component(component) => Ok(component.clone()),
-            ComponentOrReference::Reference(reference) => {
-                let component_base_path = base_path.join(&reference.r#ref);
-                let component_base_path_str = component_base_path
-                    .to_str()
-                    .ok_or(Error::UnableToConvertPath)?;
+        .map(|item| {
+            let value = base_path.clone();
+            async move {
+                match item {
+                    ComponentOrReference::Component(component) => Ok(component.clone()),
+                    ComponentOrReference::Reference(reference) => {
+                        let component_base_path = value.join(&reference.r#ref);
 
-                let component_rdr = fs
-                    .open_yaml(component_base_path_str, component_name)
-                    .ok_or_else(|| Error::InvalidComponentReference {
-                        path: component_base_path.clone(),
-                    })?;
+                        let component_rdr = fs
+                            .open_yaml(component_base_path.clone(), component_name)
+                            .await
+                            .ok_or_else(|| Error::InvalidComponentReference {
+                                path: component_base_path.clone(),
+                            })?;
 
-                let component_definition: ComponentType = serde_yaml::from_reader(component_rdr)
-                    .context(UnableToParseSpicepodComponentSnafu {
-                        path: component_base_path,
-                    })?;
+                        let component_definition: ComponentType = serde_yaml::from_reader(
+                            component_rdr,
+                        )
+                        .context(UnableToParseSpicepodComponentSnafu {
+                            path: component_base_path,
+                        })?;
 
-                let component = component_definition.depends_on(&reference.depends_on);
+                        let component = component_definition.depends_on(&reference.depends_on);
 
-                Ok(component)
+                        Ok(component)
+                    }
+                }
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    futures::future::try_join_all(futures).await
 }
 
 pub(super) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
