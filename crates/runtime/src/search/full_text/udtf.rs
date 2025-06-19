@@ -210,7 +210,7 @@ impl TableProvider for TextSearchTableProvider {
             arrow_schema::DataType::Float64,
             false,
         )));
-
+        tracing::error!("Fields in TextSearchTableProvider. {fields:#?}");
         Arc::new(Schema::new(fields))
     }
 
@@ -274,8 +274,40 @@ impl TableProvider for TextSearchTableProvider {
             )));
         };
 
-        let tbl = FullTextSearchTable::new(index, query.clone()).minimal_schema();
-        tbl.scan(state, projection, filters, limit.or(*args_limit))
-            .await
+        let tbl = FullTextSearchTable::new(index, query.clone());
+        // Must convert projection of full virtual schema (base schema + 'score'), to the schema of the full text search index.
+        let underlying_projection = match projection {
+            Some(proj) => {
+                let fields: Vec<_> = self
+                    .schema()
+                    .project(proj.as_slice())
+                    .map_err(|e| DataFusionError::ArrowError(e, None))?
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                tbl.schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| {
+                        if fields.contains(&f.name()) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
+            None => (0..tbl.schema().fields().len()).collect(),
+        };
+
+        tbl.scan(
+            state,
+            Some(&underlying_projection),
+            filters,
+            limit.or(*args_limit),
+        )
+        .await
     }
 }

@@ -393,7 +393,7 @@ fn make_stream(
             remaining_limit -= limit;
 
             let mut decoder = match tantivy_json_to_arrow_decoder(hits.as_slice())
-                .map_err(|e| DataFusionError::ArrowError(e, None)) {
+                .map_err(DataFusionError::from) {
                     Ok(h) => h,
                     Err(e) => {
                         yield Err(e);
@@ -404,7 +404,7 @@ fn make_stream(
             match decoder.flush() {
                 Ok(Some(rb)) => yield Ok(rb),
                 Ok(None) => {},
-                Err(e) => yield Err(DataFusionError::ArrowError(e, None))
+                Err(e) => yield Err(DataFusionError::from(e))
             }
         }
     }
@@ -446,10 +446,6 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
 pub struct FullTextSearchTable {
     index: FullTextSearch,
     query: String,
-
-    // If minimal, return only primary key and score.
-    minimal: bool,
-
     default_limit: usize,
 }
 
@@ -459,15 +455,8 @@ impl FullTextSearchTable {
         Self {
             index,
             query,
-            minimal: false,
             default_limit: DEFAULT_BATCH_SIZE,
         }
-    }
-
-    #[must_use]
-    pub fn minimal_schema(mut self) -> Self {
-        self.minimal = true;
-        self
     }
 
     #[must_use]
@@ -485,48 +474,22 @@ impl TableProvider for FullTextSearchTable {
     fn schema(&self) -> SchemaRef {
         let tantivy_schema = self.index.idx.schema();
 
-        let fields = if self.minimal {
-            let mut fields = self
-                .index
-                .primary_key
-                .iter()
-                .filter_map(|pk| {
-                    let f = tantivy_schema.get_field(pk).ok()?;
-                    let entry = tantivy_schema.get_field_entry(f);
-                    let data_type = tantivy_to_arrow_type(entry.field_type())?;
-                    Some(Field::new(pk, data_type, false))
-                })
-                .collect::<Vec<_>>();
-            fields.push(Field::new(
+        let fields = self
+            .index
+            .all_columns()
+            .iter()
+            .filter_map(|field_name| {
+                let f = tantivy_schema.get_field(field_name).ok()?;
+                let entry = tantivy_schema.get_field_entry(f);
+                let data_type = tantivy_to_arrow_type(entry.field_type())?;
+                Some(Field::new(field_name, data_type, false))
+            })
+            .chain([Field::new(
                 SEARCH_SCORE_COLUMN_NAME,
                 arrow::datatypes::DataType::Float64,
                 false,
-            ));
-            fields
-        } else {
-            self.index
-                .all_columns()
-                .iter()
-                .filter_map(|field_name| {
-                    let f = tantivy_schema.get_field(field_name).ok()?;
-                    let entry = tantivy_schema.get_field_entry(f);
-                    let data_type = tantivy_to_arrow_type(entry.field_type())?;
-                    Some(Field::new(field_name, data_type, false))
-                })
-                .chain([
-                    Field::new(
-                        SEARCH_SCORE_COLUMN_NAME,
-                        arrow::datatypes::DataType::Float64,
-                        false,
-                    ),
-                    Field::new(
-                        SEARCH_VALUE_COLUMN_NAME,
-                        arrow::datatypes::DataType::Utf8,
-                        false,
-                    ),
-                ])
-                .collect::<Vec<_>>()
-        };
+            )])
+            .collect::<Vec<_>>();
 
         Arc::new(Schema::new(fields))
     }
@@ -554,7 +517,7 @@ impl TableProvider for FullTextSearchTable {
                 filters.to_vec(),
                 limit.unwrap_or(self.default_limit),
             )
-            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+            .map_err(DataFusionError::from)?,
         ))
     }
 
@@ -666,12 +629,7 @@ impl ExecutionPlan for FullTextSearchTableExec {
                                         None
                                     }
                                 }).collect::<Vec<_>>();
-                                yield rb.project(proj.as_slice()).map_err(|e| {
-                                    DataFusionError::ArrowError(
-                                        e,
-                                        None,
-                                    )
-                                })
+                                yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
                             }
                         }
                     }
