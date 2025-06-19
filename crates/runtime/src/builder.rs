@@ -207,7 +207,6 @@ impl RuntimeBuilder {
         let df = Arc::new(df);
 
         // UDF that require a reference to the DataFusion instance defined here.
-
         df.ctx.register_udtf(
             "text_search",
             Arc::new(TextSearchTableFunc::new(Arc::clone(&df))),

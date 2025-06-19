@@ -32,6 +32,8 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
+use crate::datafusion::indexes::Index;
+use crate::datafusion::indexes::full_text::FullTextIndex;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -79,6 +81,7 @@ pub mod dialect;
 pub mod error;
 pub mod extension;
 pub mod filter_converter;
+pub(crate) mod indexes;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
@@ -278,6 +281,13 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
+
+    // Spice managed indexes on tables.
+    // Indexes perform two tasks:
+    //   1. Alter [`LogicalPlan`]s for more efficient predicates
+    //   2. For use in UDTFs that provide a required ordering to table scans.
+    // Therefore, they are needed here (not on the [`TableProvider`]).
+    indexes: std::sync::RwLock<HashMap<TableReference, Vec<Index>>>,
 
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
@@ -489,6 +499,32 @@ impl DataFusion {
         }
 
         Ok(is_ready)
+    }
+
+    pub async fn register_table_index(
+        &self,
+        table_ref: impl Into<TableReference>,
+        index: impl Into<Index>,
+    ) {
+        let tbl = table_ref.into();
+        tracing::warn!("register_table_index: {:?}", tbl.clone());
+        let mut index_ref = self.indexes.write().unwrap();
+        if let Some(existing_indexes) = index_ref.get_mut(&tbl) {
+            existing_indexes.push(index.into());
+        } else {
+            index_ref.insert(tbl, vec![index.into()]);
+        }
+    }
+
+    pub(crate) fn get_full_text_index(&self, tbl: &TableReference) -> Option<FullTextIndex> {
+        let indexes = self.indexes.read().unwrap();
+        let idxs = indexes.get(tbl)?;
+        idxs.iter()
+            .find_map(|i| match i {
+                Index::FullText(t) => Some(t),
+                _ => None,
+            })
+            .cloned()
     }
 
     #[must_use]

@@ -13,7 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-pub mod analyzer_rule;
-pub mod connector;
-pub mod table;
-pub mod udtf;
+
+use std::sync::Arc;
+
+use datafusion::catalog::TableProvider;
+
+#[derive(Clone)]
+pub struct FullTextIndex {
+    pub underlying: Arc<dyn TableProvider>,
+}
+
+impl From<Arc<dyn TableProvider>> for FullTextIndex {
+    fn from(underlying: Arc<dyn TableProvider>) -> Self {
+        FullTextIndex { underlying }
+    }
+}

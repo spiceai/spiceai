@@ -29,12 +29,14 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
+    dataaccelerator::AccelerationSource,
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
     },
+    datafusion::indexes::full_text::FullTextIndex,
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
@@ -665,6 +667,14 @@ impl Runtime {
 
             self.status
                 .update_dataset(&ds_name, status::ComponentStatus::Ready);
+
+            if ds.has_full_text_column() {
+                if let Some(provider) = self.datafusion().get_table(ds.name()).await {
+                    self.datafusion()
+                        .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                        .await;
+                };
+            };
             return Ok(());
         }
 
@@ -715,6 +725,13 @@ impl Runtime {
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
                 notifier.notified().await;
+                if ds.has_full_text_column() {
+                    let df = Arc::clone(&runtime).datafusion();
+                    if let Some(provider) = df.get_table(ds.name()).await {
+                        df.register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                            .await;
+                    };
+                };
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
                     tracing::error!(
                         "Failed to create dataset schedule for '{}': {e}",
@@ -722,7 +739,15 @@ impl Runtime {
                     );
                 }
             });
-        }
+        } else {
+            if ds.has_full_text_column() {
+                if let Some(provider) = self.datafusion().get_table(ds.name()).await {
+                    self.datafusion()
+                        .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                        .await;
+                };
+            };
+        };
 
         Ok(())
     }

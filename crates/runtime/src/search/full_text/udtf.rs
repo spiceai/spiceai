@@ -1,6 +1,3 @@
-use std::{any::Any, sync::Arc};
-
-use arrow_schema::{Field, Schema, SchemaRef};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -16,6 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::{any::Any, sync::Arc};
+
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -33,6 +33,8 @@ use crate::{
     search::{full_text::table::TableWithFullText, util::find_concrete_table_provider},
 };
 
+pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
+
 // fn text_search(tbl: TableReference, query: &str, col: Option<str>, limit: Option<usize>, include_score: Option<bool>)
 // ```
 // - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), and empty table is returned.
@@ -43,16 +45,16 @@ use crate::{
 
 // The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //  - `score` (f32): The similarity score of the row with the request `query`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
-    tbl: TableReference,
-    query: String,
+    pub tbl: TableReference,
+    pub query: String,
 
     // For now: force user to specify
-    primary_key: String,
-    column: Option<String>,
-    limit: Option<usize>,
-    include_score: Option<bool>,
+    pub primary_key: String,
+    pub column: Option<String>,
+    pub limit: Option<usize>,
+    pub include_score: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -173,18 +175,26 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.tbl.clone()
             )));
         };
+        let Some(fts_index) = self.df.get_full_text_index(&args.tbl) else {
+            return Err(DataFusionError::Plan(format!(
+                "UDTF {TEXT_SEARCH_UDTF_NAME} requires the table '{}' to have a full text search index, but it does not.",
+                args.tbl
+            )));
+        };
 
         Ok(Arc::new(TextSearchTableProvider {
             df: self.df.clone(),
             args,
+            underlying: Arc::clone(&fts_index.underlying),
         }))
     }
 }
 
-#[derive(Debug)]
-struct TextSearchTableProvider {
+#[derive(Debug, Clone)]
+pub(super) struct TextSearchTableProvider {
     df: Arc<DataFusion>,
-    args: TextSearchTableFuncArgs,
+    pub args: TextSearchTableFuncArgs,
+    pub underlying: Arc<dyn TableProvider>,
 }
 
 #[async_trait::async_trait]
@@ -194,19 +204,14 @@ impl TableProvider for TextSearchTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        // This is a simplification for now.
-        Arc::new(Schema::new(vec![
-            Field::new(
-                self.args.primary_key.clone(),
-                arrow_schema::DataType::Utf8,
-                false,
-            ),
-            Field::new(
-                SEARCH_SCORE_COLUMN_NAME.to_string(),
-                arrow_schema::DataType::Float64,
-                false,
-            ),
-        ]))
+        let mut fields: Vec<_> = self.underlying.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(
+            SEARCH_SCORE_COLUMN_NAME.to_string(),
+            arrow_schema::DataType::Float64,
+            false,
+        )));
+
+        Arc::new(Schema::new(fields))
     }
 
     fn table_type(&self) -> TableType {
@@ -223,10 +228,9 @@ impl TableProvider for TextSearchTableProvider {
         let TextSearchTableFuncArgs {
             tbl,
             query,
-            primary_key,
             column,
             limit: args_limit,
-            include_score,
+            ..
         } = &self.args;
         let Some(table_provider) = self.df.get_table(&tbl).await else {
             return Err(DataFusionError::Internal(format!(

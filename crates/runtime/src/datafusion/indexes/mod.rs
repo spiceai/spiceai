@@ -13,7 +13,23 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-pub mod analyzer_rule;
-pub mod connector;
-pub mod table;
-pub mod udtf;
+
+use crate::datafusion::indexes::full_text::FullTextIndex;
+
+pub(crate) mod full_text;
+
+pub enum Index {
+    FullText(FullTextIndex),
+}
+
+impl Index {
+    pub fn is_full_text(&self) -> bool {
+        matches!(self, Self::FullText(_))
+    }
+}
+
+impl From<FullTextIndex> for Index {
+    fn from(value: FullTextIndex) -> Self {
+        Index::FullText(value)
+    }
+}

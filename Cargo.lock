@@ -3252,7 +3252,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3306,7 +3306,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3331,7 +3331,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3353,7 +3353,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3376,7 +3376,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "futures",
  "log",
@@ -3386,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-compression",
@@ -3421,7 +3421,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3445,7 +3445,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3469,7 +3469,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3499,12 +3499,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 
 [[package]]
 name = "datafusion-execution"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "dashmap",
@@ -3522,7 +3522,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "chrono",
@@ -3542,7 +3542,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -3566,7 +3566,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3594,7 +3594,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3614,7 +3614,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3638,7 +3638,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -3658,7 +3658,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3673,7 +3673,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "datafusion-common",
  "datafusion-doc",
@@ -3689,7 +3689,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -3698,7 +3698,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "datafusion-expr",
  "quote",
@@ -3708,7 +3708,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "chrono",
@@ -3726,7 +3726,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3747,7 +3747,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3760,7 +3760,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -3778,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3807,7 +3807,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3830,7 +3830,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "47.0.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=ea3a2aba98fb65443a52956db718aaae38f086cc#ea3a2aba98fb65443a52956db718aaae38f086cc"
+source = "git+https://github.com/spiceai/datafusion.git?branch=jeadie%2Fudtf-logical#3cb4ac4d353260d67caca3b3412a9053990d5114"
 dependencies = [
  "arrow",
  "bigdecimal",
