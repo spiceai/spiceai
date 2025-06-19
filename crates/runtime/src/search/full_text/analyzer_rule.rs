@@ -98,7 +98,7 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     projection.as_ref().map(|v| {
                         v.iter()
                             .filter(|idx| **idx <= base_schema.fields().len())
-                            .cloned()
+                            .copied()
                             .collect()
                     }),
                     filters.clone(),
@@ -113,7 +113,7 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     // Hardcoded to only one primary key for now.
                     Some(vec![0, text_search_udtf.schema().fields().len() - 1]),
                     vec![],
-                    fetch.clone(),
+                    *fetch,
                 )?;
 
                 let Ok(df_schema) = DFSchema::try_from(text_search_udtf.schema()).map(Arc::new)
@@ -137,7 +137,7 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                 };
 
                 let sort = Sort {
-                    fetch: fetch.clone(),
+                    fetch: *fetch,
                     input: Arc::new(LogicalPlan::Join(join)),
                     expr: vec![SortExpr {
                         expr: Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),

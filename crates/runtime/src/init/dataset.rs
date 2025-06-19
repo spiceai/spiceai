@@ -673,8 +673,8 @@ impl Runtime {
                     self.datafusion()
                         .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
                         .await;
-                };
-            };
+                }
+            }
             return Ok(());
         }
 
@@ -730,8 +730,8 @@ impl Runtime {
                     if let Some(provider) = df.get_table(ds.name()).await {
                         df.register_table_index(ds.name().clone(), FullTextIndex::from(provider))
                             .await;
-                    };
-                };
+                    }
+                }
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
                     tracing::error!(
                         "Failed to create dataset schedule for '{}': {e}",
@@ -739,15 +739,13 @@ impl Runtime {
                     );
                 }
             });
-        } else {
-            if ds.has_full_text_column() {
-                if let Some(provider) = self.datafusion().get_table(ds.name()).await {
-                    self.datafusion()
-                        .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
-                        .await;
-                };
-            };
-        };
+        } else if ds.has_full_text_column() {
+            if let Some(provider) = self.datafusion().get_table(ds.name()).await {
+                self.datafusion()
+                    .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                    .await;
+            }
+        }
 
         Ok(())
     }

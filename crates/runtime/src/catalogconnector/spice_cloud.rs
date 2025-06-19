@@ -119,9 +119,9 @@ impl SpiceCloudPlatformCatalog {
             .expose()
             .unwrap_or_else(|_| {
                 if cfg!(feature = "dev") {
-                    "https://dev.spiceai.io".into()
+                    "https://dev.spiceai.io"
                 } else {
-                    "https://spiceai.io".into()
+                    "https://spiceai.io"
                 }
             });
 

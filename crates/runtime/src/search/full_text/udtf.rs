@@ -26,7 +26,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::text_search::FullTextSearchTable};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::text_search::table::FullTextSearchTable};
 
 use crate::{
     datafusion::DataFusion,
@@ -174,7 +174,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 "Table '{}' does not exist.",
                 args.tbl.clone()
             )));
-        };
+        }
         let Some(fts_index) = self.df.get_full_text_index(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "UDTF {TEXT_SEARCH_UDTF_NAME} requires the table '{}' to have a full text search index, but it does not.",
@@ -232,46 +232,46 @@ impl TableProvider for TextSearchTableProvider {
             limit: args_limit,
             ..
         } = &self.args;
-        let Some(table_provider) = self.df.get_table(&tbl).await else {
-            return Err(DataFusionError::Internal(format!(
-                "TODO, need to return empty exec instead"
-            )));
+        let Some(table_provider) = self.df.get_table(tbl).await else {
+            return Err(DataFusionError::Internal(
+                "TODO, need to return empty exec instead".to_string(),
+            ));
         };
 
         let Some(fts) = find_concrete_table_provider::<TableWithFullText>(&table_provider).await
         else {
-            return Err(DataFusionError::Internal(format!(
-                "TODO, need to return empty exec instead"
-            )));
+            return Err(DataFusionError::Internal(
+                "TODO, need to return empty exec instead".to_string(),
+            ));
         };
         let col: String = if let Some(col) = column {
             if !fts.search_fields.contains(col) {
-                return Err(DataFusionError::Internal(format!(
-                    "TODO, need to return empty exec instead"
-                )));
-            };
+                return Err(DataFusionError::Internal(
+                    "TODO, need to return empty exec instead".to_string(),
+                ));
+            }
             col.clone()
         } else {
             let mut fields = fts.search_fields.iter();
-            let z = match (fields.next(), fields.next()) {
+
+            match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Internal(format!(
-                        "TODO, need to return empty exec instead"
-                    )));
+                    return Err(DataFusionError::Internal(
+                        "TODO, need to return empty exec instead".to_string(),
+                    ));
                 }
                 _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "TODO, need to return empty exec instead"
-                    )));
+                    return Err(DataFusionError::Internal(
+                        "TODO, need to return empty exec instead".to_string(),
+                    ));
                 }
-            };
-            z
+            }
         };
         let Some(index) = fts.index_as_full_text(col.as_str()).ok() else {
-            return Err(DataFusionError::Internal(format!(
-                "TODO, need to return empty exec instead"
-            )));
+            return Err(DataFusionError::Internal(
+                "TODO, need to return empty exec instead".to_string(),
+            ));
         };
 
         let tbl = FullTextSearchTable::new(index, query.clone());
@@ -291,7 +291,7 @@ impl TableProvider for TextSearchTableProvider {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, f)| {
-                        if fields.contains(&f.name()) {
+                        if fields.contains(f.name()) {
                             Some(i)
                         } else {
                             None
