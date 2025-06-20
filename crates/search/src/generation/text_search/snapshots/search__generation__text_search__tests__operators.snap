@@ -1,5 +1,5 @@
 ---
-source: crates/search/src/generation/text_search.rs
+source: crates/search/src/generation/text_search/mod.rs
 expression: "parse_query_literal(\"How much (in USD) don't I get?\")"
 snapshot_kind: text
 ---
