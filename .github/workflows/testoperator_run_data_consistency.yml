@@ -57,7 +57,7 @@ on:
         options:
           - 'spiceai-runners'
           - 'spiceai-large-runners'
-          - 'spiceai-dev-runners'
+          - 'spicehq-dev-runners'
           - 'spiceai-dev-large-runners'
 
 jobs:

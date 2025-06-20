@@ -56,10 +56,10 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
+          - 'spicehq-dev-runners'
           - 'spiceai-dev-large-runners'
 
 jobs:

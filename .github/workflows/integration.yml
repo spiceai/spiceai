@@ -51,7 +51,7 @@ env:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v4
 

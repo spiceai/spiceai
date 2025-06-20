@@ -35,7 +35,7 @@ on:
 jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
@@ -104,7 +104,7 @@ jobs:
 
   dispatch-input:
     name: Dispatch tests - Input
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     if: ${{ github.event_name == 'workflow_dispatch' }}
     concurrency:
       group: testoperator-dispatch-${{ github.event.ref }}

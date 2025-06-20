@@ -152,7 +152,7 @@ pub enum RunnerType {
     SelfHosted,
     #[serde(rename = "spiceai-large-runners")]
     LargeSelfHosted,
-    #[serde(rename = "spiceai-dev-runners")]
+    #[serde(rename = "spicehq-dev-runners")]
     Dev,
     #[serde(rename = "spiceai-dev-large-runners")]
     DevLarge,
