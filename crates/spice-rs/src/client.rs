@@ -1,16 +1,32 @@
+use crate::flight::RetryableQueryStream;
 use crate::util::{retry, FibonacciBackoffBuilder, RetryError};
 use crate::{
     config::{GenericError, SPICE_CLOUD_FLIGHT_ADDR, SPICE_LOCAL_FLIGHT_ADDR},
-    flight::SqlFlightClient,
+    flight::{is_connection_reset_generic_error, SqlFlightClient},
     tls::{ensure_crypto_provider, new_tls_flight_channel},
 };
-use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use snafu::Snafu;
+use std::sync::Arc;
 
 use tonic::transport::Channel;
 
-const MAX_RETRIES: usize = 3;
+const MAX_RETRIES: u32 = 3;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Query execution failed: {source}"))]
+    Query {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to process query stream: {source}"))]
+    QueryStream { source: FlightError },
+
+    #[snafu(display("Connection reset: {message}\nPlease retry the query."))]
+    ConnectionReset { message: String },
+}
 
 struct SpiceClientConfig {
     flight_channel: Channel,
@@ -33,7 +49,7 @@ impl SpiceClientConfig {
 #[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct SpiceClient {
-    flight: SqlFlightClient,
+    flight: Arc<SqlFlightClient>,
 }
 
 impl SpiceClient {
@@ -55,12 +71,13 @@ impl SpiceClient {
         let config = SpiceClientConfig::load_from_default().await?;
 
         Ok(Self {
-            flight: SqlFlightClient::new(
+            flight: Arc::new(SqlFlightClient::new(
                 config.flight_channel,
                 Some(api_key.to_string()),
                 None,
                 None,
-            ),
+                MAX_RETRIES,
+            )),
         })
     }
 
@@ -75,26 +92,36 @@ impl SpiceClient {
     /// # #[tokio::main]
     /// # async fn main() {
     /// #  let client = Client::new("API_KEY").await.unwrap();
-    /// let data = client.query("SELECT * FROM taxi_trips LIMIT 10;").await;
+    /// #  let data = client.query("SELECT * FROM taxi_trips LIMIT 10;").await;
     /// # }
     /// ````
     ///
     /// ## Errors
     ///
     /// - `Box<dyn Error + Send + Sync>` for any query error
-    pub async fn query(&self, query: &str) -> Result<FlightRecordBatchStream, GenericError> {
+    pub async fn query(&self, query: &str) -> Result<RetryableQueryStream, Error> {
         let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_RETRIES))
+            .max_retries(Some(MAX_RETRIES as usize))
             .build();
 
         retry(retry_strategy, || async {
             match self.flight.query(query).await {
-                Ok(stream) => Ok(stream),
-                Err(e) => Err(map_retryable_error(e)),
+                Ok(stream) => Ok(RetryableQueryStream::new(
+                    Arc::clone(&self.flight),
+                    query,
+                    None,
+                    Box::pin(stream),
+                )),
+                Err(e) => {
+                    if is_connection_reset_generic_error(&e) {
+                        return Err(RetryError::transient(e));
+                    }
+                    Err(RetryError::Permanent(e))
+                }
             }
         })
         .await
-        .map_err(map_generic_error)
+        .map_err(|e| Error::Query { source: e })
     }
 
     /// Optional parameterized query with the Spice Flight endpoint with the given SQL query.
@@ -107,7 +134,7 @@ impl SpiceClient {
     /// # #[tokio::main]
     /// # async fn main() {
     /// #  let client = Client::new("API_KEY").await.unwrap();
-    /// let data = client.query_with_params("SELECT * FROM taxi_trips LIMIT 10;", None).await;
+    /// #  let data = client.query_with_params("SELECT * FROM taxi_trips LIMIT 10;", None).await;
     /// # }
     /// ````
     ///
@@ -118,41 +145,30 @@ impl SpiceClient {
         &self,
         query: &str,
         params: Option<RecordBatch>,
-    ) -> Result<FlightRecordBatchStream, GenericError> {
+    ) -> Result<RetryableQueryStream, Error> {
         let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_RETRIES))
+            .max_retries(Some(MAX_RETRIES as usize))
             .build();
 
         retry(retry_strategy, || async {
             match self.flight.query_with_params(query, params.clone()).await {
-                Ok(stream) => Ok(stream),
-                Err(e) => Err(map_retryable_error(e)),
+                Ok(stream) => Ok(RetryableQueryStream::new(
+                    Arc::clone(&self.flight),
+                    query,
+                    params.clone(),
+                    Box::pin(stream),
+                )),
+                Err(e) => {
+                    if is_connection_reset_generic_error(&e) {
+                        return Err(RetryError::transient(e));
+                    }
+                    Err(RetryError::Permanent(e))
+                }
             }
         })
         .await
-        .map_err(map_generic_error)
+        .map_err(|e| Error::Query { source: e })
     }
-}
-
-fn map_retryable_error(error: GenericError) -> RetryError<GenericError> {
-    if let Some(status) = error.downcast_ref::<tonic::Status>() {
-        if status.metadata().get("spiceai-retryable").is_some() {
-            return RetryError::transient(error);
-        }
-    }
-    RetryError::permanent(error)
-}
-
-fn map_generic_error(error: GenericError) -> GenericError {
-    if let Some(status) = error.downcast_ref::<tonic::Status>() {
-        return status_to_arrow_error(status).into();
-    }
-    error
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn status_to_arrow_error(status: &tonic::Status) -> ArrowError {
-    ArrowError::IpcError(format!("{status:?}"))
 }
 
 /// Builder for creating a `SpiceClient`.
@@ -190,7 +206,7 @@ pub struct SpiceClientBuilder {
     user_agent: Option<String>,
     flight_url: Option<String>,
     cache_control: Option<String>,
-    max_retries: usize,
+    max_retries: u32,
 }
 
 impl Default for SpiceClientBuilder {
@@ -234,7 +250,7 @@ impl SpiceClientBuilder {
 
     /// Configures the `SpiceClient` to use the given maximum number of retries.
     #[must_use]
-    pub fn max_retries(mut self, max_retries: usize) -> Self {
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
@@ -267,12 +283,13 @@ impl SpiceClientBuilder {
         };
 
         Ok(SpiceClient {
-            flight: SqlFlightClient::new(
+            flight: Arc::new(SqlFlightClient::new(
                 flight_channel,
                 self.api_key.clone(),
                 self.user_agent.clone(),
                 self.cache_control.clone(),
-            ),
+                self.max_retries,
+            )),
         })
     }
 }
