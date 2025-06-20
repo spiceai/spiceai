@@ -44,7 +44,7 @@ impl Runtime {
             .clone()
             .unwrap_or(CacheConfig::default());
 
-        if sql_results_config.inner.enabled {
+        if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(
                 &sql_results_config,
                 Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
@@ -65,7 +65,7 @@ impl Runtime {
 
         // TODO: logical plan cache needs its own configuration?
         let plan_cache_provider: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync> =
-            match sql_results_config.inner.hashing_algorithm {
+            match sql_results_config.hashing_algorithm {
                 HashingAlgorithm::Siphash => Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),

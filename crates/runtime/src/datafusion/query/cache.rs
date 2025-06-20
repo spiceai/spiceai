@@ -263,7 +263,7 @@ mod tests {
     use cache::{
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
-    use spicepod::component::caching::{CacheConfig, SQLResultsCacheConfig};
+    use spicepod::component::caching::SQLResultsCacheConfig;
 
     use crate::{
         builder::RuntimeBuilder,
@@ -295,11 +295,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let results_cache_config = SQLResultsCacheConfig {
-            inner: CacheConfig {
-                item_ttl: Some("10m".to_string()),
-                ..Default::default()
-            },
+            item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
@@ -408,11 +406,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_plan_or_cached_sql_cached_prepared_statements() {
         let results_cache_config = SQLResultsCacheConfig {
-            inner: CacheConfig {
-                item_ttl: Some("10m".to_string()),
-                ..Default::default()
-            },
+            item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
@@ -472,11 +468,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_plan_or_cached_plan_cached_prepared_statements() {
         let results_cache_config = SQLResultsCacheConfig {
-            inner: CacheConfig {
-                item_ttl: Some("10m".to_string()),
-                ..Default::default()
-            },
+            item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
+            ..Default::default()
         };
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
