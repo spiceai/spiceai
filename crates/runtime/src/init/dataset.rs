@@ -20,7 +20,7 @@ use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
     OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToAttachIndexSnafu, UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
@@ -35,12 +35,12 @@ use crate::{
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
     },
-    datafusion::indexes::full_text::FullTextIndex,
+    datafusion::indexes::full_text::FullTextDatabaseIndex,
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
     metrics::{self, components::register_component_metric},
-    search::full_text::connector::FullTextConnector,
+    search::{full_text::connector::FullTextConnector, util::get_primary_keys},
     status,
     tracing_util::dataset_registered_trace,
     warn_spaced,
@@ -634,6 +634,25 @@ impl Runtime {
         Ok(data_connector)
     }
 
+    async fn register_dataset_indexes(self: &Arc<Self>, ds: &Arc<Dataset>) -> Result<()> {
+        if ds.has_full_text_column() {
+            if let Some(provider) = self.datafusion().get_table(&ds.name).await {
+                let pks = match ds.primary_key_override() {
+                    Some(pks) => pks,
+                    None => get_primary_keys(&provider).await.unwrap_or_default(),
+                };
+
+                self.datafusion()
+                    .register_table_index(
+                        ds.name.clone(),
+                        FullTextDatabaseIndex::new(provider, pks),
+                    )
+                    .context(UnableToAttachIndexSnafu)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn register_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -667,16 +686,7 @@ impl Runtime {
             self.status
                 .update_dataset(&ds_name, status::ComponentStatus::Ready);
 
-            if ds.has_full_text_column() {
-                if let Some(provider) = self.datafusion().get_table(&ds.name).await {
-                    self.datafusion()
-                        .register_table_index(ds.name.clone(), FullTextIndex::from(provider))
-                        .context(UnableToAttachDataConnectorSnafu {
-                            data_connector: source,
-                            connector_component: ConnectorComponent::from(&ds),
-                        })?;
-                }
-            }
+            let () = self.register_dataset_indexes(&ds).await?;
             return Ok(());
         }
 
@@ -727,33 +737,16 @@ impl Runtime {
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
                 notifier.notified().await;
-                if ds.has_full_text_column() {
-                    let df = Arc::clone(&runtime).datafusion();
-                    if let Some(provider) = df.get_table(&ds.name).await {
-                        if let Err(e) =
-                            df.register_table_index(ds.name.clone(), FullTextIndex::from(provider))
-                        {
-                            tracing::error!(
-                                "Failed to register full text index for dataset '{dataset_name}': {e}"
-                            );
-                        }
-                    }
-                }
+                if let Err(e) = runtime.register_dataset_indexes(&ds).await {
+                    tracing::error!("{e}");
+                };
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
             });
-        } else if ds.has_full_text_column() {
-            if let Some(provider) = self.datafusion().get_table(&ds.name).await {
-                self.datafusion()
-                    .register_table_index(ds.name.clone(), FullTextIndex::from(provider))
-                    .context(UnableToAttachDataConnectorSnafu {
-                        data_connector: source,
-                        connector_component: ConnectorComponent::from(&ds),
-                    })?;
-            }
         }
 
+        self.register_dataset_indexes(&ds).await?;
         Ok(())
     }
 

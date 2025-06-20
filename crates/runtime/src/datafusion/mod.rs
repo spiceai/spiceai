@@ -33,7 +33,7 @@ use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::datafusion::indexes::Index;
-use crate::datafusion::indexes::full_text::FullTextIndex;
+use crate::datafusion::indexes::full_text::FullTextDatabaseIndex;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -536,7 +536,7 @@ impl DataFusion {
     pub(crate) fn get_full_text_index(
         &self,
         tbl: &TableReference,
-    ) -> Result<Option<FullTextIndex>> {
+    ) -> Result<Option<FullTextDatabaseIndex>> {
         let indexes_guard = self
             .indexes
             .read()
@@ -547,7 +547,7 @@ impl DataFusion {
 
         Ok(indexes_guard.get(tbl).and_then(|idxs| {
             idxs.iter().find_map(|i| {
-                if let Index::FullText(ref t) = i {
+                if let Index::FullText(t) = i {
                     Some(t.clone())
                 } else {
                     None

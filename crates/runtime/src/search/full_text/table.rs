@@ -84,10 +84,7 @@ impl TableWithFullText {
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Self, Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (
-            primary_key_override,
-            get_primary_keys(Arc::clone(&inner)).await,
-        ) {
+        let pks = match (primary_key_override, get_primary_keys(&inner).await) {
             (Some(pks), _) => pks,
             (None, Ok(pks)) if !pks.is_empty() => pks,
             (None, _) => {

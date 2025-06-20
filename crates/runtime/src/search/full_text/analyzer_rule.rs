@@ -14,6 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! [`AnalyzerRule`] to resolve 'text_search' UDTFs properly by resolving them as a join between the full text search index and their underlying table. See [`crate::search::full_text::udtf::TextSearchTableFunc`] for details on the underlying [`TableProvider`].
+//!
+//! ### Example
+//! ```sql
+//! SELECT * from text_search(notes, 'search embed')
+//! ```
+//! Becomes
+//! ```sql
+//! SELECT *
+//! FROM text_search(notes, 'search embed') t
+//! JOIN notes n ON t.primary_key = n.primary_key
+//! ORDER BY score desc
+//! ```
+
 use std::sync::Arc;
 
 use datafusion::{
@@ -34,21 +48,6 @@ use search::SEARCH_SCORE_COLUMN_NAME;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::search::full_text::udtf::{TextSearchTableFuncArgs, TextSearchUDTFProvider};
 
-/// Rewrites [`super::udtf::TextSearchTableFunc`] calls to:
-///   - Join on the underlying table
-///   - Order by the [`search::SEARCH_SCORE_COLUMN_NAME`] column
-///
-/// ### Example
-/// ```sql
-/// SELECT * from text_search(notes, 'search embed')
-/// ```
-/// Gets rewritten to
-/// ```sql
-// SELECT *
-// FROM text_search(notes, 'search embed') t
-// JOIN notes n ON t.primary_key = n.primary_key
-// ORDER BY score desc
-/// ```
 #[derive(Debug, Clone)]
 pub struct FullTextUDTFAnalyzerRule {}
 
@@ -70,7 +69,6 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                 if table_name.to_string() != format!("{TEXT_SEARCH_UDTF_NAME}()") {
                     return Ok(Transformed::no(plan));
                 }
-                tracing::warn!("Found the udtf");
                 let Some(default_source) = source.as_any().downcast_ref::<DefaultTableSource>()
                 else {
                     return Ok(Transformed::no(plan));
@@ -81,18 +79,15 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                 else {
                     return Ok(Transformed::no(plan));
                 };
-                tracing::warn!("and its on a TextSearchTableProvider");
 
                 let TextSearchTableFuncArgs {
-                    tbl: base_table,
-                    primary_key,
-                    ..
+                    tbl: base_table, ..
                 } = &text_search_udtf.args;
-                let base_schema = text_search_udtf.underlying.schema();
+                let base_schema = text_search_udtf.index.underlying.schema();
                 let base_table_scan = TableScan::try_new(
                     base_table.clone(),
                     Arc::new(DefaultTableSource::new(Arc::clone(
-                        &text_search_udtf.underlying,
+                        &text_search_udtf.index.underlying,
                     ))),
                     projection.as_ref().map(|v| {
                         v.iter()
@@ -103,13 +98,11 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     filters.clone(),
                     None,
                 )?;
-                tracing::warn!("base table good");
 
                 let index_table_name = format!("{}_udtf", base_table.clone());
                 let index_scan = TableScan::try_new(
                     index_table_name.clone(),
                     Arc::new(DefaultTableSource::new(Arc::new(text_search_udtf.clone()))),
-                    // Hardcoded to only one primary key for now.
                     Some(vec![0, text_search_udtf.schema().fields().len() - 1]),
                     vec![],
                     *fetch,
@@ -120,16 +113,23 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
                 };
 
-                tracing::warn!("index scan table good");
+                let on_condition = text_search_udtf
+                    .index
+                    .primary_key
+                    .iter()
+                    .map(|p| {
+                        (
+                            Column::new_unqualified(p.clone()).into(),
+                            Column::new_unqualified(p.clone()).into(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let join = Join {
                     left: Arc::new(LogicalPlan::TableScan(index_scan)),
                     right: Arc::new(LogicalPlan::TableScan(base_table_scan)),
                     join_type: JoinType::Left,
                     join_constraint: JoinConstraint::On,
-                    on: vec![(
-                        Column::new_unqualified(primary_key.clone()).into(),
-                        Column::new_unqualified(primary_key.clone()).into(),
-                    )],
+                    on: on_condition,
                     filter: None,
                     schema: Arc::clone(&df_schema),
                     null_equals_null: false,
@@ -145,7 +145,6 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     }],
                 };
 
-                tracing::warn!("giving back a 'Transformed::yes'");
                 Ok(Transformed::yes(LogicalPlan::SubqueryAlias(
                     SubqueryAlias::try_new(Arc::new(LogicalPlan::Sort(sort)), table_name.clone())?,
                 )))
@@ -153,7 +152,6 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
             _ => Ok(Transformed::no(plan)),
         })?;
 
-        tracing::error!("ftsrule: {:?}", transformed_plan.data);
         Ok(transformed_plan.data)
     }
 

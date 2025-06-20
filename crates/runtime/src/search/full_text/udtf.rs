@@ -168,7 +168,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
                     args.tbl
                 )));
             }
-            Err(e) => {
+            Err(_) => {
                 return Err(DataFusionError::Internal(
                     "An internal issue occurred retrieving the text search".into(),
                 ));
@@ -211,7 +211,7 @@ impl TextSearchUDTFProvider {
 
             match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
-                (Some(a), Some(b)) => {
+                (Some(_), Some(_)) => {
                     return Err(DataFusionError::Internal(format!(
                         "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
                         fts.search_fields.len()
@@ -224,18 +224,19 @@ impl TextSearchUDTFProvider {
                 }
             }
         };
+        Ok(col)
     }
 
     // Convert projection relative to [`TextSearchUDTFProvider`] (i.e. base schema + 'score'), to the schema of the underlying full text search index.
     fn convert_projection(
         &self,
-        projection: Option<&[usize]>,
+        projection: Option<&Vec<usize>>,
         search_index_schema: SchemaRef,
-    ) -> Vec<usize> {
-        match projection {
+    ) -> Result<Vec<usize>, DataFusionError> {
+        let proj = match projection {
             Some(proj) => {
                 let fields: Vec<_> = search_index_schema
-                    .project(proj.as_slice())
+                    .project(proj)
                     .map_err(DataFusionError::from)?
                     .fields()
                     .iter()
@@ -255,7 +256,8 @@ impl TextSearchUDTFProvider {
                     .collect::<Vec<_>>()
             }
             None => (0..search_index_schema.fields().len()).collect(),
-        }
+        };
+        Ok(proj)
     }
 }
 
@@ -301,7 +303,6 @@ impl TableProvider for TextSearchUDTFProvider {
         let TextSearchTableFuncArgs {
             tbl,
             query,
-            column,
             limit: args_limit,
             ..
         } = &self.args;
@@ -330,7 +331,7 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let search_index_table = FullTextSearchTable::new(index, query.clone());
         let underlying_projection =
-            self.convert_projection(&projection, search_index_table.schema());
+            self.convert_projection(projection.as_deref(), search_index_table.schema())?;
 
         search_index_table
             .scan(

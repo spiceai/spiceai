@@ -84,42 +84,20 @@ pub async fn parse_explicit_primary_keys(
         app.datasets
             .iter()
             .filter_map(|d| {
-                let pks_from_embeddings: Option<Vec<String>> =
-                    d.embeddings.iter().find_map(|e| e.primary_keys.clone());
-
-                let mut pks_from_columns: Option<Vec<String>> = d
-                    .columns
-                    .iter()
-                    .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
-
-                let pks_from_fts: Option<Vec<String>> = d
-                    .columns
-                    .iter()
-                    .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
-
-                pks_from_columns = pks_from_columns.or(pks_from_fts);
-
-                let primary_keys = match (pks_from_columns, pks_from_embeddings) {
-                    (Some(pks), None) | (None, Some(pks)) => pks,
-                    (Some(pks), Some(_)) => {
-                        tracing::warn!("Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.", d.name);
-                        pks
-                    }
-                    (None, None) => return None,
-                };
-
-                Some((
-                    TableReference::parse_str(&d.name)
-                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                        .into(),
-                    primary_keys,
-                ))
+                d.primary_key_override().map(|pks| {
+                    (
+                        TableReference::parse_str(&d.name)
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                            .into(),
+                        pks,
+                    )
+                })
             })
             .collect::<HashMap<TableReference, Vec<_>>>()
     })
 }
 
-pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> Result<Vec<String>> {
+pub(crate) async fn get_primary_keys(tbl: &Arc<dyn TableProvider>) -> Result<Vec<String>> {
     let constraint_idx = tbl
         .constraints()
         .map(|c| c.iter())
@@ -155,7 +133,7 @@ pub(crate) async fn get_primary_keys_from_table(
             data_source: vec![table.clone()],
         })?;
 
-    get_primary_keys(tbl_ref).await
+    get_primary_keys(&tbl_ref).await
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
