@@ -51,10 +51,12 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 enum Error {
     #[snafu(display(
-        "Could not retrieve table '{table}' from database '{database}'. Verify that both the database and table exist and are accessible."
+        "Cannot retrieve table '{table}' from Glue database '{database}'.\nVerify that both the database and table exist and are accessible.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     GetTable { database: String, table: String },
-    #[snafu(display("Unable to load the AWS configuration.\n{source}"))]
+    #[snafu(display(
+        "Cannot load AWS configuration for Glue data connector.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue \n{source}"
+    ))]
     AWSConfig { source: aws::Error },
 }
 
@@ -143,7 +145,7 @@ impl DataConnector for GlueDataConnector {
                 .ok_or_else(|| super::DataConnectorError::UnableToGetSchemaInternal {
                     dataconnector: PREFIX.to_string(),
                     connector_component: dataset.into(),
-                    source: format!("schema unavailable for path `{path}`").into(),
+                    source: format!("schema unavailable for path '{path}'").into(),
                 })?;
         let table = path.table();
 

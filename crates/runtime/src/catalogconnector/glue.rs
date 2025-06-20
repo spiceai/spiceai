@@ -48,58 +48,84 @@ static VALIDATORS: LazyLock<
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get Glue databases.\n{source}"))]
+    #[snafu(display(
+        "Cannot connect to AWS Glue to retrieve databases.\nVerify your AWS credentials and region are configured correctly.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
     GetDatabases { source: SdkError<GetDatabasesError> },
 
-    #[snafu(display("Failed to get Glue table from database `{database}`.\n{source}"))]
+    #[snafu(display(
+        "Cannot retrieve tables from Glue database '{database}'.\nVerify the database exists and you have permissions to access it.\n{source}"
+    ))]
     GetTables {
         database: String,
         source: SdkError<GetTablesError>,
     },
 
-    #[snafu(display("Failed to build FileIO.\n{source}"))]
+    #[snafu(display(
+        "Cannot access Iceberg table storage.\nVerify your S3 credentials and bucket permissions are configured correctly.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
     BuildFileIO { source: iceberg::Error },
 
-    #[snafu(display("Failed to create file input for metadata location '{location}'.\n{source}",))]
+    #[snafu(display(
+        "Cannot read Iceberg metadata from location '{location}'.\nVerify the metadata file exists and is accessible.\n{source}",
+    ))]
     CreateFileInput {
         source: iceberg::Error,
         location: String,
     },
 
-    #[snafu(display("Failed to read metadata from '{location}'.\n{source}"))]
+    #[snafu(display(
+        "Cannot read Iceberg table metadata from '{location}'.\nVerify the metadata file exists and is not corrupted.\n{source}"
+    ))]
     ReadMetadata {
         source: iceberg::Error,
         location: String,
     },
 
-    #[snafu(display("Failed to deserialize metadata.\n{source}"))]
+    #[snafu(display(
+        "Cannot parse Iceberg table metadata.\nThe metadata file may be corrupted or in an unsupported format.\n{source}"
+    ))]
     DeserializeMetadata { source: serde_json::Error },
 
-    #[snafu(display("Failed to build Iceberg table.\n{source}"))]
+    #[snafu(display(
+        "Cannot initialize Iceberg table.\nVerify the table metadata and schema are valid.\n{source}"
+    ))]
     BuildIcebergTable { source: iceberg::Error },
 
-    #[snafu(display("Failed to create Iceberg table provider.\n{source}"))]
+    #[snafu(display(
+        "Cannot create table provider for Iceberg table.\nVerify the table configuration and permissions.\n{source}"
+    ))]
     CreateIcebergTableProvider { source: iceberg::Error },
 
-    #[snafu(display("No 'metadata_location' set on table '{table}'"))]
+    #[snafu(display(
+        "Cannot find metadata location for Iceberg table '{table}'.\nEnsure the table has a 'metadata_location' parameter in AWS Glue."
+    ))]
     MissingMetadataLocation { table: String },
 
-    #[snafu(display("No 'parameters' set on table"))]
+    #[snafu(display(
+        "Cannot find table parameters in AWS Glue.\nEnsure the table is properly configured with required parameters."
+    ))]
     MissingParameters,
 
-    #[snafu(display("Parameter validation failed.\n{source}",))]
+    #[snafu(display(
+        "Invalid AWS configuration for Glue catalog.\nVerify your region, credentials, and other AWS parameters are correct.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}",
+    ))]
     ParameterValidation {
         #[snafu(source)]
         source: parameters::aws::Error,
     },
 
-    #[snafu(display("Configuration loading failed.\n{source}"))]
+    #[snafu(display(
+        "Cannot load AWS configuration for Glue catalog.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
     ConfigurationLoadingFailed {
         #[snafu(source)]
         source: parameters::aws::Error,
     },
 
-    #[snafu(display("Failed to create dataset `{dataset}`.\n{source}"))]
+    #[snafu(display(
+        "Cannot create dataset for table `{dataset}`.\nVerify the table configuration and format are supported.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
     CreatingDataset {
         dataset: String,
         source: Box<dyn std::error::Error + Sync + Send>,
