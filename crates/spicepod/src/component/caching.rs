@@ -38,6 +38,7 @@ pub enum HashingAlgorithm {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Caching {
     #[serde(skip_serializing_if = "is_default_or_none")]
@@ -47,6 +48,7 @@ pub struct Caching {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct CacheConfig {
     #[serde(default = "default_true")]
@@ -71,6 +73,7 @@ impl Default for CacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SQLResultsCacheConfig {
     #[serde(flatten)]
@@ -80,6 +83,7 @@ pub struct SQLResultsCacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ResultsCache {
     #[serde(default = "default_true")]
