@@ -520,18 +520,16 @@ impl DataFusion {
         let tbl = table_ref.into();
         let idx: Index = index.into();
 
-        let mut index_ref =
+        let mut indexes_guard =
             self.indexes
                 .write()
                 .map_err(|_| Error::UnableToRegisterTableIndex {
                     dataset_name: tbl.to_string(),
                     index_type: idx.index_type().to_string(),
                 })?;
-        if let Some(existing_indexes) = index_ref.get_mut(&tbl) {
-            existing_indexes.push(idx);
-        } else {
-            index_ref.insert(tbl, vec![idx]);
-        }
+
+        indexes_guard.entry(tbl).or_insert_with(Vec::new).push(idx);
+
         Ok(())
     }
 
@@ -539,23 +537,23 @@ impl DataFusion {
         &self,
         tbl: &TableReference,
     ) -> Result<Option<FullTextIndex>> {
-        let Ok(indexes) = self.indexes.read() else {
-            return Err(Error::UnableToGetTableIndex {
+        let indexes_guard = self
+            .indexes
+            .read()
+            .map_err(|_e| Error::UnableToGetTableIndex {
                 dataset_name: tbl.to_string(),
                 index_type: "full_text".to_string(),
-            });
-        };
+            })?;
 
-        let Some(idxs) = indexes.get(tbl) else {
-            return Ok(None);
-        };
-        Ok(idxs
-            .iter()
-            .find_map(|i| match i {
-                Index::FullText(t) => Some(t),
-                _ => None,
+        Ok(indexes_guard.get(tbl).and_then(|idxs| {
+            idxs.iter().find_map(|i| {
+                if let Index::FullText(ref t) = i {
+                    Some(t.clone())
+                } else {
+                    None
+                }
             })
-            .cloned())
+        }))
     }
 
     #[must_use]

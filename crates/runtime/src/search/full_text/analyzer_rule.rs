@@ -32,7 +32,7 @@ use datafusion::{
 use search::SEARCH_SCORE_COLUMN_NAME;
 
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
-use crate::search::full_text::udtf::{TextSearchTableFuncArgs, TextSearchTableProvider};
+use crate::search::full_text::udtf::{TextSearchTableFuncArgs, TextSearchUDTFProvider};
 
 /// Rewrites [`super::udtf::TextSearchTableFunc`] calls to:
 ///   - Join on the underlying table
@@ -76,9 +76,8 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     return Ok(Transformed::no(plan));
                 };
                 let underlying = Arc::clone(&default_source.table_provider);
-                let Some(text_search_udtf) = underlying
-                    .as_any()
-                    .downcast_ref::<TextSearchTableProvider>()
+                let Some(text_search_udtf) =
+                    underlying.as_any().downcast_ref::<TextSearchUDTFProvider>()
                 else {
                     return Ok(Transformed::no(plan));
                 };

@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::indexes::full_text::FullTextIndex;
+use crate::datafusion::indexes::full_text::FullTextDatabaseIndex;
 
 pub(crate) mod full_text;
 
 pub enum Index {
-    FullText(FullTextIndex),
+    FullText(FullTextDatabaseIndex),
 }
 
 impl Index {
@@ -34,8 +34,8 @@ impl Index {
     }
 }
 
-impl From<FullTextIndex> for Index {
-    fn from(value: FullTextIndex) -> Self {
+impl From<FullTextDatabaseIndex> for Index {
+    fn from(value: FullTextDatabaseIndex) -> Self {
         Index::FullText(value)
     }
 }

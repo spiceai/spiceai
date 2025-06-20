@@ -18,13 +18,17 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 
-#[derive(Clone)]
-pub struct FullTextIndex {
+#[derive(Clone, Debug)]
+pub struct FullTextDatabaseIndex {
     pub underlying: Arc<dyn TableProvider>,
+    pub primary_key: Vec<String>,
 }
 
-impl From<Arc<dyn TableProvider>> for FullTextIndex {
-    fn from(underlying: Arc<dyn TableProvider>) -> Self {
-        FullTextIndex { underlying }
+impl FullTextDatabaseIndex {
+    pub fn new(underlying: Arc<dyn TableProvider>, primary_key: Vec<String>) -> Self {
+        Self {
+            underlying,
+            primary_key,
+        }
     }
 }

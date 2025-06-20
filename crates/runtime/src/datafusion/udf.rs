@@ -24,6 +24,7 @@ pub mod alias;
 pub mod bucket;
 pub mod truncate;
 
+// UDFs that need a reference to [`crate::datafusion::DataFusion`] must be defined in [`crate::builder::RuntimeBuilder::build`].
 pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udf(CosineDistance::new().into());
     ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
