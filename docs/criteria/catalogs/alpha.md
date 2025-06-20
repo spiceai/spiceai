@@ -12,6 +12,7 @@ All criteria must be met for the Catalog to be considered Alpha. As Alpha signif
 | Iceberg       | ✅            | @phillipleblanc |
 | Spice.ai      | ✅            | @peasee         |
 | Unity Catalog | ✅            | @Sevenannn      |
+| Glue          | ✅            | @kczimm         |
 
 ## Alpha Release Criteria
 

@@ -92,6 +92,29 @@ pub enum ModelSource {
     Databricks,
 }
 
+impl ModelSource {
+    pub fn parse_from(&self, from: &str) -> Option<String> {
+        match self {
+            ModelSource::HuggingFace => HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
+                let model = format!("{}/{}", &caps["org"], &caps["model"]);
+                if let Some(revision) = caps.name("revision") {
+                    format!("{}:{}", model, revision.as_str())
+                } else {
+                    model
+                }
+            }),
+            p => {
+                if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
+                    Some(stripped.to_string())
+                } else {
+                    from.strip_prefix(&format!("{p}/"))
+                        .map(std::string::ToString::to_string)
+                }
+            }
+        }
+    }
+}
+
 // Matches model paths in these formats:
 // - organization/model-name
 // - organization/model-name:revision
@@ -299,28 +322,7 @@ impl Model {
     ///    - Source: `gpt-4o`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
-        match self.get_source() {
-            Some(ModelSource::HuggingFace) => {
-                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
-                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                    if let Some(revision) = caps.name("revision") {
-                        format!("{}:{}", model, revision.as_str())
-                    } else {
-                        model
-                    }
-                })
-            }
-            Some(p) => {
-                let from = &self.from;
-                if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
-                    Some(stripped.to_string())
-                } else {
-                    from.strip_prefix(&format!("{p}/"))
-                        .map(std::string::ToString::to_string)
-                }
-            }
-            None => None,
-        }
+        self.get_source()?.parse_from(self.from.as_str())
     }
 
     /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.

@@ -34,9 +34,9 @@ datasets:
       engine: duckdb
       mode: file
       primary_key: (l_orderkey, l_linenumber)
-      refresh_sql: "SELECT * FROM lineitem LIMIT 300000000"
+      refresh_sql: "SELECT * FROM lineitem LIMIT 250000000"
       params:
-        duckdb_memory_limit: 60gb
+        duckdb_memory_limit: 48gb
       indexes:
         l_suppkey: enabled
         l_shipdate: enabled
@@ -60,6 +60,8 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
+      params:
+        duckdb_memory_limit: 48gb
       primary_key: o_orderkey
       indexes:
         o_orderdate: enabled

@@ -278,15 +278,16 @@ impl AppBuilder {
         }
     }
 
-    pub fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
+    pub async fn build_from_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
-        let spicepod_root =
-            Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        Self::build_from_spicepod(spicepod_root, path)
+        let spicepod_root = Spicepod::load(&path)
+            .await
+            .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
+        Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
+    pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();
         let runtime = spicepod.runtime.clone();
@@ -339,9 +340,11 @@ impl AppBuilder {
         for dependency in &spicepod.dependencies {
             let dependency_path = path.join("spicepods").join(dependency);
             let dependent_spicepod =
-                Spicepod::load(&dependency_path).context(UnableToLoadSpicepodSnafu {
-                    path: &dependency_path,
-                })?;
+                Spicepod::load(&dependency_path)
+                    .await
+                    .context(UnableToLoadSpicepodSnafu {
+                        path: &dependency_path,
+                    })?;
             for catalog in &dependent_spicepod.catalogs {
                 catalogs.push(catalog.clone());
             }

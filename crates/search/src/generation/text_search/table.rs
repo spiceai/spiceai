@@ -30,7 +30,9 @@ use datafusion::{
     prelude::Expr as LogicalExpr,
 };
 
-/// An implementation of [`TableProvider`] based on a known query on a [`FullTextSearch`] index.
+/// An implementation of [`TableProvider`] based on a given query on a [`FullTextSearch`] index.
+///
+/// Currently, filter pushdown support is unavailable.
 #[derive(Clone, Debug)]
 pub struct FullTextSearchTable {
     pub index: FullTextSearch,
