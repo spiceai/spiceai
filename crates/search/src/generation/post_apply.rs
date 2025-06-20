@@ -313,7 +313,7 @@ mod tests {
     use crate::generation::CandidateGeneration;
     use crate::generation::text_search::tests::{create_basic_index, validate_result};
     use crate::generation::{
-        post_apply::PostApplyCandidateGeneration, text_search::FullTextSearch,
+        post_apply::PostApplyCandidateGeneration, text_search::FullTextSearchIndex,
     };
     use arrow::{
         array::{RecordBatch, StringArray, UInt64Array},
@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter() {
-        let fts = FullTextSearch::try_new(
+        let fts = FullTextSearchIndex::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
             vec!["title".to_string()],
@@ -422,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_projection() {
-        let fts = FullTextSearch::try_new(
+        let fts = FullTextSearchIndex::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
             vec![],

@@ -96,7 +96,7 @@ impl Error {
 }
 
 #[derive(Clone, Debug)]
-pub struct FullTextSearch {
+pub struct FullTextSearchIndex {
     idx: Arc<Index>,
     field: String,
     primary_key: Vec<String>,
@@ -106,7 +106,7 @@ pub struct FullTextSearch {
     additional_columns: Option<Vec<String>>,
 }
 
-impl FullTextSearch {
+impl FullTextSearchIndex {
     pub fn try_new(
         index: Arc<Index>,
         field: String,
@@ -292,7 +292,7 @@ fn parse_query_literal(q: &str) -> UserInputAst {
 }
 
 #[async_trait]
-impl CandidateGeneration for FullTextSearch {
+impl CandidateGeneration for FullTextSearchIndex {
     async fn search(
         &self,
         query: String,
@@ -366,7 +366,7 @@ impl CandidateGeneration for FullTextSearch {
 }
 
 fn make_stream(
-    fts: FullTextSearch,
+    fts: FullTextSearchIndex,
     query: String,
     keep_search_field: bool,
     limit: usize,
@@ -462,7 +462,7 @@ pub(crate) mod tests {
         aggregation::write_to_json_string,
         generation::{
             CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearch, parse_query_literal},
+            text_search::{FullTextSearchIndex, parse_query_literal},
         },
     };
 
@@ -544,7 +544,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let fts = FullTextSearch::try_new(
+        let fts = FullTextSearchIndex::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
             vec![],
