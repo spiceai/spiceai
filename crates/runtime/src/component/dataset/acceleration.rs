@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::{
+    common::DFSchema,
+    error::DataFusionError,
+    prelude::{Expr, SessionContext},
+};
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
 use spicepod::{acceleration as spicepod_acceleration, param::Params};
@@ -284,7 +289,7 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    pub partition_by: Vec<String>, // these are `Expr` but we need a `SessionContext` to parse them
+    partition_by: Vec<String>,
 }
 
 impl Acceleration {
@@ -301,6 +306,18 @@ impl Acceleration {
     ) -> Self {
         self.on_conflict = on_conflict;
         self
+    }
+
+    #[must_use]
+    pub fn partition_by_expressions(
+        &self,
+        ctx: &SessionContext,
+        df_schema: &DFSchema,
+    ) -> Result<Vec<Expr>, DataFusionError> {
+        self.partition_by
+            .iter()
+            .map(|sql| ctx.parse_sql_expr(sql, df_schema))
+            .collect()
     }
 }
 
