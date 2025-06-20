@@ -32,14 +32,15 @@ use futures::StreamExt;
 
 use super::CandidateGeneration;
 
-pub struct FullTextSearchTableExec {
+/// Executes a  [`FullTextSearchTable`]
+pub struct FullTextSearchExec {
     pub(super) tbl: FullTextSearchTable,
     filters: Vec<LogicalExpr>,
     limit: usize,
     plan_properties: PlanProperties,
 }
 
-impl FullTextSearchTableExec {
+impl FullTextSearchExec {
     pub fn try_new(
         tbl: FullTextSearchTable,
         projection: Option<&Vec<usize>>,
@@ -65,7 +66,7 @@ impl FullTextSearchTableExec {
     }
 }
 
-impl std::fmt::Debug for FullTextSearchTableExec {
+impl std::fmt::Debug for FullTextSearchExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchTableExec")
             .field("tbl", &self.tbl)
@@ -74,13 +75,13 @@ impl std::fmt::Debug for FullTextSearchTableExec {
             .finish_non_exhaustive()
     }
 }
-impl DisplayAs for FullTextSearchTableExec {
+impl DisplayAs for FullTextSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "FullTextSearchTableExec q={}", self.tbl.query)
     }
 }
 
-impl ExecutionPlan for FullTextSearchTableExec {
+impl ExecutionPlan for FullTextSearchExec {
     fn name(&self) -> &'static str {
         "FullTextSearchTableExec"
     }

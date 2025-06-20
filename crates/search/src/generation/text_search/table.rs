@@ -15,7 +15,7 @@ use std::{any::Any, sync::Arc};
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
     generation::text_search::{
-        DEFAULT_BATCH_SIZE, FullTextSearch, exec::FullTextSearchTableExec, tantivy_to_arrow_type,
+        DEFAULT_BATCH_SIZE, FullTextSearchIndex, exec::FullTextSearchExec, tantivy_to_arrow_type,
     },
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -35,14 +35,14 @@ use datafusion::{
 /// Currently, filter pushdown support is unavailable.
 #[derive(Clone, Debug)]
 pub struct FullTextSearchTable {
-    pub index: FullTextSearch,
+    pub index: FullTextSearchIndex,
     pub query: String,
     pub default_limit: usize,
 }
 
 impl FullTextSearchTable {
     #[must_use]
-    pub fn new(index: FullTextSearch, query: String) -> Self {
+    pub fn new(index: FullTextSearchIndex, query: String) -> Self {
         Self {
             index,
             query,
@@ -102,7 +102,7 @@ impl TableProvider for FullTextSearchTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(
-            FullTextSearchTableExec::try_new(
+            FullTextSearchExec::try_new(
                 self.clone(),
                 projection,
                 filters.to_vec(),

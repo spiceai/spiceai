@@ -27,7 +27,7 @@ use datafusion::prelude::{Expr, SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
-use search::generation::text_search::FullTextSearch;
+use search::generation::text_search::FullTextSearchIndex;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
@@ -232,8 +232,8 @@ impl TableWithFullText {
     pub fn index_as_full_text(
         &self,
         search_field: &str,
-    ) -> Result<FullTextSearch, search::generation::text_search::Error> {
-        FullTextSearch::try_new(
+    ) -> Result<FullTextSearchIndex, search::generation::text_search::Error> {
+        FullTextSearchIndex::try_new(
             Arc::clone(&self.index),
             search_field.to_string(),
             self.primary_key.clone(),
