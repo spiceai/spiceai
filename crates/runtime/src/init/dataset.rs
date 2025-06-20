@@ -668,9 +668,9 @@ impl Runtime {
                 .update_dataset(&ds_name, status::ComponentStatus::Ready);
 
             if ds.has_full_text_column() {
-                if let Some(provider) = self.datafusion().get_table(ds.name()).await {
+                if let Some(provider) = self.datafusion().get_table(&ds.name).await {
                     self.datafusion()
-                        .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                        .register_table_index(ds.name.clone(), FullTextIndex::from(provider))
                         .context(UnableToAttachDataConnectorSnafu {
                             data_connector: source,
                             connector_component: ConnectorComponent::from(&ds),
@@ -729,9 +729,9 @@ impl Runtime {
                 notifier.notified().await;
                 if ds.has_full_text_column() {
                     let df = Arc::clone(&runtime).datafusion();
-                    if let Some(provider) = df.get_table(ds.name()).await {
-                        if let Err(e) = df
-                            .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                    if let Some(provider) = df.get_table(&ds.name).await {
+                        if let Err(e) =
+                            df.register_table_index(ds.name.clone(), FullTextIndex::from(provider))
                         {
                             tracing::error!(
                                 "Failed to register full text index for dataset '{dataset_name}': {e}"
@@ -744,9 +744,9 @@ impl Runtime {
                 }
             });
         } else if ds.has_full_text_column() {
-            if let Some(provider) = self.datafusion().get_table(ds.name()).await {
+            if let Some(provider) = self.datafusion().get_table(&ds.name).await {
                 self.datafusion()
-                    .register_table_index(ds.name().clone(), FullTextIndex::from(provider))
+                    .register_table_index(ds.name.clone(), FullTextIndex::from(provider))
                     .context(UnableToAttachDataConnectorSnafu {
                         data_connector: source,
                         connector_component: ConnectorComponent::from(&ds),
