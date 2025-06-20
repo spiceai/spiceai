@@ -102,7 +102,7 @@ jobs:
           spice init spice_qs
           cd spice_qs
           spice add spiceai/quickstart
-          spiced &> spice.log &
+          spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
 
