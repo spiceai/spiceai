@@ -591,15 +591,14 @@ impl FlightClient {
             payload: Bytes::default(),
         };
 
-        let once_req = stream::once(async { cmd });
-        let mut req = tonic::Request::new(once_req);
+        let mut req = tonic::Request::new(stream::iter(vec![cmd]));
         let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
 
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;
         req.metadata_mut().insert("authorization", val);
-        let mut resp = self
+        let resp = self
             .flight_client
             .clone()
             .handshake(req)
@@ -616,39 +615,12 @@ impl FlightClient {
                 }
             })?;
 
-        // First Check Headers
         let mut token: Option<Token> = None;
-
-        // Consume the response stream before reading the metadata
-        let stream = resp.get_mut();
-        while let Some(data) = stream.next().await {
-            match data {
-                Ok(_) => {}
-                Err(e) => {
-                    if is_connection_reset_error(&e) {
-                        return Err(Error::ConnectionReset {
-                            source: TonicStatusError::from(e),
-                        });
-                    }
-                    return Err(Error::UnableToPerformHandshake {
-                        source: TonicStatusError::from(e),
-                    });
-                }
-            }
-        }
-
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
             token = Some(Token::new(&auth["Bearer ".len()..], true));
-        } else {
-            if let Some(grpc_status) = resp.metadata().get("grpc-status") {
-                let grpc_status = grpc_status
-                    .to_str()
-                    .context(UnableToConvertMetadataToStringSnafu)?;
-                println!("Token missing and GRPC status is: {grpc_status}");
-            }
         }
 
         Ok(token)
