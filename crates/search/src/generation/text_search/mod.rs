@@ -13,7 +13,11 @@ limitations under the License.
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
-use arrow::{array::RecordBatch, datatypes::Schema, error::ArrowError};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Field, Schema},
+    error::ArrowError,
+};
 use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -31,7 +35,7 @@ use tantivy::{
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
-    schema::{Field, OwnedValue},
+    schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
 
@@ -41,6 +45,9 @@ use super::{
 };
 
 static DEFAULT_BATCH_SIZE: usize = 100;
+
+pub mod exec;
+pub mod table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -88,7 +95,7 @@ impl Error {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FullTextSearch {
     idx: Arc<Index>,
     field: String,
@@ -211,7 +218,7 @@ impl FullTextSearch {
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
-                let doc: HashMap<Field, OwnedValue> =
+                let doc: HashMap<tantivy::schema::Field, OwnedValue> =
                     searcher.doc(addr).context(TextSearchSnafu)?;
 
                 let mut doc_w_col_names = doc
@@ -378,7 +385,7 @@ fn make_stream(
             remaining_limit -= limit;
 
             let mut decoder = match tantivy_json_to_arrow_decoder(hits.as_slice())
-                .map_err(|e| DataFusionError::ArrowError(e, None)) {
+                .map_err(DataFusionError::from) {
                     Ok(h) => h,
                     Err(e) => {
                         yield Err(e);
@@ -389,7 +396,7 @@ fn make_stream(
             match decoder.flush() {
                 Ok(Some(rb)) => yield Ok(rb),
                 Ok(None) => {},
-                Err(e) => yield Err(DataFusionError::ArrowError(e, None))
+                Err(e) => yield Err(DataFusionError::from(e))
             }
         }
     }
@@ -399,11 +406,44 @@ fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder,
     let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
         hits.iter().map(Ok),
     )?);
+
+    // Ensure `SEARCH_SCORE_COLUMN_NAME` is f64 not f32 or other numeric.
+    let schema = Arc::new(Schema::new(
+        schema
+            .fields()
+            .into_iter()
+            .map(|f| {
+                if f.name() == SEARCH_SCORE_COLUMN_NAME {
+                    Arc::new(Field::new(
+                        f.name(),
+                        arrow::datatypes::DataType::Float64,
+                        f.is_nullable(),
+                    ))
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+
     let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
 
     decoder.serialize(hits)?;
 
     Ok(decoder)
+}
+
+fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
+    match t {
+        FieldType::Str(_) => Some(arrow::datatypes::DataType::Utf8),
+        FieldType::I64(_) => Some(arrow::datatypes::DataType::Int64),
+        FieldType::U64(_) => Some(arrow::datatypes::DataType::UInt64),
+        FieldType::F64(_) => Some(arrow::datatypes::DataType::Float64),
+        FieldType::Date(_) => Some(arrow::datatypes::DataType::Date32),
+        FieldType::Bool(_) => Some(arrow::datatypes::DataType::Boolean),
+        FieldType::Bytes(_) => Some(arrow::datatypes::DataType::Binary),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
