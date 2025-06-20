@@ -655,7 +655,6 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
 }
 
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
-    println!("Checking connection reset error: {:?}", error);
     match error.code() {
         tonic::Code::Internal | tonic::Code::Cancelled | tonic::Code::Unknown => {
             let error_message = error.message().to_lowercase();
