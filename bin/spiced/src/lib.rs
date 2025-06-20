@@ -161,6 +161,12 @@ pub struct Args {
     #[arg(long)]
     pub very_verbose: bool,
 
+    /// Path to the Spicepod directory or file. Supports local paths and remote URLs (i.e. `s3://my_bucket/spicepod.yaml`)
+    ///
+    /// When specified, the behavior to automatically reload changes to the Spicepod is disabled.
+    #[arg(value_name = "PATH")]
+    pub spicepod: Option<PathBuf>,
+
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
@@ -169,8 +175,11 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
-    let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone()) {
+    let spicepod_path = args
+        .spicepod
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             Some(Arc::new(app))
@@ -214,8 +223,8 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
 
-    if args.pods_watcher_enabled {
-        let pods_watcher = PodsWatcher::new(current_dir.clone());
+    if args.pods_watcher_enabled && args.spicepod.is_none() {
+        let pods_watcher = PodsWatcher::new(spicepod_path.clone());
         builder = builder.with_pods_watcher(pods_watcher);
     }
 

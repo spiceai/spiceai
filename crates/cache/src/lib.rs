@@ -204,20 +204,20 @@ impl QueryResultsCacheProvider {
         config: &SQLResultsCacheConfig,
         ignore_schemas: Box<[Box<str>]>,
     ) -> Result<Self> {
-        let cache_max_size: u64 = match &config.inner.max_size {
+        let cache_max_size: u64 = match &config.max_size {
             Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
                 .context(FailedToParseCacheMaxSizeSnafu)?
                 .as_u64(),
             None => 128 * 1024 * 1024, // 128 MiB
         };
 
-        let ttl = match &config.inner.item_ttl {
+        let ttl = match &config.item_ttl {
             Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
             None => std::time::Duration::from_secs(1),
         };
 
         let cache_provider = QueryResultsCacheProvider {
-            cache: match config.inner.hashing_algorithm {
+            cache: match config.hashing_algorithm {
                 HashingAlgorithm::Ahash => Arc::new(LruCache::new(
                     cache_max_size,
                     ttl,

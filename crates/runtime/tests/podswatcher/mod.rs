@@ -78,7 +78,7 @@ async fn podswatcher_integration_test() -> Result<(), anyhow::Error> {
 
             write_spicepod_yaml(YAML_CONTENT_BEFORE)?;
 
-            let app = AppBuilder::build_from_filesystem_path(spicepod_dir.clone())
+            let app = AppBuilder::build_from_path(spicepod_dir.clone()).await
                 .expect("Failed to build app");
             let pods_watcher = PodsWatcher::new(spicepod_dir.clone());
 

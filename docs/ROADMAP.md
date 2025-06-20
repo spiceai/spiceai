@@ -15,17 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.4 (June 2025)
-
-- Upgrade to DataFusion v47.
-- Cron for dataset refresh and workers
-
-- **Catalog Connectors**
-
-  - AWS Glue Catalog Connector (Beta).
-
-- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
-
 ### v1.5 (July 2025)
 
 **Focus:** Search
@@ -34,6 +23,12 @@ To propose features or report issues, please [file an issue](https://github.com/
 - [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
 - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
+
+- **Catalog Connectors**
+
+  - AWS Glue Catalog Connector (Beta).
+
+- **Spice Cloud Catalog Connector** (Stable): Unified access to cloud-based datasets.
 
 ### v1.6 (August 2025)
 

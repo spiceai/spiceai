@@ -40,6 +40,8 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
@@ -128,6 +130,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -135,9 +139,9 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
@@ -147,13 +151,14 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
       - name: Run the throughput test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -182,6 +187,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -189,9 +196,9 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
@@ -201,10 +208,11 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

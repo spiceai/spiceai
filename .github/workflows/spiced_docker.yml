@@ -45,9 +45,6 @@ jobs:
     if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
     needs: setup
     runs-on: spiceai-runners
-    env:
-      IMAGE_TAG: default
-      CARGO_FEATURES: release
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
@@ -56,6 +53,10 @@ jobs:
           # Enable docker driver for layer caching
           driver-opts: |
             image=moby/buildkit:latest
+      - name: default
+        run: |
+          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
       - name: Build AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
@@ -68,6 +69,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: odbc
         run: |
           echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
@@ -84,6 +86,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
@@ -100,6 +103,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: jemalloc
         run: |
           echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
@@ -116,6 +120,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: mimalloc
         run: |
           echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
@@ -132,6 +137,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: sysalloc
         run: |
           echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
@@ -148,6 +154,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
@@ -164,6 +171,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
@@ -180,6 +188,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
@@ -196,6 +205,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -243,6 +253,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: odbc
         run: |
           echo "IMAGE_TAG=odbc" >> $GITHUB_ENV
@@ -259,6 +270,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
@@ -275,6 +287,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: jemalloc
         run: |
           echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
@@ -291,6 +304,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: mimalloc
         run: |
           echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
@@ -307,6 +321,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: sysalloc
         run: |
           echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
@@ -323,6 +338,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-jemalloc
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
@@ -339,6 +355,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
@@ -355,6 +372,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
@@ -371,6 +389,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -415,6 +434,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release,models,cuda
+            RUST_PROFILE=release
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@v4
         with:

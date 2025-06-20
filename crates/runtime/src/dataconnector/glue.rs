@@ -30,6 +30,7 @@ use iceberg_catalog_glue::{
     GlueCatalogConfig,
 };
 use iceberg_datafusion::IcebergTableProvider;
+use snafu::prelude::*;
 
 use crate::{
     component::dataset::Dataset,
@@ -46,6 +47,16 @@ use super::{
 };
 
 static PREFIX: &str = "glue";
+
+#[derive(Debug, Snafu)]
+enum Error {
+    #[snafu(display(
+        "Could not retrieve table '{table}' from database '{database}'. Verify that both the database and table exist and are accessible."
+    ))]
+    GetTable { database: String, table: String },
+    #[snafu(display("Unable to load the AWS configuration.\n{source}"))]
+    AWSConfig { source: aws::Error },
+}
 
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
@@ -140,7 +151,7 @@ impl DataConnector for GlueDataConnector {
             super::DataConnectorError::UnableToConnectInternal {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                source: e.into(),
+                source: Box::new(Error::AWSConfig { source: e }),
             }
         })?;
 
@@ -152,10 +163,13 @@ impl DataConnector for GlueDataConnector {
             .name(table)
             .send()
             .await
-            .map_err(|e| super::DataConnectorError::UnableToConnectInternal {
+            .map_err(|_| super::DataConnectorError::UnableToConnectInternal {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                source: e.into(),
+                source: Box::new(Error::GetTable {
+                    database: database.to_string(),
+                    table: table.to_string(),
+                }),
             })?;
 
         let table =
@@ -251,7 +265,7 @@ async fn create_iceberg_provider(
             .ok_or_else(|| super::DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message: "no region specified".to_string(),
+                message: "No AWS region specified. Add `glue_region` to the spicepod.".to_string(),
             })?;
 
     let credentials = config

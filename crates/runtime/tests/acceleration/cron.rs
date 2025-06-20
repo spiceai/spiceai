@@ -308,6 +308,7 @@ datasets:
       refresh_cron: \"* * * * * *\" # every minute
 ";
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_reload() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -322,7 +323,8 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
 
             write_spicepod_yaml(YAML_CONTENT_BEFORE)?;
 
-            let app = AppBuilder::build_from_filesystem_path(spicepod_dir.clone())
+            let app = AppBuilder::build_from_path(spicepod_dir.clone())
+                .await
                 .expect("Failed to build app");
             let pods_watcher = PodsWatcher::new(spicepod_dir.clone());
 
@@ -453,6 +455,7 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
             let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
                 "./spicepods/test_append_cron_schedule.yaml"
             ))
+            .await
             .expect("Should load app from spicepod string");
 
             let rt = Arc::new(

@@ -41,6 +41,7 @@ impl DocumentParserFactory for PdfParserFactory {
 #[derive(Default)]
 pub struct PdfParser {}
 impl PdfParser {
+    #[must_use]
     pub fn new(_parser_options: &HashMap<String, String>) -> Self {
         PdfParser::default()
     }
