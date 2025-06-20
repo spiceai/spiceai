@@ -29,7 +29,6 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
-    dataaccelerator::AccelerationSource,
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,

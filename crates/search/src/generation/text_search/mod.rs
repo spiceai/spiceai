@@ -334,9 +334,6 @@ impl CandidateGeneration for FullTextSearch {
                 ));
             }
         };
-        let strm =
-            Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream;
-
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
