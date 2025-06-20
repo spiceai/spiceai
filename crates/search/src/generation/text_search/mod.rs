@@ -187,6 +187,16 @@ impl FullTextSearch {
             .searcher())
     }
 
+    fn query_parser(&self) -> QueryParser {
+        let default_field = self
+            .idx
+            .schema()
+            .find_field(self.field.as_str())
+            .map(|(f, _)| vec![f])
+            .unwrap_or_default();
+        QueryParser::for_index(&self.idx, default_field)
+    }
+
     /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
     fn search_query_literal(
         &self,
@@ -195,14 +205,8 @@ impl FullTextSearch {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
-        // Explicitly create AST to avoid user queries being considered a query language (e.g. `"title:sea^20 body:whale^70"`).
-        let default_field = self
-            .idx
-            .schema()
-            .find_field(self.field.as_str())
-            .map(|(f, _)| vec![f])
-            .unwrap_or_default();
-        let q = QueryParser::for_index(&self.idx, default_field)
+        let q = self
+            .query_parser()
             .build_query_from_user_input_ast(parse_query_literal(literal))
             .context(InvalidTextSearchQuerySnafu {
                 query: literal.to_string(),
@@ -330,10 +334,7 @@ impl CandidateGeneration for FullTextSearch {
                 ));
             }
         };
-        let strm =
-            Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream;
-
-        Ok(strm)
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
