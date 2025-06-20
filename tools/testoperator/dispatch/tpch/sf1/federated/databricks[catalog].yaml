@@ -3,7 +3,7 @@ tests:
     spicepod_path: federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     validate_results: true
   throughput:
     spicepod_path: federated/databricks[catalog].yaml
