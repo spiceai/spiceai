@@ -141,50 +141,49 @@ fn with_native_types_metadata(schema: &Schema) -> Schema {
     Schema::new(fields)
 }
 
-/// Returns data source-specific name for the data type.
-/// As we are using `DataFusion` that is based on Arrow, we use the Arrow data types directly.
+/// Returns associated `DataFusion` SQL type name for provided Arrow `DataType`.
+/// `<https://datafusion.apache.org/user-guide/sql/data_types.html>`
 pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
     // For non-complex types, `to_string()` can be used to return type information, but for consistency and control over naming,
     // explicit matching and type names are used.
     match data_type {
         DataType::Null => "NULL",
         DataType::Boolean => "BOOLEAN",
-        DataType::Int8 => "INT8",
-        DataType::Int16 => "INT16",
-        DataType::Int32 => "INT32",
-        DataType::Int64 => "INT64",
-        DataType::UInt8 => "UINT8",
-        DataType::UInt16 => "UINT16",
-        DataType::UInt32 => "UINT32",
-        DataType::UInt64 => "UINT64",
-        DataType::Float16 => "FLOAT16",
-        DataType::Float32 => "FLOAT32",
-        DataType::Float64 => "FLOAT64",
+        DataType::Int8 => "TINYINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INTEGER",
+        DataType::Int64 => "BIGINT",
+        DataType::UInt8 => "TINYINT UNSIGNED",
+        DataType::UInt16 => "SMALLINT UNSIGNED",
+        DataType::UInt32 => "INTEGER UNSIGNED",
+        DataType::UInt64 => "BIGINT UNSIGNED",
+        // There is no direct mapping for Float16 in DataFusion SQL, so we use REAL.
+        DataType::Float16 | DataType::Float32 => "REAL",
+        DataType::Float64 => "DOUBLE",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL",
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR",
         DataType::Timestamp(_, _) => "TIMESTAMP",
-        DataType::Date32 => "DATE32",
-        DataType::Date64 => "DATE64",
-        DataType::Time32(_) => "TIME32",
-        DataType::Time64(_) => "TIME64",
-        DataType::Duration(_) => "DURATION",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Time32(_) | DataType::Time64(_) => "TIME",
         DataType::Interval(_) => "INTERVAL",
-        DataType::Binary => "BINARY",
-        DataType::FixedSizeBinary(_) => "FIXED_SIZE_BINARY",
-        DataType::LargeBinary => "LARGE_BINARY",
-        DataType::Utf8 => "UTF8",
-        DataType::LargeUtf8 => "LARGE_UTF8",
-        DataType::List(_) => "LIST",
-        DataType::FixedSizeList(_, _) => "FIXED_SIZE_LIST",
-        DataType::LargeList(_) => "LARGE_LIST",
+        DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView => "BYTEA",
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::LargeListView(_)
+        | DataType::ListView(_) => "ARRAY",
+
         DataType::Struct(_) => "STRUCT",
+        // The following types are not durectly supported in SQL queries by DataFusion,
+        // Clients must treat them as text or use custom logic to handle them.
+        // `<https://github.com/apache/datafusion/blob/85eebcd25dfbe8e2d2d75d85b8683de8be4851e8/datafusion/sql/src/planner.rs#L720>`
+        DataType::Map(_, _) => "MAP",
+        DataType::Duration(_) => "DURATION",
         DataType::Union(_, _) => "UNION",
         DataType::Dictionary(_, _) => "DICTIONARY",
-        DataType::Decimal128(_, _) => "DECIMAL128",
-        DataType::Decimal256(_, _) => "DECIMAL256",
-        DataType::Map(_, _) => "MAP",
-        DataType::RunEndEncoded(_, _) => "RUN_END_ENCODED",
-        DataType::BinaryView => "BINARY_VIEW",
-        DataType::Utf8View => "UTF8_VIEW",
-        DataType::ListView(_) => "LIST_VIEW",
-        DataType::LargeListView(_) => "LARGE_LIST_VIEW",
+        DataType::RunEndEncoded(_, _) => "RUNENDENCODED",
     }
 }
