@@ -118,7 +118,9 @@ impl DynamoDBTableProvider {
                 // If a connection error occurs, provide detailed information available via Debug format.
                 // This happens when the request failed during dispatch. An HTTP response was not received, thus no error code or message is available.
                 if let Some(conn_error) = source.downcast_ref::<aws_sdk_dynamodb::error::ConnectorError>() {
-                    return format!("The request failed during dispatch (response was not received). This might indicate an invalid region setting or another connectivity problem.\n{conn_error:?}").into();
+                    return format!(
+                        "Connection error. This may indicate an invalid region setting, connectivity, or access issue.\nDetails: {conn_error:?}"
+                    ).into();
                 }
 
                 source
