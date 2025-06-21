@@ -64,7 +64,6 @@ impl TableProvider for FullTextSearchTable {
 
     fn schema(&self) -> SchemaRef {
         let tantivy_schema = self.index.idx.schema();
-
         let fields = self
             .index
             .all_columns()

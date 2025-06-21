@@ -27,7 +27,7 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::{
@@ -229,34 +229,52 @@ impl TextSearchUDTFProvider {
 
     // Convert projection relative to [`TextSearchUDTFProvider`] (i.e. base schema + 'score'), to the schema of the underlying full text search index.
     fn convert_projection(
+        &self,
         projection: Option<&Vec<usize>>,
         search_index_schema: &SchemaRef,
     ) -> Result<Vec<usize>, DataFusionError> {
         let proj = match projection {
             Some(proj) => {
-                let fields: Vec<_> = search_index_schema
+                let fields: Vec<_> = self
+                    .schema()
                     .project(proj)
                     .map_err(DataFusionError::from)?
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())
                     .collect();
-                search_index_schema
+
+                // Need to preserve order of projection.
+                // Map name of fields above, in order, to the indices within the search index.
+                let index_fields: HashMap<String, usize> = search_index_schema
                     .fields()
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| {
-                        if fields.contains(f.name()) {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|(i, f)| (f.name().clone(), i))
+                    .collect();
+
+                fields
+                    .iter()
+                    .filter_map(|f| index_fields.get(f).copied())
+                    .collect::<Vec<usize>>()
             }
             None => (0..search_index_schema.fields().len()).collect(),
         };
         Ok(proj)
+    }
+
+    /// Return the indices of the primary key in the schema.
+    pub fn primary_key_projection(&self) -> Vec<usize> {
+        let schema = self.schema();
+
+        self.index
+            .primary_key
+            .iter()
+            .filter_map(|pk| {
+                let (idx, _) = schema.column_with_name(pk)?;
+                Some(idx)
+            })
+            .collect()
     }
 }
 
@@ -330,7 +348,7 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let search_index_table = FullTextSearchTable::new(index, query.clone());
         let underlying_projection =
-            Self::convert_projection(projection, &search_index_table.schema())?;
+            self.convert_projection(projection, &search_index_table.schema())?;
 
         search_index_table
             .scan(

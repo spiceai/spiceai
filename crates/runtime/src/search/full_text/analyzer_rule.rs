@@ -83,13 +83,14 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                 let TextSearchTableFuncArgs {
                     tbl: base_table, ..
                 } = &text_search_udtf.args;
-                let base_schema = text_search_udtf.index.underlying.schema();
+
                 let base_table_scan = TableScan::try_new(
                     base_table.clone(),
                     Arc::new(DefaultTableSource::new(Arc::clone(
                         &text_search_udtf.index.underlying,
                     ))),
                     projection.as_ref().map(|v| {
+                        let base_schema = text_search_udtf.index.underlying.schema();
                         v.iter()
                             .filter(|idx| **idx <= base_schema.fields().len())
                             .copied()
@@ -99,11 +100,16 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     None,
                 )?;
 
-                let index_table_name = format!("{}_udtf", base_table.clone());
                 let index_scan = TableScan::try_new(
-                    index_table_name.clone(),
+                    format!("{}_udtf", base_table.clone()),
                     Arc::new(DefaultTableSource::new(Arc::new(text_search_udtf.clone()))),
-                    Some(vec![0, text_search_udtf.schema().fields().len() - 1]),
+                    Some(
+                        [
+                            text_search_udtf.primary_key_projection(), // Primary key
+                            vec![text_search_udtf.schema().fields().len() - 1], // 'score' column
+                        ]
+                        .concat(),
+                    ),
                     vec![],
                     *fetch,
                 )?;
@@ -113,36 +119,35 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
                 };
 
-                let on_condition = text_search_udtf
-                    .index
-                    .primary_key
-                    .iter()
-                    .map(|p| {
-                        (
-                            Column::new_unqualified(p.clone()).into(),
-                            Column::new_unqualified(p.clone()).into(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
                 let join = Join {
                     left: Arc::new(LogicalPlan::TableScan(index_scan)),
                     right: Arc::new(LogicalPlan::TableScan(base_table_scan)),
                     join_type: JoinType::Left,
                     join_constraint: JoinConstraint::On,
-                    on: on_condition,
+                    on: text_search_udtf
+                        .index
+                        .primary_key
+                        .iter()
+                        .map(|p| {
+                            (
+                                Column::new_unqualified(p.clone()).into(),
+                                Column::new_unqualified(p.clone()).into(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                     filter: None,
                     schema: Arc::clone(&df_schema),
                     null_equals_null: false,
                 };
 
                 let sort = Sort {
-                    fetch: *fetch,
                     input: Arc::new(LogicalPlan::Join(join)),
                     expr: vec![SortExpr {
                         expr: Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
                         nulls_first: false,
                         asc: false,
                     }],
+                    fetch: *fetch,
                 };
 
                 Ok(Transformed::yes(LogicalPlan::SubqueryAlias(
