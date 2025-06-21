@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use snafu::ResultExt;
 use std::{any::Any, sync::Arc};
@@ -63,6 +63,7 @@ impl DataAccelerator for ArrowAccelerator {
         &self,
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
+        _partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = SessionContext::new();
         TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)

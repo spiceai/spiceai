@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
@@ -247,6 +247,7 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
+        _partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(source) = source {
             if source.is_file_accelerated() {
@@ -369,7 +370,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
-            .create_external_table(external_table, None)
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 
