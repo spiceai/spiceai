@@ -533,6 +533,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[allow(irrefutable_let_patterns)]
     pub(crate) fn get_full_text_index(
         &self,
         tbl: &TableReference,

@@ -739,7 +739,7 @@ impl Runtime {
                 notifier.notified().await;
                 if let Err(e) = runtime.register_dataset_indexes(&ds).await {
                     tracing::error!("{e}");
-                };
+                }
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }

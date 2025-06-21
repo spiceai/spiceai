@@ -16,13 +16,13 @@ limitations under the License.
 
 //! A user-defined table function (UDTF) for performing full text search on a preexisting table that has an associated [`crate::datafusion::indexes::full_text::FullTextIndex`] in [`DataFusion`].
 //!
-//! text_search(tbl: TableReference, query: &str, col: Option<str>, limit: Option<usize>, include_score: Option<bool>)
+//! `text_search(tbl`: `TableReference`, query: &str, col: Option<str>, limit: Option<usize>, `include_score`: Option<bool>)
 //!
 //! - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), and empty table is returned.
 //! - query: Query to perform full text search against.
 //! - col: If provided, use this column to compare vector search results against.
 //! - limit:
-//! - include_score (default true): If false, do not return `score` in the table projection.
+//! - `include_score` (default true): If false, do not return `score` in the table projection.
 //!
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
@@ -176,7 +176,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         };
 
         Ok(Arc::new(TextSearchUDTFProvider {
-            df: self.df.clone(),
+            df: Arc::clone(&self.df),
             args,
             index: fts_index,
         }))
@@ -229,9 +229,8 @@ impl TextSearchUDTFProvider {
 
     // Convert projection relative to [`TextSearchUDTFProvider`] (i.e. base schema + 'score'), to the schema of the underlying full text search index.
     fn convert_projection(
-        &self,
         projection: Option<&Vec<usize>>,
-        search_index_schema: SchemaRef,
+        search_index_schema: &SchemaRef,
     ) -> Result<Vec<usize>, DataFusionError> {
         let proj = match projection {
             Some(proj) => {
@@ -331,7 +330,7 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let search_index_table = FullTextSearchTable::new(index, query.clone());
         let underlying_projection =
-            self.convert_projection(projection.as_deref(), search_index_table.schema())?;
+            Self::convert_projection(projection, &search_index_table.schema())?;
 
         search_index_table
             .scan(

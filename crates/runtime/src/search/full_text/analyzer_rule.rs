@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`AnalyzerRule`] to resolve 'text_search' UDTFs properly by resolving them as a join between the full text search index and their underlying table. See [`crate::search::full_text::udtf::TextSearchTableFunc`] for details on the underlying [`TableProvider`].
+//! [`AnalyzerRule`] to resolve '`text_search`' UDTFs properly by resolving them as a join between the full text search index and their underlying table. See [`crate::search::full_text::udtf::TextSearchTableFunc`] for details on the underlying [`TableProvider`].
 //!
 //! ### Example
 //! ```sql
