@@ -96,6 +96,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod parameters;
+pub mod partition;
 pub mod podswatcher;
 pub mod request;
 mod scheduling;

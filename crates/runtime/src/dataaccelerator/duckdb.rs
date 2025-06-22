@@ -26,6 +26,7 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
+    partition::PartitionTableProvider,
     spice_data_base_path,
 };
 use async_trait::async_trait;
@@ -302,13 +303,14 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        _partition_by: Vec<Expr>,
+        partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
         }
 
+        // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
             if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
                 cmd.options
@@ -366,26 +368,33 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
-        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
-            .await
-            .context(UnableToCreateTableSnafu)
-            .boxed()?;
+        let table_provider: Arc<dyn TableProvider> = if partition_by.is_empty() {
+            let ctx = SessionContext::new();
+            let table_provider =
+                TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
+                    .await
+                    .context(UnableToCreateTableSnafu)
+                    .boxed()?;
 
-        let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
-        else {
-            unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
+            let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
+            else {
+                unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
+            };
+
+            let read_provider = Arc::clone(&duckdb_writer.read_provider);
+            let duckdb_writer = Arc::new(duckdb_writer.clone());
+            let cloned_writer = Arc::clone(&duckdb_writer);
+
+            Arc::new(PolyTableProvider::new(
+                cloned_writer,
+                duckdb_writer,
+                read_provider,
+            ))
+        } else {
+            Arc::new(PartitionTableProvider::new(partition_by, &cmd))
         };
 
-        let read_provider = Arc::clone(&duckdb_writer.read_provider);
-        let duckdb_writer = Arc::new(duckdb_writer.clone());
-        let cloned_writer = Arc::clone(&duckdb_writer);
-
-        Ok(Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            duckdb_writer,
-            read_provider,
-        )))
+        Ok(table_provider)
     }
 
     fn prefix(&self) -> &'static str {

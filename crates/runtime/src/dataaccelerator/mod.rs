@@ -124,6 +124,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -229,10 +230,11 @@ impl AcceleratorEngineRegistry {
 
         let external_table = external_table_builder.build()?;
 
-        let df_schema = DFSchema::try_from(schema).unwrap();
+        let df_schema = DFSchema::try_from(schema)
+            .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
         let partition_by = acceleration_settings
             .partition_by_expressions(&ctx, &df_schema)
-            .unwrap();
+            .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
         let table_provider = accelerator
             .create_external_table(external_table, source, partition_by)

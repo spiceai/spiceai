@@ -289,7 +289,7 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    partition_by: Vec<String>,
+    pub partition_by: Vec<String>,
 }
 
 impl Acceleration {
@@ -308,7 +308,6 @@ impl Acceleration {
         self
     }
 
-    #[must_use]
     pub fn partition_by_expressions(
         &self,
         ctx: &SessionContext,
