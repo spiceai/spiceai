@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -23,8 +23,9 @@ use datafusion::{
     common::Constraints,
     datasource::TableType,
     error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::CreateExternalTable,
-    physical_plan::ExecutionPlan,
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
     prelude::Expr,
 };
 
@@ -74,6 +75,55 @@ impl TableProvider for PartitionTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub struct PartitionedTableInsert {
+    properties: PlanProperties,
+    projected_schema: SchemaRef,
+}
+
+impl ExecutionPlan for PartitionedTableInsert {
+    fn name(&self) -> &'static str {
+        "PartitionedTableInsert"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.projected_schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        todo!()
+    }
+}
+
+impl DisplayAs for PartitionedTableInsert {
+    fn fmt_as(&self, _t: DisplayFormatType, _f: &mut fmt::Formatter) -> fmt::Result {
         todo!()
     }
 }
