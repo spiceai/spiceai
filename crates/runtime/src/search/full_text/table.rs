@@ -27,7 +27,7 @@ use datafusion::prelude::{Expr, SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
-use search::generation::text_search::FullTextSearch;
+use search::generation::text_search::FullTextSearchIndex;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
@@ -235,7 +235,7 @@ impl TableWithFullText {
     ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
-            let base = FullTextSearch::try_new(
+            let base = FullTextSearchIndex::try_new(
                 Arc::clone(&self.index),
                 search_field.clone(),
                 self.primary_key.clone(),
