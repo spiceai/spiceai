@@ -1,5 +1,5 @@
 ---
-source: crates/search/src/generation/text_search.rs
+source: crates/search/src/generation/text_search/mod.rs
 expression: rb_as_value
 snapshot_kind: text
 ---

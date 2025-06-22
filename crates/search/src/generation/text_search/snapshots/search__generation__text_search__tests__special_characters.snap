@@ -1,5 +1,5 @@
 ---
-source: crates/search/src/generation/text_search.rs
+source: crates/search/src/generation/text_search/mod.rs
 expression: "parse_query_literal(\"title:sea^20 body:whale^70\")"
 snapshot_kind: text
 ---

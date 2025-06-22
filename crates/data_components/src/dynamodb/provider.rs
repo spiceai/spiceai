@@ -23,10 +23,7 @@ use arrow::{
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
-    operation::{
-        describe_table::DescribeTableError,
-        scan::{ScanError, builders::ScanFluentBuilder},
-    },
+    operation::scan::{ScanError, builders::ScanFluentBuilder},
     types::{AttributeValue, TableStatus},
 };
 use datafusion::{
@@ -49,9 +46,11 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display(
+        "Failed to fetch table information.\nError: {source}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
+    ))]
     DescribeTableError {
-        source: aws_sdk_dynamodb::error::SdkError<DescribeTableError>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("{source}"))]
@@ -99,6 +98,33 @@ impl DynamoDBTableProvider {
             .table_name(table_name.to_string())
             .send()
             .await
+            .map_err(|err| {
+                // Convert the SdkError to a more user-friendly error
+                let source = match err.into_source() {
+                    Ok(source) => source,
+                    Err(err) => {
+                        // If there is no error source, then original instance of SdkError is returned
+                        return err.into();
+                    }
+                };
+
+                if let Some(err) = source.downcast_ref::<aws_sdk_dynamodb::operation::describe_table::DescribeTableError>() {
+                    // Error metadata message (if present) contains a specific error message
+                    if let Some(err_msg) = err.meta().message() {
+                        return err_msg.into();
+                    }
+                }
+
+                // If a connection error occurs, provide detailed information available via Debug format.
+                // This happens when the request failed during dispatch. An HTTP response was not received, thus no error code or message is available.
+                if let Some(conn_error) = source.downcast_ref::<aws_sdk_dynamodb::error::ConnectorError>() {
+                    return format!(
+                        "Connection error. This may indicate an invalid region setting, connectivity, or access issue.\nDetails: {conn_error:?}"
+                    ).into();
+                }
+
+                source
+            })
             .context(DescribeTableSnafu)?;
 
         let Some(table) = response.table() else {
