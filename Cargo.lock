@@ -11096,6 +11096,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "snafu",
+ "tokio",
 ]
 
 [[package]]

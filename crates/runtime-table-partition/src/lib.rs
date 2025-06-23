@@ -21,6 +21,7 @@ use snafu::prelude::*;
 
 pub mod creator;
 pub mod execution_plan;
+pub mod expression;
 pub mod provider;
 
 #[derive(Debug, Snafu)]
