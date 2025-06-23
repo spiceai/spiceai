@@ -40,7 +40,6 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
-use runtime_table_partition::provider::PartitionTableProvider;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
@@ -368,31 +367,26 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let table_provider: Arc<dyn TableProvider> = if partition_by.is_empty() {
-            let ctx = SessionContext::new();
-            let table_provider =
-                TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
-                    .await
-                    .context(UnableToCreateTableSnafu)
-                    .boxed()?;
+        let ctx = SessionContext::new();
+        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
+            .await
+            .context(UnableToCreateTableSnafu)
+            .boxed()?;
 
-            let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
-            else {
-                unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
-            };
-
-            let read_provider = Arc::clone(&duckdb_writer.read_provider);
-            let duckdb_writer = Arc::new(duckdb_writer.clone());
-            let cloned_writer = Arc::clone(&duckdb_writer);
-
-            Arc::new(PolyTableProvider::new(
-                cloned_writer,
-                duckdb_writer,
-                read_provider,
-            ))
-        } else {
-            Arc::new(PartitionTableProvider::new(partition_by, &cmd))
+        let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
+        else {
+            unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
         };
+
+        let read_provider = Arc::clone(&duckdb_writer.read_provider);
+        let duckdb_writer = Arc::new(duckdb_writer.clone());
+        let cloned_writer = Arc::clone(&duckdb_writer);
+
+        let table_provider = Arc::new(PolyTableProvider::new(
+            cloned_writer,
+            duckdb_writer,
+            read_provider,
+        ));
 
         Ok(table_provider)
     }

@@ -32,6 +32,6 @@ pub enum Error {
 }
 
 pub struct Partition {
-    _partition_value: ScalarValue,
-    _table_provider: Arc<dyn TableProvider>,
+    partition_value: ScalarValue,
+    table_provider: Arc<dyn TableProvider>,
 }

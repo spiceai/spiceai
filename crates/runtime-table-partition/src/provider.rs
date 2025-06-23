@@ -23,27 +23,41 @@ use datafusion::{
     common::Constraints,
     datasource::TableType,
     error::DataFusionError,
-    logical_expr::CreateExternalTable,
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
-use crate::creator::PartitionCreator;
+use crate::{Error, creator::PartitionCreator};
 
 type ScalarValueString = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
-    schema: SchemaRef,
+    _creator: Arc<dyn PartitionCreator>,
     _partition_by: Vec<Expr>,
     _partitions: HashMap<ScalarValueString, Arc<dyn TableProvider>>,
-    _creator: Arc<dyn PartitionCreator>,
+    schema: SchemaRef,
 }
 
 impl PartitionTableProvider {
     #[must_use]
-    pub fn new(_partition_by: Vec<Expr>, _cmd: &CreateExternalTable) -> Self {
-        todo!()
+    pub fn new(
+        creator: Arc<dyn PartitionCreator>,
+        _partition_by: Vec<Expr>,
+        schema: SchemaRef,
+    ) -> Result<Self, Error> {
+        let partitions = creator
+            .infer_existing_partitions()?
+            .into_iter()
+            .map(|p| (p.partition_value.to_string(), p.table_provider))
+            .collect();
+
+        Ok(Self {
+            _creator: creator,
+            _partition_by,
+            _partitions: partitions,
+            schema,
+        })
     }
 }
 
