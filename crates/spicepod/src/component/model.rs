@@ -401,23 +401,6 @@ impl Model {
 
         None
     }
-
-    /// Returns the subset of [`Self::params`] that are `OpenAI` request overrides. These will be
-    /// used as the default values in the request payload, instead of the provider's defaults.
-    ///
-    /// `OpenAI` request overrides are parameters that start with `openai_`. The returned keys will be
-    /// without the `openai_` prefix.
-    #[must_use]
-    pub fn get_openai_request_overrides(&self, prefix: &ModelSource) -> Vec<(String, Value)> {
-        let prefix_str = format!("{}_", prefix.short_name());
-        self.params
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix(&prefix_str)
-                    .map(|new_k| (new_k.to_string(), v.clone()))
-            })
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

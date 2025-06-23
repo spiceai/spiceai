@@ -222,6 +222,22 @@ impl Parameters {
     pub fn iter(&self) -> std::slice::Iter<'_, (String, SecretString)> {
         self.params.iter()
     }
+
+    pub fn get_runtime_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| !self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_component_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
