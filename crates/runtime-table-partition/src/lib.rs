@@ -14,6 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
+use datafusion::{catalog::TableProvider, scalar::ScalarValue};
+use snafu::prelude::*;
+
 pub mod creator;
 pub mod execution_plan;
 pub mod provider;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(""))]
+    CreatePartition,
+    #[snafu(display(""))]
+    InferringPartitions,
+}
+
+pub struct Partition {
+    _partition_value: ScalarValue,
+    _table_provider: Arc<dyn TableProvider>,
+}

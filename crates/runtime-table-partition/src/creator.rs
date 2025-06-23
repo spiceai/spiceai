@@ -14,5 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[derive(Debug)]
-pub struct PartitionCreator {}
+use std::fmt::Debug;
+
+use datafusion::scalar::ScalarValue;
+
+use crate::{Error, Partition};
+
+pub trait PartitionCreator: Debug + Send + Sync {
+    /// Create a new [`Partition`] using the `partition_value`.
+    fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
+
+    /// Find and load previously created [`Parition`]s.
+    fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+}

@@ -47,7 +47,8 @@ impl ExecutionPlan for PartitionedTableInsert {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        todo!()
+        // TODO
+        vec![]
     }
 
     fn with_new_children(
@@ -68,7 +69,7 @@ impl ExecutionPlan for PartitionedTableInsert {
 
 impl DisplayAs for PartitionedTableInsert {
     fn fmt_as(&self, _t: DisplayFormatType, _f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO:
+        // TODO
         Ok(())
     }
 }

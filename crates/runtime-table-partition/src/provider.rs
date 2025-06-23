@@ -37,7 +37,7 @@ pub struct PartitionTableProvider {
     schema: SchemaRef,
     _partition_by: Vec<Expr>,
     _partitions: HashMap<ScalarValueString, Arc<dyn TableProvider>>,
-    _creator: PartitionCreator,
+    _creator: Arc<dyn PartitionCreator>,
 }
 
 impl PartitionTableProvider {

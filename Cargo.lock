@@ -11095,6 +11095,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "snafu",
 ]
 
 [[package]]
