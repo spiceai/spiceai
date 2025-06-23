@@ -236,7 +236,7 @@ impl TableWithFullText {
             self.primary_key.clone(),
             Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
         )?;
-        search_index.add_type_hints(self.underlying_table().schema());
+        search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index)
     }
 

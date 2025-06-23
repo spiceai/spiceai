@@ -158,9 +158,9 @@ impl FullTextSearchIndex {
     /// Add type hints for all fields in [`SchemaRef`].
     ///
     /// Fields in `schema` but not in the underlying [`FullTextSearchIndex::idx`] are added.
-    pub fn add_type_hints(&mut self, schema: SchemaRef) {
+    pub fn add_type_hints(&mut self, schema: &SchemaRef) {
         for f in schema.fields() {
-            self.add_type_hint(f.name(), f.clone());
+            self.add_type_hint(f.name(), Arc::clone(f));
         }
     }
 
