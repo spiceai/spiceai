@@ -1,6 +1,6 @@
 ---
-source: crates/search/src/generation/text_search.rs
-expression: "parse_query_literal(\"foo and bar\")"
+source: crates/search/src/generation/text_search/mod.rs
+expression: "parse_query_literal(\"'foo and' bar\")"
 snapshot_kind: text
 ---
 {
