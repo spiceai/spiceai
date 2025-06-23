@@ -26,7 +26,6 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    partition::PartitionTableProvider,
     spice_data_base_path,
 };
 use async_trait::async_trait;
@@ -41,6 +40,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_table_partition::provider::PartitionTableProvider;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};

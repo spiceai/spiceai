@@ -11024,6 +11024,7 @@ dependencies = [
  "reqwest 0.12.15",
  "rmcp",
  "runtime-auth",
+ "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",
  "rustls-pemfile 2.2.0",
@@ -11085,6 +11086,15 @@ dependencies = [
  "tonic",
  "tower 0.5.2",
  "tracing",
+]
+
+[[package]]
+name = "runtime-table-partition"
+version = "1.5.0-unstable"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
 ]
 
 [[package]]

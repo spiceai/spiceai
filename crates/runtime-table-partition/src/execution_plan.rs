@@ -14,70 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
-use async_trait::async_trait;
 use datafusion::{
-    catalog::{Session, TableProvider},
-    common::Constraints,
-    datasource::TableType,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::CreateExternalTable,
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
-    prelude::Expr,
 };
-
-// [`datafusion::scalar::ScalarValue`] does not necessary traits for Hash key.
-type ScalarValueString = String;
-
-#[derive(Debug)]
-pub struct PartitionTableProvider {
-    schema: SchemaRef,
-    _partition_by: Vec<Expr>,
-    _partitions: HashMap<ScalarValueString, Arc<dyn TableProvider>>,
-    _creator: PartitionCreator,
-}
-
-#[derive(Debug)]
-struct PartitionCreator {}
-
-impl PartitionTableProvider {
-    #[must_use]
-    pub fn new(_partition_by: Vec<Expr>, _cmd: &CreateExternalTable) -> Self {
-        todo!()
-    }
-}
-
-#[async_trait]
-impl TableProvider for PartitionTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        None
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        todo!()
-    }
-}
 
 #[derive(Debug)]
 pub struct PartitionedTableInsert {
@@ -124,6 +68,7 @@ impl ExecutionPlan for PartitionedTableInsert {
 
 impl DisplayAs for PartitionedTableInsert {
     fn fmt_as(&self, _t: DisplayFormatType, _f: &mut fmt::Formatter) -> fmt::Result {
-        todo!()
+        // TODO:
+        Ok(())
     }
 }
