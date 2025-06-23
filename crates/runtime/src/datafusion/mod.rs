@@ -323,21 +323,6 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
-    pub async fn has_table(&self, table_reference: &TableReference) -> bool {
-        let table_name = table_reference.table();
-
-        if let Some(schema_name) = table_reference.schema() {
-            if let Some(schema) = self.schema(schema_name) {
-                return match schema.table(table_name).await {
-                    Ok(table) => table.is_some(),
-                    Err(_) => false,
-                };
-            }
-        }
-
-        self.ctx.table(table_name).await.is_ok()
-    }
-
     pub async fn get_table(
         &self,
         table_reference: &TableReference,
