@@ -8,30 +8,27 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Structural, general years must grow years. Roughly cogni"
       },
       "dataset": "catalog_page",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Structural, general years must grow years. Roughly cogni"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 2598
       },
-      "score": 0.032
+      "score": 0.016
     },
     {
       "data": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+        "cp_department": "DEPARTMENT"
       },
       "dataset": "catalog_page",
       "matches": {
         "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "cp_catalog_page_sk": 1
       },
       "score": 0.016
     }

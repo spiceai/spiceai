@@ -21,7 +21,7 @@ use datafusion::{
     datasource::{MemTable, TableProvider},
     error::DataFusionError,
     execution::SendableRecordBatchStream,
-    logical_expr::{Expr as LogicalExpr, select_expr::SelectExpr, sqlparser::ast::Expr},
+    logical_expr::{Expr as LogicalExpr, SortExpr, select_expr::SelectExpr, sqlparser::ast::Expr},
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionContext,
 };
@@ -30,7 +30,10 @@ use futures::{Stream, StreamExt};
 use snafu::ResultExt;
 use std::sync::Arc;
 
-use crate::generation::{CandidateGeneration, InternalSnafu, Result};
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME,
+    generation::{CandidateGeneration, InternalSnafu, Result},
+};
 
 /// [`PostApplyCandidateGeneration`] applies filter predicate and retrieves additional columns to a
 ///  [`CandidateGeneration`] that may not have full support.
@@ -150,6 +153,7 @@ impl PostApplyCandidateGeneration {
     ) {
         let mut schema = stream.schema();
         let mut remaining_limit = limit;
+
         let s = stream! {
             while let Some(item) = stream.next().await {
                 let batch = item?;
@@ -178,11 +182,15 @@ impl PostApplyCandidateGeneration {
 
                 let mut sql = ctx.table(CANDIDATE_GENERATION_TABLE_NAME).await?.join(
                     ctx.table(TABLE_PROVIDER_TABLE_NAME).await?,
-                    JoinType::Inner,
+                    JoinType::Left,
                     pks.as_slice(),
                     pks.as_slice(),
                     None
-                )?;
+                )?.sort(vec![SortExpr{
+                    expr: LogicalExpr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
+                    asc: false,
+                    nulls_first: false
+                }])?;
 
                 if !remaining_filters.is_empty() {
                     let filter_expr = sql.parse_sql_expr(remaining_filters
@@ -214,6 +222,7 @@ impl PostApplyCandidateGeneration {
                         yield Err(e);
                     }
                 }
+                let _ = ctx.deregister_table(CANDIDATE_GENERATION_TABLE_NAME)?;
                 // Early exit on `LIMIT` clause
                 if remaining_limit == 0 {
                     break;

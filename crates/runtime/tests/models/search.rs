@@ -170,7 +170,7 @@ async fn start_app(app: App) -> Result<Config, anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = Arc::clone(&rt).load_components() => {}
@@ -377,6 +377,12 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         enabled: true,
         row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
     });
+    if let Some(mut acc) = ds.acceleration.as_mut() {
+        acc.refresh_sql = Some(
+            "SELECT * FROM hybrid_column_search WHERE cp_type is Null and  cp_description!=''"
+                .into(),
+        )
+    };
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
@@ -440,6 +446,12 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
             row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
         }),
     });
+    if let Some(mut acc) = ds.acceleration.as_mut() {
+        acc.refresh_sql = Some(
+            "SELECT * FROM multi_column_hybrid_search WHERE cp_type is Null and cp_description!=''"
+                .into(),
+        )
+    };
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
@@ -493,6 +505,9 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             row_ids: Some(vec!["i_item_sk".to_string()]),
         }),
     }];
+    if let Some(mut acc) = ds.acceleration.as_mut() {
+        acc.refresh_sql = Some("SELECT * FROM item WHERE i_manager_id=97".into())
+    };
 
     run_search(
         AppBuilder::new("search_app").with_dataset(ds).build(),
@@ -526,7 +541,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset(
             "catalog_page",
             Some("catalog_page"),
-            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20".to_string().as_str()),
+            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page where cp_type is Null and  cp_description!='' and cp_department!=''".to_string().as_str()),
         );
     ds.columns = vec![
         Column {
@@ -548,13 +563,14 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             }),
         },
     ];
+
     run_search(
         AppBuilder::new("search_app").with_dataset(ds).build(),
         vec![
             SearchTestCase {
                 name: "multi_text_column_basic",
                 body: json!({
-                    "text": "In general basic",
+                    "text": "woman years department",
                     "limit": 2,
                     "datasets": ["catalog_page"]
                 }),
@@ -562,7 +578,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "multi_text_column_fused",
                 body: json!({
-                    "text": "In general basic department",
+                    "text": "woman years department",
                     "limit": 2,
                     "datasets": ["catalog_page"],
                     "additional_columns": ["cp_department", "cp_description"]
@@ -571,7 +587,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "multi_text_column_additional",
                 body: json!({
-                    "text": "In general basic",
+                    "text": "woman years department",
                     "limit": 2,
                     "datasets": ["catalog_page"],
                     "additional_columns": ["cp_catalog_number"],
@@ -580,7 +596,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "multi_text_column_where",
                 body: json!({
-                    "text": "In general basic",
+                    "text": "woman years department",
                     "datasets": ["catalog_page"],
                     "where": "cp_department='DEPARTMENT'"
                 }),

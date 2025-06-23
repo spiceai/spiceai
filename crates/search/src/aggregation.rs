@@ -125,7 +125,6 @@ fn from_single_input(
         data,
         derived_from: derived_column,
     } = input;
-
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the
     // `SEARCH_VALUE_COLUMN_NAME` column, so we directly know the mapping.
     let mut matches = HashMap::new();

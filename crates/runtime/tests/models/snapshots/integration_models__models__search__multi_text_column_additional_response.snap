@@ -7,30 +7,24 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Structural, general years must grow years. Roughly cogni"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2598
+      },
+      "score": 0.016
+    },
+    {
+      "dataset": "catalog_page",
+      "matches": {
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 12.843
-    },
-    {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "catalog_page",
-      "matches": {
-        "cp_description": "Close times adopt only in a interests. Far strings might say slowly. Times go strictly cattle. Sign"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 21
-      },
-      "score": 2.205
+      "score": 0.016
     }
   ]
 }

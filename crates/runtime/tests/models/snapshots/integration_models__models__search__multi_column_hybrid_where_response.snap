@@ -9,32 +9,32 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Women might list further. Due, domestic issues find preci"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 821
       },
-      "score": 0.016
+      "score": 0.939
     },
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "Earlier different differences get just to a methods; masses inclu"
+        "cp_description": "At least personal cities decide yesterday. Domestic, advanced men would not t"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 3
+        "cp_catalog_page_sk": 7137
       },
-      "score": 0.016
+      "score": 0.934
     },
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": "Ideal models should not bring very on a men. New t"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 11065
       },
-      "score": 0.015
+      "score": 0.931
     }
   ]
 }

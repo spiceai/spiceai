@@ -9,32 +9,22 @@ snapshot_kind: text
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Single, vulnerable goods would expect generously for the years. Dramatic,"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 10400
       },
-      "score": 12.843
+      "score": 0.016
     },
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Great, available rules find in addition groups; broad, local circumstances wa"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 23
+        "cp_catalog_page_sk": 192
       },
-      "score": 2.696
-    },
-    {
-      "dataset": "catalog_page",
-      "matches": {
-        "cp_description": "Close times adopt only in a interests. Far strings might say slowly. Times go strictly cattle. Sign"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 21
-      },
-      "score": 2.205
+      "score": 0.016
     }
   ]
 }

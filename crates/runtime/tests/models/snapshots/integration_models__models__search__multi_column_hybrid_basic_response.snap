@@ -9,13 +9,12 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Women might list further. Due, domestic issues find preci"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 821
       },
-      "score": 0.032
+      "score": 0.016
     },
     {
       "dataset": "multi_column_hybrid_search",
@@ -23,7 +22,7 @@ snapshot_kind: text
         "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "cp_catalog_page_sk": 1
       },
       "score": 0.016
     }

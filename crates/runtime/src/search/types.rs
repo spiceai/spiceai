@@ -162,7 +162,6 @@ pub async fn to_matches(
     while let Some(Ok(rb)) = result.data.next().await {
         let data = result.data_json(&rb)?;
         let primary_key = result.primary_key_json(&rb)?;
-
         // Collect the highlights for each column. Value of map is a vector rows, each of which contains the highlights for that row.
         let matches = result
             .matches

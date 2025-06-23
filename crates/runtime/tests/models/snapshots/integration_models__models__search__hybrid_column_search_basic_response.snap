@@ -9,10 +9,10 @@ snapshot_kind: text
     {
       "dataset": "hybrid_column_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Women might list further. Due, domestic issues find precis"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 821
       },
       "score": 0.016
     },

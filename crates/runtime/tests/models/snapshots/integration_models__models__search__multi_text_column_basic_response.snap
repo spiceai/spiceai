@@ -9,22 +9,22 @@ snapshot_kind: text
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": "Structural, general years must grow years. Roughly cogni"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 2598
       },
-      "score": 12.843
+      "score": 0.016
     },
     {
       "dataset": "catalog_page",
       "matches": {
-        "cp_description": "Levels will attend ago general, basic ideas. Physical, "
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 3404
+        "cp_catalog_page_sk": 1
       },
-      "score": 10.345
+      "score": 0.016
     }
   ]
 }
