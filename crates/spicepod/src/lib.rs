@@ -35,6 +35,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 pub mod acceleration;
 pub mod component;
 pub mod extension;
+mod keywords;
 pub mod metric;
 pub mod param;
 pub mod reader;
@@ -78,6 +79,11 @@ pub enum Error {
         source: object_store_aws_sdk::Error,
         path: String,
     },
+
+    #[snafu(display(
+        "The dataset name '{keyword}' is a protected keyword and cannot be used as a name for a dataset."
+    ))]
+    UseOfProtectedKeyword { keyword: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -128,6 +134,17 @@ fn detect_duplicate_component_names(
             });
         }
         component_names.push(component.name());
+    }
+    Ok(())
+}
+
+fn check_for_protected_keywords(components: &[impl component::Nameable]) -> Result<()> {
+    for component in components {
+        if keywords::is_protected_keyword(component.name()) {
+            return Err(Error::UseOfProtectedKeyword {
+                keyword: component.name().to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -248,6 +265,8 @@ impl Spicepod {
         detect_duplicate_component_names("eval", &resolved_evals[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
+
+        check_for_protected_keywords(&resolved_datasets[..])?;
 
         Ok(from_definition(
             spicepod_definition,
