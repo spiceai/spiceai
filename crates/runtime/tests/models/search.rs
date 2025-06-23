@@ -46,6 +46,16 @@ pub struct SearchTestCase {
     pub body: serde_json::Value,
 }
 
+async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+    let response_str = http_post(&format!("{base_url}/v1/sql").to_string(), sql, headers).await?;
+    serde_json::from_str(&response_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {}", e))
+}
+
 pub async fn run_search_test(
     base_url: &str,
     ts: &SearchTestCase,
@@ -184,6 +194,7 @@ async fn start_app(app: App) -> Result<Config, anyhow::Error> {
 pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
+    test_sql_cases: Vec<(&str, &str)>,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -193,6 +204,19 @@ pub(crate) async fn run_search(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             for ts in test_cases {
                 run_search_test(http_base_url.as_str(), &ts, None).await?;
+            }
+            for (sql_test_name, sql) in test_sql_cases {
+                match http_sql(http_base_url.as_str(), sql).await {
+                    Ok(resp) => {
+                        insta::assert_json_snapshot!(sql_test_name, resp);
+                    }
+                    Err(e) => {
+                        insta::assert_snapshot!(
+                            format!("{sql_test_name}_error_response"),
+                            e.to_string()
+                        );
+                    }
+                }
             }
             Ok(())
         })
@@ -259,6 +283,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![],
     )
     .await
 }
@@ -325,6 +350,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![],
     )
     .await
 }
@@ -360,6 +386,7 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
                 "datasets": ["mulit_column_no_pks"]
             }),
         }],
+        vec![],
     )
     .await
 }
@@ -377,6 +404,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         enabled: true,
         row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
     });
+    let column_name = col.name.clone();
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
@@ -414,6 +442,18 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![
+            (
+                "hybrid_column_sql_text_search_basic",
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_text_search_projection",
+                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_text_search_filters",
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+            )
+        ]
     )
     .await
 }
@@ -477,6 +517,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![],
     )
     .await
 }
@@ -517,6 +558,18 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![
+            (
+                "text_search_sql_text_search_basic",
+                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+            ), (
+                "text_search_sql_text_search_projection",
+                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+            ), (
+                "text_search_sql_text_search_filters",
+                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
+            )
+        ]
     )
     .await
 }
@@ -586,6 +639,24 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![
+            (
+                "multi_text_column_sql_text_search_basic",
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+            ),
+            // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
+            (
+                "multi_text_column_sql_text_search_error",
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic') LIMIT 4"
+            ),
+            (
+                "multi_text_column_sql_text_search_additional",
+                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+            ), (
+                "multi_text_column_sql_text_search_filters",
+                "SELECT cp_catalog_page_sk, score, cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
+            )
+        ]
     )
     .await
 }
@@ -683,6 +754,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
+        vec![],
     )
     .await
 }
