@@ -13,7 +13,7 @@ limitations under the License.
 use std::{any::Any, fmt::Formatter, sync::Arc};
 
 use crate::generation::text_search::table::FullTextSearchTable;
-use arrow::{datatypes::Schema, error::ArrowError};
+use arrow::error::ArrowError;
 use async_stream::stream;
 use datafusion::{
     catalog::TableProvider,

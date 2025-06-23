@@ -230,12 +230,14 @@ impl TableWithFullText {
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchIndex, search::generation::text_search::Error> {
-        FullTextSearchIndex::try_new(
+        let mut search_index = FullTextSearchIndex::try_new(
             Arc::clone(&self.index),
             search_field.to_string(),
             self.primary_key.clone(),
             Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
-        )
+        )?;
+        search_index.add_type_hints(self.underlying_table().schema());
+        Ok(search_index)
     }
 
     /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
