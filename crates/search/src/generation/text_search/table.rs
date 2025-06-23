@@ -40,6 +40,7 @@ pub struct FullTextSearchTable {
     pub default_limit: usize,
 }
 
+// TODO:phillip - remove
 impl FullTextSearchTable {
     #[must_use]
     pub fn new(index: FullTextSearchIndex, query: String) -> Self {

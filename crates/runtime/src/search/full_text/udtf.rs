@@ -160,6 +160,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         }
 
+        // TODO:phillip - rework
         let fts_index = match self.df.get_full_text_index(&args.tbl) {
             Ok(Some(fts_index)) => fts_index,
             Ok(None) => {
