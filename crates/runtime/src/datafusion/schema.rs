@@ -44,6 +44,7 @@ impl SpiceSchemaProvider {
         }
     }
 
+    #[must_use]
     pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.get(name).map(|table| Arc::clone(table.value()))
     }
