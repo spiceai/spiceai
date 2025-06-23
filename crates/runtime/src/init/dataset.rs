@@ -67,12 +67,8 @@ impl Runtime {
         };
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
-        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
 
-        if valid_datasets.is_empty() && valid_catalogs.is_empty() {
-            tracing::info!(
-                "No datasets were configured. If this is unexpected, check the Spicepod configuration."
-            );
+        if valid_datasets.is_empty() {
             return;
         }
 
