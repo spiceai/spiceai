@@ -75,7 +75,7 @@ async fn huggingface(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let hf_token = extract_secret!(params, "token");
+    let hf_token = extract_secret!(params, "hf_token");
     let pooling = extract_secret!(params, "pooling");
     let max_seq_len = max_seq_length_from_params(params)?;
     if let Some(id) = model_id {

@@ -154,6 +154,14 @@ pub enum Error {
         "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
     ))]
     ModelFileMissing { file_url: String },
+
+    #[snafu(display(
+        "Failed to load the model parameters for model '{model}'.\nThis may be due to an unsupported model type or a misconfiguration.\nVerify the model parameters, and try again."
+    ))]
+    ModelParameterFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

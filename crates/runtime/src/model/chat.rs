@@ -67,14 +67,17 @@ pub async fn try_to_chat_model(
     })?;
 
     let params_struct = Parameters::try_new(
-        &format!("model {}", source),
+        &format!("model {source}"),
         params.clone().into_iter().collect::<Vec<_>>(),
         source.short_name(),
         rt.secrets(),
         param_spec,
     )
     .await
-    .expect("Failed to create params");
+    .map_err(|e| LlmError::ModelParameterFailed {
+        model: component.from.clone(),
+        source: e,
+    })?;
 
     let model = construct_model(component, &params_struct, rt.token_provider_registry()).await?;
 
@@ -121,14 +124,14 @@ pub async fn construct_model(
     })?;
 
     let model = match prefix {
-        ModelSource::HuggingFace => huggingface(model_id, component, &params),
-        ModelSource::File => file(component, &params),
-        ModelSource::Anthropic => anthropic(model_id.as_deref(), &params),
-        ModelSource::Perplexity => perplexity(model_id.as_deref(), &params),
-        ModelSource::Azure => azure(model_id, component.name.as_str(), &params),
-        ModelSource::Xai => xai(model_id.as_deref(), &params),
-        ModelSource::OpenAi => openai(model_id, &params),
-        ModelSource::Databricks => databricks(model_id, &params, Arc::clone(&token_registry)).await,
+        ModelSource::HuggingFace => huggingface(model_id, component, params),
+        ModelSource::File => file(component, params),
+        ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
+        ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+        ModelSource::Xai => xai(model_id.as_deref(), params),
+        ModelSource::OpenAi => openai(model_id, params),
+        ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
