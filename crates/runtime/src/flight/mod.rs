@@ -399,9 +399,8 @@ pub async fn start(
             return Error::AddressAlreadyInUse {
                 addr: bind_address.to_string(),
             };
-        } else {
-            Error::UnableToStartFlightServer { source: e }
         }
+        Error::UnableToStartFlightServer { source: e }
     })?;
 
     tracing::debug!("Spice Runtime Flight stopped");

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) fn is_address_in_use_error<'a>(err: &'a tonic::transport::Error) -> bool {
+pub(crate) fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     let mut source: Option<&dyn std::error::Error> = Some(err);
     while let Some(e) = source {
         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -22,5 +22,5 @@ pub(crate) fn is_address_in_use_error<'a>(err: &'a tonic::transport::Error) -> b
         }
         source = e.source();
     }
-    return false;
+    false
 }
