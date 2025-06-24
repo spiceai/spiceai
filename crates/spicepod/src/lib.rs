@@ -82,7 +82,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The name '{keyword}' cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
+        "The name '{keyword}' is reserved and cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
     ))]
     UseOfReservedKeyword { keyword: String },
 }
