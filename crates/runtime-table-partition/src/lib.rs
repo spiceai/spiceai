@@ -20,16 +20,18 @@ use datafusion::{catalog::TableProvider, scalar::ScalarValue};
 use snafu::prelude::*;
 
 pub mod creator;
-pub mod execution_plan;
 pub mod expression;
+pub mod insert;
 pub mod provider;
+
+type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(""))]
-    CreatePartition,
-    #[snafu(display(""))]
-    InferringPartitions,
+    #[snafu(display("Failed to create an accelerated partition: {source}"))]
+    CreatePartition { source: StdError },
+    #[snafu(display("Failed to infer accelerated partitions: {source}"))]
+    InferringPartitions { source: StdError },
 }
 
 #[derive(Debug)]
