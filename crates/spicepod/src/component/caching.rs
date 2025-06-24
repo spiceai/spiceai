@@ -75,7 +75,7 @@ impl Default for CacheConfig {
 // https://serde.rs/attr-flatten.html
 // > Note: flatten is not supported in combination with structs that use deny_unknown_fields. Neither the outer nor inner flattened struct should use that attribute.
 // As a result, we cannot use flatten to get a nice unknown field experience
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SQLResultsCacheConfig {
@@ -88,6 +88,21 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+}
+
+// serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
+// we need to implement Default manually
+impl Default for SQLResultsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: None,
+            item_ttl: None,
+            eviction_policy: None,
+            hashing_algorithm: HashingAlgorithm::default(),
+            cache_key_type: CacheKeyType::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
