@@ -75,7 +75,7 @@ pub async fn try_to_chat_model(
     )
     .await
     .map_err(|e| LlmError::ModelParameterFailed {
-        model: component.from.clone(),
+        model: component.name.clone(),
         source: e,
     })?;
 

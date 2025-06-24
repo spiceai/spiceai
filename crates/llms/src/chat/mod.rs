@@ -156,7 +156,7 @@ pub enum Error {
     ModelFileMissing { file_url: String },
 
     #[snafu(display(
-        "Failed to load the model parameters for model '{model}'.\nThis may be due to an unsupported model type or a misconfiguration.\nVerify the model parameters, and try again."
+        "Invalid parameters for model '{model}':\n{source}\nVerify the model parameters, and try again."
     ))]
     ModelParameterFailed {
         model: String,
