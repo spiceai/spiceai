@@ -14,30 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEFAULT_OVERRIDE_PARAMETERS, PARAM_LEN, concat_arrays};
+use super::{DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<ParameterSpec, OPENAI_PARAM_LEN, PARAM_LEN, { OPENAI_PARAM_LEN + PARAM_LEN }>(
-        OPENAI_PARAMETERS,
-        DEFAULT_OVERRIDE_PARAMETERS,
-    );
+pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+    ParameterSpec,
+    ANTHROPIC_PARAM_LEN,
+    PARAM_WITH_DEPRE_LEN,
+    { ANTHROPIC_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
+>(
+    ANTHROPIC_PARAMETERS,
+    DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED,
+);
 
-const OPENAI_PARAM_LEN: usize = 6;
+const ANTHROPIC_PARAM_LEN: usize = 5;
 
-pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
+pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
     ParameterSpec::runtime("tools")
         .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
-    ParameterSpec::component("endpoint")
-        .description("The OpenAI API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).")
-        .default("https://api.openai.com/v1"),
-    ParameterSpec::component("api_key")
-        .secret()
-        .description("The OpenAI API key."),
-    ParameterSpec::component("org_id")
-        .description("The OpenAI organization ID."),
-    ParameterSpec::component("project_id")
-        .description("The OpenAI project ID."),
+    ParameterSpec::runtime("endpoint")
+        .description("The Anthropic API base endpoint."),
+    ParameterSpec::component("api_key").description("The Anthropic API key."),
+    ParameterSpec::component("auth_token")
+        .description("The Anthropic Auth Token."),
 ];

@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod anthropic;
+mod azure;
+mod databricks;
+mod file;
+mod huggingface;
 mod openai;
 use spicepod::component::model::ModelSource;
 
@@ -21,9 +26,15 @@ use crate::parameters::ParameterSpec;
 
 const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
 
-pub(crate) fn get_params_spec(source: ModelSource) -> &'static [ParameterSpec] {
+pub(crate) fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
     match source {
         ModelSource::OpenAi => openai::PARAMETERS,
+        ModelSource::Azure => azure::PARAMETERS,
+        ModelSource::File => file::PARAMETERS,
+        ModelSource::Databricks => databricks::PARAMETERS,
+        ModelSource::HuggingFace => huggingface::PARAMETERS,
+        ModelSource::Anthropic => anthropic::PARAMETERS,
+
         _ => unimplemented!("Model source {:?} does not have parameters defined", source),
     }
 }
@@ -46,8 +57,8 @@ const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     out
 }
 
-pub(crate) const PARAM_LEN: usize = DEFAULT_OVERRIDE_PARAMETERS.len();
-pub(crate) const PARAM_WITH_DEPRE_LEN: usize = DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED.len();
+pub(crate) const PARAM_LEN: usize = 21;
+pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 42;
 
 // Default Override parameters start with `<model_prefix>` is deprecated.
 pub(crate) const DEFAULT_OVERRIDE_PARAMETERS: [ParameterSpec; PARAM_LEN] = [

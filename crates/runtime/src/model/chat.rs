@@ -66,7 +66,7 @@ pub async fn try_to_chat_model(
         params.clone().into_iter().collect::<Vec<_>>(),
         source.short_name(),
         rt.secrets(),
-        get_params_spec(source),
+        get_params_spec(&source),
     )
     .await
     .expect("Failed to create params");
