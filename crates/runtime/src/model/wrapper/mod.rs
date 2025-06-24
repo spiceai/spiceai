@@ -46,7 +46,6 @@ use super::metrics::request_labels;
 
 mod ast;
 
-/// Valid OpenAI request parameter keys that can be used as defaults
 pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| {
         HashSet::from([

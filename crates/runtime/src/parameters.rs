@@ -223,6 +223,7 @@ impl Parameters {
         self.params.iter()
     }
 
+    #[must_use]
     pub fn get_runtime_params(&self) -> HashMap<String, SecretString> {
         self.params
             .iter()
@@ -231,6 +232,7 @@ impl Parameters {
             .collect()
     }
 
+    #[must_use]
     pub fn get_component_params(&self) -> HashMap<String, SecretString> {
         self.params
             .iter()

@@ -39,7 +39,7 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
         ModelSource::Anthropic => Some(anthropic::PARAMETERS),
         ModelSource::Perplexity => Some(perplexity::PARAMETERS),
         ModelSource::Xai => Some(xai::PARAMETERS),
-        _ => None,
+        ModelSource::SpiceAI => None,
     }
 }
 
