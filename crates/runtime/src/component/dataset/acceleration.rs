@@ -307,17 +307,6 @@ impl Acceleration {
         self.on_conflict = on_conflict;
         self
     }
-
-    pub fn partition_by_expressions(
-        &self,
-        ctx: &SessionContext,
-        df_schema: &DFSchema,
-    ) -> Result<Vec<Expr>, DataFusionError> {
-        self.partition_by
-            .iter()
-            .map(|sql| ctx.parse_sql_expr(sql, df_schema))
-            .collect()
-    }
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {

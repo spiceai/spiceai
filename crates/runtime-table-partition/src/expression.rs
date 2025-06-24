@@ -22,7 +22,7 @@ use datafusion::{
     },
     error::DataFusionError,
     logical_expr::ExprSchemable,
-    prelude::Expr,
+    prelude::{Expr, SessionContext},
 };
 use snafu::prelude::*;
 
@@ -34,9 +34,30 @@ pub enum ValidationError {
     CriterionFailed { expr: String, message: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },
+    #[snafu(display("Parsing SQL expression failed: {source}"))]
+    ParsingExpression { source: DataFusionError },
 }
 
 pub type ValidationResult = Result<(), ValidationError>;
+
+/// Converts the spicepod `partition_by` list of [`String`]s into [`Expr`]s,
+/// validating that they meet the expression criteria.
+pub fn partition_by_expressions(
+    partition_by: Vec<String>,
+    ctx: &SessionContext,
+    df_schema: &DFSchema,
+) -> Result<Vec<Expr>, ValidationError> {
+    partition_by
+        .iter()
+        .map(|sql| {
+            let expr = ctx
+                .parse_sql_expr(sql, df_schema)
+                .context(ParsingExpressionSnafu)?;
+            PartitionCriteria.validate(&expr, df_schema)?;
+            Ok(expr)
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
 
 /// Trait for defining validation criteria for an Expr.
 pub trait Criterion: Send + Sync {
