@@ -14,15 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) fn find_io_error<'a>(
-    err: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a std::io::Error> {
-    let mut source = Some(err);
+pub(crate) fn is_address_in_use_error<'a>(err: &'a tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
     while let Some(e) = source {
         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            return Some(io_err);
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
         }
         source = e.source();
     }
-    None
+    return false;
 }

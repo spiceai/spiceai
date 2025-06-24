@@ -20,7 +20,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
 use crate::tls::TlsConfig;
-use crate::utils::find_io_error;
+use crate::utils::is_address_in_use_error;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -396,15 +396,13 @@ pub async fn start(
         server.serve(bind_address).await
     }
     .map_err(|e| {
-        if let Some(io_err) = find_io_error(&e) {
-            if io_err.kind() == io::ErrorKind::AddrInUse {
-                return Error::AddressAlreadyInUse {
-                    addr: bind_address.to_string(),
-                };
-            }
+        if is_address_in_use_error(&e) {
+            return Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            };
+        } else {
+            Error::UnableToStartFlightServer { source: e }
         }
-
-        Error::UnableToStartFlightServer { source: e }
     })?;
 
     tracing::debug!("Spice Runtime Flight stopped");

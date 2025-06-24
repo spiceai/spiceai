@@ -62,7 +62,7 @@ use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
 use crate::tls::TlsConfig;
-use crate::utils::find_io_error;
+use crate::utils::is_address_in_use_error;
 use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -629,15 +629,13 @@ pub async fn start(
         server.serve(bind_address).await
     }
     .map_err(|e| {
-        if let Some(io_err) = find_io_error(&e) {
-            if io_err.kind() == io::ErrorKind::AddrInUse {
-                return Error::AddressAlreadyInUse {
-                    addr: bind_address.to_string(),
-                };
+        if is_address_in_use_error(&e) {
+            Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
             }
+        } else {
+            Error::UnableToServe { source: e }
         }
-
-        Error::UnableToServe { source: e }
     })?;
 
     tracing::debug!("Spice Runtime OpenTelemetry stopped");
