@@ -51,7 +51,6 @@ use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
-use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::RwLock;
