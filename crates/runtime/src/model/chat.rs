@@ -464,29 +464,107 @@ fn file(
 
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let prefix_str = format!("{prefix}_");
-    model
-        .params
-        .iter()
-        .filter_map(|(k, v)| {
-            if k.starts_with(&prefix_str) {
-                k.strip_prefix(&prefix_str).and_then(|new_k| {
-                    if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k) {
-                        Some((new_k.to_string(), v.clone()))
-                    } else {
-                        None
-                    }
-                })
-            } else if k.starts_with("openai_") {
-                k.strip_prefix("openai_").and_then(|new_k| {
-                    if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k) {
-                        Some((new_k.to_string(), v.clone()))
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
+    let mut request_overrides: HashMap<String, Value> = HashMap::new();
+
+    for (k, v) in &model.params {
+        if k.starts_with(&prefix_str) {
+            if let Some(new_k) = k.strip_prefix(&prefix_str) {
+                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k) {
+                    request_overrides.insert(new_k.to_string(), v.clone());
+                }
             }
-        })
-        .collect()
+        } else if k.starts_with("openai_") {
+            if let Some(new_k) = k.strip_prefix("openai_") {
+                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
+                    && request_overrides.contains_key(new_k)
+                {
+                    request_overrides.insert(new_k.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
+    request_overrides.into_iter().collect()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use serde_json::Number;
+    use spicepod::component::model::Model;
+
+    #[test]
+    fn test_get_openai_request_overrides_with_deprecated() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "openai_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 1);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+    }
+
+    #[test]
+    fn test_get_openai_request_overrides_with_model_prefix() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        model.params.insert(
+            "hf_max_completion_tokens".to_string(),
+            Value::Number(1.into()),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    // Param with <model-prefix> takes precedence over the deprecated openai_ prefix.
+    fn test_get_openai_request_overrides_with_model_prefix_and_deprecated() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        model.params.insert(
+            "hf_reasoning_effort".to_string(),
+            Value::String("low".into()),
+        );
+        model.params.insert(
+            "hf_max_completion_tokens".to_string(),
+            Value::Number(1.into()),
+        );
+        model.params.insert(
+            "openai_temperature".to_string(),
+            Value::Number(Number::from_f64(0.6).expect("valid number")),
+        );
+        model.params.insert(
+            "openai_max_completion_tokens".to_string(),
+            Value::Number(2.into()),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 3);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "reasoning_effort" && v == &Value::String("low".into()))
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
 }
