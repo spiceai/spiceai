@@ -68,6 +68,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
 
       - name: odbc
         run: |
@@ -163,6 +164,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=release
 
       - name: odbc
         run: |
@@ -254,6 +256,7 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release,models,cuda
+            RUST_PROFILE=release
 
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@v4

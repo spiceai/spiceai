@@ -1,0 +1,21 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q6"
+---
++---------------+---------------------------------------------------------------------------------+
+| plan_type     | plan                                                                            |
++---------------+---------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                |
+|               |   Projection: orders.o_orderkey + Int64(1) AS key                               |
+|               |     Limit: skip=0, fetch=10                                                     |
+|               |       BytesProcessedNode                                                        |
+|               |         TableScan: orders projection=[o_orderkey], fetch=10                     |
+| physical_plan | ProjectionExec: expr=[o_orderkey@0 + 1 as key]                                  |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1         |
+|               |     CoalescePartitionsExec: fetch=10                                            |
+|               |       BytesProcessedExec                                                        |
+|               |         SchemaCastScanExec                                                      |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
+|               |             DataSourceExec: partitions=1, partition_sizes=[184]                 |
+|               |                                                                                 |
++---------------+---------------------------------------------------------------------------------+

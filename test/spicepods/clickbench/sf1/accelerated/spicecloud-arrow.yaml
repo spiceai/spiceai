@@ -1,0 +1,12 @@
+version: v1
+kind: Spicepod
+name: spicecloud-arrow
+datasets:
+  - from: spice.ai:spiceai/benchmarks-clickbench/datasets/clickbench.hits
+    name: hits
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_sql: "SELECT * FROM hits LIMIT 50000000" # dev-runners do not have enough memory for full clickbench in-memory
+    params:
+      spiceai_api_key: ${secrets:SPICEAI_CLICKBENCH_API_KEY}

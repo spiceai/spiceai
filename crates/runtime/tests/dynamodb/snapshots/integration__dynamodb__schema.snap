@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/dynamodb/mod.rs
+expression: formatted
+---
++----------------+-----------+-------------+
+| column_name    | data_type | is_nullable |
++----------------+-----------+-------------+
+| customer_id    | Utf8      | YES         |
+| payment_method | Utf8      | YES         |
+| product_id     | Utf8      | YES         |
+| quantity       | Int64     | YES         |
+| timestamp      | Utf8      | YES         |
+| total_amount   | Float64   | YES         |
+| transaction_id | Utf8      | YES         |
++----------------+-----------+-------------+

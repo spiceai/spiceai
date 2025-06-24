@@ -27,16 +27,11 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use aws_sdk_glue::{
-    error::SdkError,
-    operation::{get_databases::GetDatabasesError, get_tables::GetTablesError},
-};
-use snafu::prelude::*;
+use data_components::RefreshableCatalogProvider as _;
 use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
 mod provider;
-mod state;
 
 use provider::GlueCatalogProvider;
 
@@ -45,68 +40,6 @@ pub static PREFIX: &str = "glue";
 static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
 > = LazyLock::new(|| vec![Box::new(RegionValidator), Box::new(AuthValidator)]);
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to get Glue databases: {source}"))]
-    GetDatabases { source: SdkError<GetDatabasesError> },
-
-    #[snafu(display("Failed to get Glue table from database `{database}`: {source}"))]
-    GetTables {
-        database: String,
-        source: SdkError<GetTablesError>,
-    },
-
-    #[snafu(display("Failed to build FileIO: {source}"))]
-    BuildFileIO { source: iceberg::Error },
-
-    #[snafu(display("Failed to create file input for metadata location '{location}': {source}",))]
-    CreateFileInput {
-        source: iceberg::Error,
-        location: String,
-    },
-
-    #[snafu(display("Failed to read metadata from '{location}': {source}"))]
-    ReadMetadata {
-        source: iceberg::Error,
-        location: String,
-    },
-
-    #[snafu(display("Failed to deserialize metadata: {source}"))]
-    DeserializeMetadata { source: serde_json::Error },
-
-    #[snafu(display("Failed to build Iceberg table: {source}"))]
-    BuildIcebergTable { source: iceberg::Error },
-
-    #[snafu(display("Failed to create Iceberg table provider: {source}"))]
-    CreateIcebergTableProvider { source: iceberg::Error },
-
-    #[snafu(display("No 'metadata_location' set on table '{table}'"))]
-    MissingMetadataLocation { table: String },
-
-    #[snafu(display("No 'parameters' set on table"))]
-    MissingParameters,
-
-    #[snafu(display("Parameter validation failed: {source}",))]
-    ParameterValidation {
-        #[snafu(source)]
-        source: parameters::aws::Error,
-    },
-
-    #[snafu(display("Configuration loading failed: {source}"))]
-    ConfigurationLoadingFailed {
-        #[snafu(source)]
-        source: parameters::aws::Error,
-    },
-
-    #[snafu(display("Failed to refresh catalog: {source}"))]
-    RefreshFailed {
-        #[snafu(source)]
-        source: Box<dyn std::error::Error + Sync + Send>,
-    },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 type DatabaseName = String;
 
@@ -134,14 +67,31 @@ impl CatalogConnector for GlueCatalog {
         runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn data_components::RefreshableCatalogProvider>> {
-        Ok(Arc::new(
-            GlueCatalogProvider::new(self.params.clone(), catalog, runtime)
+        let app = match runtime.app.read().await.as_ref() {
+            Some(app) => Arc::clone(app),
+            None => {
+                return Err(super::Error::FailedToGetAppFromRuntime {});
+            }
+        };
+
+        let refreshable_provider = Arc::new(
+            GlueCatalogProvider::new(self.params.clone(), catalog, runtime, app)
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })?,
-        ))
+        );
+
+        refreshable_provider.refresh().await.map_err(|source| {
+            super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source,
+            }
+        })?;
+
+        Ok(refreshable_provider)
     }
 }

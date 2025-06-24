@@ -22,8 +22,8 @@ arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { version = "1.6.1", optional = true }
-aws-credential-types = "1.2"
+aws-config = { workspace = true, optional = true }
+aws-credential-types.workspace = true
 aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-glue = "1"
 aws-sdk-secretsmanager = { version = "1", optional = true }

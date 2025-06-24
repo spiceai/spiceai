@@ -31,7 +31,7 @@ use serde_json::json;
 use crate::chat::{Chat, Error, nsql::SqlGeneration};
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
-static DEFAULT_MODEL: &str = "grok-beta";
+static DEFAULT_MODEL: &str = "grok-3";
 
 /// [`Xai`] is a chat model for xAI models. xAI is nearly `OpenAI` compatible.
 pub struct Xai {

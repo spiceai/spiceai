@@ -44,7 +44,7 @@ pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     MODELS_METER
         .u64_gauge("model_load_state")
         .with_description(
-            "Status of the model. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
+            "Status of the model. 0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown.",
         )
         .build()
 });

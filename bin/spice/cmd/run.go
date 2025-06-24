@@ -32,7 +32,17 @@ var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Run Spice.ai - starts the Spice.ai runtime, installing if necessary",
 	Example: `
+# Run with Spicepod in the current directory
 spice run
+
+# Run with Spicepod from a local file
+spice run /path/to/spicepod.yaml
+
+# Run with Spicepod from an S3 URL (requires AWS credentials)
+spice run s3://my-bucket/spicepod.yaml
+
+# Run with Spicepod from a remote HTTPS URL
+spice run https://host.com/spicepod.yaml
 
 # See more at: https://spiceai.org/docs/
 `,

@@ -32,6 +32,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
+use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -323,44 +324,39 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
-    pub async fn has_table(&self, table_reference: &TableReference) -> bool {
-        let table_name = table_reference.table();
-
-        if let Some(schema_name) = table_reference.schema() {
-            if let Some(schema) = self.schema(schema_name) {
-                return match schema.table(table_name).await {
-                    Ok(table) => table.is_some(),
-                    Err(_) => false,
-                };
-            }
-        }
-
-        self.ctx.table(table_name).await.is_ok()
-    }
-
     pub async fn get_table(
         &self,
         table_reference: &TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        let catalog_provider = match table_reference {
-            TableReference::Bare { .. } | TableReference::Partial { .. } => {
-                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
-            }
-            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
-        }?;
+        let catalog_provider = self.resolve_catalog_provider(table_reference)?;
 
-        let schema_provider = match table_reference {
-            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
-            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
-                catalog_provider.schema(schema)
-            }
-        }?;
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
 
         schema_provider
             .table(table_reference.table())
             .await
             .ok()
             .flatten()
+    }
+
+    /// Returns the `TableProvider` for the given `TableReference` synchronously.
+    ///
+    /// This method may return `None` if the table is registered from a catalog provider that doesn't support synchronous table access.
+    /// All tables registered in the default catalog (i.e. `spice`) are available synchronously.
+    /// Catalog implementations that use `SpiceSchemaProvider` objects are also available synchronously.
+    pub fn get_table_sync(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        let catalog_provider = self.resolve_catalog_provider(table_reference)?;
+
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
+
+        let spice_schema_provider = schema_provider
+            .as_any()
+            .downcast_ref::<SpiceSchemaProvider>()?;
+
+        spice_schema_provider.table_sync(table_reference.table())
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -1606,6 +1602,30 @@ impl DataFusion {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all();
+        }
+    }
+
+    fn resolve_catalog_provider(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn CatalogProvider>> {
+        match table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => {
+                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
+            }
+            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
+        }
+    }
+
+    fn resolve_schema_provider(
+        catalog_provider: &Arc<dyn CatalogProvider>,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn SchemaProvider>> {
+        match table_reference {
+            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
+            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
+                catalog_provider.schema(schema)
+            }
         }
     }
 }

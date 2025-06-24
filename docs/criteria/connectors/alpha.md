@@ -19,6 +19,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | FTP/SFTP                         | ➖            |                 |
 | GraphQL                          | ➖            |                 |
 | GitHub                           | ✅            | @peasee         |
+| Glue                             | ✅            | @kczimm         |
 | HTTP/HTTPS                       | ➖            |                 |
 | IMAP                             | ✅            | @peasee         |
 | Iceberg                          | ✅            | @phillipleblanc |
