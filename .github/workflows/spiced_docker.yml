@@ -215,7 +215,7 @@ jobs:
 
   build-cuda:
     # Enterprise does not currently include CUDA Docker version, skip it
-    if: ${{ false }} 
+    if: ${{ false }}
     needs: setup
     runs-on: 'ubuntu-gpu-t4-4-core'
     steps:
