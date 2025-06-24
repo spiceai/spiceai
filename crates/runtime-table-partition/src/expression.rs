@@ -42,8 +42,12 @@ pub type ValidationResult = Result<(), ValidationError>;
 
 /// Converts the spicepod `partition_by` list of [`String`]s into [`Expr`]s,
 /// validating that they meet the expression criteria.
+///
+/// # Errors
+/// Returns an error if the `partition_by` expressions could not be parsed or
+/// validated.
 pub fn partition_by_expressions(
-    partition_by: Vec<String>,
+    partition_by: &[String],
     ctx: &SessionContext,
     df_schema: &DFSchema,
 ) -> Result<Vec<Expr>, ValidationError> {

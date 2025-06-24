@@ -31,6 +31,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use runtime_table_partition::expression::partition_by_expressions;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -232,9 +233,10 @@ impl AcceleratorEngineRegistry {
 
         let df_schema = DFSchema::try_from(schema)
             .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
-        let partition_by = acceleration_settings
-            .partition_by_expressions(&ctx, &df_schema)
-            .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+
+        let partition_by =
+            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
         let table_provider = accelerator
             .create_external_table(external_table, source, partition_by)

@@ -14,11 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::{
-    common::DFSchema,
-    error::DataFusionError,
-    prelude::{Expr, SessionContext},
-};
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
 use spicepod::{acceleration as spicepod_acceleration, param::Params};
