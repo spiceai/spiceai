@@ -813,16 +813,6 @@ impl Runtime {
             }
         }
 
-        if let Some(app) = self.app.read().await.as_ref() {
-            let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
-            let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
-            if valid_datasets.is_empty() && valid_catalogs.is_empty() {
-                tracing::info!(
-                    "No datasets or catalogs were configured. If this is unexpected, please check the configuration of your Spicepod."
-                );
-            }
-        }
-
         let components = vec![task_history, datasets, catalogs, models_and_evals];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded
@@ -871,6 +861,17 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
+                            if let Some(app) = self.app.read().await.as_ref() {
+                                let valid_datasets =
+                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
+                                let valid_catalogs =
+                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
+                                if valid_datasets.is_empty() && valid_catalogs.is_empty() {
+                                    tracing::info!(
+                                        "No datasets or catalogs were configured. If this is unexpected, please check the configuration of your Spicepod."
+                                    );
+                                }
+                            }
                             tracing::info!("All components are loaded. Spice runtime is ready!");
                             break;
                         }
