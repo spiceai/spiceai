@@ -476,7 +476,7 @@ pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String,
         } else if k.starts_with("openai_") {
             if let Some(new_k) = k.strip_prefix("openai_") {
                 if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-                    && request_overrides.contains_key(new_k)
+                    && !request_overrides.contains_key(new_k)
                 {
                     request_overrides.insert(new_k.to_string(), v.clone());
                 }
