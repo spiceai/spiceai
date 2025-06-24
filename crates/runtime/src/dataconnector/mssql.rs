@@ -71,7 +71,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("trust_server_certificate"),
 ];
 
-const PROTECTED_KEYWORDS: &[&str] = &["OUTER", "SET", "QUALIFY", "WINDOW", "END", "FOR"];
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1045
+const RESERVED_KEYWORDS: &[&str] = &["OUTER", "SET", "QUALIFY", "WINDOW", "END", "FOR"];
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -199,8 +200,8 @@ impl DataConnectorFactory for SqlServerFactory {
         PARAMETERS
     }
 
-    fn protected_keywords(&self) -> &'static [&'static str] {
-        PROTECTED_KEYWORDS
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 

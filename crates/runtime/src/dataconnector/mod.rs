@@ -299,7 +299,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The dataset name '{keyword}' is a protected keyword for the {dataconnector} data connector and cannot be used as a name for a dataset.\nPlease change the name of your dataset in your Spicepod."
+        "The name '{keyword}' cannot be used as a name for a dataset for the {dataconnector} data connector.\nChange the name in the Spicepod and try again."
     ))]
     UseOfProtectedKeyword {
         dataconnector: String,
@@ -341,17 +341,19 @@ pub async fn create_new_connector(
 
     let factory = connector_factory?;
 
-    if let ConnectorComponent::Dataset(ds) = &params.component {
-        if factory
-            .protected_keywords()
-            .contains(&ds.name.table().to_ascii_lowercase().as_str())
-        {
-            return Some(Err(DataConnectorError::UseOfProtectedKeyword {
-                dataconnector: name.to_string(),
-                keyword: ds.name.table().to_string(),
-            }
-            .into()));
+    let ConnectorComponent::Dataset(ds) = &params.component else {
+        unreachable!("Component is always a dataset at this point")
+    };
+
+    if factory
+        .reserved_keywords()
+        .contains(&ds.name.table().to_ascii_lowercase().as_str())
+    {
+        return Some(Err(DataConnectorError::UseOfProtectedKeyword {
+            dataconnector: name.to_string(),
+            keyword: ds.name.table().to_string(),
         }
+        .into()));
     }
 
     if params.unsupported_type_action.is_some() && !factory.supports_unsupported_type_action() {
@@ -453,9 +455,9 @@ pub trait DataConnectorFactory: Send + Sync {
     /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
     fn parameters(&self) -> &'static [ParameterSpec];
 
-    /// Returns a list of keywords that are protected by the data connector.
-    /// Used to ensure that any table name isn't a protected keyword.
-    fn protected_keywords(&self) -> &'static [&'static str] {
+    /// Returns a list of keywords that are reserved by the data connector.
+    /// Used to ensure that any table name isn't a reserved keyword.
+    fn reserved_keywords(&self) -> &'static [&'static str] {
         &[]
     }
 }

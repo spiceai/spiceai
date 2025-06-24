@@ -149,7 +149,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds.")
 ];
 
-const PROTECTED_KEYWORDS: &[&str] = &["PREWHERE", "SETTINGS", "FORMAT"];
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1054
+const RESERVED_KEYWORDS: &[&str] = &["PREWHERE", "SETTINGS", "FORMAT"];
 
 impl DataConnectorFactory for ClickhouseFactory {
     fn as_any(&self) -> &dyn Any {
@@ -217,8 +218,8 @@ impl DataConnectorFactory for ClickhouseFactory {
         PARAMETERS
     }
 
-    fn protected_keywords(&self) -> &'static [&'static str] {
-        PROTECTED_KEYWORDS
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 

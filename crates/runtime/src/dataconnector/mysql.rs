@@ -90,7 +90,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("100"),
 ];
 
-const PROTECTED_KEYWORDS: &[&str] = &["PARTITION"];
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
+const RESERVED_KEYWORDS: &[&str] = &["PARTITION"];
 
 impl DataConnectorFactory for MySQLFactory {
     fn as_any(&self) -> &dyn Any {
@@ -199,8 +200,8 @@ impl DataConnectorFactory for MySQLFactory {
         PARAMETERS
     }
 
-    fn protected_keywords(&self) -> &'static [&'static str] {
-        PROTECTED_KEYWORDS
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 

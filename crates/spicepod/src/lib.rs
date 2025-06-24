@@ -30,6 +30,7 @@ use component::{
     runtime::Runtime, secret::Secret, tool::Tool, view::View, worker::Worker,
 };
 
+use crate::component::Nameable;
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
@@ -81,7 +82,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The dataset name '{keyword}' is a protected keyword and cannot be used as a name for a dataset."
+        "The name '{keyword}' cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
     ))]
     UseOfProtectedKeyword { keyword: String },
 }
@@ -138,7 +139,7 @@ fn detect_duplicate_component_names(
     Ok(())
 }
 
-fn check_for_protected_keywords(components: &[impl component::Nameable]) -> Result<()> {
+fn check_for_protected_keywords(components: &[Dataset]) -> Result<()> {
     for component in components {
         if keywords::is_protected_keyword(component.name()) {
             return Err(Error::UseOfProtectedKeyword {
