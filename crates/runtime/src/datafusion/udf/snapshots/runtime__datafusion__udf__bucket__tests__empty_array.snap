@@ -1,0 +1,8 @@
+---
+source: crates/runtime/src/datafusion/udf/bucket.rs
+expression: result
+---
++-------------------------+
+| ColumnarValue(ArrayRef) |
++-------------------------+
++-------------------------+

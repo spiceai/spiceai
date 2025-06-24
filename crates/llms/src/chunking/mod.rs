@@ -104,7 +104,7 @@ impl From<Arc<dyn ChunkSizer + Send + Sync>> for ArcSizer {
 }
 
 /// Basic wrapper around a [`Arc<Tokenizer>`], so as to be able to `impl ChunkSizer for TokenizerWrapper`.
-pub(crate) struct TokenizerWrapper(Arc<Tokenizer>);
+pub struct TokenizerWrapper(Arc<Tokenizer>);
 
 impl ChunkSizer for TokenizerWrapper {
     fn size(&self, chunk: &str) -> usize {

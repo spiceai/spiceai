@@ -1,24 +1,19 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Spicepod Definition",
   "description": "A Spicepod definition is a YAML file that describes a Spicepod.",
   "type": "object",
-  "required": [
-    "kind",
-    "name",
-    "version"
-  ],
   "properties": {
     "catalogs": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Catalog"
+        "$ref": "#/$defs/ComponentOrReference_for_Catalog"
       }
     },
     "datasets": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Dataset"
+        "$ref": "#/$defs/ComponentOrReference_for_Dataset"
       }
     },
     "dependencies": {
@@ -30,27 +25,34 @@
     "embeddings": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Embeddings"
+        "$ref": "#/$defs/ComponentOrReference_for_Embeddings"
       }
     },
     "evals": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Eval"
+        "$ref": "#/$defs/ComponentOrReference_for_Eval"
       }
     },
     "extensions": {
       "description": "Optional extensions configuration",
       "type": "object",
       "additionalProperties": {
-        "$ref": "#/definitions/Extension"
+        "$ref": "#/$defs/Extension"
       }
     },
     "kind": {
       "description": "The kind of Spicepod",
-      "allOf": [
+      "$ref": "#/$defs/SpicepodKind"
+    },
+    "management": {
+      "description": "Optional management configuration",
+      "anyOf": [
         {
-          "$ref": "#/definitions/SpicepodKind"
+          "$ref": "#/$defs/Management"
+        },
+        {
+          "type": "null"
         }
       ]
     },
@@ -61,7 +63,7 @@
     "models": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Model"
+        "$ref": "#/$defs/ComponentOrReference_for_Model"
       }
     },
     "name": {
@@ -70,53 +72,50 @@
     },
     "runtime": {
       "description": "Optional runtime configuration",
-      "allOf": [
-        {
-          "$ref": "#/definitions/Runtime"
-        }
-      ]
+      "$ref": "#/$defs/Runtime"
     },
     "secrets": {
-      "description": "Optional spicepod secrets configuration Default value is: ```yaml secrets: - from: env name: env ```",
+      "description": "Optional spicepod secrets configuration\n Default value is:\n ```yaml\n secrets:\n   - from: env\n     name: env\n ```",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/Secret"
+        "$ref": "#/$defs/Secret"
       }
     },
     "tools": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Tool"
+        "$ref": "#/$defs/ComponentOrReference_for_Tool"
       }
     },
     "version": {
       "description": "The version of the Spicepod",
-      "allOf": [
-        {
-          "$ref": "#/definitions/SpicepodVersion"
-        }
-      ]
+      "$ref": "#/$defs/SpicepodVersion"
     },
     "views": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_View"
+        "$ref": "#/$defs/ComponentOrReference_for_View"
       }
     },
     "workers": {
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ComponentOrReference_for_Worker"
+        "$ref": "#/$defs/ComponentOrReference_for_Worker"
       }
     }
   },
-  "definitions": {
+  "required": [
+    "name",
+    "version",
+    "kind"
+  ],
+  "$defs": {
     "Acceleration": {
       "type": "object",
       "properties": {
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "engine": {
           "type": [
@@ -127,13 +126,13 @@
         "indexes": {
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/IndexType"
+            "$ref": "#/$defs/IndexType"
           }
         },
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -141,31 +140,23 @@
           ]
         },
         "mode": {
-          "default": "memory",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Mode2"
-            }
-          ]
+          "$ref": "#/$defs/Mode2",
+          "default": "memory"
         },
         "on_conflict": {
           "type": "object",
           "additionalProperties": {
-            "$ref": "#/definitions/OnConflictBehavior"
+            "$ref": "#/$defs/OnConflictBehavior"
           }
         },
         "on_zero_results": {
-          "default": "return_empty",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ZeroResultsAction"
-            }
-          ]
+          "$ref": "#/$defs/ZeroResultsAction",
+          "default": "return_empty"
         },
         "params": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Params"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
@@ -179,16 +170,16 @@
           ]
         },
         "ready_state": {
-          "default": null,
-          "deprecated": true,
           "anyOf": [
             {
-              "$ref": "#/definitions/ReadyState"
+              "$ref": "#/$defs/ReadyState"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null,
+          "deprecated": true
         },
         "refresh_append_overlap": {
           "type": [
@@ -202,6 +193,12 @@
             "null"
           ]
         },
+        "refresh_cron": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "refresh_data_window": {
           "type": [
             "string",
@@ -209,8 +206,8 @@
           ]
         },
         "refresh_jitter_enabled": {
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         },
         "refresh_jitter_max": {
           "type": [
@@ -221,7 +218,7 @@
         "refresh_mode": {
           "anyOf": [
             {
-              "$ref": "#/definitions/RefreshMode"
+              "$ref": "#/$defs/RefreshMode"
             },
             {
               "type": "null"
@@ -229,16 +226,12 @@
           ]
         },
         "refresh_on_startup": {
-          "default": "auto",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RefreshOnStartup"
-            }
-          ]
+          "$ref": "#/$defs/RefreshOnStartup",
+          "default": "auto"
         },
         "refresh_retry_enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "refresh_retry_max_attempts": {
           "type": [
@@ -246,7 +239,7 @@
             "null"
           ],
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "refresh_sql": {
           "type": [
@@ -276,64 +269,64 @@
       "oneOf": [
         {
           "type": "object",
-          "required": [
-            "ReadOnly"
-          ],
           "properties": {
             "ReadOnly": {
               "type": "object",
-              "required": [
-                "key"
-              ],
               "properties": {
                 "key": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "key"
+              ]
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "ReadOnly"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "ReadWrite"
-          ],
           "properties": {
             "ReadWrite": {
               "type": "object",
-              "required": [
-                "key"
-              ],
               "properties": {
                 "key": {
                   "type": "string"
                 }
-              }
+              },
+              "required": [
+                "key"
+              ]
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "ReadWrite"
+          ]
         }
       ]
     },
     "ApiKeyAuth": {
       "type": "object",
-      "required": [
-        "keys"
-      ],
       "properties": {
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "keys": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/ApiKey"
+            "$ref": "#/$defs/ApiKey"
           }
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "keys"
+      ]
     },
     "Auth": {
       "type": "object",
@@ -341,7 +334,7 @@
         "api_key": {
           "anyOf": [
             {
-              "$ref": "#/definitions/ApiKeyAuth"
+              "$ref": "#/$defs/ApiKeyAuth"
             },
             {
               "type": "null"
@@ -351,6 +344,37 @@
       },
       "additionalProperties": false
     },
+    "CacheConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "eviction_policy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hashing_algorithm": {
+          "$ref": "#/$defs/HashingAlgorithm",
+          "default": "siphash"
+        },
+        "item_ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "CacheKeyType": {
       "type": "string",
       "enum": [
@@ -358,17 +382,44 @@
         "sql"
       ]
     },
+    "Caching": {
+      "type": "object",
+      "properties": {
+        "search_results": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sql_results": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SQLResultsCacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "Catalog": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "dataset_params": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Params"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
@@ -380,12 +431,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "from": {
           "type": "string"
@@ -403,7 +448,7 @@
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -416,20 +461,21 @@
         "params": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Params"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
             }
           ]
         }
-      }
+      },
+      "required": [
+        "from",
+        "name"
+      ]
     },
     "Column": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
         "description": {
           "description": "Optional semantic details about the column",
@@ -441,25 +487,35 @@
         "embeddings": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/ColumnLevelEmbeddingConfig"
+            "$ref": "#/$defs/ColumnLevelEmbeddingConfig"
           }
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FullTextSearchConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "name": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "name"
+      ]
     },
     "ColumnEmbeddingConfig": {
-      "description": "Configuration for if and how a dataset's column should be embedded.\n\nPrefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going forward. Support for [`ColumnEmbeddingConfig`] will be removed in future.",
+      "description": "Configuration for if and how a dataset's column should be embedded.\n\n Prefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going\n forward. Support for [`ColumnEmbeddingConfig`] will be removed in future.",
       "type": "object",
-      "required": [
-        "column"
-      ],
       "properties": {
         "chunking": {
           "anyOf": [
             {
-              "$ref": "#/definitions/EmbeddingChunkConfig"
+              "$ref": "#/$defs/EmbeddingChunkConfig"
             },
             {
               "type": "null"
@@ -479,19 +535,22 @@
           }
         },
         "use": {
-          "default": "",
-          "type": "string"
+          "type": "string",
+          "default": ""
         }
-      }
+      },
+      "required": [
+        "column"
+      ]
     },
     "ColumnLevelEmbeddingConfig": {
-      "description": "Configuration for if and how a dataset's column should be embedded. Different to [`crate::component::embeddings::ColumnEmbeddingConfig`], as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`], not [`super::Dataset`].\n\n[`crate::component::embeddings::ColumnEmbeddingConfig`] will be deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].",
+      "description": "Configuration for if and how a dataset's column should be embedded.\n Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],\n as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],\n not [`super::Dataset`].\n\n [`crate::component::embeddings::ColumnEmbeddingConfig`] will be\n deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].",
       "type": "object",
       "properties": {
         "chunking": {
           "anyOf": [
             {
-              "$ref": "#/definitions/EmbeddingChunkConfig"
+              "$ref": "#/$defs/EmbeddingChunkConfig"
             },
             {
               "type": "null"
@@ -499,8 +558,8 @@
           ]
         },
         "from": {
-          "default": "",
-          "type": "string"
+          "type": "string",
+          "default": ""
         },
         "row_id": {
           "type": [
@@ -516,88 +575,85 @@
     "ComponentOrReference_for_Catalog": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Catalog"
+          "$ref": "#/$defs/Catalog"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Dataset": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Dataset"
+          "$ref": "#/$defs/Dataset"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Embeddings": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Embeddings"
+          "$ref": "#/$defs/Embeddings"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Eval": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Eval"
+          "$ref": "#/$defs/Eval"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Model": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Model"
+          "$ref": "#/$defs/Model"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Tool": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Tool"
+          "$ref": "#/$defs/Tool"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_View": {
       "anyOf": [
         {
-          "$ref": "#/definitions/View"
+          "$ref": "#/$defs/View"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentOrReference_for_Worker": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Worker"
+          "$ref": "#/$defs/Worker"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/$defs/ComponentReference"
         }
       ]
     },
     "ComponentReference": {
       "type": "object",
-      "required": [
-        "ref"
-      ],
       "properties": {
         "dependsOn": {
           "type": "array",
@@ -608,37 +664,43 @@
         "ref": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "ref"
+      ]
     },
     "CorsConfig": {
       "type": "object",
       "properties": {
         "allowed_origins": {
+          "type": "array",
           "default": [
             "*"
           ],
-          "type": "array",
           "items": {
             "type": "string"
           }
         },
         "enabled": {
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
     },
     "Dataset": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "acceleration": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Acceleration"
+              "$ref": "#/$defs/Acceleration"
             },
             {
               "type": "null"
@@ -648,7 +710,7 @@
         "columns": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/Column"
+            "$ref": "#/$defs/Column"
           }
         },
         "dependsOn": {
@@ -657,16 +719,10 @@
             "type": "string"
           }
         },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "embeddings": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/ColumnEmbeddingConfig"
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
           }
         },
         "from": {
@@ -685,7 +741,7 @@
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -693,7 +749,7 @@
           ]
         },
         "mode": {
-          "$ref": "#/definitions/Mode"
+          "$ref": "#/$defs/Mode"
         },
         "name": {
           "type": "string"
@@ -701,7 +757,7 @@
         "params": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Params"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
@@ -709,12 +765,12 @@
           ]
         },
         "ready_state": {
-          "$ref": "#/definitions/ReadyState"
+          "$ref": "#/$defs/ReadyState"
         },
         "replication": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Replication"
+              "$ref": "#/$defs/Replication"
             },
             {
               "type": "null"
@@ -730,7 +786,7 @@
         "time_format": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TimeFormat"
+              "$ref": "#/$defs/TimeFormat"
             },
             {
               "type": "null"
@@ -746,7 +802,7 @@
         "time_partition_format": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TimeFormat"
+              "$ref": "#/$defs/TimeFormat"
             },
             {
               "type": "null"
@@ -756,7 +812,7 @@
         "unsupported_type_action": {
           "anyOf": [
             {
-              "$ref": "#/definitions/UnsupportedTypeAction"
+              "$ref": "#/$defs/UnsupportedTypeAction"
             },
             {
               "type": "null"
@@ -764,39 +820,38 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
     },
     "EmbeddingChunkConfig": {
       "type": "object",
       "properties": {
         "enabled": {
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         },
         "overlap_size": {
-          "default": 0,
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "default": 0,
+          "minimum": 0
         },
         "target_chunk_size": {
-          "default": 0,
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "default": 0,
+          "minimum": 0
         },
         "trim_whitespace": {
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         }
       }
     },
     "Embeddings": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
       "properties": {
         "datasets": {
           "type": "array",
@@ -813,7 +868,7 @@
         "files": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/ModelFile"
+            "$ref": "#/$defs/ModelFile"
           }
         },
         "from": {
@@ -822,7 +877,7 @@
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -838,16 +893,21 @@
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "from",
+        "name"
+      ]
     },
     "Eval": {
       "type": "object",
-      "required": [
-        "dataset",
-        "name",
-        "scorers"
-      ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "dataset": {
           "type": "string"
         },
@@ -857,16 +917,10 @@
             "type": "string"
           }
         },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -882,14 +936,19 @@
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "name",
+        "dataset",
+        "scorers"
+      ]
     },
     "Extension": {
       "type": "object",
       "properties": {
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "params": {
           "type": "object",
@@ -910,6 +969,26 @@
         }
       }
     },
+    "FullTextSearchConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "row_id": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
     "HashingAlgorithm": {
       "type": "string",
       "enum": [
@@ -924,34 +1003,66 @@
         "unique"
       ]
     },
+    "LoadBalanceParams": {
+      "type": "object",
+      "properties": {
+        "routing": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RouterConfig"
+          }
+        }
+      }
+    },
+    "Management": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "api_key"
+      ]
+    },
     "Metric": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "name": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "name"
+      ]
     },
     "Metrics": {
       "type": "object",
-      "required": [
-        "metrics"
-      ],
       "properties": {
         "metrics": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/Metric"
+            "$ref": "#/$defs/Metric"
           }
         }
-      }
+      },
+      "required": [
+        "metrics"
+      ]
     },
     "Mode": {
       "type": "string",
@@ -969,11 +1080,13 @@
     },
     "Model": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "datasets": {
           "type": "array",
           "items": {
@@ -986,16 +1099,10 @@
             "type": "string"
           }
         },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "files": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/ModelFile"
+            "$ref": "#/$defs/ModelFile"
           }
         },
         "from": {
@@ -1008,7 +1115,7 @@
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -1022,14 +1129,26 @@
           "type": "object",
           "additionalProperties": true
         }
-      }
+      },
+      "required": [
+        "from",
+        "name"
+      ]
     },
     "ModelFile": {
       "type": "object",
-      "required": [
-        "path"
-      ],
       "properties": {
+        "type": {
+          "description": "Should use [`Self::file_type`] to access.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelFileType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": [
             "string",
@@ -1047,19 +1166,11 @@
         },
         "path": {
           "type": "string"
-        },
-        "type": {
-          "description": "Should use [`Self::file_type`] to access.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelFileType"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
-      }
+      },
+      "required": [
+        "path"
+      ]
     },
     "ModelFileType": {
       "type": "string",
@@ -1097,7 +1208,10 @@
       ]
     },
     "Params": {
-      "type": "object"
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamValue"
+      }
     },
     "ReadyState": {
       "description": "Controls when the dataset is marked ready for queries.",
@@ -1105,16 +1219,12 @@
         {
           "description": "The table is ready once the initial load completes.",
           "type": "string",
-          "enum": [
-            "on_load"
-          ]
+          "const": "on_load"
         },
         {
           "description": "The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.",
           "type": "string",
-          "enum": [
-            "on_registration"
-          ]
+          "const": "on_registration"
         }
       ]
     },
@@ -1131,16 +1241,12 @@
         {
           "description": "Always start a new refresh when Spice starts.",
           "type": "string",
-          "enum": [
-            "always"
-          ]
+          "const": "always"
         },
         {
           "description": "Only start a refresh if an existing acceleration is not available.",
           "type": "string",
-          "enum": [
-            "auto"
-          ]
+          "const": "auto"
         }
       ]
     },
@@ -1148,8 +1254,8 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "default": false,
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -1157,12 +1263,8 @@
       "type": "object",
       "properties": {
         "cache_key_type": {
-          "default": "plan",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CacheKeyType"
-            }
-          ]
+          "$ref": "#/$defs/CacheKeyType",
+          "default": "plan"
         },
         "cache_max_size": {
           "type": [
@@ -1171,8 +1273,8 @@
           ]
         },
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "eviction_policy": {
           "type": [
@@ -1181,12 +1283,8 @@
           ]
         },
         "hashing_algorithm": {
-          "default": "siphash",
-          "allOf": [
-            {
-              "$ref": "#/definitions/HashingAlgorithm"
-            }
-          ]
+          "$ref": "#/$defs/HashingAlgorithm",
+          "default": "siphash"
         },
         "item_ttl": {
           "type": [
@@ -1200,10 +1298,6 @@
       "anyOf": [
         {
           "type": "object",
-          "required": [
-            "from",
-            "order"
-          ],
           "properties": {
             "from": {
               "type": "string"
@@ -1211,16 +1305,16 @@
             "order": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "from",
+            "order"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "from",
-            "weight"
-          ],
           "properties": {
             "from": {
               "type": "string"
@@ -1228,20 +1322,24 @@
             "weight": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "from",
+            "weight"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "from"
-          ],
           "properties": {
             "from": {
               "type": "string"
             }
-          }
+          },
+          "required": [
+            "from"
+          ]
         }
       ]
     },
@@ -1251,15 +1349,18 @@
         "auth": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Auth"
+              "$ref": "#/$defs/Auth"
             },
             {
               "type": "null"
             }
           ]
         },
+        "caching": {
+          "$ref": "#/$defs/Caching"
+        },
         "cors": {
-          "$ref": "#/definitions/CorsConfig"
+          "$ref": "#/$defs/CorsConfig"
         },
         "dataset_load_parallelism": {
           "type": [
@@ -1267,12 +1368,12 @@
             "null"
           ],
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "flight": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Flight"
+              "$ref": "#/$defs/Flight"
             },
             {
               "type": "null"
@@ -1280,7 +1381,7 @@
           ]
         },
         "memory_limit": {
-          "description": "Specifies the runtime memory limit. When configured, will spill to disk for supported queries larger than memory.",
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
           "type": [
             "string",
             "null"
@@ -1293,23 +1394,30 @@
           }
         },
         "results_cache": {
-          "$ref": "#/definitions/ResultsCache"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResultsCache"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "shutdown_timeout": {
-          "description": "Configures how long the runtime waits for connections to be gracefully drained and components to shut down cleanly during runtime termination",
+          "description": "Configures how long the runtime waits for connections to be gracefully drained\n and components to shut down cleanly during runtime termination",
           "type": [
             "string",
             "null"
           ]
         },
         "task_history": {
-          "$ref": "#/definitions/TaskHistory"
+          "$ref": "#/$defs/TaskHistory"
         },
         "telemetry": {
-          "$ref": "#/definitions/TelemetryConfig"
+          "$ref": "#/$defs/TelemetryConfig"
         },
         "temp_directory": {
-          "description": "Configures where the runtime will store temporary files needed for operations like spilling to disk for queries & accelerations that are larger than memory.",
+          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
           "type": [
             "string",
             "null"
@@ -1319,7 +1427,7 @@
           "description": "If set, the runtime will configure all endpoints to use TLS",
           "anyOf": [
             {
-              "$ref": "#/definitions/TlsConfig"
+              "$ref": "#/$defs/TlsConfig"
             },
             {
               "type": "null"
@@ -1329,7 +1437,7 @@
         "tracing": {
           "anyOf": [
             {
-              "$ref": "#/definitions/TracingConfig"
+              "$ref": "#/$defs/TracingConfig"
             },
             {
               "type": "null"
@@ -1339,13 +1447,44 @@
       },
       "additionalProperties": false
     },
-    "Secret": {
-      "description": "The secrets configuration for a Spicepod.\n\nExample: ```yaml secrets: - from: env name: env - from: kubernetes:my_secret_name name: k8s ```",
+    "SQLResultsCacheConfig": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
+      "properties": {
+        "cache_key_type": {
+          "$ref": "#/$defs/CacheKeyType",
+          "default": "plan"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "eviction_policy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hashing_algorithm": {
+          "$ref": "#/$defs/HashingAlgorithm",
+          "default": "siphash"
+        },
+        "item_ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Secret": {
+      "description": "The secrets configuration for a Spicepod.\n\n Example:\n ```yaml\n secrets:\n   - from: env\n     name: env\n   - from: kubernetes:my_secret_name\n     name: k8s\n ```",
+      "type": "object",
       "properties": {
         "description": {
           "type": [
@@ -1362,14 +1501,18 @@
         "params": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Params"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
             }
           ]
         }
-      }
+      },
+      "required": [
+        "from",
+        "name"
+      ]
     },
     "SpicepodKind": {
       "type": "string",
@@ -1388,20 +1531,20 @@
       "type": "object",
       "properties": {
         "captured_output": {
-          "default": "none",
-          "type": "string"
+          "type": "string",
+          "default": "none"
         },
         "enabled": {
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "retention_check_interval": {
-          "default": "15m",
-          "type": "string"
+          "type": "string",
+          "default": "15m"
         },
         "retention_period": {
-          "default": "8h",
-          "type": "string"
+          "type": "string",
+          "default": "8h"
         }
       },
       "additionalProperties": false
@@ -1409,24 +1552,20 @@
     "TelemetryConfig": {
       "type": "object",
       "properties": {
-        "enabled": {
-          "default": true,
-          "type": "boolean"
-        },
         "properties": {
-          "default": {},
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "default": {}
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
         },
         "user_agent_collection": {
-          "default": "full",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UserAgentCollection"
-            }
-          ]
+          "$ref": "#/$defs/UserAgentCollection",
+          "default": "full"
         }
       },
       "additionalProperties": false
@@ -1444,9 +1583,6 @@
     },
     "TlsConfig": {
       "type": "object",
-      "required": [
-        "enabled"
-      ],
       "properties": {
         "certificate": {
           "description": "A PEM encoded certificate",
@@ -1481,26 +1617,25 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ]
     },
     "Tool": {
       "type": "object",
-      "required": [
-        "from",
-        "name"
-      ],
       "properties": {
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
         "description": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "env": {
           "type": "object",
@@ -1514,7 +1649,7 @@
         "metrics": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Metrics"
+              "$ref": "#/$defs/Metrics"
             },
             {
               "type": "null"
@@ -1530,13 +1665,14 @@
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "from",
+        "name"
+      ]
     },
     "TracingConfig": {
       "type": "object",
-      "required": [
-        "zipkin_enabled"
-      ],
       "properties": {
         "zipkin_enabled": {
           "type": "boolean"
@@ -1548,7 +1684,10 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "zipkin_enabled"
+      ]
     },
     "UnsupportedTypeAction": {
       "type": "string",
@@ -1568,14 +1707,17 @@
     },
     "View": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "acceleration": {
           "anyOf": [
             {
-              "$ref": "#/definitions/Acceleration"
+              "$ref": "#/$defs/Acceleration"
             },
             {
               "type": "null"
@@ -1585,7 +1727,7 @@
         "columns": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/Column"
+            "$ref": "#/$defs/Column"
           }
         },
         "dependsOn": {
@@ -1593,12 +1735,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "metadata": {
           "type": "object",
@@ -1608,7 +1744,7 @@
           "type": "string"
         },
         "ready_state": {
-          "$ref": "#/definitions/ReadyState"
+          "$ref": "#/$defs/ReadyState"
         },
         "sql": {
           "description": "Inline SQL that describes a view.",
@@ -1624,13 +1760,13 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "name"
+      ]
     },
     "Worker": {
       "type": "object",
-      "required": [
-        "name"
-      ],
       "properties": {
         "description": {
           "type": [
@@ -1638,11 +1774,21 @@
             "null"
           ]
         },
-        "models": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/RouterConfig"
-          }
+        "cron": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "load_balance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoadBalanceParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "name": {
           "type": "string"
@@ -1650,8 +1796,17 @@
         "params": {
           "type": "object",
           "additionalProperties": true
+        },
+        "sql": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
-      }
+      },
+      "required": [
+        "name"
+      ]
     },
     "ZeroResultsAction": {
       "description": "Behavior when a query on an accelerated table returns zero results.",
@@ -1659,16 +1814,12 @@
         {
           "description": "Return an empty result set. This is the default.",
           "type": "string",
-          "enum": [
-            "return_empty"
-          ]
+          "const": "return_empty"
         },
         {
           "description": "Fallback to querying the source table.",
           "type": "string",
-          "enum": [
-            "use_source"
-          ]
+          "const": "use_source"
         }
       ]
     }

@@ -11,9 +11,9 @@
 <p align="center">
   <a href="https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?branch=trunk&label=docker%20build" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?branch=trunk&event=merge_group&label=unit%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&event=pull_request&label=integration%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&event=pull_request&label=integration%20tests%20(models)" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models)" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
@@ -88,7 +88,7 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Primary deployment model**     | Sidecar                                | Cluster              | Cluster               | Cluster             | Cluster              |
 | **Federated Query Support**      | ✅                                     | ✅                   | ✅                    | ―                   | ―                    |
 | **Acceleration/Materialization** | ✅ (Arrow, SQLite, DuckDB, PostgreSQL) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog)            | ✅                   | ✅                    | ―                   | ―                    |
+| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                   | ✅                    | ―                   | ―                    |
 | **Query Result Caching**         | ✅                                     | ✅                   | ✅                    | ✅                  | Limited              |
 | **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                    |
 | **Change Data Capture (CDC)**    | ✅ (Debezium)                          | ―                    | ―                     | ―                   | ✅ (Debezium)        |
@@ -177,6 +177,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
+| `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
@@ -191,6 +192,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme
 [localpod]: https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md
 [iceberg]: https://github.com/spiceai/cookbook/tree/trunk/catalogs/iceberg#readme
+[glue]: https://github.com/spiceai/cookbook/tree/trunk/glue/README.md
 
 ## Supported Data Accelerators
 
@@ -237,7 +239,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
 | `spice.ai`      | Spice.ai Cloud Platform | Beta        | Arrow Flight                 |
-| `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
+| `glue`          | AWS Glue                | Alpha       | CSV, Parquet, Iceberg        |
 
 ## ⚡️ Quickstart (Local Machine)
 

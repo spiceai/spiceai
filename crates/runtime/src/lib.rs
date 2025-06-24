@@ -861,6 +861,17 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
+                            if let Some(app) = self.app.read().await.as_ref() {
+                                let valid_datasets =
+                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                let valid_catalogs =
+                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                if valid_datasets.is_empty() && valid_catalogs.is_empty() {
+                                    tracing::info!(
+                                        "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
+                                    );
+                                }
+                            }
                             tracing::info!("All components are loaded. Spice runtime is ready!");
                             break;
                         }

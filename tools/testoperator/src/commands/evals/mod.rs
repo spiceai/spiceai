@@ -92,7 +92,7 @@ impl EvalMetrics {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     let eval = args
@@ -163,7 +163,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     // json format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
-    // Record benchamrk results
+    // Record benchmark results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
         KeyValue::new("type", "model_benchmark"),
@@ -206,8 +206,7 @@ async fn execute_sql(
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let res = spice_client
         .query(sql)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .await?
         .try_collect::<Vec<RecordBatch>>()
         .await?;
     Ok(res)

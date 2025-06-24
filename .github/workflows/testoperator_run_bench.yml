@@ -41,6 +41,7 @@ on:
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
           - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
@@ -184,9 +185,9 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
@@ -245,9 +246,9 @@ jobs:
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa

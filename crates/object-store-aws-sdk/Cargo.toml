@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "object-store-aws-sdk"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+object_store.workspace = true
+snafu.workspace = true
+url.workspace = true

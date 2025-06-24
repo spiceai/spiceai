@@ -8,8 +8,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 byte-unit.workspace = true
 fundu.workspace = true
+futures.workspace = true
+object-store-aws-sdk = { path = "../object-store-aws-sdk" }
+object_store.workspace = true
 regex.workspace = true
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -17,7 +21,9 @@ serde-value = "0.7.0"
 serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [features]
 default = []

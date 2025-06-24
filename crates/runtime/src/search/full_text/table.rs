@@ -27,7 +27,7 @@ use datafusion::prelude::{Expr, SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
-use search::generation::text_search::FullTextSearch;
+use search::generation::text_search::FullTextSearchIndex;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
@@ -110,6 +110,19 @@ impl TableWithFullText {
     #[must_use]
     pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
+    }
+
+    /// Construct a new [`TableWithFullText`] with an updated [`TableProvider`].
+    ///
+    /// No Checks are done to confirm compatibility between the current index and the provided [`TableProvider`].
+    #[must_use]
+    pub fn with_new_base(&self, base_table: Arc<dyn TableProvider>) -> Self {
+        Self {
+            search_fields: self.search_fields.clone(),
+            primary_key: self.primary_key.clone(),
+            index: Arc::clone(&self.index),
+            base_table,
+        }
     }
 
     async fn create_index(
@@ -222,7 +235,7 @@ impl TableWithFullText {
     ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
-            let base = FullTextSearch::try_new(
+            let base = FullTextSearchIndex::try_new(
                 Arc::clone(&self.index),
                 search_field.clone(),
                 self.primary_key.clone(),
