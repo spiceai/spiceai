@@ -299,7 +299,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The dataset name '{keyword}' is a protected keyword for {dataconnector} and cannot be used as a name for a dataset.\nPlease change the name of your dataset in your Spicepod."
+        "The dataset name '{keyword}' is a protected keyword for the {dataconnector} data connector and cannot be used as a name for a dataset.\nPlease change the name of your dataset in your Spicepod."
     ))]
     UseOfProtectedKeyword {
         dataconnector: String,
