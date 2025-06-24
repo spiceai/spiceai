@@ -61,12 +61,17 @@ pub async fn try_to_chat_model(
         from: component.from.clone(),
     })?;
 
+    let param_spec = get_params_spec(&source).ok_or(LlmError::UnsupportedTaskForModel {
+        from: component.from.clone(),
+        task: "llm".into(),
+    })?;
+
     let params_struct = Parameters::try_new(
         &format!("model {}", source),
         params.clone().into_iter().collect::<Vec<_>>(),
         source.short_name(),
         rt.secrets(),
-        get_params_spec(&source),
+        param_spec,
     )
     .await
     .expect("Failed to create params");

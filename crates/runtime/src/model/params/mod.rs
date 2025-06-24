@@ -20,22 +20,26 @@ mod databricks;
 mod file;
 mod huggingface;
 mod openai;
+mod perplexity;
+mod xai;
+
 use spicepod::component::model::ModelSource;
 
 use crate::parameters::ParameterSpec;
 
 const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
 
-pub(crate) fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
+pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
     match source {
-        ModelSource::OpenAi => openai::PARAMETERS,
-        ModelSource::Azure => azure::PARAMETERS,
-        ModelSource::File => file::PARAMETERS,
-        ModelSource::Databricks => databricks::PARAMETERS,
-        ModelSource::HuggingFace => huggingface::PARAMETERS,
-        ModelSource::Anthropic => anthropic::PARAMETERS,
-
-        _ => unimplemented!("Model source {:?} does not have parameters defined", source),
+        ModelSource::OpenAi => Some(openai::PARAMETERS),
+        ModelSource::Azure => Some(azure::PARAMETERS),
+        ModelSource::File => Some(file::PARAMETERS),
+        ModelSource::Databricks => Some(databricks::PARAMETERS),
+        ModelSource::HuggingFace => Some(huggingface::PARAMETERS),
+        ModelSource::Anthropic => Some(anthropic::PARAMETERS),
+        ModelSource::Perplexity => Some(perplexity::PARAMETERS),
+        ModelSource::Xai => Some(xai::PARAMETERS),
+        _ => None,
     }
 }
 
