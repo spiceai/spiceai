@@ -90,6 +90,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("100"),
 ];
 
+const PROTECTED_KEYWORDS: &[&str] = &["PARTITION"];
+
 impl DataConnectorFactory for MySQLFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -195,6 +197,10 @@ impl DataConnectorFactory for MySQLFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn protected_keywords(&self) -> &'static [&'static str] {
+        PROTECTED_KEYWORDS
     }
 }
 

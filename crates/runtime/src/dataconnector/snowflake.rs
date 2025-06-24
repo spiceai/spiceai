@@ -76,6 +76,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("auth_type"),
 ];
 
+const PROTECTED_KEYWORDS: &[&str] = &[
+    "START",
+    "CONNECT",
+    "MATCH_RECOGNIZE",
+    "SAMPLE",
+    "TABLESAMPLE",
+    "FROM",
+];
+
 impl DataConnectorFactory for SnowflakeFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -106,6 +115,10 @@ impl DataConnectorFactory for SnowflakeFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn protected_keywords(&self) -> &'static [&'static str] {
+        PROTECTED_KEYWORDS
     }
 }
 

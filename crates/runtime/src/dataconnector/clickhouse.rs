@@ -149,6 +149,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds.")
 ];
 
+const PROTECTED_KEYWORDS: &[&str] = &["PREWHERE", "SETTINGS", "FORMAT"];
+
 impl DataConnectorFactory for ClickhouseFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -213,6 +215,10 @@ impl DataConnectorFactory for ClickhouseFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn protected_keywords(&self) -> &'static [&'static str] {
+        PROTECTED_KEYWORDS
     }
 }
 

@@ -71,6 +71,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("trust_server_certificate"),
 ];
 
+const PROTECTED_KEYWORDS: &[&str] = &["OUTER", "SET", "QUALIFY", "WINDOW", "END", "FOR"];
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -195,6 +197,10 @@ impl DataConnectorFactory for SqlServerFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn protected_keywords(&self) -> &'static [&'static str] {
+        PROTECTED_KEYWORDS
     }
 }
 
