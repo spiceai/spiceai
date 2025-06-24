@@ -16,20 +16,22 @@ limitations under the License.
 
 use std::fmt::Debug;
 
+use async_trait::async_trait;
 use datafusion::scalar::ScalarValue;
 
 use crate::{Error, Partition};
 
+#[async_trait]
 pub trait PartitionCreator: Debug + Send + Sync {
     /// Create a new [`Partition`] using the `partition_value`.
     ///
     /// # Errors
     /// Returns an error when creating a [`Partition`] is unsuccessful.
-    fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
+    async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
     /// Find and load previously created [`Parition`]s.
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
-    fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
 }

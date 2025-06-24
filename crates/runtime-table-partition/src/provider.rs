@@ -45,13 +45,14 @@ impl PartitionTableProvider {
     ///
     /// # Errors
     /// Returns an error if partition inferencing fails.
-    pub fn new(
+    pub async fn new(
         creator: Arc<dyn PartitionCreator>,
         partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let partitions = creator
-            .infer_existing_partitions()?
+            .infer_existing_partitions()
+            .await?
             .into_iter()
             .map(|p| (p.partition_value.to_string(), p.table_provider))
             .collect();

@@ -32,6 +32,7 @@ pub enum Error {
     InferringPartitions,
 }
 
+#[derive(Debug)]
 pub struct Partition {
     partition_value: ScalarValue,
     table_provider: Arc<dyn TableProvider>,
