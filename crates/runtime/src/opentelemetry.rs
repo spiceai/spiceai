@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -61,6 +62,7 @@ use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
 use crate::tls::TlsConfig;
+use crate::utils::find_io_error;
 use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -98,6 +100,11 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display(
+        "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
+    ))]
+    AddressAlreadyInUse { addr: String },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -621,7 +628,19 @@ pub async fn start(
     } else {
         server.serve(bind_address).await
     }
-    .context(UnableToServeSnafu)?;
+    .map_err(|e| match e {
+        _ => {
+            if let Some(io_err) = find_io_error(&e) {
+                if io_err.kind() == io::ErrorKind::AddrInUse {
+                    return Error::AddressAlreadyInUse {
+                        addr: bind_address.to_string(),
+                    };
+                }
+            }
+
+            Error::UnableToServe { source: e }
+        }
+    })?;
 
     tracing::debug!("Spice Runtime OpenTelemetry stopped");
 

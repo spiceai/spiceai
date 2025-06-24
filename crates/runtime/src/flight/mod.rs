@@ -20,6 +20,7 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
 use crate::tls::TlsConfig;
+use crate::utils::find_io_error;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -50,6 +51,7 @@ use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -335,6 +337,11 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display(
+        "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
+    ))]
+    AddressAlreadyInUse { addr: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -388,7 +395,17 @@ pub async fn start(
     } else {
         server.serve(bind_address).await
     }
-    .context(UnableToStartFlightServerSnafu)?;
+    .map_err(|e| {
+        if let Some(io_err) = find_io_error(&e) {
+            if io_err.kind() == io::ErrorKind::AddrInUse {
+                return Error::AddressAlreadyInUse {
+                    addr: bind_address.to_string(),
+                };
+            }
+        }
+
+        Error::UnableToStartFlightServer { source: e }
+    })?;
 
     tracing::debug!("Spice Runtime Flight stopped");
 
