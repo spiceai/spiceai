@@ -1,1 +1,1 @@
-1.7.0-unstable
+1.7.0-enterprise-beta
