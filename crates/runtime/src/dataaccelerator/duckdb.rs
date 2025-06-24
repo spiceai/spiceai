@@ -302,7 +302,7 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        _partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options

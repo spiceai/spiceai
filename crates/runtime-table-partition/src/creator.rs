@@ -22,8 +22,14 @@ use crate::{Error, Partition};
 
 pub trait PartitionCreator: Debug + Send + Sync {
     /// Create a new [`Partition`] using the `partition_value`.
+    ///
+    /// # Errors
+    /// Returns an error when creating a [`Partition`] is unsuccessful.
     fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
     /// Find and load previously created [`Parition`]s.
+    ///
+    /// # Errors
+    /// Returns an error when [`Partition`]s cannot be inferred.
     fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
 }

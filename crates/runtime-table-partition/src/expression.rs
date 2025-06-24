@@ -40,6 +40,10 @@ pub type ValidationResult = Result<(), ValidationError>;
 
 /// Trait for defining validation criteria for an Expr.
 pub trait Criterion: Send + Sync {
+    /// Validate the expression meets a certain criterion.
+    ///
+    /// # Errors
+    /// Returns an error if the validation failed or cannot complete.
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult;
 }
 
@@ -163,7 +167,7 @@ mod tests {
             ),
             Field::new("sales_volume", DataType::Int32, true),
         ]));
-        DFSchema::try_from(schema).unwrap()
+        DFSchema::try_from(schema).expect("schema created")
     }
 
     #[tokio::test]
@@ -191,7 +195,7 @@ mod tests {
                 lit("datafusion"),
             )
             .otherwise(lit("other"))
-            .unwrap();
+            .expect("expression created");
         assert!(criterion.validate(&expr, &schema).is_ok());
 
         // Invalid: date_trunc('month', date)

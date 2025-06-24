@@ -40,10 +40,14 @@ pub struct PartitionTableProvider {
 }
 
 impl PartitionTableProvider {
-    #[must_use]
+    /// Create a new [`PartitionTableProvider`] and attempt to infer existing
+    /// `partitions` using the specified `creator`.
+    ///
+    /// # Errors
+    /// Returns an error if partition inferencing fails.
     pub fn new(
         creator: Arc<dyn PartitionCreator>,
-        _partition_by: Vec<Expr>,
+        partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let partitions = creator
@@ -54,7 +58,7 @@ impl PartitionTableProvider {
 
         Ok(Self {
             _creator: creator,
-            _partition_by,
+            _partition_by: partition_by,
             _partitions: partitions,
             schema,
         })
