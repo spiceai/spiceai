@@ -84,7 +84,7 @@ pub enum Error {
     #[snafu(display(
         "The name '{keyword}' cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
     ))]
-    UseOfProtectedKeyword { keyword: String },
+    UseOfReservedKeyword { keyword: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -141,8 +141,8 @@ fn detect_duplicate_component_names(
 
 fn check_for_protected_keywords(components: &[Dataset]) -> Result<()> {
     for component in components {
-        if keywords::is_protected_keyword(component.name()) {
-            return Err(Error::UseOfProtectedKeyword {
+        if keywords::is_reserved_keyword(component.name()) {
+            return Err(Error::UseOfReservedKeyword {
                 keyword: component.name().to_string(),
             });
         }

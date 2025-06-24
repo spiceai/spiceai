@@ -15,49 +15,10 @@ limitations under the License.
 */
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs
-static PROTECTED_KEYWORDS: &[&str] = &[
-    "WITH",
-    "EXPLAIN",
-    "ANALYZE",
-    "SELECT",
-    "WHERE",
-    "GROUP",
-    "SORT",
-    "PIVOT",
-    "UNPIVOT",
-    "TOP",
-    "LATERAL",
-    "VIEW",
-    "LIMIT",
-    "OFFSET",
-    "FETCH",
-    "UNION",
-    "EXCEPT",
-    "INTERSECT",
-    "MINUS",
-    "ON",
-    "JOIN",
-    "INNER",
-    "CROSS",
-    "FULL",
-    "LEFT",
-    "RIGHT",
-    "NATURAL",
-    "USING",
-    "CLUSTER",
-    "DISTRIBUTE",
-    "GLOBAL",
-    "ANTI",
-    "SEMI",
-    "RETURNING",
-    "ASOF",
-    "MATCH_CONDITION",
-    "TABLE",
-    "FROM",
-    "INTO",
-    "END",
+static RESERVED_KEYWORDS: &[&str] = &[
+    "COUNT", "FALSE", "NULL", "TRUE", "END-EXEC", "LATERAL", "TABLE", "UNNEST",
 ];
 
-pub(crate) fn is_protected_keyword(keyword: &str) -> bool {
-    PROTECTED_KEYWORDS.contains(&keyword.to_ascii_uppercase().as_str())
+pub(crate) fn is_reserved_keyword(keyword: &str) -> bool {
+    RESERVED_KEYWORDS.contains(&keyword.to_ascii_uppercase().as_str())
 }
