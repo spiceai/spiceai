@@ -61,11 +61,17 @@ const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     out
 }
 
-pub(crate) const PARAM_LEN: usize = 21;
-pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 42;
+pub(crate) const PARAM_LEN: usize = 24;
+pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 45;
 
-// Default Override parameters start with `<model_prefix>` is deprecated.
-pub(crate) const DEFAULT_OVERRIDE_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
+pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
+    // Common parameters for all models
+    ParameterSpec::runtime("tools")
+        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
+    ParameterSpec::runtime("system_prompt")
+        .description("An additional system prompt used for all chat completions to this model."),
+    ParameterSpec::runtime("parameterized_prompt"),
+    // OpenAI compatible default override parameters for all models
     ParameterSpec::component("frequency_penalty"),
     ParameterSpec::component("logit_bias"),
     ParameterSpec::component("logprobs"),
@@ -89,10 +95,14 @@ pub(crate) const DEFAULT_OVERRIDE_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::component("user"),
 ];
 
-// Default Override parameters start with `openai_` is deprecated and will be removed in a future release.
-// Keep the `openai_` for backward compatibility, but recommend user using `<model_prefix>_<param>` instead.
-pub(crate) const DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED: [ParameterSpec;
-    PARAM_WITH_DEPRE_LEN] = [
+pub(crate) const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
+    // Common parameters for all models
+    ParameterSpec::runtime("tools")
+        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
+    ParameterSpec::runtime("system_prompt")
+        .description("An additional system prompt used for all chat completions to this model."),
+    ParameterSpec::runtime("parameterized_prompt"),
+    // OpenAI compatible default override parameters for all models
     ParameterSpec::component("frequency_penalty"),
     ParameterSpec::component("logit_bias"),
     ParameterSpec::component("logprobs"),
@@ -114,7 +124,8 @@ pub(crate) const DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED: [ParameterSpec;
     ParameterSpec::component("tool_choice"),
     ParameterSpec::component("parallel_tool_calls"),
     ParameterSpec::component("user"),
-    // Deprecated OpenAI Compatible API default parameters overrides
+    // Default Override parameters start with `openai_` is deprecated and will be removed in a future release.
+    // Keep the `openai_` for backward compatibility, but recommend user using `<model_prefix>_<param>` instead.
     ParameterSpec::runtime("openai_frequency_penalty").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_logit_bias").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_logprobs").deprecated(DEPRECATED_MESSAGE),

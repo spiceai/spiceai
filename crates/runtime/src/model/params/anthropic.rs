@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
@@ -24,19 +24,13 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     { ANTHROPIC_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
 >(
     ANTHROPIC_PARAMETERS,
-    DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED,
+    COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
 );
 
-const ANTHROPIC_PARAM_LEN: usize = 5;
+const ANTHROPIC_PARAM_LEN: usize = 3;
 
 pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
-    ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
-    ParameterSpec::runtime("system_prompt")
-        .description("An additional system prompt used for all chat completions to this model."),
-    ParameterSpec::runtime("endpoint")
-        .description("The Anthropic API base endpoint."),
+    ParameterSpec::runtime("endpoint").description("The Anthropic API base endpoint."),
     ParameterSpec::component("api_key").description("The Anthropic API key."),
-    ParameterSpec::component("auth_token")
-        .description("The Anthropic Auth Token."),
+    ParameterSpec::component("auth_token").description("The Anthropic Auth Token."),
 ];

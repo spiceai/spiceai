@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] =
@@ -23,14 +23,13 @@ pub(crate) const PARAMETERS: &[ParameterSpec] =
         FILE_PARAM_LEN,
         PARAM_WITH_DEPRE_LEN,
         { FILE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
-    >(FILE_PARAMETERS, DEFAULT_OVERRIDE_PARAMETERS_WITH_DEPRECATED);
+    >(FILE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const FILE_PARAM_LEN: usize = 3;
+const FILE_PARAM_LEN: usize = 1;
 
-pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
-    ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
-    ParameterSpec::runtime("system_prompt")
-        .description("An additional system prompt used for all chat completions to this model."),
-    ParameterSpec::runtime("chat_template").description("Customizes the transformation of OpenAI chat messages into a character stream for the model."),
-];
+pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [ParameterSpec::runtime(
+    "chat_template",
+)
+.description(
+    "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
+)];
