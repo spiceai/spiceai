@@ -628,18 +628,16 @@ pub async fn start(
     } else {
         server.serve(bind_address).await
     }
-    .map_err(|e| match e {
-        _ => {
-            if let Some(io_err) = find_io_error(&e) {
-                if io_err.kind() == io::ErrorKind::AddrInUse {
-                    return Error::AddressAlreadyInUse {
-                        addr: bind_address.to_string(),
-                    };
-                }
+    .map_err(|e| {
+        if let Some(io_err) = find_io_error(&e) {
+            if io_err.kind() == io::ErrorKind::AddrInUse {
+                return Error::AddressAlreadyInUse {
+                    addr: bind_address.to_string(),
+                };
             }
-
-            Error::UnableToServe { source: e }
         }
+
+        Error::UnableToServe { source: e }
     })?;
 
     tracing::debug!("Spice Runtime OpenTelemetry stopped");
