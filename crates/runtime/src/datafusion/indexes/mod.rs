@@ -22,6 +22,26 @@ pub enum Index {
     FullText(FullTextDatabaseIndex),
 }
 
+pub enum IndexQueryResult {
+}
+
+pub trait Index1 {
+    fn resolve_plan(&self, filters: &[Expr], limit: Option<usize>) -> Arc<dyn ExecutionPlan>;
+    async fn query(&self, )
+}
+
+// resolve "search me" -> vector -> primary keys (topK=10)
+// scan primary keys
+
+// SELECT * FROM underlying WHERE primary_key IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+// underlying.scan()
+
+// sort
+//   left join (order preserving?)
+//      underlying.scan()
+//      index_scan() -> primary keys + score
+
 impl Index {
     pub fn is_full_text(&self) -> bool {
         matches!(self, Self::FullText(_))

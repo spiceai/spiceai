@@ -1,0 +1,13 @@
+[package]
+description = "Indexing middleware and traits for the Spice runtime that extend DataFusion"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-datafusion-index"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true

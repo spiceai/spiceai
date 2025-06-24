@@ -160,6 +160,9 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         }
 
+        // get the underlying table provider, IndexTableProvider
+        // downcast IndexTableProvider to FullTextSearchTable
+
         // TODO:phillip - rework
         let fts_index = match self.df.get_full_text_index(&args.tbl) {
             Ok(Some(fts_index)) => fts_index,
