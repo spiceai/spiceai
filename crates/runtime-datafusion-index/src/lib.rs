@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,21 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use datafusion::catalog::TableProvider;
-
-#[derive(Clone, Debug)]
-pub struct FullTextDatabaseIndex {
-    pub underlying: Arc<dyn TableProvider>,
-    pub primary_key: Vec<String>,
-}
-
-impl FullTextDatabaseIndex {
-    pub fn new(underlying: Arc<dyn TableProvider>, primary_key: Vec<String>) -> Self {
-        Self {
-            underlying,
-            primary_key,
-        }
-    }
-}
+mod provider;
+pub use provider::*;

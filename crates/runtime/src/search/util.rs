@@ -20,6 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::CandidateGeneration;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
@@ -29,8 +30,9 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
+use crate::search::full_text::index::FullTextDatabaseIndex;
 
-use super::{Error, Result, full_text::table::TableWithFullText};
+use super::{Error, Result};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
 pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
@@ -47,8 +49,8 @@ pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'sta
         }
 
         // Handle specific table wrapping logic.
-        if let Some(fts_table) = current_tbl.as_any().downcast_ref::<TableWithFullText>() {
-            current_tbl = fts_table.underlying_table();
+        if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
+            current_tbl = index_table.get_underlying();
             continue;
         }
 
@@ -209,7 +211,13 @@ pub async fn full_text_search_candidates(
     let table_provider = df.get_table(tbl).await?;
 
     // If the table exists, but does not have full text search support, return no candidates.
-    let Some(fts) = find_concrete_table_provider::<TableWithFullText>(&table_provider).await else {
+    let Some(indexed_table) =
+        find_concrete_table_provider::<IndexedTableProvider>(&table_provider).await
+    else {
+        return Some(Ok(vec![]));
+    };
+
+    let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() else {
         return Some(Ok(vec![]));
     };
 
@@ -222,7 +230,7 @@ pub async fn full_text_search_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::TableWithFullText;
+    use super::FullTextDatabaseIndex;
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
@@ -254,14 +262,21 @@ mod tests {
             )
             .expect("failed to make table"),
         );
-        let wrapped_table = Arc::new(
-            TableWithFullText::try_new(base_table, vec!["search_field".to_string()], vec![].into())
-                .await
-                .expect("cannot make full text table"),
-        ) as Arc<dyn TableProvider>;
+        let index = Arc::new(
+            FullTextDatabaseIndex::try_new(
+                base_table,
+                vec!["search_field".to_string()],
+                vec![].into(),
+            )
+            .await
+            .expect("cannot make full text table"),
+        );
+
+        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+            as Arc<dyn TableProvider>;
 
         assert!(
-            find_concrete_table_provider::<TableWithFullText>(&wrapped_table)
+            find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table)
                 .await
                 .is_some()
         );

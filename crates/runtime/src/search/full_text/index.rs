@@ -13,21 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::{DataType, SchemaRef};
-use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Statistics};
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use arrow_schema::DataType;
+use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::TableProviderFilterPushDown;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{Expr, SessionConfig, SessionContext};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
-use search::generation::text_search::FullTextSearchIndex;
+use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::sync::Arc;
@@ -38,8 +32,8 @@ use crate::datafusion::query::write_to_json_string;
 use crate::object_store_registry::SpiceObjectStoreRegistry;
 use crate::search::util::get_primary_keys;
 
-#[derive(Clone)]
-pub struct TableWithFullText {
+#[derive(Clone, Debug)]
+pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     base_table: Arc<dyn TableProvider>,
@@ -77,7 +71,7 @@ pub enum Error {
     },
 }
 
-impl TableWithFullText {
+impl FullTextDatabaseIndex {
     pub async fn try_new(
         inner: Arc<dyn TableProvider>,
         search_fields: Vec<String>,
@@ -105,11 +99,16 @@ impl TableWithFullText {
     }
 
     #[must_use]
+    pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    #[must_use]
     pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
     }
 
-    /// Construct a new [`TableWithFullText`] with an updated [`TableProvider`].
+    /// Construct a new [`FullTextDatabaseIndex`] with an updated [`TableProvider`].
     ///
     /// No Checks are done to confirm compatibility between the current index and the provided [`TableProvider`].
     #[must_use]
@@ -226,11 +225,11 @@ impl TableWithFullText {
         Ok(Arc::new(index))
     }
 
-    pub fn index_as_full_text(
+    pub fn full_text_search_field_index(
         &self,
         search_field: &str,
-    ) -> Result<FullTextSearchIndex, search::generation::text_search::Error> {
-        let mut search_index = FullTextSearchIndex::try_new(
+    ) -> Result<FullTextSearchFieldIndex, search::generation::text_search::Error> {
+        let mut search_index = FullTextSearchFieldIndex::try_new(
             Arc::clone(&self.index),
             search_field.to_string(),
             self.primary_key.clone(),
@@ -247,7 +246,7 @@ impl TableWithFullText {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
             let base = self
-                .index_as_full_text(search_field.as_str())
+                .full_text_search_field_index(search_field.as_str())
                 .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
             let post_apply = PostApplyCandidateGeneration::new(
@@ -264,69 +263,6 @@ impl TableWithFullText {
         }
 
         Ok(generators)
-    }
-}
-
-impl std::fmt::Debug for TableWithFullText {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TableWithFullText")
-            .field("base_table", &self.base_table)
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl TableProvider for TableWithFullText {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.base_table.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.base_table.table_type()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.base_table.get_column_default(column)
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.base_table.schema()
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table
-            .scan(state, projection, filters, limit)
-            .await
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.base_table.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.base_table.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.base_table.insert_into(state, input, overwrite).await
     }
 }
 

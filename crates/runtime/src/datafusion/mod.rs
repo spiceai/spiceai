@@ -32,8 +32,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::datafusion::indexes::Index;
-use crate::datafusion::indexes::full_text::FullTextDatabaseIndex;
+use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
@@ -81,7 +80,6 @@ pub mod dialect;
 pub mod error;
 pub mod extension;
 pub mod filter_converter;
-pub(crate) mod indexes;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
@@ -293,13 +291,6 @@ pub struct DataFusion {
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
-    // Spice managed indexes on tables.
-    // Indexes perform two tasks:
-    //   1. Alter [`LogicalPlan`]s for more efficient predicates
-    //   2. For use in UDTFs that provide a required ordering to table scans.
-    // Therefore, they are needed here (not on the [`TableProvider`]).
-    indexes: std::sync::RwLock<HashMap<TableReference, Vec<Index>>>,
-
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
@@ -344,44 +335,39 @@ impl DataFusion {
         Arc::clone(&self.accelerator_engine_registry)
     }
 
-    pub async fn has_table(&self, table_reference: &TableReference) -> bool {
-        let table_name = table_reference.table();
-
-        if let Some(schema_name) = table_reference.schema() {
-            if let Some(schema) = self.schema(schema_name) {
-                return match schema.table(table_name).await {
-                    Ok(table) => table.is_some(),
-                    Err(_) => false,
-                };
-            }
-        }
-
-        self.ctx.table(table_name).await.is_ok()
-    }
-
     pub async fn get_table(
         &self,
         table_reference: &TableReference,
     ) -> Option<Arc<dyn TableProvider>> {
-        let catalog_provider = match table_reference {
-            TableReference::Bare { .. } | TableReference::Partial { .. } => {
-                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
-            }
-            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
-        }?;
+        let catalog_provider = self.resolve_catalog_provider(table_reference)?;
 
-        let schema_provider = match table_reference {
-            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
-            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
-                catalog_provider.schema(schema)
-            }
-        }?;
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
 
         schema_provider
             .table(table_reference.table())
             .await
             .ok()
             .flatten()
+    }
+
+    /// Returns the `TableProvider` for the given `TableReference` synchronously.
+    ///
+    /// This method may return `None` if the table is registered from a catalog provider that doesn't support synchronous table access.
+    /// All tables registered in the default catalog (i.e. `spice`) are available synchronously.
+    /// Catalog implementations that use `SpiceSchemaProvider` objects are also available synchronously.
+    pub fn get_table_sync(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        let catalog_provider = self.resolve_catalog_provider(table_reference)?;
+
+        let schema_provider = Self::resolve_schema_provider(&catalog_provider, table_reference)?;
+
+        let spice_schema_provider = schema_provider
+            .as_any()
+            .downcast_ref::<SpiceSchemaProvider>()?;
+
+        spice_schema_provider.table_sync(table_reference.table())
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -510,51 +496,6 @@ impl DataFusion {
         }
 
         Ok(is_ready)
-    }
-
-    pub fn register_table_index(
-        &self,
-        table_ref: impl Into<TableReference>,
-        index: impl Into<Index>,
-    ) -> Result<()> {
-        let tbl = table_ref.into();
-        let idx: Index = index.into();
-
-        let mut indexes_guard =
-            self.indexes
-                .write()
-                .map_err(|_| Error::UnableToRegisterTableIndex {
-                    dataset_name: tbl.to_string(),
-                    index_type: idx.index_type().to_string(),
-                })?;
-
-        indexes_guard.entry(tbl).or_insert_with(Vec::new).push(idx);
-
-        Ok(())
-    }
-
-    #[allow(irrefutable_let_patterns)]
-    pub(crate) fn get_full_text_index(
-        &self,
-        tbl: &TableReference,
-    ) -> Result<Option<FullTextDatabaseIndex>> {
-        let indexes_guard = self
-            .indexes
-            .read()
-            .map_err(|_e| Error::UnableToGetTableIndex {
-                dataset_name: tbl.to_string(),
-                index_type: "full_text".to_string(),
-            })?;
-
-        Ok(indexes_guard.get(tbl).and_then(|idxs| {
-            idxs.iter().find_map(|i| {
-                if let Index::FullText(t) = i {
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            })
-        }))
     }
 
     #[must_use]
@@ -1672,6 +1613,30 @@ impl DataFusion {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
             cache_provider.invalidate_all();
+        }
+    }
+
+    fn resolve_catalog_provider(
+        &self,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn CatalogProvider>> {
+        match table_reference {
+            TableReference::Bare { .. } | TableReference::Partial { .. } => {
+                self.ctx.catalog(SPICE_DEFAULT_CATALOG)
+            }
+            TableReference::Full { catalog, .. } => self.ctx.catalog(catalog),
+        }
+    }
+
+    fn resolve_schema_provider(
+        catalog_provider: &Arc<dyn CatalogProvider>,
+        table_reference: &TableReference,
+    ) -> Option<Arc<dyn SchemaProvider>> {
+        match table_reference {
+            TableReference::Bare { .. } => catalog_provider.schema(SPICE_DEFAULT_SCHEMA),
+            TableReference::Partial { schema, .. } | TableReference::Full { schema, .. } => {
+                catalog_provider.schema(schema)
+            }
         }
     }
 }

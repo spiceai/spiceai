@@ -15,6 +15,7 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 
-use super::table::TableWithFullText;
+use super::index::FullTextDatabaseIndex;
 
 #[derive(Debug)]
 pub struct FullTextConnector {
@@ -34,8 +35,8 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
-    /// Wrap an existing [`TableProvider`] with a [`TableWithFullText`] provider. If no embeddings
-    /// are needed for the [`Dataset`], it is not unnecessarily nested.
+    /// Wrap an existing [`TableProvider`] with a [`IndexedTableProvider`] provider with a [`FullTextDatabaseIndex`]. If no full text search fields
+    /// are specified for the [`Dataset`], it is not unnecessarily nested.
     pub(crate) async fn wrap_table(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,
@@ -61,8 +62,8 @@ impl FullTextConnector {
             return Ok(inner_table_provider);
         }
 
-        let tbl = TableWithFullText::try_new(
-            inner_table_provider,
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::clone(&inner_table_provider),
             search_fields.clone(),
             Self::warn_different_primary_keys(
                 dataset.name.to_string().as_str(),
@@ -77,6 +78,9 @@ impl FullTextConnector {
             connector_component: dataset.into(),
             source: Box::new(e),
         })?;
+
+        let tbl =
+            IndexedTableProvider::new(inner_table_provider).add_index(Arc::new(index).as_arc_any());
 
         Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
     }

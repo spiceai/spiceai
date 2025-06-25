@@ -18,6 +18,7 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
+    "crates/runtime-datafusion-index",
     "crates/search",
     "crates/spice_cloud",
     "crates/spicepod",
@@ -193,11 +194,11 @@ lto = "off"
 
 [patch.crates-io]
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", branch = "jeadie/udtf-logical" }            # spiceai-47
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", branch = "jeadie/udtf-logical" }     # spiceai-47
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", branch = "jeadie/udtf-logical" } # spiceai-47
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", branch = "jeadie/udtf-logical" }  # spiceai-47
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", branch = "jeadie/udtf-logical" }       # spiceai-47
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4e258ff048c7558e08e2eab9af2665dfbfb8f8b3" }            # spiceai-47
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "4e258ff048c7558e08e2eab9af2665dfbfb8f8b3" }     # spiceai-47
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "4e258ff048c7558e08e2eab9af2665dfbfb8f8b3" } # spiceai-47
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "4e258ff048c7558e08e2eab9af2665dfbfb8f8b3" }  # spiceai-47
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4e258ff048c7558e08e2eab9af2665dfbfb8f8b3" }       # spiceai-47
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "9db74a4b360df6be1bb554c59a474a2fd4bfb7e9" }                      # spiceai-47
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d2cfe4644286df7cad006c090174e475716cb8d8" } # spiceai

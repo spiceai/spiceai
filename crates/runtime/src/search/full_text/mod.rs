@@ -15,5 +15,5 @@ limitations under the License.
 */
 pub mod analyzer_rule;
 pub mod connector;
-pub mod table;
+pub mod index;
 pub mod udtf;

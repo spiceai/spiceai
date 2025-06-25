@@ -117,10 +117,7 @@ pub(crate) async fn post(
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     }
 
-    if !df
-        .has_table(&TableReference::parse_str(eval.dataset.as_str()))
-        .await
-    {
+    if !df.table_exists(TableReference::parse_str(eval.dataset.as_str())) {
         return (
             StatusCode::NOT_FOUND,
             format!("dataset '{}' not found", eval.dataset),
