@@ -65,7 +65,7 @@ const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
 pub(crate) const PARAM_LEN: usize = 24;
 pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 45;
 
-// Model parameters that are used for openai model provider.
+// Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
 // OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
 pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
