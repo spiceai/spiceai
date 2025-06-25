@@ -230,7 +230,7 @@ pub async fn full_text_search_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::TableWithFullText;
+    use super::FullTextDatabaseIndex;
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
@@ -262,14 +262,20 @@ mod tests {
             )
             .expect("failed to make table"),
         );
-        let wrapped_table = Arc::new(
-            TableWithFullText::try_new(base_table, vec!["search_field".to_string()], vec![].into())
-                .await
-                .expect("cannot make full text table"),
-        ) as Arc<dyn TableProvider>;
+        let index = Arc::new(
+            FullTextDatabaseIndex::try_new(
+                base_table,
+                vec!["search_field".to_string()],
+                vec![].into(),
+            )
+            .await
+            .expect("cannot make full text table"),
+        );
+
+        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index));
 
         assert!(
-            find_concrete_table_provider::<TableWithFullText>(&wrapped_table)
+            find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table)
                 .await
                 .is_some()
         );
