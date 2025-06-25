@@ -28,20 +28,38 @@ limitations under the License.
 
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display("Failed to serialize scalar value: {source}"))]
+    Serialize { source: serde_qs::Error },
+
+    #[snafu(display("Failed to deserialize scalar value: {source}"))]
+    Deserialize { source: serde_qs::Error },
+
+    #[snafu(display("Unsupported scalar value type"))]
+    UnsupportedType,
+}
 
 /// Converts a [`ScalarValue`] to its [`String`] representation.
 ///
-/// Format is <data_type>_<value>
-pub fn encode_scalar_value(value: &ScalarValue) -> Result<String, ()> {
-    let supported_value = SupportedScalarValue::try_from(value.clone()).unwrap();
-    let encoded = serde_qs::to_string(&supported_value).unwrap();
+/// # Errors
+/// Returns an error if the [`ScalarValue`] is not supported.
+pub fn encode_scalar_value(value: &ScalarValue) -> Result<String, Error> {
+    let supported_value = SupportedScalarValue::try_from(value.clone())?;
+    let encoded = serde_qs::to_string(&supported_value).context(SerializeSnafu)?;
     Ok(encoded)
 }
 
 /// Converts a [`String`] back to a [`ScalarValue`].
-pub fn decode_scalar_value(value: &str) -> Result<ScalarValue, ()> {
-    let decoded: SupportedScalarValue = serde_qs::from_str(value).unwrap();
-    let value = ScalarValue::try_from(decoded).unwrap();
+///
+/// # Errors
+/// Returns an error if a [`ScalarValue`] cannot be created.
+pub fn decode_scalar_value(value: &str) -> Result<ScalarValue, Error> {
+    let decoded: SupportedScalarValue = serde_qs::from_str(value).context(DeserializeSnafu)?;
+    let value = ScalarValue::try_from(decoded)?;
     Ok(value)
 }
 
@@ -63,7 +81,7 @@ enum SupportedScalarValue {
 }
 
 impl TryFrom<ScalarValue> for SupportedScalarValue {
-    type Error = ();
+    type Error = Error;
 
     fn try_from(value: ScalarValue) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -79,14 +97,18 @@ impl TryFrom<ScalarValue> for SupportedScalarValue {
             ScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             ScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             ScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
-            _ => return Err(()),
+            _ => {
+                return UnsupportedTypeSnafu.fail();
+            }
         })
     }
 }
 
-impl From<SupportedScalarValue> for ScalarValue {
-    fn from(value: SupportedScalarValue) -> Self {
-        match value {
+impl TryFrom<SupportedScalarValue> for ScalarValue {
+    type Error = Error;
+
+    fn try_from(value: SupportedScalarValue) -> Result<Self, Self::Error> {
+        Ok(match value {
             SupportedScalarValue::Boolean(maybe_value) => Self::Boolean(maybe_value),
             SupportedScalarValue::Int8(maybe_value) => Self::Int8(maybe_value),
             SupportedScalarValue::Int16(maybe_value) => Self::Int16(maybe_value),
@@ -99,7 +121,7 @@ impl From<SupportedScalarValue> for ScalarValue {
             SupportedScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             SupportedScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             SupportedScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
-        }
+        })
     }
 }
 
@@ -156,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_int32() {
-        let values = vec![Some(100000_i32), Some(-100000_i32), None];
+        let values = vec![Some(100_000_i32), Some(-100_000_i32), None];
         for value in values {
             let scalar = ScalarValue::Int32(value);
             let encoded =
@@ -172,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_int64() {
-        let values = vec![Some(1000000000_i64), Some(-1000000000_i64), None];
+        let values = vec![Some(1_000_000_000_i64), Some(-1_000_000_000_i64), None];
         for value in values {
             let scalar = ScalarValue::Int64(value);
             let encoded =
@@ -204,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_uint16() {
-        let values = vec![Some(65535_u16), Some(0_u16), None];
+        let values = vec![Some(65_535_u16), Some(0_u16), None];
         for value in values {
             let scalar = ScalarValue::UInt16(value);
             let encoded =
@@ -220,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_uint32() {
-        let values = vec![Some(4294967295_u32), Some(0_u32), None];
+        let values = vec![Some(4_294_967_295_u32), Some(0_u32), None];
         for value in values {
             let scalar = ScalarValue::UInt32(value);
             let encoded =
@@ -236,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_uint64() {
-        let values = vec![Some(18446744073709551615_u64), Some(0_u64), None];
+        let values = vec![Some(18_446_744_073_709_551_615_u64), Some(0_u64), None];
         for value in values {
             let scalar = ScalarValue::UInt64(value);
             let encoded =
@@ -252,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_utf8() {
-        let values = vec![Some("hello".to_string()), Some("".to_string()), None];
+        let values = vec![Some("hello".to_string()), Some(String::new()), None];
         for value in values {
             let scalar = ScalarValue::Utf8(value.clone());
             let encoded = encode_scalar_value(&scalar).expect("Failed to encode utf8 scalar value");
@@ -267,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_utf8_view() {
-        let values = vec![Some("world".to_string()), Some("".to_string()), None];
+        let values = vec![Some("world".to_string()), Some(String::new()), None];
         for value in values {
             let scalar = ScalarValue::Utf8View(value.clone());
             let encoded =
@@ -283,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_large_utf8() {
-        let values = vec![Some("large string".to_string()), Some("".to_string()), None];
+        let values = vec![Some("large string".to_string()), Some(String::new()), None];
         for value in values {
             let scalar = ScalarValue::LargeUtf8(value.clone());
             let encoded =
