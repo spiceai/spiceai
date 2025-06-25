@@ -37,7 +37,7 @@ pub enum HashingAlgorithm {
     Ahash,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Caching {
@@ -45,6 +45,15 @@ pub struct Caching {
     pub sql_results: Option<SQLResultsCacheConfig>,
     #[serde(skip_serializing_if = "is_default_or_none")]
     pub search_results: Option<CacheConfig>,
+}
+
+impl Default for Caching {
+    fn default() -> Self {
+        Self {
+            sql_results: Some(SQLResultsCacheConfig::default()),
+            search_results: Some(CacheConfig::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,7 +84,7 @@ impl Default for CacheConfig {
 // https://serde.rs/attr-flatten.html
 // > Note: flatten is not supported in combination with structs that use deny_unknown_fields. Neither the outer nor inner flattened struct should use that attribute.
 // As a result, we cannot use flatten to get a nice unknown field experience
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SQLResultsCacheConfig {
@@ -88,6 +97,21 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+}
+
+// serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
+// we need to implement Default manually
+impl Default for SQLResultsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: None,
+            item_ttl: None,
+            eviction_policy: None,
+            hashing_algorithm: HashingAlgorithm::default(),
+            cache_key_type: CacheKeyType::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,5 +152,38 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test your assumptions - caching default should be enabled
+    #[test]
+    fn test_caching_default() {
+        let caching = Caching::default();
+        assert!(caching.sql_results.is_some());
+        assert!(caching.search_results.is_some());
+
+        let sql_results = caching.sql_results.expect("Should have cache config");
+        assert!(sql_results.enabled);
+        assert_eq!(sql_results.hashing_algorithm, HashingAlgorithm::default());
+        assert_eq!(sql_results.cache_key_type, CacheKeyType::default());
+        assert!(sql_results.max_size.is_none());
+        assert!(sql_results.item_ttl.is_none());
+        assert!(sql_results.eviction_policy.is_none());
+        assert_eq!(sql_results, SQLResultsCacheConfig::default());
+
+        let search_results = caching.search_results.expect("Should have cache config");
+        assert!(search_results.enabled);
+        assert_eq!(
+            search_results.hashing_algorithm,
+            HashingAlgorithm::default()
+        );
+        assert!(search_results.max_size.is_none());
+        assert!(search_results.item_ttl.is_none());
+        assert!(search_results.eviction_policy.is_none());
+        assert_eq!(search_results, CacheConfig::default());
     }
 }

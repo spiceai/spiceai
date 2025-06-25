@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DatabaseName, Result};
-use crate::catalogconnector::glue::ConfigurationLoadingFailedSnafu;
-use crate::dataconnector::DataConnector;
+use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
 use crate::dataconnector::parameters::aws::load_config;
+use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
@@ -27,16 +26,61 @@ use crate::{
 use app::App;
 use async_trait::async_trait;
 use aws_sdk_glue::Client;
+use aws_sdk_glue::error::SdkError;
+use aws_sdk_glue::operation::get_databases::GetDatabasesError;
+use aws_sdk_glue::operation::get_tables::GetTablesError;
 use data_components::RefreshableCatalogProvider;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
     common::Result as DFResult,
 };
 use globset::GlobSet;
-use snafu::ResultExt;
+use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::{any::Any, fmt};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Cannot connect to AWS Glue to retrieve databases.\nVerify your AWS credentials and region are configured correctly.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
+    GetDatabases { source: SdkError<GetDatabasesError> },
+
+    #[snafu(display(
+        "Cannot retrieve tables from Glue database '{database}'.\nVerify the database exists and you have permissions to access it.\n{source}"
+    ))]
+    GetTables {
+        database: String,
+        source: SdkError<GetTablesError>,
+    },
+
+    #[snafu(display(
+        "Cannot create dataset for table `{dataset}`.\nVerify the table configuration and format are supported.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
+    CreatingDataset {
+        dataset: String,
+        source: Box<dyn std::error::Error + Sync + Send>,
+    },
+
+    #[snafu(display(
+        "Cannot load AWS configuration for Glue catalog.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+    ))]
+    ConfigurationLoadingFailed {
+        #[snafu(source)]
+        source: parameters::aws::Error,
+    },
+
+    #[snafu(display(
+        "Invalid AWS configuration for Glue catalog.\nVerify your region, credentials, and other AWS parameters are correct.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}",
+    ))]
+    ParameterValidation {
+        #[snafu(source)]
+        source: parameters::aws::Error,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
@@ -110,11 +154,10 @@ impl GlueCatalogProvider {
         let mut tables = HashMap::new();
 
         while let Some(maybe_get_tables_output) = paginator.next().await {
-            let get_tables_output =
-                maybe_get_tables_output.map_err(|source| super::Error::GetTables {
-                    database: database.clone(),
-                    source,
-                })?;
+            let get_tables_output = maybe_get_tables_output.map_err(|source| Error::GetTables {
+                database: database.clone(),
+                source,
+            })?;
             let some_tables = get_tables_output
                 .table_list
                 .unwrap_or_default()
@@ -130,19 +173,19 @@ impl GlueCatalogProvider {
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
-                    .map_err(|e| super::Error::CreatingDataset {
+                    .map_err(|e| Error::CreatingDataset {
                         dataset: table.name().to_string(),
                         source: e.into(),
                     })?
                     .with_app(Arc::clone(&self.app))
                     .with_runtime(runtime)
                     .build()
-                    .map_err(|e| super::Error::CreatingDataset {
+                    .map_err(|e| Error::CreatingDataset {
                         dataset: table.name().to_string(),
                         source: e.into(),
                     })?;
                 let table_provider = connector.read_provider(&dataset).await.map_err(|e| {
-                    super::Error::CreatingDataset {
+                    Error::CreatingDataset {
                         dataset: table.name().to_string(),
                         source: e.into(),
                     }
@@ -162,7 +205,7 @@ impl GlueCatalogProvider {
             validator
                 .validate(parameters)
                 .await
-                .context(super::ParameterValidationSnafu)?;
+                .context(ParameterValidationSnafu)?;
         }
 
         Ok(())
@@ -202,8 +245,7 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
         let mut databases = HashMap::new();
 
         while let Some(maybe_get_databases_output) = paginator.next().await {
-            let get_databases_output =
-                maybe_get_databases_output.context(super::GetDatabasesSnafu)?;
+            let get_databases_output = maybe_get_databases_output.context(GetDatabasesSnafu)?;
             for db in get_databases_output.database_list {
                 if !database_might_match(&db.name, &self.orig_include) {
                     tracing::debug!("skipping database {}", &db.name);

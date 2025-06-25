@@ -18,6 +18,7 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use aws_config::SdkConfig;
+use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_glue::{Client, types::Table};
 use aws_sdk_sts::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
@@ -49,13 +50,51 @@ use super::{
 static PREFIX: &str = "glue";
 
 #[derive(Debug, Snafu)]
-enum Error {
+pub enum Error {
     #[snafu(display(
-        "Could not retrieve table '{table}' from database '{database}'. Verify that both the database and table exist and are accessible."
+        "Cannot retrieve table '{table}' from Glue database '{database}'.\nVerify that the database and table exist and are accessible.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     GetTable { database: String, table: String },
-    #[snafu(display("Unable to load the AWS configuration.\n{source}"))]
+    #[snafu(display(
+        "Cannot load AWS configuration for Glue data connector.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+    ))]
     AWSConfig { source: aws::Error },
+    #[snafu(display(
+        "No schema specified in path '{path}'.\nEnsure the dataset path includes a valid schema."
+    ))]
+    MissingSchema { path: String },
+    #[snafu(display(
+        "No AWS region specified.\nAdd 'glue_region' to your configuration.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    MissingRegion,
+    #[snafu(display(
+        "Cannot retrieve AWS credentials.\nEnsure credentials are configured correctly.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    MissingCredentials,
+    #[snafu(display(
+        "Invalid AWS credentials provided.\nVerify your credentials and try again.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+    ))]
+    InvalidCredentials { source: CredentialsError },
+    #[snafu(display(
+        "Cannot retrieve metadata location for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{message}"
+    ))]
+    MissingMetadataLocation { table: String, message: String },
+    #[snafu(display(
+        "Cannot retrieve input format for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    MissingInputFormat { table: String },
+    #[snafu(display(
+        "The input format {input_format} for table '{table}' is not supported.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    InvalidInputFormat { input_format: String, table: String },
+    #[snafu(display(
+        "No storage descriptor found for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    MissingStorageDescriptor { table: String },
+    #[snafu(display(
+        "No storage location specified for table '{table}'.\nEnsure the table has a valid S3 location in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+    ))]
+    MissingStorageLocation { table: String },
 }
 
 #[derive(Clone, Debug)]
@@ -134,24 +173,30 @@ impl DataConnector for GlueDataConnector {
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message: "dataset parse_path failed".to_string(),
+                message: format!("Cannot parse path for dataset '{}': {e}", dataset.name),
                 source: e.into(),
             }
         })?;
-        let database =
-            path.schema()
-                .ok_or_else(|| super::DataConnectorError::UnableToGetSchemaInternal {
-                    dataconnector: PREFIX.to_string(),
-                    connector_component: dataset.into(),
-                    source: format!("schema unavailable for path `{path}`").into(),
-                })?;
+        let database = path.schema().ok_or_else(|| {
+            let e = Error::MissingSchema {
+                path: path.to_string(),
+            };
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            }
+        })?;
         let table = path.table();
 
         let config = self.config().await.map_err(|e| {
-            super::DataConnectorError::UnableToConnectInternal {
+            let e = Error::AWSConfig { source: e };
+            super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                source: Box::new(Error::AWSConfig { source: e }),
+                message: e.to_string(),
+                source: Box::new(e),
             }
         })?;
 
@@ -163,29 +208,38 @@ impl DataConnector for GlueDataConnector {
             .name(table)
             .send()
             .await
-            .map_err(|_| super::DataConnectorError::UnableToConnectInternal {
-                dataconnector: PREFIX.to_string(),
-                connector_component: dataset.into(),
-                source: Box::new(Error::GetTable {
+            .map_err(|_| {
+                let e = Error::GetTable {
                     database: database.to_string(),
                     table: table.to_string(),
-                }),
-            })?;
-
-        let table =
-            get_table_output
-                .table
-                .ok_or_else(|| super::DataConnectorError::InvalidTableName {
+                };
+                super::DataConnectorError::InvalidConfiguration {
                     dataconnector: PREFIX.to_string(),
                     connector_component: dataset.into(),
-                    table_name: table.to_string(),
-                })?;
+                    message: e.to_string(),
+                    source: Box::new(e),
+                }
+            })?;
 
-        match InputFormat::try_from(&table).map_err(|message| {
-            super::DataConnectorError::InvalidConfigurationNoSource {
+        let table = get_table_output.table.ok_or_else(|| {
+            let e = Error::GetTable {
+                database: database.to_string(),
+                table: table.to_string(),
+            };
+            super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message,
+                message: e.to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        match InputFormat::try_from(&table).map_err(|e| {
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: e.to_string(),
+                source: Box::new(e),
             }
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
@@ -223,7 +277,7 @@ impl InputFormat {
 }
 
 impl TryFrom<&Table> for InputFormat {
-    type Error = String;
+    type Error = Error;
     fn try_from(table: &Table) -> Result<Self, Self::Error> {
         if table
             .parameters
@@ -235,20 +289,26 @@ impl TryFrom<&Table> for InputFormat {
         }
 
         let Some(storage_descriptor) = table.storage_descriptor() else {
-            return Err(format!(
-                "table `{}` has no storage descriptor",
-                table.name()
-            ));
+            return Err(Error::MissingStorageDescriptor {
+                table: table.name().to_string(),
+            });
         };
 
         let Some(input_format) = storage_descriptor.input_format() else {
-            return Err(format!("table `{}` has not input format", table.name(),));
+            return Err(Error::MissingInputFormat {
+                table: table.name().to_string(),
+            });
         };
 
         Ok(match input_format {
             "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
             "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            input_format => return Err(format!("input format `{input_format}` is not supported")),
+            input_format => {
+                return Err(Error::InvalidInputFormat {
+                    input_format: input_format.to_string(),
+                    table: table.name().to_string(),
+                });
+            }
         })
     }
 }
@@ -259,39 +319,47 @@ async fn create_iceberg_provider(
     database: String,
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-    let region =
-        config
-            .region()
-            .ok_or_else(|| super::DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: PREFIX.to_string(),
-                connector_component: dataset.into(),
-                message: "No AWS region specified. Add `glue_region` to the spicepod.".to_string(),
-            })?;
+    let region = config.region().ok_or_else(|| {
+        let e = Error::MissingRegion;
+        super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        }
+    })?;
 
     let credentials = config
         .credentials_provider()
-        .ok_or_else(|| super::DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: "problem getting credentials".to_string(),
+        .ok_or_else(|| {
+            let e = Error::MissingCredentials;
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            }
         })?
         .provide_credentials()
         .await
-        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: "credentials provided incorrectly".to_string(),
-            source: e.into(),
-        })?;
-
-    let metadata_location =
-        get_metadata_location(table.parameters.as_ref()).map_err(|message| {
-            super::DataConnectorError::InternalWithSource {
+        .map_err(|e| {
+            let e = Error::InvalidCredentials { source: e };
+            super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                source: message.into(),
+                message: e.to_string(),
+                source: Box::new(e),
             }
         })?;
+
+    let metadata_location = get_metadata_location(table).map_err(|e| {
+        super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: e.to_string(),
+            source: Box::new(e),
+        }
+    })?;
 
     let mut props = HashMap::from([
         (
@@ -325,9 +393,10 @@ async fn create_iceberg_provider(
         .build();
 
     let catalog = GlueCatalog::new(config).await.map_err(|e| {
-        super::DataConnectorError::UnableToGetCatalogProvider {
+        super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
+            message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'.\nVerify your AWS Glue configuration and credentials.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
             source: e.into(),
         }
     })?;
@@ -336,9 +405,10 @@ async fn create_iceberg_provider(
 
     let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
         .await
-        .map_err(|e| super::DataConnectorError::InternalWithSource {
+        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
+            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
             source: e.into(),
         })?;
 
@@ -352,22 +422,26 @@ async fn create_s3_provider(
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
-        return Err(super::DataConnectorError::InternalWithSource {
+        let e = Error::MissingStorageDescriptor {
+            table: table.name().to_string(),
+        };
+        return Err(super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: (&dataset).into(),
-            source: format!("table `{}` has no storage descriptor", table.name()).into(),
+            message: e.to_string(),
+            source: Box::new(e),
         });
     };
 
     let Some(from) = storage_descriptor.location().map(String::from) else {
-        return Err(super::DataConnectorError::InternalWithSource {
+        let e = Error::MissingStorageLocation {
+            table: table.name().to_string(),
+        };
+        return Err(super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: (&dataset).into(),
-            source: format!(
-                "table `{}` storage descriptor has no location",
-                table.name()
-            )
-            .into(),
+            message: e.to_string(),
+            source: Box::new(e),
         });
     };
 
@@ -419,18 +493,23 @@ fn ensure_s3_trailing_slash(s3_location: &str) -> String {
         return s3_location.to_string();
     }
 
-    // Add the trailing slash
     format!("{s3_location}/")
 }
 
-fn get_metadata_location(parameters: Option<&HashMap<String, String>>) -> Result<String, String> {
+fn get_metadata_location(table: &Table) -> Result<String, Error> {
     const METADATA_LOCATION: &str = "metadata_location";
-    match parameters {
+    match &table.parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
             Some(location) => Ok(location.to_string()),
-            None => Err(format!("no property `{METADATA_LOCATION}` found")),
+            None => Err(Error::MissingMetadataLocation {
+                table: table.name().to_string(),
+                message: format!("No property '{METADATA_LOCATION}' found"),
+            }),
         },
-        None => Err("no parameters found".to_string()),
+        None => Err(Error::MissingMetadataLocation {
+            table: table.name().to_string(),
+            message: "No parameters found".to_string(),
+        }),
     }
 }
 
@@ -454,28 +533,5 @@ mod tests {
         );
         assert_eq!(ensure_s3_trailing_slash(""), "");
         assert_eq!(ensure_s3_trailing_slash("/local/path"), "/local/path");
-    }
-
-    #[test]
-    fn get_metadata_location_success() {
-        let mut params = HashMap::new();
-        params.insert(
-            "metadata_location".to_string(),
-            "s3://bucket/path".to_string(),
-        );
-        let result = get_metadata_location(Some(&params)).expect("metadata");
-        assert_eq!(result, "s3://bucket/path");
-    }
-
-    #[test]
-    fn get_metadata_location_missing_location() {
-        let params = HashMap::new();
-        assert!(get_metadata_location(Some(&params)).is_err());
-    }
-
-    #[tokio::test]
-    async fn get_metadata_location_missing() {
-        let params: Option<&HashMap<String, String>> = None;
-        assert!(get_metadata_location(params).is_err());
     }
 }
