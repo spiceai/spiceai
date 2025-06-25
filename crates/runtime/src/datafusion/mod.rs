@@ -32,8 +32,6 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
-use crate::datafusion::indexes::Index;
-use crate::datafusion::indexes::full_text::FullTextDatabaseIndex;
 use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -293,13 +291,6 @@ pub struct DataFusion {
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
-    // Spice managed indexes on tables.
-    // Indexes perform two tasks:
-    //   1. Alter [`LogicalPlan`]s for more efficient predicates
-    //   2. For use in UDTFs that provide a required ordering to table scans.
-    // Therefore, they are needed here (not on the [`TableProvider`]).
-    indexes: std::sync::RwLock<HashMap<TableReference, Vec<Index>>>,
-
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
@@ -505,51 +496,6 @@ impl DataFusion {
         }
 
         Ok(is_ready)
-    }
-
-    pub fn register_table_index(
-        &self,
-        table_ref: impl Into<TableReference>,
-        index: impl Into<Index>,
-    ) -> Result<()> {
-        let tbl = table_ref.into();
-        let idx: Index = index.into();
-
-        let mut indexes_guard =
-            self.indexes
-                .write()
-                .map_err(|_| Error::UnableToRegisterTableIndex {
-                    dataset_name: tbl.to_string(),
-                    index_type: idx.index_type().to_string(),
-                })?;
-
-        indexes_guard.entry(tbl).or_insert_with(Vec::new).push(idx);
-
-        Ok(())
-    }
-
-    #[allow(irrefutable_let_patterns)]
-    pub(crate) fn get_full_text_index(
-        &self,
-        tbl: &TableReference,
-    ) -> Result<Option<FullTextDatabaseIndex>> {
-        let indexes_guard = self
-            .indexes
-            .read()
-            .map_err(|_e| Error::UnableToGetTableIndex {
-                dataset_name: tbl.to_string(),
-                index_type: "full_text".to_string(),
-            })?;
-
-        Ok(indexes_guard.get(tbl).and_then(|idxs| {
-            idxs.iter().find_map(|i| {
-                if let Index::FullText(t) = i {
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            })
-        }))
     }
 
     #[must_use]

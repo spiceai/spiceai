@@ -362,12 +362,14 @@ impl TableProvider for TextSearchUDTFProvider {
             )));
         };
 
+        let search_field_index_schema = Self::search_field_index_schema(&field_index);
         let underlying_projection =
-            self.convert_projection(projection, &Self::search_field_index_schema(&field_index))?;
+            self.convert_projection(projection, &search_field_index_schema)?;
 
         Ok(Arc::new(FullTextSearchExec::try_new(
             field_index,
             query.clone(),
+            search_field_index_schema,
             underlying_projection,
             filters.to_vec(),
             limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),

@@ -15,6 +15,7 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -62,7 +63,7 @@ impl FullTextConnector {
         }
 
         let index = FullTextDatabaseIndex::try_new(
-            inner_table_provider,
+            Arc::clone(&inner_table_provider),
             search_fields.clone(),
             Self::warn_different_primary_keys(
                 dataset.name.to_string().as_str(),
@@ -77,6 +78,9 @@ impl FullTextConnector {
             connector_component: dataset.into(),
             source: Box::new(e),
         })?;
+
+        let tbl =
+            IndexedTableProvider::new(inner_table_provider).add_index(Arc::new(index).as_arc_any());
 
         Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
     }

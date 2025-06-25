@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow_schema::DataType;
-use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use logos::Source;
 use search::generation::CandidateGeneration;
@@ -247,7 +245,7 @@ impl FullTextDatabaseIndex {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
             let base = self
-                .index_as_full_text(search_field.as_str())
+                .full_text_search_field_index(search_field.as_str())
                 .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
             let post_apply = PostApplyCandidateGeneration::new(
