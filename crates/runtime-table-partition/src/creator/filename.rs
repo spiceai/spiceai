@@ -16,6 +16,15 @@ limitations under the License.
 
 //! Create filenames from [`ScalarValue`]s and infer [`ScalarValue`]s from
 //! filenames.
+//!
+//! `serde_qs` crate is used to serialize/deserialize [`ScalarValue`]s into
+//! [`String`]s that are URL encoded. This is helpful because we get the
+//! encoding and decoding functionality and special characters are escaped
+//! making them filesystem compatible.
+//!
+//! A subset of the [`ScalarValue`] variants are copied into a new type
+//! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
+//! on variants that have types that can be serialized/deserialized.
 
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
