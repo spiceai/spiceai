@@ -463,7 +463,7 @@ fn file(
 }
 
 // Get OpenAI compatible request parameter overrides.
-// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `hf_temperature`) parameters.
+// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `openai_temperature`) parameters.
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let prefix_str = format!("{prefix}_");
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
