@@ -17,7 +17,6 @@ models:
       description: Ensures errors across the repo are consistent
       params:
           tools: auto
-          endpoint: https://api.openai.com/v1
           openai_api_key: ${secrets:OPENAI_API_KEY}
           system_prompt: |
               You are responsible for ensuring quality error messages across the entire codebase. Validate the provided error message and ensure it is consistent with those in the codebase.
