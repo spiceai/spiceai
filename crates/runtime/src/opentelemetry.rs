@@ -61,7 +61,6 @@ use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
 use crate::tls::TlsConfig;
-use crate::utils::is_address_in_use_error;
 use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -640,4 +639,15 @@ pub async fn start(
     tracing::debug!("Spice Runtime OpenTelemetry stopped");
 
     Ok(())
+}
+
+fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        source = e.source();
+    }
+    false
 }

@@ -20,7 +20,6 @@ use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
 use crate::tls::TlsConfig;
-use crate::utils::is_address_in_use_error;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -344,6 +343,17 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        source = e.source();
+    }
+    false
+}
 
 pub async fn start(
     bind_address: std::net::SocketAddr,
