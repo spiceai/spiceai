@@ -545,10 +545,48 @@ fn lines_need_truncation(lines: &[&str]) -> bool {
     lines.iter().any(|line| line.len() > 120)
 }
 
+fn is_table_not_found_error(err: &Status) -> (bool, Option<String>) {
+    let message = err.message();
+    if message.contains("table '") && message.contains("' not found") {
+        // Find the start of the table name after "table '"
+        if let Some(start) = message.find("table '") {
+            let start_pos = start + "table '".len();
+            // Find the end of the table name at the next single quote
+            if let Some(end_pos) = message[start_pos..].find('\'') {
+                let table_name = &message[start_pos..start_pos + end_pos];
+                return (true, Some(table_name.to_string()));
+            }
+        }
+        // Found the pattern but couldn't extract the table name
+        (true, None)
+    } else {
+        (false, None)
+    }
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
+        Code::Internal => {
+            let (is_table_not_found, table_name) = is_table_not_found_error(err);
+            if is_table_not_found {
+                let message = if let Some(name) = table_name {
+                    format!(
+                        "The table '{name}' does not exist. Check that the table name was entered correctly or verify the configuration in the Spicepod."
+                    )
+                } else {
+                    "The specified table does not exist. Check that the table name was entered correctly or verify the configuration in the Spicepod.".to_string()
+                };
+                ("Table Not Found", message)
+            } else {
+                (
+                    "Internal Error",
+                    "An unexpected internal error occurred. Execute '.error' for details."
+                        .to_string(),
+                )
+            }
+        }
+        Code::Unknown | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
             "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
