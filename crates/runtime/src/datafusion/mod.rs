@@ -82,7 +82,6 @@ pub mod dialect;
 pub mod error;
 pub mod extension;
 pub mod filter_converter;
-pub(crate) mod indexes;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;

@@ -23,21 +23,22 @@ use datafusion::{
     common::{Constraints, Statistics},
     datasource::TableType,
     error::Result as DataFusionResult,
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown},
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
 /// A `TableProvider` that wraps another `TableProvider` and adds indexing capabilities.
+#[derive(Debug, Clone)]
 pub struct IndexedTableProvider {
     /// The underlying `TableProvider` that provides the data.
     pub underlying: Arc<dyn TableProvider>,
 
-    /// Indexes that are available to make queries more efficient.
+    /// Indexes that are available to make queries more efficient or enable new functionality (i.e. full text search indexes).
     ///
     /// In the future, indexes will be required to implement a trait - but for now all existing
     /// use-cases are supported via UDTFs that downcast indexes to the correct type.
-    pub indexes: Vec<Arc<dyn Any>>,
+    pub indexes: Vec<Arc<dyn Any + Send + Sync>>,
 }
 
 impl IndexedTableProvider {
@@ -48,15 +49,30 @@ impl IndexedTableProvider {
         }
     }
 
-    pub fn add_index(&mut self, index: Arc<dyn Any>) {
+    #[must_use]
+    pub fn add_index(mut self, index: Arc<dyn Any + Send + Sync>) -> Self {
         self.indexes.push(index);
+        self
+    }
+
+    #[must_use]
+    pub fn get_index<T: Any>(&self) -> Option<&T> {
+        for index in &self.indexes {
+            if let Some(index) = index.downcast_ref::<T>() {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.underlying)
     }
 }
 
 #[async_trait]
 impl TableProvider for IndexedTableProvider {
-    /// Returns the table provider as [`Any`](std::any::Any) so that it can be
-    /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -69,12 +85,10 @@ impl TableProvider for IndexedTableProvider {
         self.underlying.constraints()
     }
 
-    /// Get the type of this table for metadata/catalog purposes.
     fn table_type(&self) -> TableType {
         self.underlying.table_type()
     }
 
-    /// Get the create statement used to create this table, if available.
     fn get_table_definition(&self) -> Option<&str> {
         self.underlying.get_table_definition()
     }
@@ -94,25 +108,28 @@ impl TableProvider for IndexedTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let underlying = Arc::clone(&self.underlying);
-        underlying.scan(state, projection, filters, limit).await
+        self.underlying
+            .scan(state, projection, filters, limit)
+            .await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        self.underlying.supports_filters_pushdown(filters)
     }
 
-    /// Get statistics for this table, if available
-    /// Although not presently used in mainline DataFusion, this allows implementation specific
-    /// behavior for downstream repositories, in conjunction with specialized optimizer rules to
-    /// perform operations such as re-ordering of joins.
     fn statistics(&self) -> Option<Statistics> {
         self.underlying.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.underlying.insert_into(state, input, insert_op).await
     }
 }

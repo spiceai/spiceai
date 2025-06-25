@@ -11024,6 +11024,7 @@ dependencies = [
  "reqwest 0.12.15",
  "rmcp",
  "runtime-auth",
+ "runtime-datafusion-index",
  "rusqlite",
  "rustls 0.23.27",
  "rustls-pemfile 2.2.0",

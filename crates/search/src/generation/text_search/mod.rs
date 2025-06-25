@@ -44,10 +44,9 @@ use super::{
     TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
-static DEFAULT_BATCH_SIZE: usize = 100;
+pub static DEFAULT_BATCH_SIZE: usize = 100;
 
 pub mod exec;
-pub mod table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -95,8 +94,9 @@ impl Error {
     }
 }
 
+/// A [`FullTextSearchFieldIndex`] is a [`tantivy::Index`] that is used to search a single field of a table.
 #[derive(Clone, Debug)]
-pub struct FullTextSearchIndex {
+pub struct FullTextSearchFieldIndex {
     idx: Arc<Index>,
     field: String,
     primary_key: Vec<String>,
@@ -111,7 +111,7 @@ pub struct FullTextSearchIndex {
     type_hints: HashMap<String, Arc<arrow::datatypes::Field>>,
 }
 
-impl FullTextSearchIndex {
+impl FullTextSearchFieldIndex {
     pub fn try_new(
         index: Arc<Index>,
         field: String,
@@ -201,6 +201,11 @@ impl FullTextSearchIndex {
                 }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn tantivy_schema(&self) -> tantivy::schema::Schema {
+        self.idx.schema()
     }
 
     fn index_searcher(&self) -> Result<Searcher> {
@@ -349,7 +354,7 @@ fn parse_query_literal(q: &str) -> UserInputAst {
 }
 
 #[async_trait]
-impl CandidateGeneration for FullTextSearchIndex {
+impl CandidateGeneration for FullTextSearchFieldIndex {
     async fn search(
         &self,
         query: String,
@@ -423,7 +428,7 @@ impl CandidateGeneration for FullTextSearchIndex {
 }
 
 fn make_stream(
-    fts: FullTextSearchIndex,
+    fts: FullTextSearchFieldIndex,
     query: String,
     keep_search_field: bool,
     limit: usize,
@@ -460,7 +465,8 @@ fn make_stream(
     }
 }
 
-fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
+#[must_use]
+pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
     match t {
         FieldType::Str(_) => Some(arrow::datatypes::DataType::Utf8),
         FieldType::I64(_) => Some(arrow::datatypes::DataType::Int64),
@@ -488,7 +494,7 @@ pub(crate) mod tests {
         aggregation::write_to_json_string,
         generation::{
             CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearchIndex, parse_query_literal},
+            text_search::{FullTextSearchFieldIndex, parse_query_literal},
         },
     };
 
@@ -570,7 +576,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let fts = FullTextSearchIndex::try_new(
+        let fts = FullTextSearchFieldIndex::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
             vec![],

@@ -40,12 +40,16 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::text_search::table::FullTextSearchTable};
-
-use crate::{
-    datafusion::{DataFusion, indexes::full_text::FullTextDatabaseIndex},
-    search::{full_text::table::TableWithFullText, util::find_concrete_table_provider},
+use runtime_datafusion_index::IndexedTableProvider;
+use search::{
+    SEARCH_SCORE_COLUMN_NAME,
+    generation::text_search::{
+        DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec,
+        tantivy_to_arrow_type,
+    },
 };
+
+use crate::{datafusion::DataFusion, search::full_text::index::FullTextDatabaseIndex};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 
@@ -153,29 +157,33 @@ impl TableFunctionImpl for TextSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
 
-        if !self.df.table_exists(args.tbl.clone()) {
-            return Err(DataFusionError::Plan(format!(
-                "Table '{}' does not exist.",
-                args.tbl.clone()
-            )));
-        }
-
-        // get the underlying table provider, IndexTableProvider
-        // downcast IndexTableProvider to FullTextSearchTable
-
-        // TODO:phillip - rework
-        let fts_index = match self.df.get_full_text_index(&args.tbl) {
-            Ok(Some(fts_index)) => fts_index,
-            Ok(None) => {
+        let table_provider = match self.df.get_table_sync(&args.tbl) {
+            Some(table_provider) => table_provider,
+            None => {
                 return Err(DataFusionError::Plan(format!(
-                    "UDTF {TEXT_SEARCH_UDTF_NAME} requires the table '{}' to have a full text search index, but it does not.",
-                    args.tbl
+                    "Table '{}' does not exist.",
+                    args.tbl.clone()
                 )));
             }
-            Err(_) => {
-                return Err(DataFusionError::Internal(
-                    "An internal issue occurred retrieving the text search".into(),
-                ));
+        };
+
+        let index_table_provider = table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Table '{}' does not have a full text search index.",
+                    args.tbl.clone()
+                ))
+            })?;
+
+        let fts_index = match index_table_provider.get_index::<FullTextDatabaseIndex>() {
+            Some(fts_index) => fts_index,
+            None => {
+                return Err(DataFusionError::Plan(format!(
+                    "Table '{}' does not have a full text search index.",
+                    args.tbl.clone()
+                )));
             }
         };
 
@@ -183,6 +191,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
             df: Arc::clone(&self.df),
             args,
             index: fts_index,
+            underlying: index_table_provider.get_underlying(),
         }))
     }
 }
@@ -195,30 +204,31 @@ pub(super) struct TextSearchUDTFProvider {
     df: Arc<DataFusion>,
     pub args: TextSearchTableFuncArgs,
     pub index: FullTextDatabaseIndex,
+    underlying: Arc<dyn TableProvider>,
 }
 
 impl TextSearchUDTFProvider {
     // Find column to perform full text search upon. Use either column specified in
     // [`TextSearchTableFuncArgs`] or if index has one column.
-    fn column(&self, fts: &TableWithFullText) -> datafusion::error::Result<String> {
+    fn column(&self) -> datafusion::error::Result<String> {
         let TextSearchTableFuncArgs { column, tbl, .. } = &self.args;
         let col: String = if let Some(col) = column {
-            if !fts.search_fields.contains(col) {
+            if !self.index.search_fields.contains(col) {
                 return Err(DataFusionError::Internal(format!(
                     "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
-                    fts.search_fields.join(", ")
+                    self.index.search_fields.join(", ")
                 )));
             }
             col.clone()
         } else {
-            let mut fields = fts.search_fields.iter();
+            let mut fields = self.index.search_fields.iter();
 
             match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
                     return Err(DataFusionError::Internal(format!(
                         "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
-                        fts.search_fields.len()
+                        self.index.search_fields.len()
                     )));
                 }
                 _ => {
@@ -280,6 +290,28 @@ impl TextSearchUDTFProvider {
             })
             .collect()
     }
+
+    fn search_field_index_schema(field_index: &FullTextSearchFieldIndex) -> SchemaRef {
+        let tantivy_schema = field_index.tantivy_schema();
+
+        let fields = field_index
+            .all_columns()
+            .iter()
+            .filter_map(|field_name| {
+                let f = tantivy_schema.get_field(field_name).ok()?;
+                let entry = tantivy_schema.get_field_entry(f);
+                let data_type = tantivy_to_arrow_type(entry.field_type())?;
+                Some(Field::new(field_name, data_type, false))
+            })
+            .chain([Field::new(
+                SEARCH_SCORE_COLUMN_NAME,
+                arrow::datatypes::DataType::Float64,
+                false,
+            )])
+            .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
+    }
 }
 
 #[async_trait::async_trait]
@@ -294,14 +326,7 @@ impl TableProvider for TextSearchUDTFProvider {
     //
     // When used via [`TextSearchTableFunc`], [`TextSearchUDTFProvider`] relies on [`FullTextUDTFAnalyzerRule`] to resolve queries correctly (joining on the underlying table (see `self.args.tbl`)).
     fn schema(&self) -> SchemaRef {
-        let mut fields: Vec<_> = self
-            .index
-            .underlying
-            .schema()
-            .fields()
-            .iter()
-            .cloned()
-            .collect();
+        let mut fields: Vec<_> = self.underlying.schema().fields().iter().cloned().collect();
         fields.push(Arc::new(Field::new(
             SEARCH_SCORE_COLUMN_NAME.to_string(),
             arrow_schema::DataType::Float64,
@@ -328,39 +353,24 @@ impl TableProvider for TextSearchUDTFProvider {
             ..
         } = &self.args;
 
-        let Some(table_provider) = self.df.get_table(tbl).await else {
-            return Err(DataFusionError::Internal(format!(
-                "The table '{tbl}' does not exist"
-            )));
-        };
+        let col = self.column()?;
 
-        let Some(fts) = find_concrete_table_provider::<TableWithFullText>(&table_provider).await
-        else {
-            return Err(DataFusionError::Internal(format!(
-                "The table '{tbl}' does not have an associated full text search index."
-            )));
-        };
-
-        let col = self.column(&fts)?;
-
-        let Some(index) = fts.index_as_full_text(col.as_str()).ok() else {
+        let Some(field_index) = self.index.full_text_search_field_index(col.as_str()).ok() else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
             return Err(DataFusionError::Internal(format!(
                 "User function 'text_search' is called on table '{tbl}'. Unexpectedly, text search cannot be performed on '{col}' column. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues."
             )));
         };
 
-        let search_index_table = FullTextSearchTable::new(index, query.clone());
         let underlying_projection =
-            self.convert_projection(projection, &search_index_table.schema())?;
+            self.convert_projection(projection, &Self::search_field_index_schema(&field_index))?;
 
-        search_index_table
-            .scan(
-                state,
-                Some(&underlying_projection),
-                filters,
-                limit.or(*args_limit),
-            )
-            .await
+        Ok(Arc::new(FullTextSearchExec::try_new(
+            field_index,
+            query.clone(),
+            underlying_projection,
+            filters.to_vec(),
+            limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
+        )))
     }
 }

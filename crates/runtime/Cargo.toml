@@ -122,6 +122,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
 ] }
 runtime-auth = { path = "../runtime-auth" }
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
