@@ -32,7 +32,7 @@ use crate::datafusion::query::write_to_json_string;
 use crate::object_store_registry::SpiceObjectStoreRegistry;
 use crate::search::util::get_primary_keys;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,

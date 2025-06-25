@@ -229,7 +229,6 @@ impl DataFusionBuilder {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             caching,
-            indexes: std::sync::RwLock::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),

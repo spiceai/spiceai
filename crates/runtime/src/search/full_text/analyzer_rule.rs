@@ -84,13 +84,13 @@ impl AnalyzerRule for FullTextUDTFAnalyzerRule {
                     tbl: base_table, ..
                 } = &text_search_udtf.args;
 
+                let underlying_table = text_search_udtf.index.underlying_table();
+
                 let base_table_scan = TableScan::try_new(
                     base_table.clone(),
-                    Arc::new(DefaultTableSource::new(Arc::clone(
-                        &text_search_udtf.index.underlying,
-                    ))),
+                    Arc::new(DefaultTableSource::new(Arc::clone(&underlying_table))),
                     projection.as_ref().map(|v| {
-                        let base_schema = text_search_udtf.index.underlying.schema();
+                        let base_schema = underlying_table.schema();
                         v.iter()
                             .filter(|idx| **idx <= base_schema.fields().len())
                             .copied()

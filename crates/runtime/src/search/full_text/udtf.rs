@@ -157,14 +157,11 @@ impl TableFunctionImpl for TextSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
 
-        let table_provider = match self.df.get_table_sync(&args.tbl) {
-            Some(table_provider) => table_provider,
-            None => {
-                return Err(DataFusionError::Plan(format!(
-                    "Table '{}' does not exist.",
-                    args.tbl.clone()
-                )));
-            }
+        let Some(table_provider) = self.df.get_table_sync(&args.tbl) else {
+            return Err(DataFusionError::Plan(format!(
+                "Table '{}' does not exist.",
+                args.tbl.clone()
+            )));
         };
 
         let index_table_provider = table_provider
@@ -177,20 +174,16 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 ))
             })?;
 
-        let fts_index = match index_table_provider.get_index::<FullTextDatabaseIndex>() {
-            Some(fts_index) => fts_index,
-            None => {
-                return Err(DataFusionError::Plan(format!(
-                    "Table '{}' does not have a full text search index.",
-                    args.tbl.clone()
-                )));
-            }
+        let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
+            return Err(DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            )));
         };
 
         Ok(Arc::new(TextSearchUDTFProvider {
-            df: Arc::clone(&self.df),
             args,
-            index: fts_index,
+            index: fts_index.clone(),
             underlying: index_table_provider.get_underlying(),
         }))
     }
@@ -201,7 +194,6 @@ impl TableFunctionImpl for TextSearchTableFunc {
 /// Importantly, [`TextSearchUDTFProvider`] relies on [`FullTextUDTFAnalyzerRule`] because, by itself, [`TextSearchUDTFProvider`] does not have all the fields it claims to in its schema (see [`TextSearchUDTFProvider::schema`]).
 #[derive(Debug, Clone)]
 pub(super) struct TextSearchUDTFProvider {
-    df: Arc<DataFusion>,
     pub args: TextSearchTableFuncArgs,
     pub index: FullTextDatabaseIndex,
     underlying: Arc<dyn TableProvider>,
@@ -341,7 +333,7 @@ impl TableProvider for TextSearchUDTFProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -370,9 +362,9 @@ impl TableProvider for TextSearchUDTFProvider {
             field_index,
             query.clone(),
             search_field_index_schema,
-            underlying_projection,
+            Some(&underlying_projection),
             filters.to_vec(),
             limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
-        )))
+        )?))
     }
 }
