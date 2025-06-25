@@ -98,6 +98,7 @@ impl FullTextDatabaseIndex {
         })
     }
 
+    #[must_use]
     pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }
