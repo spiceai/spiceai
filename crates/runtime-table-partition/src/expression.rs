@@ -90,7 +90,8 @@ impl Criterion for PartitionCriteria {
     }
 }
 
-/// Validates that the [`Expr`]'s data type is String, Number, or Boolean.
+/// Validates that the [`Expr`]'s data type is String, Number, Boolean, and
+/// Timestamp.
 struct DataTypeCriterion;
 
 impl Criterion for DataTypeCriterion {
@@ -110,6 +111,7 @@ impl Criterion for DataTypeCriterion {
                     | DataType::UInt32
                     | DataType::UInt64
                     | DataType::Boolean
+                    | DataType::Timestamp(_, _)
             ),
             CriterionFailedSnafu {
                 expr: expr.to_string(),
@@ -223,12 +225,12 @@ mod tests {
             .expect("expression created");
         assert!(criterion.validate(&expr, &schema).is_ok());
 
-        // Invalid: date_trunc('month', date)
+        // Valid: date_trunc('month', date)
         let expr = Expr::ScalarFunction(ScalarFunction {
             func: date_trunc(),
             args: vec![lit("month"), col("date")],
         });
-        assert!(criterion.validate(&expr, &schema).is_err());
+        assert!(criterion.validate(&expr, &schema).is_ok());
 
         // Invalid: Two columns (a + region)
         let expr = col("a") + col("region");
