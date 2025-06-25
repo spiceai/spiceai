@@ -27,12 +27,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use aws_sdk_glue::{
-    error::SdkError,
-    operation::{get_databases::GetDatabasesError, get_tables::GetTablesError},
-};
 use data_components::RefreshableCatalogProvider as _;
-use snafu::prelude::*;
 use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
@@ -45,68 +40,6 @@ pub static PREFIX: &str = "glue";
 static VALIDATORS: LazyLock<
     Vec<Box<dyn Validator<Error = parameters::aws::Error> + Send + Sync + 'static>>,
 > = LazyLock::new(|| vec![Box::new(RegionValidator), Box::new(AuthValidator)]);
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Failed to get Glue databases.\n{source}"))]
-    GetDatabases { source: SdkError<GetDatabasesError> },
-
-    #[snafu(display("Failed to get Glue table from database `{database}`.\n{source}"))]
-    GetTables {
-        database: String,
-        source: SdkError<GetTablesError>,
-    },
-
-    #[snafu(display("Failed to build FileIO.\n{source}"))]
-    BuildFileIO { source: iceberg::Error },
-
-    #[snafu(display("Failed to create file input for metadata location '{location}'.\n{source}",))]
-    CreateFileInput {
-        source: iceberg::Error,
-        location: String,
-    },
-
-    #[snafu(display("Failed to read metadata from '{location}'.\n{source}"))]
-    ReadMetadata {
-        source: iceberg::Error,
-        location: String,
-    },
-
-    #[snafu(display("Failed to deserialize metadata.\n{source}"))]
-    DeserializeMetadata { source: serde_json::Error },
-
-    #[snafu(display("Failed to build Iceberg table.\n{source}"))]
-    BuildIcebergTable { source: iceberg::Error },
-
-    #[snafu(display("Failed to create Iceberg table provider.\n{source}"))]
-    CreateIcebergTableProvider { source: iceberg::Error },
-
-    #[snafu(display("No 'metadata_location' set on table '{table}'"))]
-    MissingMetadataLocation { table: String },
-
-    #[snafu(display("No 'parameters' set on table"))]
-    MissingParameters,
-
-    #[snafu(display("Parameter validation failed.\n{source}",))]
-    ParameterValidation {
-        #[snafu(source)]
-        source: parameters::aws::Error,
-    },
-
-    #[snafu(display("Configuration loading failed.\n{source}"))]
-    ConfigurationLoadingFailed {
-        #[snafu(source)]
-        source: parameters::aws::Error,
-    },
-
-    #[snafu(display("Failed to create dataset `{dataset}`.\n{source}"))]
-    CreatingDataset {
-        dataset: String,
-        source: Box<dyn std::error::Error + Sync + Send>,
-    },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 type DatabaseName = String;
 

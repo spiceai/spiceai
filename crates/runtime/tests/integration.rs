@@ -52,6 +52,8 @@ mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;

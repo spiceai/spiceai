@@ -95,7 +95,7 @@ jobs:
             AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
             CARGO_INCREMENTAL: 0
         run: |
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]] || [[ "${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release') }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -185,6 +185,8 @@ jobs:
           AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
           AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
           AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst

@@ -590,6 +590,7 @@ impl FlightClient {
             protocol_version: 0,
             payload: Bytes::default(),
         };
+
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
         let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
 
@@ -597,7 +598,7 @@ impl FlightClient {
             .parse()
             .context(InvalidMetadataSnafu)?;
         req.metadata_mut().insert("authorization", val);
-        let resp = self
+        let mut resp = self
             .flight_client
             .clone()
             .handshake(req)
@@ -613,13 +614,34 @@ impl FlightClient {
                     }
                 }
             })?;
+
         let mut token: Option<Token> = None;
+
+        // Consume the response stream before reading the metadata
+        let stream = resp.get_mut();
+        while let Some(data) = stream.next().await {
+            match data {
+                Ok(_) => {}
+                Err(e) => {
+                    if is_connection_reset_error(&e) {
+                        return Err(Error::ConnectionReset {
+                            source: TonicStatusError::from(e),
+                        });
+                    }
+                    return Err(Error::UnableToPerformHandshake {
+                        source: TonicStatusError::from(e),
+                    });
+                }
+            }
+        }
+
         if let Some(auth) = resp.metadata().get("authorization") {
             let auth = auth
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
             token = Some(Token::new(&auth["Bearer ".len()..], true));
         }
+
         Ok(token)
     }
 
@@ -653,13 +675,14 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
 
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
     match error.code() {
-        tonic::Code::Internal | tonic::Code::Cancelled => {
+        tonic::Code::Internal | tonic::Code::Cancelled | tonic::Code::Unknown => {
             let error_message = error.message().to_lowercase();
             if error_message.contains("operation was canceled")
                 || error_message.contains("http2 error")
                 || error_message.contains("grpc-status header missing")
                 || error_message.contains("received message with invalid compression flag")
                 || error_message.contains("error reading a body from connection")
+                || error_message.contains("transport error")
             {
                 return true;
             }

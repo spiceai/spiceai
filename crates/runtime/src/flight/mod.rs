@@ -335,9 +335,25 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display(
+        "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
+    ))]
+    AddressAlreadyInUse { addr: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        source = e.source();
+    }
+    false
+}
 
 pub async fn start(
     bind_address: std::net::SocketAddr,
@@ -388,7 +404,14 @@ pub async fn start(
     } else {
         server.serve(bind_address).await
     }
-    .context(UnableToStartFlightServerSnafu)?;
+    .map_err(|e| {
+        if is_address_in_use_error(&e) {
+            return Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            };
+        }
+        Error::UnableToStartFlightServer { source: e }
+    })?;
 
     tracing::debug!("Spice Runtime Flight stopped");
 
