@@ -133,7 +133,7 @@ impl Criterion for SingleColumnCriterion {
             num_columns == 1,
             CriterionFailedSnafu {
                 expr: expr.to_string(),
-                message: format!("Expression references {num_columns}, expected exactly 1")
+                message: format!("Expression references {num_columns} columns, expected exactly 1")
             }
         );
         Ok(())
