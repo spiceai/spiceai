@@ -22,6 +22,8 @@ use snafu::prelude::*;
 
 use crate::Partition;
 
+pub mod filename;
+
 type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Snafu)]
