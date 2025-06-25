@@ -4,12 +4,12 @@ version: v1
 
 datasets:
     - from: github:github.com/spiceai/spiceai/files/trunk
-      name: spiceai_spiceai_files
+      name: spiceai.files
       description:
           A portable accelerated data query and LLM-inference engine, written
           in Rust, for data-grounded AI apps and agents.
       params:
-          files_filter: '**/*.rs'
+          include: '**/*.rs'
 
 models:
     - from: openai:gpt-4.1
