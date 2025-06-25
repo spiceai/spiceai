@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/// These keywords, selected from https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs, were found to be problematic when used as dataset names in a Spicepod.
+/// These keywords, selected from https://github.com/apache/datafusion-sqlparser-rs/blob/main/src/keywords.rs, were found to be problematic when used as dataset names in a Spicepod.
 /// They are the ONLY keywords from the list above that were found to cause issues; all other keywords in the list were not problematic when testing.
 /// Note that some connectors may have additional reserved keywords that are not included here. A list of connector-specific reserved keywords can be found here: https://spiceai.org/docs/reference.
 static RESERVED_KEYWORDS: &[&str] = &[
