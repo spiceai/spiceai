@@ -264,7 +264,7 @@ mod tests {
         );
         let index = Arc::new(
             FullTextDatabaseIndex::try_new(
-                base_table,
+                Arc::clone(&base_table),
                 vec!["search_field".to_string()],
                 vec![].into(),
             )
