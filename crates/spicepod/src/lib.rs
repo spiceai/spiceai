@@ -139,7 +139,7 @@ fn detect_duplicate_component_names(
     Ok(())
 }
 
-fn check_for_protected_keywords(components: &[Dataset]) -> Result<()> {
+fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
     for component in components {
         if keywords::is_reserved_keyword(component.name()) {
             return Err(Error::UseOfReservedKeyword {
