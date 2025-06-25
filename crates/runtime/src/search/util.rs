@@ -272,7 +272,8 @@ mod tests {
             .expect("cannot make full text table"),
         );
 
-        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index));
+        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+            as Arc<dyn TableProvider>;
 
         assert!(
             find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table)
