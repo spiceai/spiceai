@@ -18,8 +18,19 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use datafusion::scalar::ScalarValue;
+use snafu::prelude::*;
 
-use crate::{Error, Partition};
+use crate::Partition;
+
+type StdError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to create an accelerated partition: {source}"))]
+    CreatePartition { source: StdError },
+    #[snafu(display("Failed to infer accelerated partitions: {source}"))]
+    InferringPartitions { source: StdError },
+}
 
 #[async_trait]
 pub trait PartitionCreator: Debug + Send + Sync {

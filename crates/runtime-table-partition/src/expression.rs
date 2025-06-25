@@ -25,11 +25,12 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::ExprSchemable,
     prelude::{Expr, SessionContext},
+    scalar::ScalarValue,
 };
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
-pub enum ValidationError {
+pub enum Error {
     #[snafu(display("Failed to determine data type: {source}"))]
     DataTypeError { source: DataFusionError },
     #[snafu(display("Expression {expr} does not meet the criteria: {criterion}\n\nExpression Criteria:\n{}", PartitionCriteria.doc()))]
@@ -38,9 +39,16 @@ pub enum ValidationError {
     InvalidExpression { message: String },
     #[snafu(display("Parsing SQL expression failed: {source}"))]
     ParsingExpression { source: DataFusionError },
+    #[snafu(display(
+        "Scalar value type {scalar_type} is incompatible with expression type {expr_type}"
+    ))]
+    IncompatibleTypes {
+        scalar_type: String,
+        expr_type: String,
+    },
 }
 
-pub type ValidationResult = Result<(), ValidationError>;
+pub type ValidationResult = Result<(), Error>;
 
 /// Converts the spicepod `partition_by` list of [`String`]s into [`Expr`]s,
 /// validating that they meet the expression criteria.
@@ -52,7 +60,7 @@ pub fn partition_by_expressions(
     partition_by: &[String],
     ctx: &SessionContext,
     df_schema: &DFSchema,
-) -> Result<Vec<Expr>, ValidationError> {
+) -> Result<Vec<Expr>, Error> {
     partition_by
         .iter()
         .map(|sql| {
@@ -63,6 +71,28 @@ pub fn partition_by_expressions(
             Ok(expr)
         })
         .collect::<Result<Vec<_>, _>>()
+}
+
+/// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].
+///
+/// # Errors
+/// Returns an error if the types are incompatible.
+pub fn validate_scalar_compatibility(
+    expr: &Expr,
+    scalar: &ScalarValue,
+    schema: &DFSchema,
+) -> ValidationResult {
+    let (expr_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+    let scalar_type = scalar.data_type();
+
+    ensure!(
+        expr_type == scalar_type,
+        IncompatibleTypesSnafu {
+            scalar_type: scalar_type.to_string(),
+            expr_type: expr_type.to_string()
+        }
+    );
+    Ok(())
 }
 
 /// Trait for defining validation criteria for an Expr.
@@ -196,7 +226,7 @@ impl Criterion for ForbiddenExpressionCriterion {
                 Ok(TreeNodeRecursion::Continue)
             }
         })
-        .map_err(|_| ValidationError::InvalidExpression {
+        .map_err(|_| Error::InvalidExpression {
             message: format!("Unsupported expression {expr}"),
         })?;
         Ok(())
@@ -230,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_partition_expression_criterion() -> Result<(), ValidationError> {
+    async fn test_partition_expression_criterion() -> Result<(), Error> {
         let schema = create_test_schema();
 
         let criterion = Arc::new(PartitionCriteria);

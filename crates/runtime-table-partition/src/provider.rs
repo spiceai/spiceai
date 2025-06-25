@@ -20,14 +20,29 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::Constraints,
+    common::{Constraints, DFSchema},
     datasource::TableType,
     error::DataFusionError,
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use snafu::prelude::*;
 
-use crate::{Error, creator::PartitionCreator};
+use crate::{creator::PartitionCreator, expression::validate_scalar_compatibility};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Only a single 'partition_by' expression is supported, but {num_partition_by} were given."
+    ))]
+    PartitionByViolation { num_partition_by: usize },
+    #[snafu(display("Creating partition failed: {source}"))]
+    CreatingPartition { source: super::creator::Error },
+    #[snafu(display("Validating expressions failed: {source}"))]
+    ValidatingExpressions { source: super::expression::Error },
+    #[snafu(display("{source}"))]
+    DataFusion { source: DataFusionError },
+}
 
 type ScalarValueString = String;
 
@@ -50,12 +65,24 @@ impl PartitionTableProvider {
         partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
+        let num_partition_by = partition_by.len();
+        let expr = partition_by
+            .first()
+            .context(PartitionByViolationSnafu { num_partition_by })?;
+
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(DataFusionSnafu)?;
+
         let partitions = creator
             .infer_existing_partitions()
-            .await?
+            .await
+            .context(CreatingPartitionSnafu)?
             .into_iter()
-            .map(|p| (p.partition_value.to_string(), p.table_provider))
-            .collect();
+            .map(|p| {
+                validate_scalar_compatibility(expr, &p.partition_value, &df_schema)?;
+                Ok((p.partition_value.to_string(), p.table_provider))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()
+            .context(ValidatingExpressionsSnafu)?;
 
         Ok(Self {
             _creator: creator,
