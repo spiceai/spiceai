@@ -267,7 +267,7 @@ impl Spicepod {
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
 
-        check_for_protected_keywords(&resolved_datasets[..])?;
+        check_for_reserved_keywords(&resolved_datasets[..])?;
 
         Ok(from_definition(
             spicepod_definition,
