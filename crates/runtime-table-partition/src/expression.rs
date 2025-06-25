@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write as _;
+
 use arrow_schema::DataType;
 use datafusion::{
     common::{
@@ -30,8 +32,8 @@ use snafu::prelude::*;
 pub enum ValidationError {
     #[snafu(display("Failed to determine data type: {source}"))]
     DataTypeError { source: DataFusionError },
-    #[snafu(display("Expression {expr} does not meet criterion: {message}"))]
-    CriterionFailed { expr: String, message: String },
+    #[snafu(display("Expression {expr} does not meet the criteria: {criterion}\n\nExpression Criteria:\n{}", PartitionCriteria.doc()))]
+    CriterionFailed { expr: String, criterion: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },
     #[snafu(display("Parsing SQL expression failed: {source}"))]
@@ -65,6 +67,9 @@ pub fn partition_by_expressions(
 
 /// Trait for defining validation criteria for an Expr.
 pub trait Criterion: Send + Sync {
+    /// Returns the documentation string for this criterion.
+    fn doc(&self) -> String;
+
     /// Validate the expression meets a certain criterion.
     ///
     /// # Errors
@@ -74,15 +79,25 @@ pub trait Criterion: Send + Sync {
 
 pub struct PartitionCriteria;
 
-impl Criterion for PartitionCriteria {
-    fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
-        let criteria: Vec<&dyn Criterion> = vec![
-            &DataTypeCriterion,
-            &SingleColumnCriterion,
-            &ForbiddenExpressionCriterion,
-        ];
+impl PartitionCriteria {
+    const CRITERIA: &[&dyn Criterion] = &[
+        &DataTypeCriterion,
+        &SingleColumnCriterion,
+        &ForbiddenExpressionCriterion,
+    ];
+}
 
-        for criterion in criteria {
+impl Criterion for PartitionCriteria {
+    fn doc(&self) -> String {
+        let mut criteria_string = String::new();
+        for criterion in PartitionCriteria::CRITERIA {
+            let _ = writeln!(criteria_string, "- {}", criterion.doc());
+        }
+        criteria_string
+    }
+
+    fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
+        for criterion in Self::CRITERIA {
             criterion.validate(expr, schema)?;
         }
 
@@ -95,6 +110,10 @@ impl Criterion for PartitionCriteria {
 struct DataTypeCriterion;
 
 impl Criterion for DataTypeCriterion {
+    fn doc(&self) -> String {
+        "data type must be a String, Number, Boolean or Timestamp".to_string()
+    }
+
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
         let (data_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
 
@@ -115,7 +134,7 @@ impl Criterion for DataTypeCriterion {
             ),
             CriterionFailedSnafu {
                 expr: expr.to_string(),
-                message: format!("Data type {data_type} is not a string, number, or boolean"),
+                criterion: self.doc(),
             }
         );
 
@@ -127,13 +146,19 @@ impl Criterion for DataTypeCriterion {
 struct SingleColumnCriterion;
 
 impl Criterion for SingleColumnCriterion {
+    fn doc(&self) -> String {
+        "expression must reference a single column".to_string()
+    }
+
     fn validate(&self, expr: &Expr, _schema: &DFSchema) -> ValidationResult {
         let num_columns = expr.column_refs().len();
         ensure!(
             num_columns == 1,
             CriterionFailedSnafu {
                 expr: expr.to_string(),
-                message: format!("Expression references {num_columns} columns, expected exactly 1")
+                criterion: format!(
+                    "Expression references {num_columns} columns, expected exactly 1"
+                )
             }
         );
         Ok(())
@@ -143,6 +168,13 @@ impl Criterion for SingleColumnCriterion {
 struct ForbiddenExpressionCriterion;
 
 impl Criterion for ForbiddenExpressionCriterion {
+    fn doc(&self) -> String {
+        "expression must not contain Alias, OuterReferenceColumn, Unnest, WindowFunction,
+  AggregateFunction, Exists, InSubquery, ScalarSubquery, Placeholder, or
+  GroupingSet"
+            .to_string()
+    }
+
     fn validate(&self, expr: &Expr, _schema: &DFSchema) -> ValidationResult {
         expr.apply(|expr| {
             if matches!(
