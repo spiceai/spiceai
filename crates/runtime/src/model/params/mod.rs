@@ -43,6 +43,7 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
     }
 }
 
+// Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
 const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     a: [T; N],
     b: [T; M],
@@ -64,6 +65,8 @@ const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
 pub(crate) const PARAM_LEN: usize = 24;
 pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 45;
 
+// Model parameters that are used for openai model provider.
+// OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
 pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
@@ -95,6 +98,7 @@ pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::component("user"),
 ];
 
+// Common model parameters that are used for all model providers except openai.
 pub(crate) const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
@@ -124,7 +128,8 @@ pub(crate) const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_
     ParameterSpec::component("tool_choice"),
     ParameterSpec::component("parallel_tool_calls"),
     ParameterSpec::component("user"),
-    // Default Override parameters start with `openai_` is deprecated and will be removed in a future release.
+    // For model providers that are not OpenAI
+    // The default Override parameters start with `openai_` is deprecated and will be removed in a future release.
     // Keep the `openai_` for backward compatibility, but recommend user using `<model_prefix>_<param>` instead.
     ParameterSpec::runtime("openai_frequency_penalty").deprecated(DEPRECATED_MESSAGE),
     ParameterSpec::runtime("openai_logit_bias").deprecated(DEPRECATED_MESSAGE),
