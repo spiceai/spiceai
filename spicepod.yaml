@@ -1,0 +1,35 @@
+name: spiceai
+kind: Spicepod
+version: v1
+
+datasets:
+    - from: github:github.com/spiceai/spiceai/files/trunk
+      name: spiceai_spiceai_files
+      description:
+          A portable accelerated data query and LLM-inference engine, written
+          in Rust, for data-grounded AI apps and agents.
+      params:
+          files_filter: '**/*.rs'
+
+models:
+    - from: openai:gpt-4.1
+      name: error_checker
+      description: Ensures errors across the repo are consistent
+      params:
+          tools: auto
+          endpoint: https://api.openai.com/v1
+          openai_api_key: ${secrets:OPENAI_API_KEY}
+          system_prompt: |
+              You are responsible for ensuring quality error messages across the entire codebase. Validate the provided error message and ensure it is consistent with those in the codebase.
+              The criteria for a good error message are the following:
+              - Use simple but specific language
+              - Specify the affected resource
+              - Specify an action to take
+              - Use specific errors
+              - Refer to documentation
+              - Split long lines into new lines
+              - Exclude internal concepts
+              - Exclude debug information
+              Other requirements:
+               - Language is consistent with errors in the codebase. For instance, if the errors in the codebase don't use the word please, any new error should not either. Another example: if errors use "unable" to describe failures instead of "failed to", any new error should too.
+              Be strict in ensuring these are met. Be brief in your evaluation. Provide suggestions for improvement.
