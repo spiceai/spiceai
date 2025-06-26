@@ -316,8 +316,31 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 to_tonic_err(e)
             }
         }
+        DataFusionError::ResourcesExhausted(source) => Status::resource_exhausted(source),
         DataFusionError::Diagnostic(_, source) => handle_datafusion_error(*source),
-        _ => to_tonic_err(e),
+        DataFusionError::Context(_, source) => handle_datafusion_error(*source),
+        DataFusionError::Shared(source) => {
+            // Since DataFusionError doesn't implement Clone, we can't extract it from Arc
+            // Just treat it as a generic error
+            Status::internal(format!("Shared DataFusion error: {}", source))
+        }
+        DataFusionError::Collection(sources) => {
+            if sources.is_empty() {
+                unreachable!("DataFusionError::Collection is never empty");
+            } else {
+                let first_error = sources.into_iter().next().unwrap();
+                handle_datafusion_error(first_error)
+            }
+        }
+        DataFusionError::Internal(_)
+        | DataFusionError::NotImplemented(_)
+        | DataFusionError::ArrowError(..)
+        | DataFusionError::IoError(_)
+        | DataFusionError::ObjectStore(_)
+        | DataFusionError::ParquetError(_)
+        | DataFusionError::Substrait(_)
+        | DataFusionError::Configuration(_)
+        | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
     }
 }
 
