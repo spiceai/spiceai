@@ -567,25 +567,10 @@ fn is_table_not_found_error(err: &Status) -> (bool, Option<String>) {
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Internal => {
-            let (is_table_not_found, table_name) = is_table_not_found_error(err);
-            if is_table_not_found {
-                let message = if let Some(name) = table_name {
-                    format!(
-                        "The table '{name}' does not exist. Check that the table name was entered correctly or verify the configuration in the Spicepod."
-                    )
-                } else {
-                    "The specified table does not exist. Check that the table name was entered correctly or verify the configuration in the Spicepod.".to_string()
-                };
-                ("Table Not Found", message)
-            } else {
-                (
-                    "Internal Error",
-                    "An unexpected internal error occurred. Execute '.error' for details."
-                        .to_string(),
-                )
-            }
-        }
+        Code::Internal => (
+            "Internal Error",
+            "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
+        ),
         Code::Unknown | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
             "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
