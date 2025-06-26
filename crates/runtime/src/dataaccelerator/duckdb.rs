@@ -367,28 +367,7 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
-        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
-            .await
-            .context(UnableToCreateTableSnafu)
-            .boxed()?;
-
-        let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
-        else {
-            unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
-        };
-
-        let read_provider = Arc::clone(&duckdb_writer.read_provider);
-        let duckdb_writer = Arc::new(duckdb_writer.clone());
-        let cloned_writer = Arc::clone(&duckdb_writer);
-
-        let table_provider = Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            duckdb_writer,
-            read_provider,
-        ));
-
-        Ok(table_provider)
+        create_table_provider(&self.duckdb_factory, &cmd).await
     }
 
     fn prefix(&self) -> &'static str {
@@ -398,6 +377,34 @@ impl DataAccelerator for DuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+}
+
+pub(crate) async fn create_table_provider(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    cmd: &CreateExternalTable,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    let ctx = SessionContext::new();
+    let table_provider = duckdb_factory
+        .create(&ctx.state(), &cmd)
+        .await
+        .context(UnableToCreateTableSnafu)
+        .boxed()?;
+
+    let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>() else {
+        unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
+    };
+
+    let read_provider = Arc::clone(&duckdb_writer.read_provider);
+    let duckdb_writer = Arc::new(duckdb_writer.clone());
+    let cloned_writer = Arc::clone(&duckdb_writer);
+
+    let table_provider = Arc::new(PolyTableProvider::new(
+        cloned_writer,
+        duckdb_writer,
+        read_provider,
+    ));
+
+    Ok(table_provider)
 }
 
 #[cfg(test)]
