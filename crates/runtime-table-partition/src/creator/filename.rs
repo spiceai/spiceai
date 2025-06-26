@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to serialize scalar value: {source}"))]
     Serialize { source: serde_qs::Error },
