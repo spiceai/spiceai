@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
@@ -302,12 +302,24 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
+        partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let num_partitions = partition_by.len();
+        ensure!(
+            num_partitions == 0,
+            super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Sqlite data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
+                )
+            }
+        );
+
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
         }
 
+        // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
             if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
                 cmd.options
@@ -380,11 +392,13 @@ impl DataAccelerator for DuckDBAccelerator {
         let duckdb_writer = Arc::new(duckdb_writer.clone());
         let cloned_writer = Arc::clone(&duckdb_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             duckdb_writer,
             read_provider,
-        )))
+        ));
+
+        Ok(table_provider)
     }
 
     fn prefix(&self) -> &'static str {
@@ -459,7 +473,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(external_table, None)
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 

@@ -342,6 +342,7 @@ pub async fn create_synced_internal_accelerated_table(
     secrets: Arc<RwLock<Secrets>>,
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
+    let ctx = Arc::clone(&runtime.datafusion().ctx);
     let source_table_provider =
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
             .await?;
@@ -355,6 +356,7 @@ pub async fn create_synced_internal_accelerated_table(
             &acceleration,
             secrets,
             None,
+            ctx,
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;

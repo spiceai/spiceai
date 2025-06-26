@@ -283,6 +283,8 @@ pub struct Acceleration {
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
     pub disable_federation: bool,
+
+    pub partition_by: Vec<String>,
 }
 
 impl Acceleration {
@@ -416,6 +418,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            partition_by: acceleration.partition_by,
         })
     }
 }
@@ -446,6 +449,7 @@ impl Default for Acceleration {
             on_conflict: HashMap::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
+            partition_by: vec![],
         }
     }
 }

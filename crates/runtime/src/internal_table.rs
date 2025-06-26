@@ -139,6 +139,7 @@ pub async fn create_internal_accelerated_table(
             &acceleration,
             secrets,
             None,
+            Arc::clone(&runtime.df.ctx),
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;

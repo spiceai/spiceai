@@ -881,6 +881,7 @@ impl DataFusion {
                 &acceleration_settings,
                 secrets,
                 Some(dataset),
+                Arc::clone(&self.ctx),
             )
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
@@ -1430,6 +1431,7 @@ impl DataFusion {
                 acceleration,
                 secrets,
                 Some(view),
+                Arc::clone(&self.ctx),
             )
             .await
             .map_err(|e| Error::UnableToCreateView {

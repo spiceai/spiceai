@@ -18,9 +18,9 @@ use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
-use snafu::ResultExt;
+use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use crate::parameters::ParameterSpec;
@@ -63,7 +63,18 @@ impl DataAccelerator for ArrowAccelerator {
         &self,
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
+        partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let num_partitions = partition_by.len();
+        ensure!(
+            num_partitions == 0,
+            super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Arrow data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
+                )
+            }
+        );
+
         let ctx = SessionContext::new();
         TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await

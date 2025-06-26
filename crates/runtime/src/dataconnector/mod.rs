@@ -297,6 +297,14 @@ pub enum DataConnectorError {
         dataset_name: String,
         differences: String,
     },
+
+    #[snafu(display(
+        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector.\nChange the name in the Spicepod and try again."
+    ))]
+    UseOfProtectedKeyword {
+        dataconnector: String,
+        keyword: String,
+    },
 }
 
 pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
@@ -332,6 +340,21 @@ pub async fn create_new_connector(
     let connector_factory = guard.get(name);
 
     let factory = connector_factory?;
+
+    let ConnectorComponent::Dataset(ds) = &params.component else {
+        unreachable!("Component is always a dataset at this point")
+    };
+
+    if factory
+        .reserved_keywords()
+        .contains(&ds.name.table().to_ascii_lowercase().as_str())
+    {
+        return Some(Err(DataConnectorError::UseOfProtectedKeyword {
+            dataconnector: name.to_string(),
+            keyword: ds.name.table().to_string(),
+        }
+        .into()));
+    }
 
     if params.unsupported_type_action.is_some() && !factory.supports_unsupported_type_action() {
         return Some(Err(DataConnectorError::UnsupportedTypeAction {
@@ -431,6 +454,12 @@ pub trait DataConnectorFactory: Send + Sync {
     ///
     /// Any parameter provided by a user that isn't in this list will be filtered out and a warning logged.
     fn parameters(&self) -> &'static [ParameterSpec];
+
+    /// Returns a list of keywords that are reserved by the data connector.
+    /// Used to ensure that any table name isn't a reserved keyword.
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
