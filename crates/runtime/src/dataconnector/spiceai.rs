@@ -170,18 +170,14 @@ impl DataConnectorFactory for SpiceAIFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
-            "https://dev-flight.spiceai.io".into()
-        } else {
-            "https://flight.spiceai.io".into()
-        };
         Box::pin(async move {
             let url: Arc<str> = params
                 .parameters
                 .get("endpoint")
                 .expose()
                 .ok()
-                .map_or(default_flight_url, Into::into);
+                .unwrap_or("https://flight.spiceai.io")
+                .into();
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
             verify_endpoint_connection(&url).await.with_context(|_| {

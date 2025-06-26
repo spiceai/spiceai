@@ -15,51 +15,58 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.4 (June 2025)
+### v1.5 (July 2025)
 
-- Upgrade to DataFusion v47.
-- Cron for dataset refresh and workers
+**Focus:** Search
+
+- **Accelerated Views**: Cron refresh.
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
+- [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
+- [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
 
 - **Catalog Connectors**
 
   - AWS Glue Catalog Connector (Beta).
 
-- **Spice Cloud Catalog Connector** (Beta): Unified access to cloud-based datasets.
-
-### v1.5 (July 2025)
-
-**Focus:** Search
-
-- Upgrade to DuckDB v1.3.x.
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search queries.
-- [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (Database + Vector):
-  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion-powered search integration.
+- **Spice Cloud Catalog Connector** (Stable): Unified access to cloud-based datasets.
 
 ### v1.6 (August 2025)
 
-**Focus:** Advanced Ingestion - Expanded write capabilities for modern data lakehouse architectures.
+**Focus:** Advanced Ingestion & CDC - Expanded write capabilities for modern data lakehouse architectures.
 
-- Hash partitioning for improved query distribution and performance.
+- **DuckDB**: Upgrade to v1.4.x.
+- **Hash Partitioning**: Improved query distribution and performance.
+- **CDC**: Expanded CDC/Debezium support.
 - **Ingestion**:
-
   - Support write operations to Spice Cloud.
-  - Delta Lake write support for transactional data lakes.
   - Apache Iceberg write support for scalable table formats.
   - PostgreSQL write support for relational database integration.
 
-- **Model Providers**:
-  - HuggingFace (Release Candidate).
-  - File-based models (Release Candidate).
+### v1.7 (September 2025)
 
-### v2.0 (H2 2025)
+- **Ingestion**:
+  - Delta Lake write support for transactional data lakes.
 
-**Focus:** Enterprise Security, Extensibility, and Scalability
+### v1.8 (October 2025)
+
+- **S3 Tables**: Direct querying of S3-Table based datasets.
+
+### v1.9 (November 2025)
+
+TBD.
+
+### v1.10 (December 2025)
+
+- **Extensible Middleware**:
+  - Pluggable extensions.
+
+### v2.0 (H1 2026)
+
+**Focus:** Enterprise Policy & Governance
 
 - **Policy Engine**:
   - Role-based security for fine-grained access control.
   - Data access policies to enforce compliance and governance.
-- **Extensible Middleware**:
-  - Pluggable extensions.
 
 ---
 
@@ -69,7 +76,6 @@ These are prioritized based on community demand and strategic alignment. Share y
 
 ### Data Connectors
 
-- **S3 Tables**: Direct querying of S3-Table based datasets.
 - **Elasticsearch**: Integration for search and analytics workloads.
 - **MotherDuck**: Hybrid cloud DuckDB connector.
 - **BigQuery**: Support for Google Cloud's data warehouse.

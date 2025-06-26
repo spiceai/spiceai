@@ -36,7 +36,7 @@ use test_framework::{
 /// duration of the test when N clients are sending queries concurrently.
 #[allow(clippy::cast_precision_loss)]
 pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let component = args.http.get_http_component()?;
     let payloads: Vec<_> = args
         .http

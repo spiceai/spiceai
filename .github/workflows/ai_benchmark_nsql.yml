@@ -19,7 +19,7 @@ on:
           - "grok2"
         default: "all"
   schedule:
-    - cron: "0 1 * * 2,5" # Every Monday and Thursday at 5pm PST (1am UTC next day)
+    - cron: "0 5 * * 2,5" # Every Monday and Thursday at 10pm PST (5am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -125,6 +125,7 @@ jobs:
       - setup-matrix
     runs-on: "spiceai-macos"
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}

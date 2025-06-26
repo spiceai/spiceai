@@ -92,7 +92,7 @@ impl EvalMetrics {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     let eval = args
@@ -206,8 +206,7 @@ async fn execute_sql(
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let res = spice_client
         .query(sql)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .await?
         .try_collect::<Vec<RecordBatch>>()
         .await?;
     Ok(res)

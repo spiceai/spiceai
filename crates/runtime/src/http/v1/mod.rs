@@ -50,7 +50,7 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::HeaderValue;
+use http::{HeaderValue, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
@@ -129,6 +129,17 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
+    pub fn to_accept_header(&self) -> Option<http::HeaderValue> {
+        let media_type = match self {
+            ResponseMimeType::Json => "application/json",
+            ResponseMimeType::Csv => "text/csv",
+            ResponseMimeType::Plain => "text/plain",
+            ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
+            ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
+        };
+        HeaderValue::from_str(media_type).ok()
+    }
+
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
@@ -230,6 +241,10 @@ pub async fn to_http_response(
     };
 
     let mut headers = HeaderMap::new();
+
+    if let Some(header_value) = format.to_accept_header() {
+        headers.insert(CONTENT_TYPE, header_value);
+    }
 
     attach_cache_headers(&mut headers, cache_status);
 

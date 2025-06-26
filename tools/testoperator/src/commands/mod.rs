@@ -34,13 +34,15 @@ mod util;
 pub(crate) mod vector_search;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
-pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
+pub(crate) async fn get_app_and_start_request(
+    args: &CommonArgs,
+) -> anyhow::Result<(App, StartRequest)> {
     if !args.metrics {
         // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
         test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
     }
 
-    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
         .build();
@@ -55,8 +57,8 @@ pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(Ap
     Ok((app, start_request))
 }
 
-pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(args)?;
+pub(crate) async fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args).await?;
 
     start_request.prepare()?;
     let tempdir_path = start_request.get_tempdir_path();

@@ -82,6 +82,8 @@ pub enum QueryOverridesArg {
     SpicecloudCatalog,
     #[serde(rename = "glue-catalog")]
     GlueCatalog,
+    #[serde(rename = "databricks-catalog")]
+    DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
 }
@@ -111,7 +113,9 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
-            QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
+            QueryOverridesArg::SpicecloudCatalog | QueryOverridesArg::DatabricksCatalog => {
+                QueryOverrides::SpicecloudCatalog
+            }
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
         }

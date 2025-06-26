@@ -21,7 +21,8 @@ use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::Constraint;
+use datafusion::common::{Constraint, DFSchema};
+use datafusion::prelude::{Expr, SessionContext};
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -30,6 +31,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use runtime_table_partition::expression::partition_by_expressions;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -123,6 +125,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -131,6 +134,7 @@ impl AcceleratorEngineRegistry {
         acceleration_settings: &acceleration::Acceleration,
         secrets: Arc<RwLock<Secrets>>,
         source: Option<&dyn AccelerationSource>,
+        ctx: Arc<SessionContext>,
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
@@ -227,8 +231,15 @@ impl AcceleratorEngineRegistry {
 
         let external_table = external_table_builder.build()?;
 
+        let df_schema = DFSchema::try_from(schema)
+            .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+
+        let partition_by =
+            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+
         let table_provider = accelerator
-            .create_external_table(external_table, source)
+            .create_external_table(external_table, source, partition_by)
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -246,6 +257,7 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
+        partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -490,6 +502,7 @@ mod test {
         let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
@@ -507,6 +520,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");
@@ -525,6 +539,7 @@ mod test {
         let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: params.clone(),
@@ -543,6 +558,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");
@@ -564,6 +580,7 @@ mod test {
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: HashMap::new(),
@@ -581,6 +598,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");

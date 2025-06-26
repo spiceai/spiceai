@@ -31,7 +31,7 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &CommonArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(args)?;
+    let (app, start_request) = get_app_and_start_request(args).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process().watch_memory(&memory_token);

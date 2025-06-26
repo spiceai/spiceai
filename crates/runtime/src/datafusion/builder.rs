@@ -44,13 +44,14 @@ use datafusion::{
 use datafusion_federation::sql::federation_analyzer_rule;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
-use crate::{embeddings, status};
+use crate::status;
 
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
     extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
     schema::SpiceSchemaProvider,
+    udf::register_udfs,
 };
 
 pub struct DataFusionBuilder {
@@ -172,14 +173,7 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
-        ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
-        ctx.register_udf(
-            crate::datafusion::udf::alias::ScalarUDFAlias::new(
-                Arc::new(datafusion::functions::math::random::RandomFunc::default()),
-                "rand",
-            )
-            .into(),
-        );
+        register_udfs(&ctx);
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
