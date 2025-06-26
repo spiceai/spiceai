@@ -679,7 +679,7 @@ impl Runtime {
         }
 
         self.accelerator_engine_registry
-            .get_accelerator_engine(accelerator_engine)
+            .get_accelerator_engine(acceleration_settings)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -793,13 +793,13 @@ impl Runtime {
 
         let mut initialized_datasets = vec![];
         for ds in datasets {
-            if let Some(acceleration) = &ds.acceleration {
+            if let Some(acceleration_settings) = &ds.acceleration {
                 let accelerator = match self
                     .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration.engine)
+                    .get_accelerator_engine(acceleration_settings)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     }) {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
@@ -814,7 +814,7 @@ impl Runtime {
 
                 match accelerator.init(ds.as_ref()).await.context(
                     AcceleratorInitializationFailedSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     },
                 ) {
                     Ok(()) => {

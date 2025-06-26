@@ -79,9 +79,15 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct EngineVariant {
+    engine: Engine,
+    partitioned: bool,
+}
+
 #[derive(Default, Clone)]
 pub struct AcceleratorEngineRegistry {
-    pub accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    pub accelerator_engine_registry: Arc<RwLock<HashMap<EngineVariant, Arc<dyn DataAccelerator>>>>,
 }
 
 impl AcceleratorEngineRegistry {
@@ -92,9 +98,17 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub async fn get_accelerator_engine(&self, engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
+    pub async fn get_accelerator_engine(
+        &self,
+        acceleration_settings: &acceleration::Acceleration,
+    ) -> Option<Arc<dyn DataAccelerator>> {
         let guard = self.accelerator_engine_registry.read().await;
-        let engine = guard.get(&engine);
+        let partitioned = !acceleration_settings.partition_by.is_empty();
+        let engine_variant = EngineVariant {
+            engine: acceleration_settings.engine,
+            partitioned,
+        };
+        let engine = guard.get(&engine_variant);
         match engine {
             Some(engine_ref) => Some(Arc::clone(engine_ref)),
             None => None,
@@ -103,25 +117,58 @@ impl AcceleratorEngineRegistry {
 
     async fn register_accelerator_engine(
         &self,
-        name: Engine,
+        engine_variant: EngineVariant,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(name, accelerator_engine);
+        registry.insert(engine_variant, accelerator_engine);
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
-            .await;
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::Arrow,
+                partitioned: false,
+            },
+            Arc::new(ArrowAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
-            .await;
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::Arrow,
+                partitioned: false,
+            },
+            Arc::new(DuckDBAccelerator::new()),
+        )
+        .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::Arrow,
+                partitioned: true,
+            },
+            Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
-            .await;
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::PostgreSQL,
+                partitioned: false,
+            },
+            Arc::new(PostgresAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await;
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::Sqlite,
+                partitioned: false,
+            },
+            Arc::new(SqliteAccelerator::new()),
+        )
+        .await;
     }
 
     pub async fn unregister_all(&self) {
@@ -142,11 +189,12 @@ impl AcceleratorEngineRegistry {
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
-        let accelerator = self.get_accelerator_engine(engine).await.ok_or_else(|| {
-            Error::InvalidConfiguration {
+        let accelerator = self
+            .get_accelerator_engine(acceleration_settings)
+            .await
+            .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
-            }
-        })?;
+            })?;
 
         if let Err(e) = acceleration_settings.validate_indexes(&schema) {
             InvalidConfigurationSnafu {

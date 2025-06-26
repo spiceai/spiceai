@@ -60,13 +60,13 @@ async fn acceleration_connection(
 ) -> Result<AccelerationConnection> {
     let runtime = source.runtime();
 
-    let acceleration = source.acceleration().ok_or("Acceleration is not enabled")?;
-    match acceleration.engine {
+    let acceleration_settings = source.acceleration().ok_or("Acceleration is not enabled")?;
+    match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(Engine::DuckDB)
+                .get_accelerator_engine(acceleration_settings)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
             let duckdb_accelerator = accelerator
@@ -92,7 +92,7 @@ async fn acceleration_connection(
         Engine::Sqlite => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(Engine::Sqlite)
+                .get_accelerator_engine(acceleration_settings)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;
             let sqlite_accelerator = accelerator
@@ -113,7 +113,7 @@ async fn acceleration_connection(
         Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
         #[cfg(feature = "postgres")]
         Engine::PostgreSQL => {
-            let secret_map = to_secret_map(acceleration.params.clone());
+            let secret_map = to_secret_map(acceleration_settings.params.clone());
 
             let pool = PostgresConnectionPool::new(secret_map)
                 .await
