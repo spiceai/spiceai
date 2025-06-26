@@ -21,10 +21,17 @@ use crate::{
     parameters::ParameterSpec,
 };
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, logical_expr::CreateExternalTable, prelude::Expr};
+use datafusion::{
+    datasource::TableProvider, logical_expr::CreateExternalTable, prelude::Expr,
+    scalar::ScalarValue,
+};
 use datafusion_table_providers::duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory};
 use duckdb::AccessMode;
-use runtime_table_partition::provider::PartitionTableProvider;
+use runtime_table_partition::{
+    Partition,
+    creator::{self, PartitionCreator},
+    provider::PartitionTableProvider,
+};
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, sync::Arc};
 use tokio::sync::Mutex;
@@ -70,13 +77,15 @@ pub enum Error {
 
     #[snafu(display("Partitioned DuckDB acceleration only supported for file mode."))]
     FileModeOnly,
+
+    #[snafu(display("Partitioned DuckDB acceleration only supports a single table"))]
+    SingleTable,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
-    duckdb_factory: DuckDBTableProviderFactory,
     table_provider: Mutex<Option<Arc<PartitionTableProvider>>>,
 }
 
@@ -85,12 +94,6 @@ impl PartitionedDuckDBAccelerator {
     pub fn new() -> Self {
         Self {
             base_accelerator: DuckDBAccelerator::new(),
-            // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(new_duckdb_dialect())
-                .with_settings_registry(
-                    DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-                ),
             table_provider: Mutex::new(None),
         }
     }
@@ -142,13 +145,6 @@ impl Default for PartitionedDuckDBAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("file"),
-    ParameterSpec::runtime("file_watcher"),
-    ParameterSpec::component("memory_limit"),
-    ParameterSpec::component("preserve_insertion_order"),
-];
-
 #[async_trait]
 impl DataAccelerator for PartitionedDuckDBAccelerator {
     fn as_any(&self) -> &dyn Any {
@@ -184,11 +180,21 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        _cmd: CreateExternalTable,
+        cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-        _partition_by: Vec<Expr>,
+        partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        todo!()
+        let mut table_provider_guard = self.table_provider.lock().await;
+        ensure!(table_provider_guard.is_none(), SingleTableSnafu);
+
+        let schema = Arc::new(cmd.schema.as_arrow().clone());
+        let creator = Arc::new(DuckDBPartitionCreator::new(cmd));
+        let table_provider =
+            Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
+
+        *table_provider_guard = Some(Arc::clone(&table_provider));
+
+        Ok(table_provider)
     }
 
     fn prefix(&self) -> &'static str {
@@ -197,5 +203,38 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         self.base_accelerator.parameters()
+    }
+}
+
+#[derive(Debug)]
+struct DuckDBPartitionCreator {
+    cmd: CreateExternalTable,
+    duckdb_factory: DuckDBTableProviderFactory,
+}
+
+impl DuckDBPartitionCreator {
+    fn new(cmd: CreateExternalTable) -> Self {
+        Self {
+            cmd,
+            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+                .with_dialect(new_duckdb_dialect())
+                .with_settings_registry(
+                    DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+                ),
+        }
+    }
+}
+
+#[async_trait]
+impl PartitionCreator for DuckDBPartitionCreator {
+    async fn create_partition(
+        &self,
+        _partition_value: ScalarValue,
+    ) -> Result<Partition, creator::Error> {
+        todo!()
+    }
+
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+        todo!()
     }
 }
