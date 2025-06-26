@@ -136,7 +136,7 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(
             EngineVariant {
-                engine: Engine::Arrow,
+                engine: Engine::DuckDB,
                 partitioned: false,
             },
             Arc::new(DuckDBAccelerator::new()),
@@ -145,7 +145,7 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(
             EngineVariant {
-                engine: Engine::Arrow,
+                engine: Engine::DuckDB,
                 partitioned: true,
             },
             Arc::new(PartitionedDuckDBAccelerator::new()),
