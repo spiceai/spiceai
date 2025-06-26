@@ -26,6 +26,7 @@ limitations under the License.
 //! [`SupportedScalarValue`] so that we can derive `Serialize` and `Deserialize`
 //! on variants that have types that can be serialized/deserialized.
 
+use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -39,8 +40,8 @@ pub enum Error {
     #[snafu(display("Failed to deserialize scalar value: {source}"))]
     Deserialize { source: serde_qs::Error },
 
-    #[snafu(display("Unsupported scalar value type"))]
-    UnsupportedType,
+    #[snafu(display("Unsupported scalar value type: {data_type}"))]
+    UnsupportedType { data_type: DataType },
 }
 
 /// Converts a [`ScalarValue`] to its [`String`] representation.
@@ -77,7 +78,6 @@ enum SupportedScalarValue {
     Utf8(Option<String>),
     Utf8View(Option<String>),
     LargeUtf8(Option<String>),
-    // TimestampSecond(Option<i64>, Option<String>), // TODO
 }
 
 impl TryFrom<ScalarValue> for SupportedScalarValue {
@@ -98,7 +98,10 @@ impl TryFrom<ScalarValue> for SupportedScalarValue {
             ScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             ScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
             _ => {
-                return UnsupportedTypeSnafu.fail();
+                return UnsupportedTypeSnafu {
+                    data_type: value.data_type(),
+                }
+                .fail();
             }
         })
     }
