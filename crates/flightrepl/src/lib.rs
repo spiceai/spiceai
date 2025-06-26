@@ -548,11 +548,7 @@ fn lines_need_truncation(lines: &[&str]) -> bool {
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Internal => (
-            "Internal Error",
-            "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
-        ),
-        Code::Unknown | Code::DataLoss | Code::FailedPrecondition => (
+        Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
             "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),

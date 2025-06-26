@@ -316,13 +316,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 to_tonic_err(e)
             }
         }
-        DataFusionError::Diagnostic(_, ref source) => {
-            if let DataFusionError::Plan(err_msg) = source.as_ref() {
-                Status::invalid_argument(err_msg.clone())
-            } else {
-                to_tonic_err(e)
-            }
-        }
+        DataFusionError::Diagnostic(_, source) => handle_datafusion_error(*source),
         _ => to_tonic_err(e),
     }
 }
