@@ -46,7 +46,7 @@ use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
 use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
-mod settings;
+pub(crate) mod settings;
 
 const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 

@@ -24,7 +24,6 @@ use crate::{
         view::View,
     },
     datafusion::dialect::new_duckdb_dialect,
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -46,7 +45,10 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{
+    AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
+    duckdb::settings::OrderByNonIntegerLiteral,
+};
 
 const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
@@ -81,6 +83,9 @@ pub enum Error {
 
     #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display("Partitioned DuckDB acceleration only supported for file mode."))]
+    FileModeOnly,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -238,62 +243,28 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     }
 
     fn name(&self) -> &'static str {
-        "duckdb"
+        "partitioned_duckdb"
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
     }
 
-    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
-        self.duckdb_file_path(source)
-            .map_err(|e| DataAcceleratorError::InvalidConfiguration { msg: e.to_string() })
-    }
-
-    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
-        if !source.is_file_accelerated() {
-            return true; // memory mode DuckDB is always initialized
-        }
-
-        // otherwise, we're initialized if the file exists
-        self.has_existing_file(source)
+    fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        // We have (possibly) many file paths because we make a file for each partition
+        Ok(String::new())
     }
 
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !source.is_file_accelerated() {
-            return Ok(());
+        if let Some(acceleration_settings) = source.acceleration() {
+            ensure!(
+                matches!(acceleration_settings.mode, Mode::File),
+                FileModeOnlySnafu
+            );
         }
-
-        let path = self.file_path(source)?;
-
-        if let Some(acceleration) = source.acceleration() {
-            if !acceleration.params.contains_key("duckdb_file") {
-                make_spice_data_directory().map_err(|err| {
-                    Error::AccelerationInitializationFailed { source: err.into() }
-                })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
-            }
-
-            self.get_shared_pool(source).await?;
-        }
-
         Ok(())
     }
 
@@ -407,27 +378,6 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct OrderByNonIntegerLiteral;
-
-impl DuckDBSetting for OrderByNonIntegerLiteral {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn setting_name(&self) -> &'static str {
-        "order_by_non_integer_literal"
-    }
-
-    fn get_value(&self, _options: &std::collections::HashMap<String, String>) -> Option<String> {
-        Some(String::from("true"))
-    }
-
-    fn scope(&self) -> DuckDBSettingScope {
-        DuckDBSettingScope::Local
     }
 }
 
