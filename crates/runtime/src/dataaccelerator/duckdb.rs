@@ -302,18 +302,8 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        _partition_by: Vec<Expr>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let num_partitions = partition_by.len();
-        ensure!(
-            num_partitions == 0,
-            super::InvalidConfigurationSnafu {
-                msg: format!(
-                    "Sqlite data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
-                )
-            }
-        );
-
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
