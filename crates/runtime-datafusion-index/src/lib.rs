@@ -14,5 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use async_trait::async_trait;
+use std::fmt::Debug;
+
+use datafusion::arrow::array::RecordBatch;
+
 mod provider;
 pub use provider::*;
+
+#[async_trait]
+pub trait Index: Debug + Send + Sync + 'static {
+    async fn compute_index(&self, _batches: &[RecordBatch]) {}
+}

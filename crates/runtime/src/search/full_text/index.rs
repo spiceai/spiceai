@@ -13,12 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use logos::Source;
+use runtime_datafusion_index::Index;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
@@ -39,6 +42,9 @@ pub struct FullTextDatabaseIndex {
     base_table: Arc<dyn TableProvider>,
     index: Arc<tantivy::Index>,
 }
+
+#[async_trait]
+impl Index for FullTextDatabaseIndex {}
 
 #[derive(Debug, Snafu)]
 pub enum Error {

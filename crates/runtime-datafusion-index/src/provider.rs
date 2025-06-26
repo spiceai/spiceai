@@ -28,6 +28,8 @@ use datafusion::{
     prelude::Expr,
 };
 
+use crate::Index;
+
 /// A `TableProvider` that wraps another `TableProvider` and adds indexing capabilities.
 #[derive(Debug, Clone)]
 pub struct IndexedTableProvider {
@@ -38,7 +40,7 @@ pub struct IndexedTableProvider {
     ///
     /// In the future, indexes will be required to implement a trait - but for now all existing
     /// use-cases are supported via UDTFs that downcast indexes to the correct type.
-    pub indexes: Vec<Arc<dyn Any + Send + Sync>>,
+    pub indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl IndexedTableProvider {
@@ -50,15 +52,15 @@ impl IndexedTableProvider {
     }
 
     #[must_use]
-    pub fn add_index(mut self, index: Arc<dyn Any + Send + Sync>) -> Self {
+    pub fn add_index(mut self, index: Arc<dyn Index + Send + Sync>) -> Self {
         self.indexes.push(index);
         self
     }
 
     #[must_use]
-    pub fn get_index<T: Any>(&self) -> Option<&T> {
+    pub fn get_index<T: Index + 'static>(&self) -> Option<&T> {
         for index in &self.indexes {
-            if let Some(index) = index.downcast_ref::<T>() {
+            if let Some(index) = (index as &dyn Any).downcast_ref::<T>() {
                 return Some(index);
             }
         }
