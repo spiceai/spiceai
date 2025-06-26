@@ -21,7 +21,10 @@ use datafusion::{
     datasource::TableProvider, logical_expr::CreateExternalTable, prelude::Expr,
     scalar::ScalarValue,
 };
-use datafusion_table_providers::duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory};
+use datafusion_table_providers::{
+    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    sql::db_connection_pool::duckdbpool::DuckDbConnectionPoolBuilder,
+};
 use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
@@ -196,13 +199,22 @@ impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
-    ) -> Result<Partition, creator::Error> {
+    ) -> Result<Arc<dyn TableProvider>, creator::Error> {
         let mut cmd = self.cmd.clone();
         let partition_value_str = encode_scalar_value(&partition_value).unwrap();
 
         let data_path = spice_data_base_path();
 
-        cmd.location = format!("{data_path}/{partition_value_str}.duckdb");
+        let duckdb_file = format!("{data_path}/{partition_value_str}.duckdb");
+        let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+            .with_max_size(Some(10))
+            .with_min_idle(Some(10));
+        self.duckdb_factory
+            .get_or_init_instance_with_builder(pool_builder)
+            .await
+            .unwrap();
+
+        cmd.options.insert("open".to_string(), duckdb_file);
 
         tracing::debug!("creating partition at {}", &cmd.location);
 
@@ -210,12 +222,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .unwrap();
 
-        let partition = Partition {
-            partition_value,
-            table_provider,
-        };
-
-        Ok(partition)
+        Ok(table_provider)
     }
 
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {

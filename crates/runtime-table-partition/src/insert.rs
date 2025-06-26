@@ -27,6 +27,16 @@ use datafusion::{
 pub struct PartitionedTableInsert {
     properties: PlanProperties,
     projected_schema: SchemaRef,
+    input: Arc<dyn ExecutionPlan>,
+}
+impl PartitionedTableInsert {
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            properties: todo!(),
+            projected_schema: todo!(),
+            input,
+        }
+    }
 }
 
 impl ExecutionPlan for PartitionedTableInsert {

@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::scalar::ScalarValue;
+use datafusion::{catalog::TableProvider, scalar::ScalarValue};
 use snafu::prelude::*;
 
 use crate::Partition;
@@ -40,7 +40,10 @@ pub trait PartitionCreator: Debug + Send + Sync {
     ///
     /// # Errors
     /// Returns an error when creating a [`Partition`] is unsuccessful.
-    async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
+    async fn create_partition(
+        &self,
+        partition_value: ScalarValue,
+    ) -> Result<Arc<dyn TableProvider>, Error>;
 
     /// Find and load previously created [`Parition`]s.
     ///

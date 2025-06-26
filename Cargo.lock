@@ -11095,10 +11095,12 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "futures",
  "serde",
  "serde_qs 1.0.0-rc.3",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
