@@ -41,6 +41,8 @@ use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
@@ -49,6 +51,8 @@ use self::sqlite::SqliteAccelerator;
 pub mod arrow;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod partitioned_duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
