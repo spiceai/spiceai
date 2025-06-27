@@ -125,7 +125,7 @@ pub async fn connect(params: &OracleConnectionParams) -> super::Result<OracleCon
     let manager = OracleConnectionManager::from_connector(connector);
 
     let pool = bb8::Pool::builder()
-        // Spice default Timezone is UTC. Set it to correctly handle TIMESTAMP WITH LOCAL TIME ZONE data types
+        // Spice uses UTC timezone for timestamp data. Set preferred timezone for automated datatype conversion to correctly handle TIMESTAMP WITH LOCAL TIME ZONE data types
         .connection_customizer(Box::new(SetTimezoneCustomizer {
             timezone: "UTC".to_string(),
         }))
