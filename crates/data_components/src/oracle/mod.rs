@@ -83,6 +83,10 @@ pub enum Error {
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
+    // NaiveDateTime
+    #[snafu(display("Failed to convert chrono::NaiveDateTime {v} to nanos timestamp"))]
+    FailedToConvertNaiveDateTimeToNanos { v: chrono::NaiveDateTime },
+
     #[snafu(display("Failed to parse decimal string as BigInterger {value}: {source}"))]
     FailedToParseBigDecimal {
         value: String,

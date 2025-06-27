@@ -17,7 +17,15 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::oracle::FailedToConvertBigDecimalToI128Snafu;
+use crate::oracle::FailedToConvertNaiveDateTimeToNanosSnafu;
 use crate::oracle::FailedToParseBigDecimalSnafu;
+use arrow::array::BinaryBuilder;
+use arrow::array::Date32Builder;
+use arrow::array::LargeBinaryBuilder;
+use arrow::array::TimestampNanosecondBuilder;
+use arrow::array::TimestampSecondBuilder;
+use arrow::datatypes::Date32Type;
+use arrow::datatypes::TimeUnit;
 use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
@@ -26,6 +34,7 @@ use arrow::{
     datatypes::{DataType, SchemaRef},
 };
 use bigdecimal::BigDecimal;
+use chrono::FixedOffset;
 use oracle::Row;
 use snafu::OptionExt;
 use snafu::ResultExt;
@@ -37,8 +46,27 @@ pub(crate) fn map_oracle_type_to_arrow_type(
     precision: Option<u8>,
     scale: Option<i8>,
 ) -> Option<arrow::datatypes::DataType> {
-    match data_type.to_uppercase().as_str() {
-        "CHAR" | "NCHAR" | "VARCHAR2" | "NVARCHAR2" => Some(DataType::Utf8),
+    let data_type = data_type.trim().to_uppercase();
+
+    // Example: TIMESTAMP(6) WITH TIME ZONE
+    if data_type.starts_with("TIMESTAMP") {
+        let precision = scale.unwrap_or(6);
+        let time_unit = match precision {
+            0 => TimeUnit::Second,
+            _ => TimeUnit::Nanosecond,
+        };
+        let tz =
+            if data_type.contains("WITH TIME ZONE") || data_type.contains("WITH LOCAL TIME ZONE") {
+                Some(Arc::<str>::from("UTC"))
+            } else {
+                None
+            };
+        return Some(DataType::Timestamp(time_unit, tz));
+    }
+
+    match data_type.as_str() {
+        // Oracle types below max size is 32767 bytes
+        "ROWID" | "CHAR" | "NCHAR" | "VARCHAR2" | "NVARCHAR2" | "LONG" => Some(DataType::Utf8),
         "CLOB" | "NCLOB" => Some(DataType::LargeUtf8),
         "NUMBER" | "DECIMAL" => {
             // In Oracle, default precision and scale are (38, 0).
@@ -46,10 +74,26 @@ pub(crate) fn map_oracle_type_to_arrow_type(
             let scale = scale.unwrap_or(0);
             Some(DataType::Decimal128(precision, scale))
         }
+        "DATE" => Some(DataType::Date32),
         "BINARY_FLOAT" => Some(DataType::Float32),
-        "FLOAT" | "BINARY_DOUBLE" => Some(DataType::Float64),
+        // A subtype of the NUMBER data type having precision p. A FLOAT value is represented internally as NUMBER.
+        // The precision p can range from 1 to 126 binary digits.
+        "FLOAT" => {
+            // If <=24: Float32, >24: Float64
+            match precision {
+                Some(p) if p <= 24 => Some(DataType::Float32),
+                _ => Some(DataType::Float64),
+            }
+        }
+        "BINARY_DOUBLE" => Some(DataType::Float64),
         "BOOLEAN" => Some(DataType::Boolean),
+        // Up to 2 GB
+        "RAW" | "LONG RAW" => Some(DataType::Binary),
 
+        // Up to 4 GB
+        "BLOB" => Some(DataType::LargeBinary),
+
+        // INTERVAL YEAR and INTERVAL DAY are not currently supported
         _ => None,
     }
 }
@@ -184,6 +228,111 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
+                DataType::Date32 => {
+                    handle_primitive_type!(
+                        builder,
+                        native_type,
+                        col,
+                        Date32Builder,
+                        chrono::NaiveDate,
+                        row,
+                        idx,
+                        |v: chrono::NaiveDate| {
+                            Ok::<_, super::Error>(Date32Type::from_naive_date(v))
+                        }
+                    );
+                }
+                DataType::Timestamp(TimeUnit::Second, None) => {
+                    handle_primitive_type!(
+                        builder,
+                        field,
+                        col,
+                        TimestampSecondBuilder,
+                        chrono::NaiveDateTime,
+                        row,
+                        idx,
+                        |v: chrono::NaiveDateTime| {
+                            // Assumes input is in session/local time and should be interpreted as UTC
+                            let t = v.and_utc().timestamp();
+                            Ok::<_, super::Error>(t)
+                        }
+                    );
+                }
+                DataType::Timestamp(TimeUnit::Second, Some(_)) => {
+                    handle_primitive_type!(
+                        builder,
+                        field,
+                        col,
+                        TimestampSecondBuilder,
+                        chrono::DateTime<FixedOffset>,
+                        row,
+                        idx,
+                        |v: chrono::DateTime<FixedOffset>| {
+                            // Normalize to UTC before converting to epoch seconds
+                            let utc_value = v.with_timezone(&chrono::Utc);
+                            Ok::<_, super::Error>(utc_value.timestamp())
+                        }
+                    );
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                    handle_primitive_type!(
+                        builder,
+                        field,
+                        col,
+                        TimestampNanosecondBuilder,
+                        chrono::NaiveDateTime,
+                        row,
+                        idx,
+                        |v: chrono::NaiveDateTime| {
+                            // Assumes input is in session/local time and should be interpreted as UTC
+                            v.and_utc()
+                                .timestamp_nanos_opt()
+                                .context(FailedToConvertNaiveDateTimeToNanosSnafu { v })
+                        }
+                    );
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
+                    handle_primitive_type!(
+                        builder,
+                        field,
+                        col,
+                        TimestampNanosecondBuilder,
+                        chrono::DateTime<FixedOffset>,
+                        row,
+                        idx,
+                        |v: chrono::DateTime<FixedOffset>| {
+                            // Normalize to UTC before converting to nanos timestamp
+                            let utc_value = v.with_timezone(&chrono::Utc);
+                            Ok::<_, super::Error>(
+                                utc_value.timestamp_nanos_opt().unwrap_or_default(),
+                            )
+                        }
+                    );
+                }
+                DataType::Binary => {
+                    handle_primitive_type!(
+                        builder,
+                        native_type,
+                        col,
+                        BinaryBuilder,
+                        Vec<u8>,
+                        row,
+                        idx,
+                        Result::Ok
+                    );
+                }
+                DataType::LargeBinary => {
+                    handle_primitive_type!(
+                        builder,
+                        native_type,
+                        col,
+                        LargeBinaryBuilder,
+                        Vec<u8>,
+                        row,
+                        idx,
+                        Result::Ok
+                    );
+                }
                 _ => {
                     return super::UnsupportedTypeSnafu {
                         data_type: format!("{native_type:?}"),
@@ -209,4 +358,86 @@ fn big_decimal_to_i128(decimal: &bigdecimal::BigDecimal, scale: i8) -> Option<i1
 
     bigdecimal::BigDecimal::from_f32(10f32.powi(i32::from(scale)))
         .and_then(|scale| (decimal * scale).to_i128())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    #[test]
+    fn test_common_oracle_types_mappings() {
+        // Test a typical Oracle table schema
+        let columns_and_expected = vec![
+            (
+                ("ID", "NUMBER", Some(10), Some(0)),
+                DataType::Decimal128(10, 0),
+            ),
+            (("NAME", "VARCHAR2", None, None), DataType::Utf8),
+            (
+                ("SALARY", "NUMBER", Some(10), Some(2)),
+                DataType::Decimal128(10, 2),
+            ),
+            (("HIRE_DATE", "DATE", None, None), DataType::Date32),
+            (
+                ("CREATED_AT", "TIMESTAMP", None, Some(6)),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                ("PROFILE_PICTURE", "BLOB", None, None),
+                DataType::LargeBinary,
+            ),
+            // Decimal edge cases
+            (
+                ("BIG_DECIMAL", "NUMBER", Some(38), Some(10)),
+                DataType::Decimal128(38, 10),
+            ),
+            (
+                ("DEFAULT_DECIMAL", "NUMBER", None, None),
+                DataType::Decimal128(38, 0),
+            ),
+            // Float
+            (("FLOAT32", "FLOAT", Some(10), None), DataType::Float32),
+            (("FLOAT64", "FLOAT", Some(30), None), DataType::Float64),
+            (
+                ("BINARY_FLOAT", "BINARY_FLOAT", None, None),
+                DataType::Float32,
+            ),
+            (
+                ("BINARY_DOUBLE", "BINARY_DOUBLE", None, None),
+                DataType::Float64,
+            ),
+            // Timestamp with and without time zone
+            (
+                ("TS_NANO", "TIMESTAMP(9)", None, Some(9)),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                ("TS_SEC", "TIMESTAMP(0)", None, Some(0)),
+                DataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                ("TS_TZ", "TIMESTAMP(6) WITH TIME ZONE", None, Some(6)),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("UTC"))),
+            ),
+            (
+                (
+                    "TS_LOCAL_TZ",
+                    "TIMESTAMP(3) WITH LOCAL TIME ZONE",
+                    None,
+                    Some(3),
+                ),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::<str>::from("UTC"))),
+            ),
+        ];
+
+        for ((name, oracle_type, precision, scale), expected) in columns_and_expected {
+            let result = map_oracle_type_to_arrow_type(oracle_type, precision, scale);
+            assert_eq!(
+                result,
+                Some(expected.clone()),
+                "Failed mapping for column {name}: {oracle_type} -> {expected:?}",
+            );
+        }
+    }
 }
