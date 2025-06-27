@@ -126,13 +126,17 @@ impl FileFormat for DuckDBFormat {
 
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
             })
             .map_err(|e| DataFusionError::Execution(format!("Failed to map query results: {e}")))?;
 
         let mut fields = Vec::new();
         for row_result in rows {
-            let (name, duckdb_type) = row_result
+            let (name, duckdb_type, not_null) = row_result
                 .map_err(|e| DataFusionError::Execution(format!("Failed to get row: {e}")))?;
             let data_type = match duckdb_type.as_str() {
                 "BOOLEAN" => DataType::Boolean,
@@ -157,7 +161,7 @@ impl FileFormat for DuckDBFormat {
                     )));
                 }
             };
-            fields.push(Field::new(name, data_type, true));
+            fields.push(Field::new(name, data_type, !not_null));
         }
 
         Ok(Arc::new(Schema::new(fields)))
@@ -222,7 +226,7 @@ mod tests {
         let conn = duckdb::Connection::open(&file_path).expect("Failed to open DuckDB connection");
         conn.execute_batch(
             "CREATE TABLE mytable (
-                id INTEGER,
+                id INTEGER NOT NULL,
                 name VARCHAR,
                 is_active BOOLEAN,
                 value DOUBLE
@@ -247,7 +251,7 @@ mod tests {
             .expect("Failed to infer schema");
 
         let expected_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("is_active", DataType::Boolean, true),
             Field::new("value", DataType::Float64, true),
