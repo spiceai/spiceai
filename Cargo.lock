@@ -5913,7 +5913,7 @@ dependencies = [
  "rand 0.7.3",
  "serde",
  "serde_json",
- "serde_qs",
+ "serde_qs 0.8.5",
  "serde_urlencoded",
  "url",
 ]
@@ -11120,6 +11120,7 @@ dependencies = [
  "reqwest 0.12.15",
  "rmcp",
  "runtime-auth",
+ "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",
  "rustls-pemfile 2.2.0",
@@ -11181,6 +11182,19 @@ dependencies = [
  "tonic",
  "tower 0.5.2",
  "tracing",
+]
+
+[[package]]
+name = "runtime-table-partition"
+version = "1.5.0-unstable"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "serde",
+ "serde_qs 1.0.0-rc.3",
+ "snafu",
+ "tokio",
 ]
 
 [[package]]
@@ -11906,6 +11920,18 @@ dependencies = [
  "percent-encoding",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "serde_qs"
+version = "1.0.0-rc.3"
+source = "git+https://github.com/samscott89/serde_qs.git?rev=f24f916a6420cf500c97fb85dc5e64015fdb6b40#f24f916a6420cf500c97fb85dc5e64015fdb6b40"
+dependencies = [
+ "itoa",
+ "percent-encoding",
+ "ryu",
+ "serde",
+ "thiserror 2.0.12",
 ]
 
 [[package]]
