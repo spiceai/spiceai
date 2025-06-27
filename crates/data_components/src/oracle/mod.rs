@@ -56,6 +56,9 @@ pub enum Error {
     #[snafu(display("Failed to retrieve schema: table '{table}' does not exist"))]
     SchemaRetrievalTableNotFound { table: String },
 
+    #[snafu(display("Failed to retrieve schema for '{table}': catalogs are not supported"))]
+    SchemaRetrievalCatalogsUnsupported { table: String },
+
     #[snafu(display("Unsupported data type: {data_type}"))]
     UnsupportedType { data_type: String },
 
@@ -111,6 +114,12 @@ impl OracleTableProvider {
         conn: Arc<OracleConnectionPool>,
         table: &TableReference,
     ) -> Result<SchemaRef> {
+        if table.catalog().is_some() {
+            return Err(Error::SchemaRetrievalCatalogsUnsupported {
+                table: table.to_string(),
+            });
+        }
+
         let table_name = table.table();
 
         let (columns_meta_query, params) = match table.schema() {

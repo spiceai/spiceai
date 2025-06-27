@@ -102,6 +102,7 @@ mysql = ["datafusion-table-providers/mysql"]
 odbc = []
 oracle = [
     "dep:oracle",
+    "dep:bb8",
     "dep:bb8-oracle",
     "dep:bigdecimal",
 ]

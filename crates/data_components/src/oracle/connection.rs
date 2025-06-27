@@ -36,7 +36,7 @@ impl OracleConnectionPool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OracleConnectionParams {
     pub host: String,
     pub port: u16,
