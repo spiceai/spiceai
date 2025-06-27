@@ -19,14 +19,14 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
+    catalog::{Session, memory::DataSourceExec},
     common::{GetExt, Statistics},
     datasource::{
         file_format::{
             FileFormat, FileFormatFactory, FilePushdownSupport,
             file_compression_type::FileCompressionType,
         },
-        physical_plan::{FileScanConfig, FileSinkConfig, FileSource},
+        physical_plan::{FileScanConfig, FileScanConfigBuilder, FileSinkConfig, FileSource},
     },
     error::DataFusionError,
     physical_expr::LexRequirement,
@@ -180,10 +180,16 @@ impl FileFormat for DuckDBFormat {
     async fn create_physical_plan(
         &self,
         _state: &dyn Session,
-        _conf: FileScanConfig,
+        conf: FileScanConfig,
         _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        todo!()
+        let conf_builder = FileScanConfigBuilder::from(conf);
+
+        let file_source = Arc::new(DuckDBSource::default());
+
+        let data_source = conf_builder.with_source(file_source).build();
+
+        Ok(DataSourceExec::from_data_source(data_source))
     }
 
     async fn create_writer_physical_plan(
