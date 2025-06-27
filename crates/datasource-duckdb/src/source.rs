@@ -13,3 +13,59 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+use std::{any::Any, sync::Arc};
+
+use arrow::datatypes::SchemaRef;
+use datafusion::{
+    common::Statistics,
+    datasource::physical_plan::{FileOpener, FileScanConfig, FileSource},
+    error::DataFusionError,
+    physical_plan::metrics::ExecutionPlanMetricsSet,
+};
+use object_store::ObjectStore;
+
+pub struct DuckDBSource {}
+
+impl FileSource for DuckDBSource {
+    fn create_file_opener(
+        &self,
+        _object_store: Arc<dyn ObjectStore>,
+        _base_config: &FileScanConfig,
+        _partition: usize,
+    ) -> Arc<dyn FileOpener> {
+        todo!()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        todo!()
+    }
+
+    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
+        todo!()
+    }
+
+    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
+        todo!()
+    }
+
+    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
+        todo!()
+    }
+
+    fn with_statistics(&self, _statistics: Statistics) -> Arc<dyn FileSource> {
+        todo!()
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        todo!()
+    }
+
+    fn statistics(&self) -> Result<Statistics, DataFusionError> {
+        todo!()
+    }
+
+    fn file_type(&self) -> &str {
+        todo!()
+    }
+}
