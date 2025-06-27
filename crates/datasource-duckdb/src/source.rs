@@ -19,10 +19,11 @@ use std::{any::Any, sync::Arc};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
     common::Statistics,
-    datasource::physical_plan::{FileOpener, FileScanConfig, FileSource},
+    datasource::physical_plan::{FileMeta, FileOpenFuture, FileOpener, FileScanConfig, FileSource},
     error::DataFusionError,
     physical_plan::metrics::ExecutionPlanMetricsSet,
 };
+use duckdb::Connection;
 use object_store::ObjectStore;
 
 #[derive(Debug, Default)]
@@ -67,6 +68,14 @@ impl FileSource for DuckDBSource {
     }
 
     fn file_type(&self) -> &str {
+        todo!()
+    }
+}
+
+pub struct DuckDBOpener;
+
+impl FileOpener for DuckDBOpener {
+    fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
         todo!()
     }
 }
