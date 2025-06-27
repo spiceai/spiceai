@@ -14,21 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use std::fmt::Debug;
-
-use datafusion::arrow::array::RecordBatch;
-
-pub mod analyzer;
-mod provider;
-pub use provider::*;
-
-#[async_trait]
-pub trait Index: Debug + Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-
-    /// Columns that are required for the index to be computed.
-    fn required_columns(&self) -> Vec<String>;
-
-    async fn compute_index(&self, _batches: Vec<RecordBatch>) {}
-}
+mod index_table_scan;
+pub use index_table_scan::*;

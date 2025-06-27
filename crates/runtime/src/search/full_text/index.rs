@@ -26,6 +26,7 @@ use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::{ResultExt, Snafu};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
@@ -43,7 +44,19 @@ pub struct FullTextDatabaseIndex {
 }
 
 #[async_trait]
-impl Index for FullTextDatabaseIndex {}
+impl Index for FullTextDatabaseIndex {
+    fn name(&self) -> &'static str {
+        "full_text"
+    }
+
+    fn required_columns(&self) -> Vec<String> {
+        // Return both the primary key and search fields, deduplicated.
+        let mut required_columns = HashSet::new();
+        required_columns.extend(self.primary_key.iter().cloned());
+        required_columns.extend(self.search_fields.iter().cloned());
+        required_columns.into_iter().collect()
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
