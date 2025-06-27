@@ -3898,10 +3898,13 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "chrono",
  "datafusion",
+ "duckdb",
  "futures",
  "object_store",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

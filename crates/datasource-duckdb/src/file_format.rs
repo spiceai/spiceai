@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, sync::Arc};
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -90,9 +90,77 @@ impl FileFormat for DuckDBFormat {
         &self,
         _state: &dyn Session,
         _store: &Arc<dyn ObjectStore>,
-        _objects: &[ObjectMeta],
+        objects: &[ObjectMeta],
     ) -> Result<SchemaRef, DataFusionError> {
-        todo!()
+        let Some(object) = objects.first() else {
+            return Err(DataFusionError::Execution(
+                "No DuckDB files provided for schema inference".to_string(),
+            ));
+        };
+
+        let file_path = object.location.to_string();
+        tracing::debug!("Inferring schema from DuckDB file: {:?}", object.location);
+
+        let conn = duckdb::Connection::open(&file_path).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to open DuckDB connection: {e}"))
+        })?;
+
+        let mut stmt = conn
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")
+            .map_err(|e| DataFusionError::Execution(format!("Failed to query all tables: {e}")))?;
+
+        let mut rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| DataFusionError::Execution(format!("Failed to map query results: {e}")))?;
+
+        let table_name = rows
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Execution("No tables found in DuckDB database".to_string())
+            })?
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get table name: {e}")))?;
+
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info('{table_name}')"))
+            .map_err(|e| DataFusionError::Execution(format!("Failed to query table info: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(|e| DataFusionError::Execution(format!("Failed to map query results: {e}")))?;
+
+        let mut fields = Vec::new();
+        for row_result in rows {
+            let (name, duckdb_type) = row_result
+                .map_err(|e| DataFusionError::Execution(format!("Failed to get row: {e}")))?;
+            let data_type = match duckdb_type.as_str() {
+                "BOOLEAN" => DataType::Boolean,
+                "TINYINT" => DataType::Int8,
+                "SMALLINT" => DataType::Int16,
+                "INTEGER" => DataType::Int32,
+                "BIGINT" => DataType::Int64,
+                "UTINYINT" => DataType::UInt8,
+                "USMALLINT" => DataType::UInt16,
+                "UINTEGER" => DataType::UInt32,
+                "UBIGINT" => DataType::UInt64,
+                "FLOAT" => DataType::Float32,
+                "DOUBLE" => DataType::Float64,
+                "VARCHAR" => DataType::Utf8,
+                "BLOB" => DataType::Binary,
+                "DATE" => DataType::Date32,
+                "TIME" => DataType::Time64(TimeUnit::Microsecond),
+                "TIMESTAMP" => DataType::Timestamp(TimeUnit::Microsecond, None),
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Unsupported DuckDB type: {duckdb_type}"
+                    )));
+                }
+            };
+            fields.push(Field::new(name, data_type, true));
+        }
+
+        Ok(Arc::new(Schema::new(fields)))
     }
 
     async fn infer_stats(
@@ -135,5 +203,58 @@ impl FileFormat for DuckDBFormat {
 
     fn file_source(&self) -> Arc<dyn FileSource> {
         Arc::new(DuckDBSource::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    use datafusion::prelude::SessionContext;
+    use object_store::path::Path;
+
+    #[tokio::test]
+    async fn test_infer_schema() {
+        let file_path = PathBuf::from("infer_schema.duckdb");
+
+        let conn = duckdb::Connection::open(&file_path).expect("Failed to open DuckDB connection");
+        conn.execute_batch(
+            "CREATE TABLE mytable (
+                id INTEGER,
+                name VARCHAR,
+                is_active BOOLEAN,
+                value DOUBLE
+            );",
+        )
+        .expect("Failed to create table");
+
+        let format = DuckDBFormat::default();
+        let session_ctx = SessionContext::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let object_meta = ObjectMeta {
+            location: Path::from(file_path.display().to_string()),
+            last_modified: chrono::Utc::now(),
+            size: 0,
+            e_tag: None,
+            version: None,
+        };
+
+        let inferred_schema = format
+            .infer_schema(&session_ctx.state(), &object_store, &[object_meta])
+            .await
+            .expect("Failed to infer schema");
+
+        let expected_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("is_active", DataType::Boolean, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        assert_eq!(inferred_schema, expected_schema);
+
+        std::fs::remove_file(file_path).expect("failed to clean up");
     }
 }
