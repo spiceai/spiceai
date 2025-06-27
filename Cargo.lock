@@ -3900,6 +3900,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "datafusion-table-providers",
  "duckdb",
  "futures",
  "object_store",

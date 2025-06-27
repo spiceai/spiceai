@@ -23,11 +23,26 @@ use datafusion::{
     error::DataFusionError,
     physical_plan::metrics::ExecutionPlanMetricsSet,
 };
-use duckdb::Connection;
 use object_store::ObjectStore;
 
-#[derive(Debug, Default)]
-pub struct DuckDBSource {}
+use crate::EXTENSION;
+
+#[derive(Debug, Clone)]
+pub struct DuckDBSource {
+    schema: Option<SchemaRef>,
+    statistics: Statistics,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl Default for DuckDBSource {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            statistics: Statistics::default(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
 
 impl FileSource for DuckDBSource {
     fn create_file_opener(
@@ -36,46 +51,50 @@ impl FileSource for DuckDBSource {
         _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
-        todo!()
+        Arc::new(DuckDBOpener)
     }
 
     fn as_any(&self) -> &dyn Any {
-        todo!()
+        self
     }
 
     fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
-        todo!()
+        Arc::new(self.clone())
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        todo!()
+    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+        let mut new_source = self.clone();
+        new_source.schema = Some(schema);
+        Arc::new(new_source)
     }
 
     fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        todo!()
+        Arc::new(self.clone())
     }
 
-    fn with_statistics(&self, _statistics: Statistics) -> Arc<dyn FileSource> {
-        todo!()
+    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
+        let mut new_source = self.clone();
+        new_source.statistics = statistics;
+        Arc::new(new_source)
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
-        todo!()
+        &self.metrics
     }
 
     fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        todo!()
+        Ok(self.statistics.clone())
     }
 
     fn file_type(&self) -> &str {
-        todo!()
+        EXTENSION
     }
 }
 
 pub struct DuckDBOpener;
 
 impl FileOpener for DuckDBOpener {
-    fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
+    fn open(&self, _file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
         todo!()
     }
 }

@@ -14,5 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+static EXTENSION: &str = "duckdb";
+
 pub mod file_format;
 pub mod source;

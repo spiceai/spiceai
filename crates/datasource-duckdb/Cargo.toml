@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
+datafusion-table-providers = { workspace = true }
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",

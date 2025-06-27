@@ -35,9 +35,7 @@ use datafusion::{
 };
 use object_store::{ObjectMeta, ObjectStore};
 
-use crate::source::DuckDBSource;
-
-static EXTENSION: &str = "duckdb";
+use crate::{EXTENSION, source::DuckDBSource};
 
 #[derive(Debug)]
 pub struct DuckDBFormatFactory {}
