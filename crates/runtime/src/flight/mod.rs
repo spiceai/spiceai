@@ -330,7 +330,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             if let Some(first_error) = first_error {
                 handle_datafusion_error(first_error)
             } else {
-                unreachable!("DataFusionError::Collection should always contain at least one error")
+                Status::internal("Several DataFusion errors occurred, but no details available")
             }
         }
         DataFusionError::Internal(_)
