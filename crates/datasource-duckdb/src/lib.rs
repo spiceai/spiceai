@@ -14,7 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use duckdb::Connection;
+
 static EXTENSION: &str = "duckdb";
 
 pub mod file_format;
 pub mod source;
+
+fn get_table_name(conn: &Connection) -> Result<Option<String>, duckdb::Error> {
+    let mut stmt = conn
+        .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")?;
+
+    let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+    rows.next().transpose()
+}

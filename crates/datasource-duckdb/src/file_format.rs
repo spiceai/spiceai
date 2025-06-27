@@ -35,7 +35,7 @@ use datafusion::{
 };
 use object_store::{ObjectMeta, ObjectStore};
 
-use crate::{EXTENSION, source::DuckDbSource};
+use crate::{EXTENSION, get_table_name, source::DuckDbSource};
 
 #[derive(Debug)]
 pub struct DuckDbFormatFactory {}
@@ -103,20 +103,13 @@ impl FileFormat for DuckDbFormat {
             DataFusionError::Execution(format!("Failed to open DuckDB connection: {e}"))
         })?;
 
-        let mut stmt = conn
-            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'")
-            .map_err(|e| DataFusionError::Execution(format!("Failed to query all tables: {e}")))?;
-
-        let mut rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to map query results: {e}")))?;
-
-        let table_name = rows
-            .next()
-            .ok_or_else(|| {
-                DataFusionError::Execution("No tables found in DuckDB database".to_string())
-            })?
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get table name: {e}")))?;
+        let Some(table_name) = get_table_name(&conn)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get a table name: {e}")))?
+        else {
+            return Err(DataFusionError::Execution(
+                "No table names were found".to_string(),
+            ));
+        };
 
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info('{table_name}')"))

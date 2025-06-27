@@ -27,7 +27,7 @@ use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::EXTENSION;
+use crate::{EXTENSION, get_table_name};
 
 #[derive(Debug, Clone)]
 pub struct DuckDbSource {
@@ -98,15 +98,24 @@ pub struct DuckDbOpener;
 impl FileOpener for DuckDbOpener {
     fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
         let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let path = file_meta.location().to_string();
+        let conn = duckdb::Connection::open(&path).unwrap();
+
+        let Some(table_name) = get_table_name(&conn)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get a table name: {e}")))?
+        else {
+            return Err(DataFusionError::Execution(
+                "No table names were found".to_string(),
+            ));
+        };
 
         // DuckDB connection is not thread safe and so cannot be in async code.
         // We handle the reading in a single thread and send into a channel to
         // be converted into a `Stream`
         std::thread::spawn(move || {
-            let table = String::new(); // TODO
-            let path = file_meta.location().to_string();
-            let conn = duckdb::Connection::open(&path).unwrap();
-            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table_name}"))
+                .unwrap();
             let mut arrow_stream = stmt.query_arrow([]).unwrap();
             while let Some(record) = arrow_stream.next() {
                 tx.blocking_send(Ok(record)).unwrap();
