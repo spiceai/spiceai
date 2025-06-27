@@ -3892,6 +3892,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datasource-duckdb"
+version = "1.5.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "futures",
+ "object_store",
+ "tokio",
+]
+
+[[package]]
 name = "db_connection_pool"
 version = "1.5.0-unstable"
 dependencies = [
