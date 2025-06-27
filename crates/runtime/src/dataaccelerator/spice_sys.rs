@@ -124,5 +124,6 @@ async fn acceleration_connection(
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => Err("Spice wasn't built with PostgreSQL support enabled".into()),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
+        Engine::Void => Err("Void acceleration not supported for metadata".into()),
     }
 }

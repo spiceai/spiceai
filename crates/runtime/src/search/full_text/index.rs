@@ -26,7 +26,6 @@ use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::{ResultExt, Snafu};
-use std::any::Any;
 use std::sync::Arc;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
@@ -102,11 +101,6 @@ impl FullTextDatabaseIndex {
             index,
             primary_key: pks,
         })
-    }
-
-    #[must_use]
-    pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 
     #[must_use]

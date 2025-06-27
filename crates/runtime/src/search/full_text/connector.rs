@@ -15,7 +15,7 @@ limitations under the License.
 */
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -79,8 +79,8 @@ impl FullTextConnector {
             source: Box::new(e),
         })?;
 
-        let tbl =
-            IndexedTableProvider::new(inner_table_provider).add_index(Arc::new(index).as_arc_any());
+        let tbl = IndexedTableProvider::new(inner_table_provider)
+            .add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>);
 
         Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
     }
