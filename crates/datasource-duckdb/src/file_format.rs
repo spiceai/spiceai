@@ -35,6 +35,10 @@ use datafusion::{
 };
 use object_store::{ObjectMeta, ObjectStore};
 
+use crate::source::DuckDBSource;
+
+static EXTENSION: &str = "duckdb";
+
 #[derive(Debug)]
 pub struct DuckDBFormatFactory {}
 
@@ -58,7 +62,7 @@ impl FileFormatFactory for DuckDBFormatFactory {
 
 impl GetExt for DuckDBFormatFactory {
     fn get_ext(&self) -> String {
-        "duckdb".to_string()
+        EXTENSION.to_string()
     }
 }
 
@@ -68,42 +72,48 @@ pub struct DuckDBFormat {}
 #[async_trait]
 impl FileFormat for DuckDBFormat {
     fn as_any(&self) -> &dyn Any {
-        todo!()
+        self
     }
+
     fn get_ext(&self) -> String {
-        todo!()
+        EXTENSION.to_string()
     }
+
     fn get_ext_with_compression(
         &self,
         _file_compression_type: &FileCompressionType,
     ) -> Result<String, DataFusionError> {
-        todo!()
+        Ok(self.get_ext())
     }
+
     async fn infer_schema(
         &self,
-        state: &dyn Session,
-        store: &Arc<dyn ObjectStore>,
-        objects: &[ObjectMeta],
+        _state: &dyn Session,
+        _store: &Arc<dyn ObjectStore>,
+        _objects: &[ObjectMeta],
     ) -> Result<SchemaRef, DataFusionError> {
         todo!()
     }
+
     async fn infer_stats(
         &self,
-        state: &dyn Session,
-        store: &Arc<dyn ObjectStore>,
+        _state: &dyn Session,
+        _store: &Arc<dyn ObjectStore>,
         table_schema: SchemaRef,
-        object: &ObjectMeta,
+        _object: &ObjectMeta,
     ) -> Result<Statistics, DataFusionError> {
-        todo!()
+        Ok(Statistics::new_unknown(&table_schema))
     }
+
     async fn create_physical_plan(
         &self,
-        state: &dyn Session,
-        conf: FileScanConfig,
-        filters: Option<&Arc<dyn PhysicalExpr>>,
+        _state: &dyn Session,
+        _conf: FileScanConfig,
+        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         todo!()
     }
+
     async fn create_writer_physical_plan(
         &self,
         _input: Arc<dyn ExecutionPlan>,
@@ -120,10 +130,10 @@ impl FileFormat for DuckDBFormat {
         _table_schema: &Schema,
         _filters: &[&Expr],
     ) -> Result<FilePushdownSupport, DataFusionError> {
-        Ok(FilePushdownSupport::NoSupport)
+        Ok(FilePushdownSupport::Supported)
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        todo!()
+        Arc::new(DuckDBSource::default())
     }
 }

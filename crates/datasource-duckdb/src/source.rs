@@ -25,6 +25,7 @@ use datafusion::{
 };
 use object_store::ObjectStore;
 
+#[derive(Debug, Default)]
 pub struct DuckDBSource {}
 
 impl FileSource for DuckDBSource {
