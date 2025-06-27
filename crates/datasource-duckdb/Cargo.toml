@@ -24,4 +24,5 @@ duckdb = { workspace = true, features = [
 futures = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tracing = { workspace = true }

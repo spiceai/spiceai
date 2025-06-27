@@ -16,25 +16,27 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use datafusion::{
     common::Statistics,
     datasource::physical_plan::{FileMeta, FileOpenFuture, FileOpener, FileScanConfig, FileSource},
     error::DataFusionError,
     physical_plan::metrics::ExecutionPlanMetricsSet,
 };
+use futures::stream::BoxStream;
 use object_store::ObjectStore;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::EXTENSION;
 
 #[derive(Debug, Clone)]
-pub struct DuckDBSource {
+pub struct DuckDbSource {
     schema: Option<SchemaRef>,
     statistics: Statistics,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl Default for DuckDBSource {
+impl Default for DuckDbSource {
     fn default() -> Self {
         Self {
             schema: None,
@@ -44,14 +46,14 @@ impl Default for DuckDBSource {
     }
 }
 
-impl FileSource for DuckDBSource {
+impl FileSource for DuckDbSource {
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
         _base_config: &FileScanConfig,
         _partition: usize,
     ) -> Arc<dyn FileOpener> {
-        Arc::new(DuckDBOpener)
+        Arc::new(DuckDbOpener)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -91,10 +93,28 @@ impl FileSource for DuckDBSource {
     }
 }
 
-pub struct DuckDBOpener;
+pub struct DuckDbOpener;
 
-impl FileOpener for DuckDBOpener {
-    fn open(&self, _file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
-        todo!()
+impl FileOpener for DuckDbOpener {
+    fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture, DataFusionError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        // DuckDB connection is not thread safe and so cannot be in async code.
+        // We handle the reading in a single thread and send into a channel to
+        // be converted into a `Stream`
+        std::thread::spawn(move || {
+            let table = String::new(); // TODO
+            let path = file_meta.location().to_string();
+            let conn = duckdb::Connection::open(&path).unwrap();
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let mut arrow_stream = stmt.query_arrow([]).unwrap();
+            while let Some(record) = arrow_stream.next() {
+                tx.blocking_send(Ok(record)).unwrap();
+            }
+        });
+
+        let record_stream: BoxStream<'static, Result<RecordBatch, ArrowError>> =
+            Box::pin(ReceiverStream::new(rx));
+        Ok(Box::pin(async move { Ok(record_stream) }))
     }
 }

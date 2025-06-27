@@ -35,12 +35,12 @@ use datafusion::{
 };
 use object_store::{ObjectMeta, ObjectStore};
 
-use crate::{EXTENSION, source::DuckDBSource};
+use crate::{EXTENSION, source::DuckDbSource};
 
 #[derive(Debug)]
-pub struct DuckDBFormatFactory {}
+pub struct DuckDbFormatFactory {}
 
-impl FileFormatFactory for DuckDBFormatFactory {
+impl FileFormatFactory for DuckDbFormatFactory {
     fn create(
         &self,
         _state: &dyn Session,
@@ -50,7 +50,7 @@ impl FileFormatFactory for DuckDBFormatFactory {
     }
 
     fn default(&self) -> Arc<dyn FileFormat> {
-        Arc::new(DuckDBFormat::default())
+        Arc::new(DuckDbFormat::default())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -58,17 +58,17 @@ impl FileFormatFactory for DuckDBFormatFactory {
     }
 }
 
-impl GetExt for DuckDBFormatFactory {
+impl GetExt for DuckDbFormatFactory {
     fn get_ext(&self) -> String {
         EXTENSION.to_string()
     }
 }
 
 #[derive(Debug, Default)]
-pub struct DuckDBFormat {}
+pub struct DuckDbFormat {}
 
 #[async_trait]
-impl FileFormat for DuckDBFormat {
+impl FileFormat for DuckDbFormat {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -183,7 +183,7 @@ impl FileFormat for DuckDBFormat {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let conf_builder = FileScanConfigBuilder::from(conf);
 
-        let file_source = Arc::new(DuckDBSource::default());
+        let file_source = Arc::new(DuckDbSource::default());
 
         let data_source = conf_builder.with_source(file_source).build();
 
@@ -210,7 +210,7 @@ impl FileFormat for DuckDBFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(DuckDBSource::default())
+        Arc::new(DuckDbSource::default())
     }
 }
 
@@ -238,7 +238,7 @@ mod tests {
         )
         .expect("Failed to create table");
 
-        let format = DuckDBFormat::default();
+        let format = DuckDbFormat::default();
         let session_ctx = SessionContext::new();
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let object_meta = ObjectMeta {
