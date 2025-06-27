@@ -41,18 +41,18 @@ pub struct DuckDBFormatFactory {}
 impl FileFormatFactory for DuckDBFormatFactory {
     fn create(
         &self,
-        state: &dyn Session,
-        format_options: &HashMap<String, String>,
+        _state: &dyn Session,
+        _format_options: &HashMap<String, String>,
     ) -> Result<Arc<dyn FileFormat>, DataFusionError> {
-        todo!()
+        Ok(self.default())
     }
 
     fn default(&self) -> Arc<dyn FileFormat> {
-        todo!()
+        Arc::new(DuckDBFormat::default())
     }
 
     fn as_any(&self) -> &dyn Any {
-        todo!()
+        self
     }
 }
 
@@ -62,7 +62,7 @@ impl GetExt for DuckDBFormatFactory {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DuckDBFormat {}
 
 #[async_trait]
