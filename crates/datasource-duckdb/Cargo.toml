@@ -1,0 +1,18 @@
+[package]
+name = "datasource-duckdb"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
