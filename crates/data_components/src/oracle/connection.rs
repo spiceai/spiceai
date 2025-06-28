@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use bb8::CustomizeConnection;
 use bb8_oracle::OracleConnectionManager;
-use oracle::Connector;
+use oracle::{Connection, Connector};
 use snafu::ResultExt;
+use std::sync::Arc;
 
 use crate::oracle::ConnectionSnafu;
 
@@ -33,6 +35,25 @@ impl OracleConnectionPool {
             .await
             .map_err(|err| super::Error::ConnectionPoolError { source: err.into() })?;
         Ok(conn)
+    }
+}
+
+#[derive(Debug)]
+pub struct SetTimezoneCustomizer {
+    pub timezone: String,
+}
+
+#[async_trait::async_trait]
+impl CustomizeConnection<Arc<Connection>, bb8_oracle::Error> for SetTimezoneCustomizer {
+    fn on_acquire<'a>(
+        &'a self,
+        conn: &'a mut Arc<Connection>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), bb8_oracle::Error>> + Send + 'a>> {
+        let sql = format!("ALTER SESSION SET TIME_ZONE = '{}'", self.timezone);
+        Box::pin(async move {
+            let _ = conn.execute(&sql, &[]);
+            Ok(())
+        })
     }
 }
 
@@ -104,6 +125,10 @@ pub async fn connect(params: &OracleConnectionParams) -> super::Result<OracleCon
     let manager = OracleConnectionManager::from_connector(connector);
 
     let pool = bb8::Pool::builder()
+        // Spice uses UTC timezone for timestamp data. Set preferred timezone for automated datatype conversion to correctly handle TIMESTAMP WITH LOCAL TIME ZONE data types
+        .connection_customizer(Box::new(SetTimezoneCustomizer {
+            timezone: "UTC".to_string(),
+        }))
         .build(manager)
         .await
         .map_err(|err| super::Error::ConnectionPoolError { source: err.into() })?;
