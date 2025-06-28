@@ -1176,11 +1176,12 @@ jobs:
         working-directory: test_app
         run: |
           echo "runtime:" >> spicepod.yaml
-          echo "  results_cache:" >> spicepod.yaml
-          echo "    enabled: true" >> spicepod.yaml
-          echo "    eviction_policy: lru" >> spicepod.yaml
-          echo "    cache_max_size: 128MiB" >> spicepod.yaml
-          echo "    item_ttl: 300s" >> spicepod.yaml
+          echo "  caching:" >> spicepod.yaml
+          echo "    sql_results:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      cache_max_size: 128MiB" >> spicepod.yaml
+          echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
           echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
           echo "    name: customer" >> spicepod.yaml
