@@ -226,8 +226,8 @@ impl TableProvider for OracleTableProvider {
                         // Currently, the expression unparser cannot handle timestamps, resulting in
                         // an `ORA-01843: not a valid month` error.
                         // https://github.com/spiceai/spiceai/issues/6325
-                        if is_time_related_expr(&binary_expr.left)
-                            || is_time_related_expr(&binary_expr.right)
+                        if is_datetime_related_expr(&binary_expr.left)
+                            || is_datetime_related_expr(&binary_expr.right)
                         {
                             results.push(TableProviderFilterPushDown::Unsupported);
                         } else {
@@ -260,24 +260,36 @@ impl TableProvider for OracleTableProvider {
     }
 }
 
-fn is_time_related_expr(expr: &Expr) -> bool {
+fn is_datetime_related_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Cast(cast) => {
             matches!(
                 cast.data_type,
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
             )
         }
         Expr::Literal(literal) => {
             matches!(
                 literal.data_type(),
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(dara_type, _) => {
+        Expr::ScalarVariable(data_type, _) => {
             matches!(
-                dara_type,
-                DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
+                data_type,
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
             )
         }
         _ => false,
