@@ -30,7 +30,7 @@ use datafusion::{
     execution::{TaskContext, context::ExecutionProps},
     logical_expr::{ColumnarValue, dml::InsertOp},
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, execute_stream, union::UnionExec},
+    physical_plan::{ExecutionPlan, common::collect, execute_stream, union::UnionExec},
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -49,8 +49,10 @@ pub enum Error {
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
     ValidatingExpressions { source: super::expression::Error },
-    #[snafu(display("{source}"))]
-    DataFusion { source: DataFusionError },
+    #[snafu(display("Failed to convert schema to DFSchema: {source}"))]
+    SchemaConversion { source: DataFusionError },
+    #[snafu(display("Expected array from partition expression, got scalar"))]
+    InvalidPartitionExpression,
 }
 
 type ScalarValueString = String;
@@ -64,11 +66,6 @@ pub struct PartitionTableProvider {
 }
 
 impl PartitionTableProvider {
-    /// Create a new [`PartitionTableProvider`] and attempt to infer existing
-    /// `partitions` using the specified `creator`.
-    ///
-    /// # Errors
-    /// Returns an error if partition inferencing fails.
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
         partition_by: Vec<Expr>,
@@ -79,7 +76,7 @@ impl PartitionTableProvider {
             .first()
             .context(PartitionByViolationSnafu { num_partition_by })?;
 
-        let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(DataFusionSnafu)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
             .infer_existing_partitions()
@@ -140,24 +137,22 @@ impl TableProvider for PartitionTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let expr = self.partition_by.first().unwrap();
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).unwrap();
+        let expr = self.partition_by.first().ok_or_else(|| {
+            DataFusionError::Execution("Failed to get first partition expression".to_string())
+        })?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
 
-        // Execute the input plan to get a RecordBatch stream
         let task_ctx = Arc::new(TaskContext::from(state));
-        let stream = execute_stream(Arc::clone(&input), task_ctx).unwrap();
-        let batches = datafusion::physical_plan::common::collect(stream)
-            .await
-            .unwrap();
+        let stream = execute_stream(Arc::clone(&input), task_ctx)?;
+        let batches = collect(stream).await?;
 
-        let partition_groups = group_by_partition(expr, &batches, &df_schema);
+        let partition_groups = group_by_partition(expr, &batches, &df_schema)?;
 
         let mut execution_plans = Vec::new();
         for (scalar_value, batch) in partition_groups {
             let partition_key = scalar_value.to_string();
             tracing::info!("Inserting into partition with key: {partition_key}");
 
-            // Check if partition exists, otherwise create a new one
             let table_provider = {
                 let partitions = self.partitions.read().await;
                 if let Some(existing_provider) = partitions.get(&partition_key) {
@@ -170,33 +165,34 @@ impl TableProvider for PartitionTableProvider {
                         .creator
                         .create_partition(scalar_value.clone())
                         .await
-                        .unwrap();
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                     let mut partitions = self.partitions.write().await;
                     partitions.insert(partition_key.clone(), Arc::clone(&new_provider));
                     new_provider
                 }
             };
 
-            let mem_exec = DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)
-                    .unwrap(),
-            ));
+            let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                &[vec![batch]],
+                Arc::clone(&self.schema),
+                None,
+            )?));
 
-            // Delegate insert to the partition's table provider
             let plan = table_provider
                 .insert_into(state, Arc::new(mem_exec), insert_op)
-                .await
-                .unwrap();
+                .await?;
             execution_plans.push(plan);
         }
 
-        // Combine execution plans
         if execution_plans.is_empty() {
-            let mem_exec = DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(&[vec![]], Arc::clone(&self.schema), None).unwrap(),
-            ));
+            let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                &[vec![]],
+                Arc::clone(&self.schema),
+                None,
+            )?));
             Ok(Arc::new(mem_exec))
         } else if execution_plans.len() == 1 {
+            #[allow(clippy::unwrap_used)]
             Ok(execution_plans.into_iter().next().unwrap())
         } else {
             Ok(Arc::new(UnionExec::new(execution_plans)))
@@ -204,14 +200,13 @@ impl TableProvider for PartitionTableProvider {
     }
 }
 
-/// Group rows by partition key, returning a map of ScalarValue to RecordBatch.
 fn group_by_partition(
     expr: &Expr,
     batches: &[RecordBatch],
     df_schema: &DFSchema,
-) -> HashMap<ScalarValue, RecordBatch> {
+) -> Result<HashMap<ScalarValue, RecordBatch>, DataFusionError> {
     let props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(expr, df_schema, &props).unwrap();
+    let physical_expr = create_physical_expr(expr, df_schema, &props)?;
     let mut partition_map: HashMap<ScalarValue, Vec<RecordBatch>> = HashMap::new();
 
     for batch in batches {
@@ -219,31 +214,29 @@ fn group_by_partition(
             continue;
         }
 
-        let column = physical_expr.evaluate(batch).unwrap();
+        let column = physical_expr.evaluate(batch)?;
         let array = match column {
             ColumnarValue::Array(array) => array,
-            ColumnarValue::Scalar(_) => panic!("Expected array from partition expression"),
+            ColumnarValue::Scalar(_) => return Err(Error::InvalidPartitionExpression).boxed()?,
         };
 
-        // Group rows by scalar value
         for i in 0..array.len() {
-            let scalar = ScalarValue::try_from_array(&array, i).unwrap();
+            let scalar = ScalarValue::try_from_array(&array, i)?;
             let partition_batches = partition_map.entry(scalar).or_insert_with(Vec::new);
             let new_batch = batch.slice(i, 1);
             partition_batches.push(new_batch);
         }
     }
 
-    // Concatenate batches for each partition
     let mut result = HashMap::new();
     for (scalar, batches) in partition_map {
         let Some(batch) = batches.first() else {
             continue;
         };
         let schema = batch.schema();
-        let concat_batch = concat_batches(&schema, &batches).unwrap();
+        let concat_batch = concat_batches(&schema, &batches)?;
         result.insert(scalar, concat_batch);
     }
 
-    result
+    Ok(result)
 }
