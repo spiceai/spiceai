@@ -74,6 +74,7 @@ pub struct TextSearchTableFunc {
 }
 
 impl TextSearchTableFunc {
+    #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
     }
