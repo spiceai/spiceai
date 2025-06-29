@@ -30,7 +30,7 @@ use datafusion::{
     execution::{TaskContext, context::ExecutionProps},
     logical_expr::{ColumnarValue, dml::InsertOp},
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, execute_stream},
+    physical_plan::{ExecutionPlan, execute_stream, union::UnionExec},
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -129,7 +129,9 @@ impl TableProvider for PartitionTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        todo!()
+        Err(DataFusionError::Execution(
+            "PartitionedTableProvider::scan not implemented yet".to_string(),
+        ))
     }
 
     async fn insert_into(
@@ -138,7 +140,6 @@ impl TableProvider for PartitionTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // Get the partition expression
         let expr = self.partition_by.first().unwrap();
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).unwrap();
 
@@ -149,24 +150,22 @@ impl TableProvider for PartitionTableProvider {
             .await
             .unwrap();
 
-        // Group rows by partition key
         let partition_groups = group_by_partition(expr, &batches, &df_schema);
 
-        // Process each partition group
         let mut execution_plans = Vec::new();
         for (scalar_value, batch) in partition_groups {
             let partition_key = scalar_value.to_string();
-            tracing::info!("Inserting into partition with key: {}", partition_key);
+            tracing::info!("Inserting into partition with key: {partition_key}");
 
             // Check if partition exists, otherwise create a new one
             let table_provider = {
                 let partitions = self.partitions.read().await;
                 if let Some(existing_provider) = partitions.get(&partition_key) {
-                    tracing::debug!("Using existing partition for key: {}", partition_key);
+                    tracing::debug!("Using existing partition for key: {partition_key}");
                     Arc::clone(existing_provider)
                 } else {
                     drop(partitions);
-                    tracing::debug!("Creating new partition for key: {}", partition_key);
+                    tracing::debug!("Creating new partition for key: {partition_key}");
                     let new_provider = self
                         .creator
                         .create_partition(scalar_value.clone())
@@ -200,9 +199,7 @@ impl TableProvider for PartitionTableProvider {
         } else if execution_plans.len() == 1 {
             Ok(execution_plans.into_iter().next().unwrap())
         } else {
-            Ok(Arc::new(datafusion::physical_plan::union::UnionExec::new(
-                execution_plans,
-            )))
+            Ok(Arc::new(UnionExec::new(execution_plans)))
         }
     }
 }
@@ -240,10 +237,10 @@ fn group_by_partition(
     // Concatenate batches for each partition
     let mut result = HashMap::new();
     for (scalar, batches) in partition_map {
-        if batches.is_empty() {
+        let Some(batch) = batches.first() else {
             continue;
-        }
-        let schema = batches[0].schema();
+        };
+        let schema = batch.schema();
         let concat_batch = concat_batches(&schema, &batches).unwrap();
         result.insert(scalar, concat_batch);
     }
