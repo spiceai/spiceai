@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{Array, RecordBatch, UInt32Array},
+        array::{Array, RecordBatch, UInt64Array},
         compute::{concat_batches, partition, take},
     },
     catalog::{
@@ -69,6 +69,12 @@ pub struct PartitionTableProvider {
 }
 
 impl PartitionTableProvider {
+    /// Creates a new [`PartitionTableProvider`] that partitions the data using
+    /// the first expression in `partition_by`.
+    ///
+    /// # Errors
+    /// This function will return an Error when the `partition_by` expression
+    /// validation fails.
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
         partition_by: Vec<Expr>,
@@ -251,7 +257,7 @@ fn filter_batch_by_indices(
     batch: &RecordBatch,
     indices: &[usize],
 ) -> Result<RecordBatch, DataFusionError> {
-    let indices_array = UInt32Array::from_iter_values(indices.iter().map(|&i| i as u32));
+    let indices_array = UInt64Array::from_iter_values(indices.iter().map(|&i| i as u64));
     let indices_array = Arc::new(indices_array) as Arc<dyn Array>;
     let columns = batch
         .columns()

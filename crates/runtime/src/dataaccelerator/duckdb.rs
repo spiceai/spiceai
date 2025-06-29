@@ -385,7 +385,7 @@ pub(crate) async fn create_table_provider(
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
     let table_provider = duckdb_factory
-        .create(&ctx.state(), &cmd)
+        .create(&ctx.state(), cmd)
         .await
         .context(UnableToCreateTableSnafu)
         .boxed()?;

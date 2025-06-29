@@ -63,13 +63,15 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(r#"The "duckdb_file" acceleration parameter has an invalid extension. Expected one of "{valid_extensions}" but got "{extension}"."#))]
+    #[snafu(display(
+        "The 'duckdb_file' acceleration parameter has an invalid extension. Expected one of '{valid_extensions}' but got '{extension}'."
+    ))]
     InvalidFileExtension {
         valid_extensions: String,
         extension: String,
     },
 
-    #[snafu(display(r#"The "duckdb_file" acceleration parameter is a directory."#))]
+    #[snafu(display(r"The 'duckdb_file' acceleration parameter is a directory."))]
     InvalidFileIsDirectory,
 
     #[snafu(display("Acceleration not enabled for dataset: {dataset}"))]
@@ -83,6 +85,17 @@ pub enum Error {
 
     #[snafu(display("Partitioned DuckDB acceleration only supports a single table"))]
     SingleTable,
+
+    #[snafu(display("Unable to read directory: {source}"))]
+    UnableToReadDirectory { source: std::io::Error },
+
+    #[snafu(display("Unable to get file stem"))]
+    UnableToGetFileStem,
+
+    #[snafu(display("Unable to create partition: {source}"))]
+    UnableToCreatePartition {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -123,7 +136,6 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     }
 
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
-        // We have (possibly) many file paths because we make a file for each partition
         Ok(String::new())
     }
 
@@ -201,7 +213,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
         partition_value: ScalarValue,
     ) -> Result<Arc<dyn TableProvider>, creator::Error> {
         let mut cmd = self.cmd.clone();
-        let partition_value_str = encode_scalar_value(&partition_value).unwrap();
+        let partition_value_str = encode_scalar_value(&partition_value)
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         let data_path = spice_data_base_path();
 
@@ -212,7 +225,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
         self.duckdb_factory
             .get_or_init_instance_with_builder(pool_builder)
             .await
-            .unwrap();
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         cmd.options.insert("open".to_string(), duckdb_file);
 
@@ -220,7 +233,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
             .await
-            .unwrap();
+            .map_err(|e| creator::Error::CreatePartition { source: e })?;
 
         Ok(table_provider)
     }
@@ -229,18 +242,19 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let data_path = spice_data_base_path();
         let data_path = Path::new(&data_path);
 
-        let mut dir_entries = match tokio::fs::read_dir(data_path).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                panic!("{e}");
-            }
-        };
+        let mut dir_entries = tokio::fs::read_dir(data_path)
+            .await
+            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
         let mut partitions = Vec::new();
 
-        let valid_extensions = vec!["duckdb"]; // From base_accelerator.valid_file_extensions()
+        let valid_extensions = ["duckdb"];
 
-        while let Some(entry) = dir_entries.next_entry().await.unwrap() {
+        while let Some(entry) = dir_entries
+            .next_entry()
+            .await
+            .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?
+        {
             let path = entry.path();
             if path.is_file() {
                 let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
@@ -248,15 +262,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
                     continue;
                 }
 
-                let file_name = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .ok_or_else(|| panic!(""))?;
+                let Some(file_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
 
                 let partition_value = match decode_scalar_value(file_name) {
                     Ok(value) => value,
                     Err(e) => {
-                        tracing::debug!("{e}");
+                        tracing::trace!("Unable to decode ScalarValue: {e}");
                         continue;
                     }
                 };
@@ -267,7 +280,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
                 let table_provider = create_table_provider(&self.duckdb_factory, &self.cmd)
                     .await
-                    .unwrap();
+                    .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
                 partitions.push(Partition {
                     partition_value,
