@@ -28,7 +28,13 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    sql::TableReference,
+    sql::{
+        TableReference, sqlparser,
+        unparser::{
+            Unparser,
+            dialect::{CustomDialect, CustomDialectBuilder},
+        },
+    },
 };
 
 pub type Result<T, E = super::Error> = std::result::Result<T, E>;
@@ -44,8 +50,8 @@ pub struct OracleExecPlan {
     projected_schema: SchemaRef,
     table_reference: TableReference,
     pool: Arc<OracleConnectionPool>,
-    _filters: Vec<Expr>,
-    _limit: Option<usize>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -64,8 +70,8 @@ impl OracleExecPlan {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
             pool,
-            _filters: filters.to_vec(),
-            _limit: limit,
+            filters: filters.to_vec(),
+            limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
@@ -75,19 +81,52 @@ impl OracleExecPlan {
         })
     }
 
+    fn dialect() -> CustomDialect {
+        CustomDialectBuilder::new()
+            .with_identifier_quote_style('"')
+            // There is no 'DOUBLE' SQL type in Oracle: it can use 'FLOAT' for both single and double precision float values
+            .with_float64_ast_dtype(sqlparser::ast::DataType::Float(None))
+            .build()
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
             .fields()
             .iter()
-            .map(|f| f.name().to_string())
+            // columns must be quoted to handle spaces and special characters
+            .map(|f| format!("\"{col}\"", col = f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
+        let dialect = OracleExecPlan::dialect();
+
+        let where_expr = if self.filters.is_empty() {
+            String::new()
+        } else {
+            let filter_expr = self
+                .filters
+                .iter()
+                .map(|f| {
+                    Unparser::new(&dialect)
+                        .expr_to_sql(f)
+                        .map(|e| e.to_string())
+                })
+                .collect::<DataFusionResult<Vec<String>>>()?
+                .join(" AND ");
+            format!("WHERE {filter_expr}")
+        };
+
+        let limit_expr = if let Some(limit) = self.limit {
+            format!("FETCH FIRST {limit} ROWS ONLY")
+        } else {
+            String::new()
+        };
+
         Ok(format!(
-            "SELECT {columns} FROM {table_reference}",
-            table_reference = self.table_reference
+            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference.to_quoted_string()
         ))
     }
 }

@@ -18,10 +18,12 @@ use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use snafu::{ResultExt, Snafu};
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
+    error::DataFusionError,
+    logical_expr::{Operator, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
     prelude::Expr,
     sql::TableReference,
@@ -206,6 +208,40 @@ impl TableProvider for OracleTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> std::result::Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        let mut results = Vec::with_capacity(filters.len());
+
+        for filter in filters {
+            match filter {
+                Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+                    Operator::Eq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq => {
+                        // Oracle requires a specific format for datetime literals to correctly cast them to timestamps.
+                        // Currently, the expression unparser cannot handle timestamps, resulting in
+                        // an `ORA-01843: not a valid month` error.
+                        // https://github.com/spiceai/spiceai/issues/6325
+                        if is_datetime_related_expr(&binary_expr.left)
+                            || is_datetime_related_expr(&binary_expr.right)
+                        {
+                            results.push(TableProviderFilterPushDown::Unsupported);
+                        } else {
+                            results.push(TableProviderFilterPushDown::Exact);
+                        }
+                    }
+                    _ => results.push(TableProviderFilterPushDown::Unsupported),
+                },
+                _ => results.push(TableProviderFilterPushDown::Unsupported),
+            }
+        }
+        Ok(results)
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -221,5 +257,41 @@ impl TableProvider for OracleTableProvider {
             filters,
             limit,
         )?))
+    }
+}
+
+fn is_datetime_related_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Cast(cast) => {
+            matches!(
+                cast.data_type,
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
+            )
+        }
+        Expr::Literal(literal) => {
+            matches!(
+                literal.data_type(),
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
+            )
+        }
+        Expr::ScalarVariable(data_type, _) => {
+            matches!(
+                data_type,
+                DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
+            )
+        }
+        _ => false,
     }
 }
