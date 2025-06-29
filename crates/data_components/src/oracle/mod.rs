@@ -39,6 +39,9 @@ pub mod connection;
 mod convert;
 mod execution_plan;
 
+// Re-export the native Oracle connector for use in dependent crates (e.g., integration tests)
+pub use oracle::Connector as oracle_connector;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to establish connection: {source}"))]

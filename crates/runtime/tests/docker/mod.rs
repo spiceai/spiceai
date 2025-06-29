@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use bollard::{
@@ -145,7 +146,10 @@ pub struct ContainerRunner<'a> {
 }
 
 impl<'a> ContainerRunner<'a> {
-    pub async fn run(self) -> Result<RunningContainer<'a>, anyhow::Error> {
+    pub async fn run(
+        self,
+        timeout: Option<Duration>,
+    ) -> Result<RunningContainer<'a>, anyhow::Error> {
         if self.container_exist().await? {
             remove(&self.docker, self.name).await?;
         }
@@ -171,7 +175,7 @@ impl<'a> ContainerRunner<'a> {
                 format!("{container_port}/tcp"),
                 Some(vec![PortBinding {
                     host_ip: Some("127.0.0.1".to_string()),
-                    host_port: Some(format!("{host_port}/tcp")),
+                    host_port: Some(format!("{host_port}")),
                 }]),
             );
         }
@@ -228,7 +232,9 @@ impl<'a> ContainerRunner<'a> {
                 break;
             }
 
-            if start_time.elapsed().as_secs() > 60 {
+            let timeout = timeout.unwrap_or_else(|| Duration::from_secs(60));
+
+            if start_time.elapsed() > timeout {
                 return Err(anyhow::anyhow!("Container failed to start"));
             }
 
