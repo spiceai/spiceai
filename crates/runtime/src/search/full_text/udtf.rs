@@ -163,9 +163,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         let args = Self::parse_args(args)?;
 
         let df = self.df.upgrade().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "An unexpected error occurred when calling text_search(). Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: DataFusion instance has been dropped."
-            ))
+            DataFusionError::Plan("An unexpected error occurred when calling text_search(). Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: DataFusion instance has been dropped.".to_string())
         })?;
 
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
