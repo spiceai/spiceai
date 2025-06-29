@@ -15,7 +15,7 @@ use std::{cmp::min, collections::HashMap, sync::Arc};
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use arrow::{
     array::RecordBatch,
-    datatypes::{Field, Schema},
+    datatypes::{Field, Schema, SchemaRef},
     error::ArrowError,
 };
 use arrow_json::reader::Decoder;
@@ -44,10 +44,9 @@ use super::{
     TextSearchSnafu as GenerationTextSearchSnafu,
 };
 
-static DEFAULT_BATCH_SIZE: usize = 100;
+pub static DEFAULT_BATCH_SIZE: usize = 100;
 
 pub mod exec;
-pub mod table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -95,8 +94,9 @@ impl Error {
     }
 }
 
+/// A [`FullTextSearchFieldIndex`] is a [`tantivy::Index`] that is used to search a single field of a table.
 #[derive(Clone, Debug)]
-pub struct FullTextSearchIndex {
+pub struct FullTextSearchFieldIndex {
     idx: Arc<Index>,
     field: String,
     primary_key: Vec<String>,
@@ -104,9 +104,14 @@ pub struct FullTextSearchIndex {
     /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
     /// This allows for the reuse of a generic `Index` in search.
     additional_columns: Option<Vec<String>>,
+
+    /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
+    /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
+    /// For columns present, use the associated [`arrow::datatypes::Field`].
+    type_hints: HashMap<String, Arc<arrow::datatypes::Field>>,
 }
 
-impl FullTextSearchIndex {
+impl FullTextSearchFieldIndex {
     pub fn try_new(
         index: Arc<Index>,
         field: String,
@@ -118,6 +123,14 @@ impl FullTextSearchIndex {
             field,
             primary_key,
             additional_columns,
+            type_hints: HashMap::from([(
+                SEARCH_SCORE_COLUMN_NAME.to_string(),
+                Arc::new(Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    arrow::datatypes::DataType::Float64,
+                    false,
+                )),
+            )]),
         };
 
         // Ensure that the index has the required primary key columns.
@@ -140,6 +153,19 @@ impl FullTextSearchIndex {
         }
 
         Ok(fts)
+    }
+
+    /// Add type hints for all fields in [`SchemaRef`].
+    ///
+    /// Fields in `schema` but not in the underlying [`FullTextSearchIndex::idx`] are added.
+    pub fn add_type_hints(&mut self, schema: &SchemaRef) {
+        for f in schema.fields() {
+            self.add_type_hint(f.name(), Arc::clone(f));
+        }
+    }
+
+    pub fn add_type_hint(&mut self, name: impl Into<String>, field: impl Into<Arc<Field>>) {
+        self.type_hints.insert(name.into(), field.into());
     }
 
     #[must_use]
@@ -175,6 +201,11 @@ impl FullTextSearchIndex {
                 }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn tantivy_schema(&self) -> tantivy::schema::Schema {
+        self.idx.schema()
     }
 
     fn index_searcher(&self) -> Result<Searcher> {
@@ -251,6 +282,37 @@ impl FullTextSearchIndex {
 
         Ok(top_docs)
     }
+
+    fn tantivy_json_to_arrow_decoder(
+        &self,
+        hits: &[Value],
+    ) -> std::result::Result<Decoder, ArrowError> {
+        let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
+            hits.iter().map(Ok),
+        )?);
+
+        let schema = Arc::new(Schema::new(
+            schema
+                .fields()
+                .into_iter()
+                .map(|f| {
+                    // Use [`Self::type_hints`].
+                    if let Some(new_field) = self.type_hints.get(f.name()) {
+                        new_field
+                    } else {
+                        f
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+
+        let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+
+        decoder.serialize(hits)?;
+
+        Ok(decoder)
+    }
 }
 
 // Parse a user-provided query to interpret it without terms (e.g. `IN ['foo', 'bar']`) or clauses (foo AND bar).
@@ -292,7 +354,7 @@ fn parse_query_literal(q: &str) -> UserInputAst {
 }
 
 #[async_trait]
-impl CandidateGeneration for FullTextSearchIndex {
+impl CandidateGeneration for FullTextSearchFieldIndex {
     async fn search(
         &self,
         query: String,
@@ -366,7 +428,7 @@ impl CandidateGeneration for FullTextSearchIndex {
 }
 
 fn make_stream(
-    fts: FullTextSearchIndex,
+    fts: FullTextSearchFieldIndex,
     query: String,
     keep_search_field: bool,
     limit: usize,
@@ -385,7 +447,7 @@ fn make_stream(
             offset += limit;
             remaining_limit -= limit;
 
-            let mut decoder = match tantivy_json_to_arrow_decoder(hits.as_slice())
+            let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
                 .map_err(DataFusionError::from) {
                     Ok(h) => h,
                     Err(e) => {
@@ -403,38 +465,8 @@ fn make_stream(
     }
 }
 
-fn tantivy_json_to_arrow_decoder(hits: &[Value]) -> std::result::Result<Decoder, ArrowError> {
-    let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
-        hits.iter().map(Ok),
-    )?);
-
-    // Ensure `SEARCH_SCORE_COLUMN_NAME` is f64 not f32 or other numeric.
-    let schema = Arc::new(Schema::new(
-        schema
-            .fields()
-            .into_iter()
-            .map(|f| {
-                if f.name() == SEARCH_SCORE_COLUMN_NAME {
-                    Arc::new(Field::new(
-                        f.name(),
-                        arrow::datatypes::DataType::Float64,
-                        f.is_nullable(),
-                    ))
-                } else {
-                    Arc::clone(f)
-                }
-            })
-            .collect::<Vec<_>>(),
-    ));
-
-    let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
-
-    decoder.serialize(hits)?;
-
-    Ok(decoder)
-}
-
-fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
+#[must_use]
+pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType> {
     match t {
         FieldType::Str(_) => Some(arrow::datatypes::DataType::Utf8),
         FieldType::I64(_) => Some(arrow::datatypes::DataType::Int64),
@@ -462,7 +494,7 @@ pub(crate) mod tests {
         aggregation::write_to_json_string,
         generation::{
             CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearchIndex, parse_query_literal},
+            text_search::{FullTextSearchFieldIndex, parse_query_literal},
         },
     };
 
@@ -544,7 +576,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_basic_index() {
-        let fts = FullTextSearchIndex::try_new(
+        let fts = FullTextSearchFieldIndex::try_new(
             Arc::new(create_basic_index()),
             "body".to_string(),
             vec![],

@@ -222,6 +222,24 @@ impl Parameters {
     pub fn iter(&self) -> std::slice::Iter<'_, (String, SecretString)> {
         self.params.iter()
     }
+
+    #[must_use]
+    pub fn get_runtime_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| !self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get_component_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -323,7 +341,7 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,

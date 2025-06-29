@@ -14,8 +14,9 @@ runtime:
   task_history:
     enabled: true
     captured_output: truncated
-  results_cache:
-    enabled: false
+  caching:
+    sql_results:
+      enabled: false
 
 defaults: &default_params
   duckdb_open: .spice/tpch.db

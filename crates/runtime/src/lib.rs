@@ -142,6 +142,9 @@ pub enum Error {
     #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
+    #[snafu(display("Unable to attach dataset index: {source}"))]
+    UnableToAttachIndex { source: datafusion::Error },
+
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 

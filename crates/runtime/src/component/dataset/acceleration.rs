@@ -129,6 +129,7 @@ pub enum Engine {
     DuckDB,
     Sqlite,
     PostgreSQL,
+    Void,
 }
 
 impl Display for Engine {
@@ -138,6 +139,7 @@ impl Display for Engine {
             Engine::DuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Void => write!(f, "void"),
         }
     }
 }
@@ -151,6 +153,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "void" => Ok(Engine::Void),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }

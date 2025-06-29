@@ -29,10 +29,12 @@ use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 
-use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
+use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
+use super::{params::get_params_spec, tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{
     Runtime,
+    parameters::Parameters,
     tools::{options::SpiceToolsOptions, utils::get_tools},
 };
 
@@ -55,7 +57,29 @@ pub async fn try_to_chat_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
-    let model = construct_model(component, params, rt.token_provider_registry()).await?;
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+
+    let param_spec = get_params_spec(&source).ok_or(LlmError::UnsupportedTaskForModel {
+        from: component.from.clone(),
+        task: "llm".into(),
+    })?;
+
+    let params_struct = Parameters::try_new(
+        &format!("model {source}"),
+        params.clone().into_iter().collect::<Vec<_>>(),
+        source.short_name(),
+        rt.secrets(),
+        param_spec,
+    )
+    .await
+    .map_err(|e| LlmError::ModelParameterFailed {
+        model: component.name.clone(),
+        source: e,
+    })?;
+
+    let model = construct_model(component, &params_struct, rt.token_provider_registry()).await?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -91,7 +115,7 @@ pub async fn try_to_chat_model(
 
 pub async fn construct_model(
     component: &spicepod::component::model::Model,
-    params: &HashMap<String, SecretString>,
+    params: &Parameters,
     token_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
@@ -128,7 +152,7 @@ pub async fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
-        component.get_openai_request_overrides(),
+        get_openai_request_overrides(component, params.prefix),
     );
 
     if let Some(Value::String(s)) = component.params.get("parameterized_prompt") {
@@ -140,11 +164,8 @@ pub async fn construct_model(
     Ok(Arc::new(wrapper))
 }
 
-fn xai(
-    model_id: Option<&str>,
-    params: &HashMap<String, SecretString>,
-) -> Result<Arc<dyn Chat>, LlmError> {
-    let Some(api_key) = extract_secret!(params, "xai_api_key") else {
+fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(api_key) = params.get("api_key").expose().ok() else {
         return Err(LlmError::FailedToLoadModel {
             source: "No `xai_api_key` provided for xAI model.".into(),
         });
@@ -152,23 +173,18 @@ fn xai(
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
 }
 
-fn perplexity(
-    model_id: Option<&str>,
-    params: &HashMap<String, SecretString>,
-) -> Result<Arc<dyn Chat>, LlmError> {
-    let model = PerplexitySonar::from_params(model_id, params)
+fn perplexity(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    // PerplexitySonar only requires prefixed parameters for constructing the model.
+    let model = PerplexitySonar::from_params(model_id, &params.get_component_params())
         .map_err(|source| LlmError::FailedToLoadModel { source })?;
 
     Ok(Arc::new(model) as Arc<dyn Chat>)
 }
 
-fn anthropic(
-    model_id: Option<&str>,
-    params: &HashMap<String, SecretString>,
-) -> Result<Arc<dyn Chat>, LlmError> {
-    let api_base = extract_secret!(params, "endpoint");
-    let api_key = extract_secret!(params, "anthropic_api_key");
-    let auth_token = extract_secret!(params, "anthropic_auth_token");
+fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let api_base = params.get("endpoint").expose().ok();
+    let api_key = params.get("api_key").expose().ok();
+    let auth_token = params.get("auth_token").expose().ok();
 
     let auth = match (api_key, auth_token) {
         (Some(s), None) => GenericAuthMechanism::from_api_key(s),
@@ -193,15 +209,16 @@ fn anthropic(
 fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
-    params: &HashMap<String, SecretString>,
+    params: &Parameters,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(id) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: "No model id for Huggingface model".to_string().into(),
         });
     };
-    let model_type = extract_secret!(params, "model_type");
-    let hf_token = params.get("hf_token");
+
+    let model_type = params.get("model_type").expose().ok();
+    let hf_token = params.get("token").ok();
 
     // For GGUF models, we require user specify via `.files[].path`
     let gguf_path = component
@@ -229,11 +246,11 @@ fn huggingface(
 
 async fn databricks(
     model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
+    params: &Parameters,
     token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     // Required parameters
-    let Some(endpoint) = extract_secret!(params, "databricks_endpoint") else {
+    let Some(endpoint) = params.get("endpoint").expose().ok() else {
         return Err(LlmError::MissingParamError {
             param_key: "databricks_endpoint",
         });
@@ -245,9 +262,9 @@ async fn databricks(
     };
 
     // Optional parameters.
-    let token_opt = extract_secret!(params, "databricks_token");
-    let client_id = extract_secret!(params, "databricks_client_id");
-    let client_secret = extract_secret!(params, "databricks_client_secret");
+    let token_opt = params.get("token").expose().ok();
+    let client_id = params.get("client_id").expose().ok();
+    let client_secret = params.get("client_secret").expose().ok();
 
     #[cfg(feature = "databricks")]
     let user_agent = Some(data_components::databricks::user_agent());
@@ -329,16 +346,13 @@ async fn databricks(
     }
 }
 
-fn openai(
-    model_id: Option<String>,
-    params: &HashMap<String, SecretString>,
-) -> Result<Arc<dyn Chat>, LlmError> {
-    let api_base = extract_secret!(params, "endpoint");
-    let api_key = extract_secret!(params, "openai_api_key");
-    let org_id = extract_secret!(params, "openai_org_id");
-    let project_id = extract_secret!(params, "openai_project_id");
+fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let api_base = params.get("endpoint").expose().ok();
+    let api_key = params.get("api_key").expose().ok();
+    let org_id = params.get("org_id").expose().ok();
+    let project_id = params.get("project_id").expose().ok();
 
-    if let Some(temperature_str) = extract_secret!(params, "openai_temperature") {
+    if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
             Ok(temperature) => {
                 if temperature < 0.0 {
@@ -369,7 +383,7 @@ fn openai(
 fn azure(
     model_id: Option<String>,
     model_name: &str,
-    params: &HashMap<String, SecretString>,
+    params: &Parameters,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
@@ -378,11 +392,11 @@ fn azure(
 ).into(),
         });
     };
-    let api_base = extract_secret!(params, "endpoint");
-    let api_version = extract_secret!(params, "azure_api_version");
-    let deployment_name = extract_secret!(params, "azure_deployment_name");
-    let api_key = extract_secret!(params, "azure_api_key");
-    let entra_token = extract_secret!(params, "azure_entra_token");
+    let api_base = params.get("endpoint").expose().ok();
+    let api_version = params.get("api_version").expose().ok();
+    let deployment_name = params.get("deployment_name").expose().ok();
+    let api_key = params.get("api_key").expose().ok();
+    let entra_token = params.get("entra_token").expose().ok();
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -422,7 +436,7 @@ fn azure(
 
 fn file(
     component: &spicepod::component::model::Model,
-    params: &HashMap<String, SecretString>,
+    params: &Parameters,
 ) -> Result<Arc<dyn Chat>, LlmError> {
     let model_weights = component.find_all_file_path(ModelFileType::Weights);
     if model_weights.is_empty() {
@@ -436,9 +450,7 @@ fn file(
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
 
-    let chat_template_literal = params
-        .get("chat_template")
-        .map(secrecy::ExposeSecret::expose_secret);
+    let chat_template_literal = params.get("chat_template").expose().ok();
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
@@ -448,4 +460,113 @@ fn file(
         generation_config.as_deref(),
         chat_template_literal,
     )
+}
+
+// Get OpenAI compatible request parameter overrides.
+// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `openai_temperature`) parameters.
+pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
+    let prefix_str = format!("{prefix}_");
+    let mut request_overrides: HashMap<String, Value> = HashMap::new();
+
+    for (k, v) in &model.params {
+        if k.starts_with(&prefix_str) {
+            if let Some(new_k) = k.strip_prefix(&prefix_str) {
+                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k) {
+                    request_overrides.insert(new_k.to_string(), v.clone());
+                }
+            }
+        } else if k.starts_with("openai_") {
+            if let Some(new_k) = k.strip_prefix("openai_") {
+                if OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
+                    && !request_overrides.contains_key(new_k)
+                {
+                    request_overrides.insert(new_k.to_string(), v.clone());
+                }
+            }
+        }
+    }
+
+    request_overrides.into_iter().collect()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use serde_json::Number;
+    use spicepod::component::model::Model;
+
+    #[test]
+    fn test_get_openai_request_overrides_with_deprecated() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "openai_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 1);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+    }
+
+    #[test]
+    fn test_get_openai_request_overrides_with_model_prefix() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        model.params.insert(
+            "hf_max_completion_tokens".to_string(),
+            Value::Number(1.into()),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    // Param with <model-prefix> takes precedence over the deprecated openai_ prefix.
+    fn test_get_openai_request_overrides_with_model_prefix_and_deprecated() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_temperature".to_string(),
+            Value::Number(Number::from_f64(0.7).expect("valid number")),
+        );
+        model.params.insert(
+            "hf_reasoning_effort".to_string(),
+            Value::String("low".into()),
+        );
+        model.params.insert(
+            "hf_max_completion_tokens".to_string(),
+            Value::Number(1.into()),
+        );
+        model.params.insert(
+            "openai_temperature".to_string(),
+            Value::Number(Number::from_f64(0.6).expect("valid number")),
+        );
+        model.params.insert(
+            "openai_max_completion_tokens".to_string(),
+            Value::Number(2.into()),
+        );
+        let overrides = get_openai_request_overrides(&model, "hf");
+        assert_eq!(overrides.len(), 3);
+        assert!(overrides.iter().any(|(k, v)| k == "temperature"
+            && v == &Value::Number(Number::from_f64(0.7).expect("valid number"))));
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "reasoning_effort" && v == &Value::String("low".into()))
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
 }

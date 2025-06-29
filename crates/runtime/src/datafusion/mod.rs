@@ -37,6 +37,7 @@ use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
 };
 use crate::federated_table::FederatedTable;
+use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::create_view_table;
@@ -244,6 +245,17 @@ pub enum Error {
     UnableToBuildAcceleratedTable {
         dataset_name: String,
         source: AcceleratedTableBuilderError,
+    },
+    #[snafu(display("Failed register a '{index_type}' index for the table '{dataset_name}'"))]
+    UnableToRegisterTableIndex {
+        dataset_name: String,
+        index_type: String,
+    },
+
+    #[snafu(display("Failed get the '{index_type}' index for the table '{dataset_name}'"))]
+    UnableToGetTableIndex {
+        dataset_name: String,
+        index_type: String,
     },
 }
 
@@ -1574,6 +1586,8 @@ impl DataFusion {
                 tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
             }
         }
+
+        self.ctx.deregister_udtf(TEXT_SEARCH_UDTF_NAME);
     }
 
     /// Create or get a logical plan from the query

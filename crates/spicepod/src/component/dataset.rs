@@ -177,6 +177,41 @@ impl Dataset {
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
+
+    /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
+    ///  1. Primary key defined in `.columns[].embeddings[].row_id`
+    ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
+    ///  3. Primary key defined in `.embeddings[].column_pk` (on the path to deprecation)
+    pub fn primary_key_override(&self) -> Option<Vec<String>> {
+        let pks_from_embeddings: Option<Vec<String>> =
+            self.embeddings.iter().find_map(|e| e.primary_keys.clone());
+
+        let mut pks_from_columns: Option<Vec<String>> = self
+            .columns
+            .iter()
+            .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
+
+        let pks_from_fts: Option<Vec<String>> = self
+            .columns
+            .iter()
+            .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
+
+        pks_from_columns = pks_from_columns.or(pks_from_fts);
+
+        let primary_keys = match (pks_from_columns, pks_from_embeddings) {
+            (Some(pks), None) | (None, Some(pks)) => pks,
+            (Some(pks), Some(_)) => {
+                tracing::warn!(
+                    "Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.",
+                    self.name
+                );
+                pks
+            }
+            (None, None) => return None,
+        };
+
+        Some(primary_keys)
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {

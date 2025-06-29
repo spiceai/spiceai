@@ -29,6 +29,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
+use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
 use snafu::{OptionExt, ResultExt};
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -587,6 +588,7 @@ impl RefreshTask {
                 .with_default_features()
                 .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
                 .with_analyzer_rules(get_analyzer_rules())
+                .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
                 .build();
 
             if let Err(e) = datafusion_functions_json::register_all(&mut state) {

@@ -656,12 +656,13 @@ impl Runtime {
                 )
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
+                    data_connector: source.clone(),
                     connector_component: ConnectorComponent::from(&ds),
                 })?;
 
             self.status
                 .update_dataset(&ds_name, status::ComponentStatus::Ready);
+
             return Ok(());
         }
 
@@ -701,7 +702,7 @@ impl Runtime {
             )
             .await
             .context(UnableToAttachDataConnectorSnafu {
-                data_connector: source,
+                data_connector: source.clone(),
                 connector_component: ConnectorComponent::from(&ds),
             })?;
 
@@ -713,10 +714,7 @@ impl Runtime {
             tokio::task::spawn(async move {
                 notifier.notified().await;
                 if let Err(e) = runtime.create_dataset_schedule(ds).await {
-                    tracing::error!(
-                        "Failed to create dataset schedule for '{}': {e}",
-                        dataset_name
-                    );
+                    tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
             });
         }

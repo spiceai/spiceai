@@ -122,6 +122,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
 ] }
 runtime-auth = { path = "../runtime-auth" }
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
@@ -223,6 +224,7 @@ models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
+oracle = ["data_components/oracle"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 postgres = [
     "db_connection_pool/postgres",

@@ -12,11 +12,9 @@ limitations under the License.
 */
 use std::{any::Any, fmt::Formatter, sync::Arc};
 
-use crate::generation::text_search::table::FullTextSearchTable;
-use arrow::error::ArrowError;
+use arrow::{datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use datafusion::{
-    catalog::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::SendableRecordBatchStream,
     physical_expr::EquivalenceProperties,
@@ -30,11 +28,12 @@ use datafusion::{
 
 use futures::StreamExt;
 
-use super::CandidateGeneration;
+use super::{CandidateGeneration, FullTextSearchFieldIndex};
 
-/// Executes a  [`FullTextSearchTable`]
+/// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
 pub struct FullTextSearchExec {
-    pub(super) tbl: FullTextSearchTable,
+    pub(super) index: FullTextSearchFieldIndex,
+    pub(super) query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
     plan_properties: PlanProperties,
@@ -42,18 +41,21 @@ pub struct FullTextSearchExec {
 
 impl FullTextSearchExec {
     pub fn try_new(
-        tbl: FullTextSearchTable,
+        index: FullTextSearchFieldIndex,
+        query: String,
+        schema: SchemaRef,
         projection: Option<&Vec<usize>>,
         filters: Vec<LogicalExpr>,
         limit: usize,
     ) -> Result<Self, ArrowError> {
         let schema = match projection {
-            Some(proj) => Arc::new(tbl.schema().project(proj.as_slice())?),
-            None => Arc::clone(&tbl.schema()),
+            Some(proj) => Arc::new(schema.project(proj.as_slice())?),
+            None => schema,
         };
 
         Ok(Self {
-            tbl,
+            index,
+            query,
             filters,
             limit,
             plan_properties: PlanProperties::new(
@@ -69,7 +71,8 @@ impl FullTextSearchExec {
 impl std::fmt::Debug for FullTextSearchExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchTableExec")
-            .field("tbl", &self.tbl)
+            .field("index", &self.index)
+            .field("query", &self.query)
             .field("filters", &self.filters)
             .field("limit", &self.limit)
             .finish_non_exhaustive()
@@ -77,7 +80,7 @@ impl std::fmt::Debug for FullTextSearchExec {
 }
 impl DisplayAs for FullTextSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "FullTextSearchTableExec q={}", self.tbl.query)
+        write!(f, "FullTextSearchTableExec q={}", self.query)
     }
 }
 
@@ -110,10 +113,10 @@ impl ExecutionPlan for FullTextSearchExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let idx = self.tbl.index.clone();
+        let idx = self.index.clone();
         let schema = self.schema();
         let limit = self.limit;
-        let query = self.tbl.query.clone();
+        let query = self.query.clone();
         let s = stream! {
         // TODO: Support filters.
             match idx

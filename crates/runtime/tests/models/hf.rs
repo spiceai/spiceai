@@ -58,6 +58,8 @@ mod nsql {
 
     use super::*;
 
+    // Tracking issue: https://github.com/spiceai/spiceai/issues/6328
+    #[ignore]
     #[tokio::test]
     async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(DEFAULT_TRACING_MODELS);
@@ -307,7 +309,7 @@ mod search {
                         "limit": 1,
                     }),
                 },
-            ],
+            ], vec![]
         ).await
     }
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::dataaccelerator::void::VoidAccelerator;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
@@ -57,6 +58,7 @@ pub mod partitioned_duckdb;
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod void;
 
 pub mod spice_sys;
 
@@ -167,6 +169,14 @@ impl AcceleratorEngineRegistry {
                 partitioned: false,
             },
             Arc::new(SqliteAccelerator::new()),
+        )
+        .await;
+        self.register_accelerator_engine(
+            EngineVariant {
+                engine: Engine::Void,
+                partitioned: false,
+            },
+            Arc::new(VoidAccelerator::new()),
         )
         .await;
     }
