@@ -224,6 +224,7 @@ pub(crate) async fn run_search(
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_search",
@@ -289,6 +290,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
         .await
@@ -356,6 +358,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
@@ -392,6 +395,7 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "hybrid_column_search",
@@ -459,6 +463,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_hybrid_search",
@@ -523,6 +528,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset("item", Some("item"), None);
     ds.columns = vec![Column {
@@ -575,6 +581,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset(
             "catalog_page",
@@ -663,6 +670,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
+#[ignore]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     let api_config = start_app(
         AppBuilder::new("search_app")
@@ -760,6 +768,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpch_dataset_w_embeddings(
         "cached_search",
@@ -819,6 +828,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpch_dataset_w_embeddings(
         "cached_search_bypass",

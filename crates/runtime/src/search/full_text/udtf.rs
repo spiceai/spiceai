@@ -27,7 +27,11 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::{
@@ -65,11 +69,13 @@ pub struct TextSearchTableFuncArgs {
 
 #[derive(Debug)]
 pub struct TextSearchTableFunc {
-    df: Arc<DataFusion>,
+    // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
+    df: Weak<DataFusion>,
 }
 
 impl TextSearchTableFunc {
-    pub fn new(df: Arc<DataFusion>) -> Self {
+    #[must_use]
+    pub fn new(df: Weak<DataFusion>) -> Self {
         Self { df }
     }
 }
@@ -157,7 +163,11 @@ impl TableFunctionImpl for TextSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
 
-        let Some(table_provider) = self.df.get_table_sync(&args.tbl) else {
+        let df = self.df.upgrade().ok_or_else(|| {
+            DataFusionError::Plan("An unexpected error occurred when calling text_search(). Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: DataFusion instance has been dropped.".to_string())
+        })?;
+
+        let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
                 args.tbl.clone()

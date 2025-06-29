@@ -117,6 +117,11 @@ impl FullTextDatabaseIndex {
     }
 
     #[must_use]
+    pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    #[must_use]
     pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
     }

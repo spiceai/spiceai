@@ -206,10 +206,10 @@ impl RuntimeBuilder {
 
         let df = Arc::new(df);
 
-        // UDFs that require a reference to the DataFusion instance defined here.
+        // UDFs that require a weak reference to the DataFusion instance defined here.
         df.ctx.register_udtf(
             "text_search",
-            Arc::new(TextSearchTableFunc::new(Arc::clone(&df))),
+            Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
         );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {

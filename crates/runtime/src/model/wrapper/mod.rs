@@ -15,8 +15,6 @@ limitations under the License.
 */
 
 #![allow(clippy::implicit_hasher)]
-use std::{collections::HashMap, pin::Pin};
-
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -33,18 +31,47 @@ use llms::{
     chat::{Chat, Result as ChatResult, nsql::SqlGeneration},
 };
 use opentelemetry::KeyValue;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use tera::Tera;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::handle_metrics;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 
 use super::metrics::request_labels;
 
 mod ast;
+
+pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| {
+        HashSet::from([
+            "frequency_penalty",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "max_completion_tokens",
+            "reasoning_effort",
+            "store",
+            "metadata",
+            "n",
+            "presence_penalty",
+            "response_format",
+            "seed",
+            "stop",
+            "stream",
+            "stream_options",
+            "temperature",
+            "top_p",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "user",
+        ])
+    });
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
 pub struct ChatWrapper {

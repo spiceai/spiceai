@@ -87,6 +87,8 @@ pub mod mssql;
 pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
 pub mod glue;
@@ -405,6 +407,8 @@ pub async fn register_all() {
     register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
     #[cfg(feature = "odbc")]
     register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
+    #[cfg(feature = "oracle")]
+    register_connector_factory("oracle", oracle::OracleFactory::new_arc()).await;
     #[cfg(feature = "sharepoint")]
     register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
     #[cfg(feature = "spark")]
