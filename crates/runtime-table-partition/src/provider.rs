@@ -19,7 +19,10 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::{array::RecordBatch, compute::concat_batches},
+    arrow::{
+        array::{Array, RecordBatch, UInt32Array},
+        compute::{concat_batches, partition, take},
+    },
     catalog::{
         Session, TableProvider,
         memory::{DataSourceExec, MemorySourceConfig},
@@ -207,36 +210,53 @@ fn group_by_partition(
 ) -> Result<HashMap<ScalarValue, RecordBatch>, DataFusionError> {
     let props = ExecutionProps::new();
     let physical_expr = create_physical_expr(expr, df_schema, &props)?;
-    let mut partition_map: HashMap<ScalarValue, Vec<RecordBatch>> = HashMap::new();
+    let mut partition_map = HashMap::new();
 
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-
+    for batch in batches.iter().filter(|b| b.num_rows() > 0) {
         let column = physical_expr.evaluate(batch)?;
         let array = match column {
             ColumnarValue::Array(array) => array,
             ColumnarValue::Scalar(_) => return Err(Error::InvalidPartitionExpression).boxed()?,
         };
 
-        for i in 0..array.len() {
-            let scalar = ScalarValue::try_from_array(&array, i)?;
+        let partitions = partition(&[Arc::clone(&array)])?;
+
+        for indices in partitions.ranges() {
+            if indices.is_empty() {
+                continue;
+            }
+            // Extract scalar value from the first row of the partition
+            let indices = indices.collect::<Vec<_>>();
+            let scalar = ScalarValue::try_from_array(&array, indices[0])?;
             let partition_batches = partition_map.entry(scalar).or_insert_with(Vec::new);
-            let new_batch = batch.slice(i, 1);
+            // Create a single batch for the partition using indices
+            let new_batch = filter_batch_by_indices(batch, &indices)?;
             partition_batches.push(new_batch);
         }
     }
 
-    let mut result = HashMap::new();
+    let mut result = HashMap::with_capacity(partition_map.len());
     for (scalar, batches) in partition_map {
-        let Some(batch) = batches.first() else {
+        if batches.is_empty() {
             continue;
-        };
-        let schema = batch.schema();
-        let concat_batch = concat_batches(&schema, &batches)?;
+        }
+        let concat_batch = concat_batches(&batches[0].schema(), &batches)?;
         result.insert(scalar, concat_batch);
     }
 
     Ok(result)
+}
+
+fn filter_batch_by_indices(
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> Result<RecordBatch, DataFusionError> {
+    let indices_array = UInt32Array::from_iter_values(indices.iter().map(|&i| i as u32));
+    let indices_array = Arc::new(indices_array) as Arc<dyn Array>;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|col| take(col, &indices_array, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| DataFusionError::ArrowError(e, None))
 }
