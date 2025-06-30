@@ -259,7 +259,8 @@ impl Runtime {
         ));
 
         let schedule = Arc::new(
-            Schedule::new(Arc::clone(&component_name), refresh_task).add_trigger(cron_request_channel),
+            Schedule::new(Arc::clone(&component_name), refresh_task)
+                .add_trigger(cron_request_channel),
         );
 
         // a `refresh_scheduler` exists but does not contain this component's schedule
