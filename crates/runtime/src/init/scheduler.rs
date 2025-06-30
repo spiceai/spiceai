@@ -241,7 +241,7 @@ impl Runtime {
         );
         let scheduler_lock = Arc::clone(&self.schedulers);
         let mut schedulers = scheduler_lock.write().await;
-        let view_name = component.name().to_string().into();
+        let component_name = component.name().to_string().into();
 
         let refresh_task: Arc<dyn ScheduledTask> = match component.clone() {
             ScheduleDataComponent::Dataset(dataset) => {
@@ -259,10 +259,10 @@ impl Runtime {
         ));
 
         let schedule = Arc::new(
-            Schedule::new(Arc::clone(&view_name), refresh_task).add_trigger(cron_request_channel),
+            Schedule::new(Arc::clone(&component_name), refresh_task).add_trigger(cron_request_channel),
         );
 
-        // a `refresh_scheduler` exists but does not contain this view's schedule
+        // a `refresh_scheduler` exists but does not contain this component's schedule
         if let Some(scheduler) = schedulers.get(REFRESH_SCHEDULER_NAME) {
             if scheduler
                 .schedules()
@@ -287,7 +287,7 @@ impl Runtime {
                 .add_schedule(schedule)
                 .await
                 .context(crate::FailedToAddScheduleSnafu {
-                    name: view_name.to_string(),
+                    name: component_name.to_string(),
                     scheduler: REFRESH_SCHEDULER_NAME.to_string(),
                 })?;
             return Ok(());
