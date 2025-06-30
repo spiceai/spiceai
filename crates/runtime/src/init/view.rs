@@ -195,7 +195,7 @@ impl Runtime {
         Ok(())
     }
 
-    async fn remove_view(self: Arc<Runtime>, name: &TableReference) {
+    async fn remove_view(self: Arc<Self>, name: &TableReference) {
         if self.df.table_exists(name.clone()) {
             if self.df.is_accelerated(name).await {
                 if let Err(e) = Arc::clone(&self)
