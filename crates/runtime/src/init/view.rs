@@ -182,12 +182,16 @@ impl Runtime {
                 Ok(Some(notifier)) => {
                     notifier.notified().await;
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
-                        tracing::error!("Failed to create refresh schedule for accelerated view '{view_name}': {e}.");
+                        tracing::error!(
+                            "Failed to create refresh schedule for accelerated view '{view_name}': {e}."
+                        );
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::error!("Failed to create refresh schedule for accelerated view '{view_name}': {e}");
+                    tracing::error!(
+                        "Failed to create refresh schedule for accelerated view '{view_name}': {e}"
+                    );
                 }
             }
         });
@@ -202,7 +206,10 @@ impl Runtime {
                     .remove_dataset_or_view_schedule(name)
                     .await
                 {
-                    tracing::warn!("Failed to remove refresh schedule for accelerated view {}: {e}", &name);
+                    tracing::warn!(
+                        "Failed to remove refresh schedule for accelerated view {}: {e}",
+                        &name
+                    );
                 }
             }
 
