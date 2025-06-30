@@ -166,16 +166,12 @@ impl TableProvider for PartitionTableProvider {
 
             for (scalar_value, batch) in partition_groups {
                 let partition_key = scalar_value.to_string();
-                tracing::info!("Inserting into partition with key: {partition_key}");
-
                 let table_provider = {
                     let partitions = self.partitions.read().await;
                     if let Some(existing_provider) = partitions.get(&partition_key) {
-                        tracing::debug!("Using existing partition for key: {partition_key}");
                         Arc::clone(existing_provider)
                     } else {
                         drop(partitions);
-                        tracing::debug!("Creating new partition for key: {partition_key}");
                         let new_provider = self
                             .creator
                             .create_partition(scalar_value.clone())

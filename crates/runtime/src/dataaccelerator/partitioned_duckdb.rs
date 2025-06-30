@@ -299,7 +299,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
         }
 
         tracing::info!(
-            "Inferred {} existing partitions from '{}'",
+            "inferred {} existing partitions from '{}'",
             partitions.len(),
             data_path.display()
         );
