@@ -33,10 +33,11 @@ use datafusion::{
     execution::{TaskContext, context::ExecutionProps},
     logical_expr::{ColumnarValue, dml::InsertOp},
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, common::collect, execute_stream, union::UnionExec},
+    physical_plan::{ExecutionPlan, execute_stream, union::UnionExec},
     prelude::Expr,
     scalar::ScalarValue,
 };
+use futures::StreamExt as _;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -152,45 +153,51 @@ impl TableProvider for PartitionTableProvider {
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
 
         let task_ctx = Arc::new(TaskContext::from(state));
-        let stream = execute_stream(Arc::clone(&input), task_ctx)?;
-        let batches = collect(stream).await?;
-
-        let partition_groups = group_by_partition(expr, &batches, &df_schema)?;
-
+        let mut stream = execute_stream(Arc::clone(&input), task_ctx)?;
         let mut execution_plans = Vec::new();
-        for (scalar_value, batch) in partition_groups {
-            let partition_key = scalar_value.to_string();
-            tracing::info!("Inserting into partition with key: {partition_key}");
 
-            let table_provider = {
-                let partitions = self.partitions.read().await;
-                if let Some(existing_provider) = partitions.get(&partition_key) {
-                    tracing::debug!("Using existing partition for key: {partition_key}");
-                    Arc::clone(existing_provider)
-                } else {
-                    drop(partitions);
-                    tracing::debug!("Creating new partition for key: {partition_key}");
-                    let new_provider = self
-                        .creator
-                        .create_partition(scalar_value.clone())
-                        .await
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                    let mut partitions = self.partitions.write().await;
-                    partitions.insert(partition_key.clone(), Arc::clone(&new_provider));
-                    new_provider
-                }
-            };
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
 
-            let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-                &[vec![batch]],
-                Arc::clone(&self.schema),
-                None,
-            )?));
+            let partition_groups = group_by_partition(expr, &[batch], &df_schema)?;
 
-            let plan = table_provider
-                .insert_into(state, Arc::new(mem_exec), insert_op)
-                .await?;
-            execution_plans.push(plan);
+            for (scalar_value, batch) in partition_groups {
+                let partition_key = scalar_value.to_string();
+                tracing::info!("Inserting into partition with key: {partition_key}");
+
+                let table_provider = {
+                    let partitions = self.partitions.read().await;
+                    if let Some(existing_provider) = partitions.get(&partition_key) {
+                        tracing::debug!("Using existing partition for key: {partition_key}");
+                        Arc::clone(existing_provider)
+                    } else {
+                        drop(partitions);
+                        tracing::debug!("Creating new partition for key: {partition_key}");
+                        let new_provider = self
+                            .creator
+                            .create_partition(scalar_value.clone())
+                            .await
+                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        let mut partitions = self.partitions.write().await;
+                        partitions.insert(partition_key.clone(), Arc::clone(&new_provider));
+                        new_provider
+                    }
+                };
+
+                let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                    &[vec![batch]],
+                    Arc::clone(&self.schema),
+                    None,
+                )?));
+
+                let plan = table_provider
+                    .insert_into(state, Arc::new(mem_exec), insert_op)
+                    .await?;
+                execution_plans.push(plan);
+            }
         }
 
         if execution_plans.is_empty() {
