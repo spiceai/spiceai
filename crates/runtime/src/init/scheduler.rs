@@ -227,7 +227,7 @@ impl Runtime {
 
         if matches!(acceleration.refresh_mode, Some(RefreshMode::Changes)) {
             tracing::warn!(
-                "Refresh schedule will not be set for the {} '{}'.\nSpecifying a `refresh_cron` with `refresh_mode` set to `changes` is not supported.\nRemove the `refresh_cron` from the dataset, or use a different `refresh_mode`.",
+                "Cannot set a refresh schedule for the {} '{}': `refresh_cron` is not supported when `refresh_mode` is set to `changes`. Either remove `refresh_cron` or use a different `refresh_mode`.",
                 component.component_type(),
                 component.name(),
             );
