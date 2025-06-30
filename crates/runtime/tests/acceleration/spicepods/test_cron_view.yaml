@@ -1,0 +1,12 @@
+version: v1
+kind: Spicepod
+name: test_cron_view
+views:
+  - name: names_view
+    sql: SELECT * FROM names
+    acceleration:
+      enabled: true
+      refresh_cron: "*/15 * * * * *" # every 15 seconds
+datasets:
+  - name: names
+    from: file:test_cron_view.csv

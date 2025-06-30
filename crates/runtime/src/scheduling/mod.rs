@@ -15,4 +15,5 @@ limitations under the License.
 */
 
 pub mod dataset;
+pub mod view;
 pub mod worker;

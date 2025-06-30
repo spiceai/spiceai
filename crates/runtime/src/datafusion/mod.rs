@@ -70,6 +70,7 @@ use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -780,7 +781,7 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
-    pub fn remove_view(&self, view_name: &TableReference) -> Result<()> {
+    pub async fn remove_view(&self, view_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(view_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -791,6 +792,11 @@ impl DataFusion {
             }
             .fail();
         }
+
+        if self.is_accelerated(view_name).await {
+            self.accelerated_tables.write().await.remove(view_name);
+        }
+
         Ok(())
     }
 
@@ -1282,7 +1288,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<()> {
+    ) -> Result<JoinHandle<Option<Arc<Notify>>>> {
         tracing::info!("Initializing view {}", &view.name);
 
         let table_exists = self.ctx.table_exist(view.name.clone()).unwrap_or(false);
@@ -1309,7 +1315,7 @@ impl DataFusion {
         let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
 
-        spawn(async move {
+        let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -1354,7 +1360,7 @@ impl DataFusion {
                     "Failed to create view {table}. Dependent table {missing_table} does not exist."
                 );
                 status.update_view(table, status::ComponentStatus::Error);
-                return;
+                return None;
             }
 
             let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
@@ -1363,20 +1369,25 @@ impl DataFusion {
                 Err(e) => {
                     tracing::error!("Failed to create view: {e}");
                     status.update_view(table, status::ComponentStatus::Error);
-                    return;
+                    return None;
                 }
             };
 
             if let Some(acceleration) = &view.acceleration {
                 if acceleration.enabled {
-                    if let Err(e) = df_ref
+                    match df_ref
                         .create_accelerated_view(&view, view_table, &dependent_table_names, secrets)
                         .await
                     {
-                        tracing::error!("Failed to create view: {e}");
-                        status.update_view(table, status::ComponentStatus::Error);
+                        Ok(is_ready) => {
+                            return is_ready;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create view: {e}");
+                            status.update_view(table, status::ComponentStatus::Error);
+                            return None;
+                        }
                     }
-                    return;
                 }
             }
 
@@ -1384,13 +1395,15 @@ impl DataFusion {
             if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
                 tracing::error!("Failed to create view: {e}");
                 status.update_view(table, status::ComponentStatus::Error);
-                return;
+                return None;
             }
             tracing::info!("{}", view_registered_trace(table, None));
             status.update_view(table, status::ComponentStatus::Ready);
+
+            None
         });
 
-        Ok(())
+        Ok(register_task)
     }
 
     pub async fn create_accelerated_view(
@@ -1399,7 +1412,7 @@ impl DataFusion {
         view_table: ViewTable,
         dependent_tables: &[TableReference],
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<Notify>>> {
         let table = &view.name;
 
         tracing::debug!(
@@ -1488,6 +1501,8 @@ impl DataFusion {
                     dataset_name: table.to_string(),
                 })?;
 
+        let is_ready = accelerated_table.refresher().on_complete_notification();
+
         self.ctx
             .register_table(table.clone(), Arc::new(accelerated_table).table_provider())
             .map_err(|e| Error::UnableToCreateView {
@@ -1496,13 +1511,18 @@ impl DataFusion {
 
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
 
+        self.accelerated_tables
+            .write()
+            .await
+            .insert(view.name.clone());
+
         // if initial load completed, mark view as ready; otherwise, ready status will be updated by acceleration
         if initial_load_complete || view.ready_state == ReadyState::OnRegistration {
             self.runtime_status
                 .update_view(&view.name, status::ComponentStatus::Ready);
         }
 
-        Ok(())
+        Ok(is_ready)
     }
 
     /// Returns all table names in user defined schemas (i.e. not system or runtime schemas).

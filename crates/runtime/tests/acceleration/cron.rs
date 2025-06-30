@@ -546,3 +546,88 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_cron_view() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            std::fs::write("./test_cron_view.csv", NAMES_CSV).expect("write file");
+
+            let app = test_framework::app_utils::load_app_from_spicepod_str(include_str!(
+                "./spicepods/test_cron_view.yaml"
+            ))
+            .await
+            .expect("Should load app from spicepod string");
+
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await,
+            );
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // validate that a scheduler exists in the runtime
+            let schedulers_lock = Arc::clone(&rt).schedulers();
+            let schedulers = schedulers_lock.read().await;
+
+            // there should only be one `refresh_scheduler` with one schedule for the configured dataset
+            assert!(
+                schedulers.len() == 1,
+                "Expected exactly one scheduler, found: {}",
+                schedulers.len()
+            );
+            let refresh_scheduler = schedulers
+                .get("refresh_scheduler")
+                .expect("Expected a refresh scheduler to be present");
+            let mut rt_schedules = refresh_scheduler.schedules().await;
+            assert!(
+                rt_schedules.len() == 1,
+                "Expected exactly one schedule, found: {}",
+                rt_schedules.len()
+            );
+            let schedule = rt_schedules
+                .pop()
+                .expect("Expected a schedule to be present");
+            assert_eq!(
+                schedule.name(),
+                "names_view".into(),
+                "Expected schedule name to match dataset name"
+            );
+
+            snapshot_names_from_runtime("test_cron_view", &rt, None).await;
+
+            // Append a new row to the CSV file
+            let new_row = "11,Spaceman,29,LEO,100\n".to_string();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open("./test_cron_view.csv")
+                .expect("open file")
+                .write_all(new_row.as_bytes())
+                .expect("append to file");
+
+            // wait for the next 15th second, and wait 5 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(15, Some(5))).await;
+            snapshot_names_from_runtime("test_cron_view_after", &rt, None).await;
+
+            rt.shutdown().await;
+            drop(rt);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            std::fs::remove_file("./test_cron_view.csv").expect("remove file");
+
+            Ok(())
+        })
+        .await
+}

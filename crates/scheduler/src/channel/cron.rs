@@ -213,6 +213,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cron_cannot_go_faster_than_second() {
+        let cron_expression = "* * * * * * *".into(); // expression attempting to run every millisecond
+        let channel = CronRequestChannel::new(&cron_expression);
+        assert!(channel.is_err(), "Cron expression should be invalid");
+    }
+
+    #[tokio::test]
     async fn test_cron_resets_to_next() {
         // resetting while in-between a schedule should evaluate to the same next instance again
         let cron_expression = "*/5 * * * * *".into();
