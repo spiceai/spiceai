@@ -33,7 +33,9 @@ use datafusion::{
     execution::{TaskContext, context::ExecutionProps},
     logical_expr::{ColumnarValue, dml::InsertOp},
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, execute_stream, union::UnionExec},
+    physical_plan::{
+        ExecutionPlan, empty::EmptyExec, execute_stream, limit::GlobalLimitExec, union::UnionExec,
+    },
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -131,14 +133,37 @@ impl TableProvider for PartitionTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Err(DataFusionError::Execution(
-            "PartitionedTableProvider::scan not implemented yet".to_string(),
-        ))
+        let partitions = self.partitions.read().await;
+        let mut plans = Vec::with_capacity(partitions.len());
+        for table_provider in partitions.values() {
+            let plan = table_provider
+                .scan(state, projection, filters, limit)
+                .await?;
+            plans.push(plan);
+        }
+
+        if plans.is_empty() {
+            let empty = EmptyExec::new(Arc::clone(&self.schema));
+            return Ok(Arc::new(empty));
+        }
+
+        let plan = if plans.len() > 1 {
+            Arc::new(UnionExec::new(plans))
+        } else {
+            #[allow(clippy::unwrap_used)]
+            plans.into_iter().next().unwrap()
+        };
+
+        if let Some(limit) = limit {
+            return Ok(Arc::new(GlobalLimitExec::new(plan, limit, None)));
+        }
+
+        Ok(plan)
     }
 
     async fn insert_into(
