@@ -35,7 +35,7 @@ use runtime_table_partition::{
     provider::PartitionTableProvider,
 };
 use snafu::prelude::*;
-use tokio::sync::Mutex;
+use tokio::{fs::create_dir, sync::Mutex};
 
 use super::{
     AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
@@ -216,9 +216,10 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let partition_value_str = encode_scalar_value(&partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
+        let table = cmd.name.table();
         let data_path = spice_data_base_path();
 
-        let duckdb_file = format!("{data_path}/{partition_value_str}.duckdb");
+        let duckdb_file = format!("{data_path}/{table}/{partition_value_str}.db");
         let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
             .with_max_size(Some(10))
             .with_min_idle(Some(10));
@@ -240,15 +241,23 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
         let data_path = spice_data_base_path();
-        let data_path = Path::new(&data_path);
+        let table = self.cmd.name.table();
+        let data_path = Path::new(&data_path).join(table);
 
-        let mut dir_entries = tokio::fs::read_dir(data_path)
+        if !data_path.is_dir() {
+            create_dir(data_path)
+                .await
+                .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+            return Ok(vec![]);
+        }
+
+        let mut dir_entries = tokio::fs::read_dir(&data_path)
             .await
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
         let mut partitions = Vec::new();
 
-        let valid_extensions = ["duckdb"];
+        let valid_extensions = ["db"];
 
         while let Some(entry) = dir_entries
             .next_entry()
