@@ -145,7 +145,7 @@ pub async fn create_internal_accelerated_table(
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
-    handle_accelerated_table_behavior(accelerated_table_behaviors, &federated_table, &name.table())
+    handle_accelerated_table_behavior(accelerated_table_behaviors, &federated_table, name.table())
         .boxed()
         .context(InternalSnafu {
             code: "IT-CIA-HATB".to_string(), // InternalTable - CreateInternalAcceleratedTable - HandleAcceleratedTableBehavior

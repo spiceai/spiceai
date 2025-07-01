@@ -17,12 +17,12 @@ limitations under the License.
 mod wants_underlying_provider;
 pub use wants_underlying_provider::WantsUnderlyingTableProvider;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Behaviors(Vec<Behavior>);
 
 impl Behaviors {
     #[must_use]
-    pub fn default() -> Self {
+    pub fn new() -> Self {
         Self(vec![])
     }
 
@@ -32,11 +32,11 @@ impl Behaviors {
         self
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = &Behavior> {
         self.0.iter()
     }
 
+    #[must_use]
     pub fn is_default(&self) -> bool {
         self.0.is_empty()
     }

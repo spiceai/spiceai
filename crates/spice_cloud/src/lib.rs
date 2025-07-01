@@ -372,7 +372,7 @@ pub async fn create_synced_internal_accelerated_table(
     handle_accelerated_table_behavior(
         accelerated_table_behaviors,
         &federated_table,
-        &table_reference.table(),
+        table_reference.table(),
     )
     .boxed()
     .context(UnableToCreateDataAcceleratorTableSnafu)?;
