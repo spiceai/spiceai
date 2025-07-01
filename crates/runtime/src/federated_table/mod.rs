@@ -124,6 +124,22 @@ impl FederatedTable {
         )))
     }
 
+    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
+    ///
+    /// Returns None if
+    ///   1. Active write on the [`DeferredTableProvider`]'s state.
+    ///   2. The [`DeferredTableProvider`] is not Ready.
+    pub fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
+        let deferred_table_provider = match self {
+            Self::Immediate(table_provider) => return Some(Arc::clone(table_provider)),
+            Self::Deferred(deferred_table_provider) => deferred_table_provider,
+        };
+        match &*deferred_table_provider.state.try_read().ok()? {
+            DeferredState::Done(tbl) => Some(Arc::clone(tbl)),
+            _ => None,
+        }
+    }
+
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Arc::clone(table_provider),
