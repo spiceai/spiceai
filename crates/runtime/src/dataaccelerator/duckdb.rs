@@ -44,7 +44,7 @@ use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
 mod settings;
 
@@ -303,7 +303,7 @@ impl DataAccelerator for DuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         let num_partitions = partition_by.len();
         ensure!(
             num_partitions == 0,
@@ -398,7 +398,7 @@ impl DataAccelerator for DuckDBAccelerator {
             read_provider,
         ));
 
-        Ok(table_provider)
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {

@@ -19,7 +19,11 @@ limitations under the License.
 //! This is useful for indexes that are injected into the data acceleration read pipeline, but
 //! do not need to persist the data.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{
+    any::Any,
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -38,7 +42,10 @@ use datafusion::{
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{
+    AccelerationSource, Behaviors, DataAccelerator,
+    behaviors::{Behavior, WantsUnderlyingTableProvider},
+};
 use crate::parameters::ParameterSpec;
 
 pub struct VoidAccelerator {}
@@ -71,8 +78,18 @@ impl DataAccelerator for VoidAccelerator {
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
         _partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Arc::new(VoidTable::new(Arc::clone(cmd.schema.inner()))))
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        let (table_provider, underlying_provider_cb) =
+            VoidTable::new(Arc::clone(cmd.schema.inner()));
+        Ok((
+            Arc::new(table_provider) as Arc<dyn TableProvider>,
+            Behaviors::default().add_behavior(Behavior::WantsUnderlyingTableProvider(
+                WantsUnderlyingTableProvider::new(Box::new(move |underlying_provider| {
+                    let _ = underlying_provider_cb.set(underlying_provider);
+                    Ok(())
+                })),
+            )),
+        ))
     }
 
     fn prefix(&self) -> &'static str {
@@ -87,12 +104,21 @@ impl DataAccelerator for VoidAccelerator {
 #[derive(Debug)]
 pub struct VoidTable {
     schema: SchemaRef,
+    underlying_provider: Arc<OnceLock<Arc<dyn TableProvider>>>,
 }
 
 impl VoidTable {
+    /// Creates a new `VoidTable` and returns the placeholder for the underlying provider.
     #[must_use]
-    pub fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+    pub fn new(schema: SchemaRef) -> (Self, Arc<OnceLock<Arc<dyn TableProvider>>>) {
+        let underlying_provider = Arc::new(OnceLock::new());
+        (
+            Self {
+                schema,
+                underlying_provider: Arc::clone(&underlying_provider),
+            },
+            underlying_provider,
+        )
     }
 }
 
@@ -112,13 +138,19 @@ impl TableProvider for VoidTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let projected_schema = project_schema(&self.schema, projection)?;
-        Ok(Arc::new(EmptyExec::new(projected_schema)))
+        let Some(underlying_provider) = self.underlying_provider.get() else {
+            let projected_schema = project_schema(&self.schema, projection)?;
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        };
+
+        underlying_provider
+            .scan(state, projection, filters, limit)
+            .await
     }
 
     async fn insert_into(
