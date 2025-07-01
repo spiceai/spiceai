@@ -32,7 +32,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{RwLock, oneshot};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
@@ -62,7 +62,7 @@ enum DeferredState {
 
 #[derive(Debug)]
 pub struct DeferredTableProvider {
-    state: Mutex<DeferredState>,
+    state: RwLock<DeferredState>,
     schema: SchemaRef,
 }
 
@@ -147,7 +147,7 @@ impl FederatedTable {
         };
 
         // If the table provider is not available immediately, see if we already have it from the deferred task.
-        let mut deferred_state_guard = deferred_table_provider.state.lock().await;
+        let mut deferred_state_guard = deferred_table_provider.state.write().await;
 
         // If the table provider is available now, return it.
         if let DeferredState::Done(table_provider) = &*deferred_state_guard {
@@ -240,7 +240,7 @@ impl FederatedTable {
         });
 
         DeferredTableProvider {
-            state: Mutex::new(DeferredState::Waiting(rx)),
+            state: RwLock::new(DeferredState::Waiting(rx)),
             schema,
         }
     }

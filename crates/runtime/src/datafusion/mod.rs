@@ -1712,7 +1712,7 @@ pub fn handle_accelerated_table_behavior(
 ) -> Result<()> {
     for behavior in accelerated_table_behaviors {
         match behavior {
-            Behavior::WantsUnderlyingTableProvider(mut wants_underlying_table_provider) => {
+            Behavior::WantsUnderlyingTableProvider(wants_underlying_table_provider) => {
                 if let Some(underlying_provider) = federated_table.try_table_provider_sync() {
                     wants_underlying_table_provider
                         .set(underlying_provider)
