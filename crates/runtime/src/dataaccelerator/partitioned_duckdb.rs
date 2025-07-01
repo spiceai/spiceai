@@ -188,13 +188,13 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 }
 
 #[derive(Debug)]
-struct DuckDBPartitionCreator {
+pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
 }
 
 impl DuckDBPartitionCreator {
-    fn new(cmd: CreateExternalTable) -> Self {
+    pub(crate) fn new(cmd: CreateExternalTable) -> Self {
         Self {
             cmd,
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
@@ -282,10 +282,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
                         continue;
                     }
                 };
-
-                let mut cmd = self.cmd.clone();
-                cmd.options
-                    .insert("location".to_string(), path.to_string_lossy().into_owned());
 
                 let table_provider = create_table_provider(&self.duckdb_factory, &self.cmd)
                     .await

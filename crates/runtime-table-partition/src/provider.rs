@@ -222,12 +222,8 @@ impl TableProvider for PartitionTableProvider {
         }
 
         if execution_plans.is_empty() {
-            let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-                &[vec![]],
-                Arc::clone(&self.schema),
-                None,
-            )?));
-            Ok(Arc::new(mem_exec))
+            let empty = EmptyExec::new(Arc::clone(&self.schema));
+            Ok(Arc::new(empty))
         } else if execution_plans.len() == 1 {
             #[allow(clippy::unwrap_used)]
             Ok(execution_plans.into_iter().next().unwrap())
