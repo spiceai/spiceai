@@ -32,7 +32,6 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use tracing::{debug, warn};
 
-const TITAN_TEXT_EMBED_V1: &str = "amazon.titan-embed-text-v1";
 const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 const COHERE_EMBED_ENGLISH_V3: &str = "cohere.embed-english-v3";
 const COHERE_EMBED_MULTILINGUAL_V3: &str = "cohere.embed-multilingual-v3";
@@ -352,7 +351,7 @@ impl Embed for BedrockEmbed {
 
     fn size(&self) -> i32 {
         match self.model_id.as_str() {
-            TITAN_TEXT_EMBED_V1 | TITAN_TEXT_EMBED_V2 => match self.dimensions {
+            TITAN_TEXT_EMBED_V2 => match self.dimensions {
                 Some(256) => 256,
                 Some(512) => 512,
                 _ => 1024,
