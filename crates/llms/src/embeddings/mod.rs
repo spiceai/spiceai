@@ -99,6 +99,13 @@ pub enum Error {
     #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
     MissingParamError { param_key: &'static str },
 
+    #[snafu(display("`param.{param_key}: {value}` is invalid: {reason}."))]
+    InvalidParamError {
+        param_key: &'static str,
+        value: String,
+        reason: String,
+    },
+
     #[snafu(display(
         "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
     ))]

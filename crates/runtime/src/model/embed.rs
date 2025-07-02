@@ -113,7 +113,7 @@ async fn bedrock(
         let credentials = aws_credential_types::Credentials::new(
             access_key,
             secret_key,
-            session_token.map(|s| s.to_string()),
+            session_token.map(std::string::ToString::to_string),
             None,
             "bedrock-embed",
         );
@@ -138,7 +138,7 @@ async fn bedrock(
         if let Some(dims) = dimensions {
             if !matches!(dims, 256 | 512 | 1024) {
                 return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Invalid dimensions '{}' for Titan model. Must be 256, 512, or 1024", dims).into(),
+                    source: format!("Invalid dimensions '{dims}' for Titan model. Must be 256, 512, or 1024").into(),
                 });
             }
         }
@@ -153,8 +153,8 @@ async fn bedrock(
         })?
         .unwrap_or(true);
     
-    let truncate = extract_secret!(params, "truncate").map(|s| s.to_string());
-    let input_type = extract_secret!(params, "input_type").map(|s| s.to_string());
+    let truncate = extract_secret!(params, "truncate").map(std::string::ToString::to_string);
+    let input_type = extract_secret!(params, "input_type").map(std::string::ToString::to_string);
     
     // Validate input_type for Cohere models
     if model_id.starts_with("cohere.embed") {
