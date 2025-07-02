@@ -73,14 +73,6 @@ impl Runtime {
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
-        if valid_datasets.is_empty() {
-            // If views are provided, make sure to load them.
-            if !valid_views.is_empty() {
-                Arc::clone(&self).load_views(app);
-            }
-            return;
-        }
-
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
 
         // Create a map of dataset names to their futures
