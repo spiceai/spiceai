@@ -498,14 +498,16 @@ func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
 	if flight, err := c.flags.GetString("flight-endpoint"); err == nil && flight != "" {
 		if slices.Contains(args, "--repl") {
 			args = append(args, "--repl-flight-endpoint", flight)
-		} else {
+		} else if !slices.Contains(args, "--flight") {
 			args = append(args, "--flight", flight)
 		}
 	}
 
-	args = append(args, "--http", c.HttpSocketAddress())
+	if !slices.Contains(args, "--http") {
+		args = append(args, "--http", c.HttpSocketAddress())
+	}
 
-	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
+	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" && !slices.Contains(args, "--metrics") {
 		args = append(args, "--metrics", endpoint)
 	}
 
