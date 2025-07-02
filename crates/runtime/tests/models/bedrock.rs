@@ -16,7 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "bedrock")]
 mod bedrock_tests {
-    use super::super::embedding::{run_embedding_tests, EmbeddingTestCase};
+    use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
     use async_openai::types::EmbeddingInput;
     use spicepod::component::embeddings::Embeddings;
     use std::collections::HashMap;
@@ -34,7 +34,7 @@ mod bedrock_tests {
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("normalize".to_string(), "true".to_string());
         params.insert("dimensions".to_string(), "1024".to_string());
-        
+
         Embeddings {
             from: "bedrock:amazon.titan-embed-text-v1".to_string(),
             name: "titan-v1".to_string(),
@@ -51,7 +51,7 @@ mod bedrock_tests {
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("normalize".to_string(), "true".to_string());
         params.insert("dimensions".to_string(), "512".to_string());
-        
+
         Embeddings {
             from: "bedrock:amazon.titan-embed-text-v2:0".to_string(),
             name: "titan-v2".to_string(),
@@ -68,7 +68,7 @@ mod bedrock_tests {
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("input_type".to_string(), "search_document".to_string());
         params.insert("truncate".to_string(), "END".to_string());
-        
+
         Embeddings {
             from: "bedrock:cohere.embed-english-v3".to_string(),
             name: "cohere-english".to_string(),
@@ -85,7 +85,7 @@ mod bedrock_tests {
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("input_type".to_string(), "classification".to_string());
         params.insert("truncate".to_string(), "NONE".to_string());
-        
+
         Embeddings {
             from: "bedrock:cohere.embed-multilingual-v3".to_string(),
             name: "cohere-multilingual".to_string(),
@@ -303,7 +303,9 @@ mod bedrock_tests {
             },
             // Special characters test
             EmbeddingTestCase {
-                input: EmbeddingInput::String("Special chars: !@#$%^&*()_+-=[]{}|;':,.<>?".to_string()),
+                input: EmbeddingInput::String(
+                    "Special chars: !@#$%^&*()_+-=[]{}|;':,.<>?".to_string(),
+                ),
                 model_name: "titan-v1",
                 encoding_format: Some("float"),
                 user: None,
@@ -332,15 +334,21 @@ mod bedrock_tests {
     async fn test_titan_dimensions() {
         let mut titan_256 = create_titan_v1_embedding();
         titan_256.name = "titan-256".to_string();
-        titan_256.params.insert("dimensions".to_string(), "256".to_string());
+        titan_256
+            .params
+            .insert("dimensions".to_string(), "256".to_string());
 
         let mut titan_512 = create_titan_v1_embedding();
         titan_512.name = "titan-512".to_string();
-        titan_512.params.insert("dimensions".to_string(), "512".to_string());
+        titan_512
+            .params
+            .insert("dimensions".to_string(), "512".to_string());
 
         let mut titan_1024 = create_titan_v1_embedding();
         titan_1024.name = "titan-1024".to_string();
-        titan_1024.params.insert("dimensions".to_string(), "1024".to_string());
+        titan_1024
+            .params
+            .insert("dimensions".to_string(), "1024".to_string());
 
         let models = vec![titan_256, titan_512, titan_1024];
         let tests = vec![

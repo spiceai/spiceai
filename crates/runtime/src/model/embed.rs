@@ -161,7 +161,7 @@ async fn bedrock(
         }
 
         Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
-    } else {
+    } else if model_id.starts_with("cohere.embed") {
         let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
             CohereEmbeddingTruncate::from_str(truncate_str)
                 .boxed()
@@ -191,6 +191,10 @@ async fn bedrock(
             input_type,
             CohereEmbeddingType::Float,
         )) as Arc<dyn Embed>)
+    } else {
+        Err(EmbedError::ModelDoesNotExist {
+            model_name: model_id,
+        })
     }
 }
 
