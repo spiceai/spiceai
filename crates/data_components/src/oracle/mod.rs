@@ -64,8 +64,8 @@ pub enum Error {
     #[snafu(display("Failed to retrieve schema for '{table}': catalogs are not supported"))]
     SchemaRetrievalCatalogsUnsupported { table: String },
 
-    #[snafu(display("Unsupported data type: {data_type}"))]
-    UnsupportedType { data_type: String },
+    #[snafu(display("Unsupported data type for column '{column}': {data_type}"))]
+    UnsupportedType { data_type: String, column: String },
 
     #[snafu(display("Failed to build record batch: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
