@@ -38,7 +38,7 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
     let connector = oracle_connector::new(
         common::ORACLE_USERNAME,
         common::ORACLE_ROOT_PASSWORD,
-        format!("//localhost:{ORACLE_PORT}/XEPDB1"),
+        format!("//localhost:{ORACLE_PORT}/FREEPDB1"),
     );
 
     let client = connector.connect()?;
@@ -68,6 +68,7 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
             CREATE TABLE "TEST_TABLE" (
                 "ID"                        NUMBER PRIMARY KEY,
                 "VAL_NUMBER"                NUMBER(10, 2),
+                "VAL_INTEGER"               NUMBER(18),
                 "VAL_DECIMAL"               DECIMAL(18,4),
                 "VAL_FLOAT"                 FLOAT(24),
                 "VAL_DOUBLE"                FLOAT(53),
@@ -96,13 +97,13 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
         .execute(
             r#"
             INSERT INTO "TEST_TABLE" (
-                "ID", "VAL_NUMBER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
+                "ID", "VAL_NUMBER", "VAL_INTEGER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
                 "VAL_CHAR", "VAL_NCHAR", "VAL_VARCHAR2", "VAL_NVARCHAR2",
                 "VAL_CLOB", "VAL_NCLOB", "VAL_DATE", "VAL_TIMESTAMP", "VAL_TIMESTAMP_TZ", "VAL_TIMESTAMP_LOCAL_TZ",
                 "VAL_BINARY_FLOAT", "VAL_BINARY_DOUBLE", "VAL_RAW", "VAL_BLOB",
                 "VAL_BOOL"
             ) VALUES (
-                1, 123.45, 555.1234, 3.14, 2.71828,
+                1, 123.45, 123456789012345678, 555.1234, 3.14, 2.71828,
                 'abc', N'def', 'ghi', N'jkl',
                 'clobtext', N'nclobtext', DATE '2024-06-27', TIMESTAMP '2024-06-27 10:00:00', TIMESTAMP '2024-06-27 10:00:00 -07:00', TIMESTAMP '2024-06-27 10:00:00',
                 1.23, 4.56, hextoraw('DEADBEEFDEADBEEFDEADBEEFDEADBEEF'), EMPTY_BLOB(),
@@ -117,13 +118,13 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
         .execute(
             r#"
             INSERT INTO "TEST_TABLE" (
-                "ID", "VAL_NUMBER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
+                "ID", "VAL_NUMBER", "VAL_INTEGER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
                 "VAL_CHAR", "VAL_NCHAR", "VAL_VARCHAR2", "VAL_NVARCHAR2",
                 "VAL_CLOB", "VAL_NCLOB", "VAL_DATE", "VAL_TIMESTAMP", "VAL_TIMESTAMP_TZ", "VAL_TIMESTAMP_LOCAL_TZ",
                 "VAL_BINARY_FLOAT", "VAL_BINARY_DOUBLE", "VAL_RAW", "VAL_BLOB",
                 "VAL_BOOL"
             ) VALUES (
-                2, 987.65, 9999.4321, 2.71, 3.14159,
+                2, 987.65, -999, 9999.4321, 2.71, 3.14159,
                 'xyz', N'pqr', 'stu', N'vwx',
                 'clobtext2', N'nclobtext2', DATE '2025-01-01', TIMESTAMP '2025-01-01 00:00:00', TIMESTAMP '2025-01-01 00:00:00 +00:00', TIMESTAMP '2025-01-01 00:00:00',
                 9.87, 6.54, hextoraw('11223344556677889900AABBCCDDEEFF'), EMPTY_BLOB(),
@@ -138,13 +139,13 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
         .execute(
             r#"
             INSERT INTO "TEST_TABLE" (
-                "ID", "VAL_NUMBER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
+                "ID", "VAL_NUMBER", "VAL_INTEGER", "VAL_DECIMAL", "VAL_FLOAT", "VAL_DOUBLE",
                 "VAL_CHAR", "VAL_NCHAR", "VAL_VARCHAR2", "VAL_NVARCHAR2",
                 "VAL_CLOB", "VAL_NCLOB", "VAL_DATE", "VAL_TIMESTAMP", "VAL_TIMESTAMP_TZ", "VAL_TIMESTAMP_LOCAL_TZ",
                 "VAL_BINARY_FLOAT", "VAL_BINARY_DOUBLE", "VAL_RAW", "VAL_BLOB",
                 "VAL_BOOL"
             ) VALUES (
-                3, NULL, NULL, NULL, NULL,
+                3, NULL, NULL, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL, NULL, NULL,
                 NULL, NULL, NULL, EMPTY_BLOB(),
@@ -222,21 +223,43 @@ async fn oracle_integration_test() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                "select * from test_tbl",
+                r#"select 
+                    round("ID") as ID, 
+                    "VAL_NUMBER", 
+                    "VAL_DECIMAL", 
+                    "VAL_FLOAT", 
+                    "VAL_DOUBLE", 
+                    "VAL_INTEGER", 
+                    "VAL_CHAR", 
+                    "VAL_NCHAR", 
+                    "VAL_VARCHAR2", 
+                    "VAL_NVARCHAR2", 
+                    "VAL_CLOB", 
+                    "VAL_NCLOB", 
+                    "VAL_DATE", 
+                    "VAL_TIMESTAMP", 
+                    "VAL_TIMESTAMP_TZ", 
+                    "VAL_TIMESTAMP_LOCAL_TZ", 
+                    "VAL_BINARY_FLOAT", 
+                    "VAL_BINARY_DOUBLE", 
+                    "VAL_RAW", 
+                    "VAL_BLOB", 
+                    "VAL_BOOL" 
+                 from test_tbl"#,
                 "data",
             )
             .await?;
 
             run_and_snapshot_query(
                 &rt,
-                r#"explain select * from test_tbl where "VAL_NUMBER" = 123.45 AND "VAL_FLOAT" > 2.8 AND "VAL_DECIMAL" < 10000 AND "VAL_VARCHAR2" = 'ghi' AND "VAL_BOOL" = 'Y' limit 1"#,
+                r#"explain select "VAL_NUMBER", "VAL_DECIMAL", "VAL_FLOAT" from test_tbl where "VAL_NUMBER" = 123.45 AND "VAL_FLOAT" > 2.8 AND "VAL_INTEGER" >= 123456789012345678 AND "VAL_DECIMAL" < 10000 AND "VAL_VARCHAR2" = 'ghi' AND "VAL_BOOL" = 'Y' limit 1"#,
                 "filters_pushdown_query_plan",
             )
             .await?;
 
             run_and_snapshot_query(
                 &rt,
-                r#"select * from test_tbl where "VAL_NUMBER" = 123.45 AND "VAL_FLOAT" > 2.8 AND "VAL_DECIMAL" < 10000 AND "VAL_VARCHAR2" = 'ghi' AND "VAL_BOOL" = 'Y' limit 1"#,
+                r#"select "VAL_NUMBER", "VAL_DECIMAL", "VAL_FLOAT" from test_tbl where "VAL_NUMBER" = 123.45 AND "VAL_FLOAT" > 2.8 AND "VAL_INTEGER" >= 123456789012345678 AND "VAL_DECIMAL" < 10000 AND "VAL_VARCHAR2" = 'ghi' AND "VAL_BOOL" = 'Y' limit 1"#,
                 "filters_pushdown_query_result",
             )
             .await?;

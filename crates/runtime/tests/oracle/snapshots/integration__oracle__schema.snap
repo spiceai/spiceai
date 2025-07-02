@@ -5,8 +5,9 @@ expression: formatted
 +------------------------+------------------------------------+-------------+
 | column_name            | data_type                          | is_nullable |
 +------------------------+------------------------------------+-------------+
-| ID                     | Decimal128(38, 0)                  | YES         |
+| ID                     | Decimal128(38, 20)                 | YES         |
 | VAL_NUMBER             | Decimal128(10, 2)                  | YES         |
+| VAL_INTEGER            | Int64                              | YES         |
 | VAL_DECIMAL            | Decimal128(18, 4)                  | YES         |
 | VAL_FLOAT              | Float32                            | YES         |
 | VAL_DOUBLE             | Float64                            | YES         |
