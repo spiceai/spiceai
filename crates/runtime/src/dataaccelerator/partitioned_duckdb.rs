@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, path::Path, sync::Arc};
+use std::{
+    any::Any,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -30,12 +34,12 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{decode_scalar_value, encode_scalar_value},
+        filename::{self, decode_scalar_value, encode_scalar_value},
     },
     provider::PartitionTableProvider,
 };
 use snafu::prelude::*;
-use tokio::{fs::create_dir, sync::Mutex};
+use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
@@ -191,10 +195,15 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
+    partition_dir: PathBuf,
 }
 
 impl DuckDBPartitionCreator {
     pub(crate) fn new(cmd: CreateExternalTable) -> Self {
+        let data_path = spice_data_base_path();
+        let table = cmd.name.table();
+        let partition_dir = Path::new(&data_path).join(table);
+
         Self {
             cmd,
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
@@ -202,6 +211,7 @@ impl DuckDBPartitionCreator {
                 .with_settings_registry(
                     DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
                 ),
+            partition_dir,
         }
     }
 }
@@ -213,14 +223,10 @@ impl PartitionCreator for DuckDBPartitionCreator {
         partition_value: ScalarValue,
     ) -> Result<Arc<dyn TableProvider>, creator::Error> {
         let mut cmd = self.cmd.clone();
-        let partition_value_str = encode_scalar_value(&partition_value)
+        let duckdb_path = add_open(&self.partition_dir, &mut cmd, &partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        let table = cmd.name.table();
-        let data_path = spice_data_base_path();
-
-        let duckdb_file = format!("{data_path}/{table}/{partition_value_str}.db");
-        let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+        let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_path)
             .with_max_size(Some(10))
             .with_min_idle(Some(10));
         self.duckdb_factory
@@ -228,9 +234,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        cmd.options.insert("open".to_string(), duckdb_file);
-
-        tracing::debug!("creating partition at {}", &cmd.location);
+        tracing::debug!("creating partition at {duckdb_path}");
 
         let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
             .await
@@ -240,18 +244,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
     }
 
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
-        let data_path = spice_data_base_path();
-        let table = self.cmd.name.table();
-        let data_path = Path::new(&data_path).join(table);
-
-        if !data_path.is_dir() {
-            create_dir(data_path)
+        if !self.partition_dir.is_dir() {
+            create_dir_all(&self.partition_dir)
                 .await
                 .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
             return Ok(vec![]);
         }
 
-        let mut dir_entries = tokio::fs::read_dir(&data_path)
+        let mut dir_entries = tokio::fs::read_dir(&self.partition_dir)
             .await
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
@@ -283,7 +283,11 @@ impl PartitionCreator for DuckDBPartitionCreator {
                     }
                 };
 
-                let table_provider = create_table_provider(&self.duckdb_factory, &self.cmd)
+                let mut cmd = self.cmd.clone();
+                add_open(&self.partition_dir, &mut cmd, &partition_value)
+                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+                let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
                     .await
                     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
@@ -294,11 +298,26 @@ impl PartitionCreator for DuckDBPartitionCreator {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "inferred {} existing partitions from '{}'",
             partitions.len(),
-            data_path.display()
+            self.partition_dir.display().to_string(),
         );
         Ok(partitions)
     }
+}
+
+fn add_open(
+    partition_dir: &Path,
+    cmd: &mut CreateExternalTable,
+    partition_value: &ScalarValue,
+) -> Result<String, filename::Error> {
+    let partition_value_str = encode_scalar_value(partition_value)?;
+
+    let duckdb_file = format!("{partition_value_str}.db");
+    let duckdb_path = partition_dir.join(&duckdb_file);
+    let duckdb_path = duckdb_path.display().to_string();
+    cmd.options.insert("open".to_string(), duckdb_path.clone());
+
+    Ok(duckdb_path)
 }
