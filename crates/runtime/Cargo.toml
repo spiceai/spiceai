@@ -83,7 +83,7 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos.workspace = true
-mediatype = "0.19.18"
+mediatype = "0.20.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
