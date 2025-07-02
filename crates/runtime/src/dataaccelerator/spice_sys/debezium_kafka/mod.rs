@@ -60,6 +60,8 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(_) => None,
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -73,6 +75,10 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(_) => {
+                Err("Not yet supported for partitioned DuckDB".into())
+            }
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]

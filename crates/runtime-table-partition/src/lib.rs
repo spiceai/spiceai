@@ -23,7 +23,8 @@ pub mod expression;
 pub mod provider;
 
 #[derive(Debug)]
-pub struct Partition {
+pub struct Partition<Pool> {
     pub partition_value: ScalarValue,
+    pub pool: Arc<Pool>,
     pub table_provider: Arc<dyn TableProvider>,
 }

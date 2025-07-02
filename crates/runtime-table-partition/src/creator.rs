@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use async_trait::async_trait;
-use datafusion::{catalog::TableProvider, scalar::ScalarValue};
+use datafusion::scalar::ScalarValue;
 use snafu::prelude::*;
 
 use crate::Partition;
@@ -36,6 +36,9 @@ pub enum Error {
 
 #[async_trait]
 pub trait PartitionCreator: Debug + Send + Sync {
+    /// Connection pool to the partitioned data source
+    type ConnectionPool;
+
     /// Create a new [`Partition`] using the `partition_value`.
     ///
     /// # Errors
@@ -43,11 +46,13 @@ pub trait PartitionCreator: Debug + Send + Sync {
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
-    ) -> Result<Arc<dyn TableProvider>, Error>;
+    ) -> Result<Partition<Self::ConnectionPool>, Error>;
 
     /// Find and load previously created [`Parition`]s.
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+    async fn infer_existing_partitions(
+        &self,
+    ) -> Result<Vec<Partition<Self::ConnectionPool>>, Error>;
 }

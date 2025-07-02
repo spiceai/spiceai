@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
-use super::AccelerationSource;
+use super::{AccelerationSource, partitioned_duckdb::PartitionedDuckDBAccelerator};
 
 #[cfg(feature = "postgres")]
 use {
@@ -46,6 +46,8 @@ pub mod debezium_kafka;
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
+    #[cfg(feature = "duckdb")]
+    PartitionedDuckDB(Vec<Arc<DuckDbConnectionPool>>),
     #[cfg(feature = "postgres")]
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
@@ -69,22 +71,34 @@ async fn acceleration_connection(
                 .get_accelerator_engine(acceleration_settings)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
-            let duckdb_accelerator = accelerator
-                .as_any()
-                .downcast_ref::<DuckDBAccelerator>()
-                .ok_or("Accelerator is not a DuckDBAccelerator")?;
 
-            let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
-            if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
-                return Err("DuckDB file does not exist.".into());
+            if acceleration_settings.partition_by.is_empty() {
+                let duckdb_accelerator = accelerator
+                    .as_any()
+                    .downcast_ref::<DuckDBAccelerator>()
+                    .ok_or("Accelerator is not a DuckDBAccelerator")?;
+
+                let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
+                if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
+                    return Err("DuckDB file does not exist.".into());
+                }
+
+                let pool = duckdb_accelerator
+                    .get_shared_pool(source)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
+            } else {
+                let duckdb_accelerator = accelerator
+                    .as_any()
+                    .downcast_ref::<PartitionedDuckDBAccelerator>()
+                    .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
+
+                let pools = duckdb_accelerator.get_shared_pools().await;
+
+                Ok(AccelerationConnection::PartitionedDuckDB(pools))
             }
-
-            let pool = duckdb_accelerator
-                .get_shared_pool(source)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
         #[cfg(not(feature = "duckdb"))]
         Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),

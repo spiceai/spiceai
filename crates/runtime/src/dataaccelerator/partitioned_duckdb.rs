@@ -27,7 +27,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
-    sql::db_connection_pool::duckdbpool::DuckDbConnectionPoolBuilder,
+    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
@@ -104,17 +104,25 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct PartitionedDuckDBAccelerator {
+pub(crate) struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
-    table_provider: Mutex<Option<Arc<PartitionTableProvider>>>,
+    table_provider: Mutex<Option<Arc<PartitionTableProvider<DuckDbConnectionPool>>>>,
 }
 
 impl PartitionedDuckDBAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base_accelerator: DuckDBAccelerator::new(),
             table_provider: Mutex::new(None),
+        }
+    }
+
+    pub(crate) async fn get_shared_pools(&self) -> Vec<Arc<DuckDbConnectionPool>> {
+        if let Some(provider) = self.table_provider.lock().await.as_ref() {
+            provider.get_shared_pools().await
+        } else {
+            vec![]
         }
     }
 }
@@ -218,19 +226,17 @@ impl DuckDBPartitionCreator {
 
 #[async_trait]
 impl PartitionCreator for DuckDBPartitionCreator {
+    type ConnectionPool = DuckDbConnectionPool;
+
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
-    ) -> Result<Arc<dyn TableProvider>, creator::Error> {
+    ) -> Result<Partition<Self::ConnectionPool>, creator::Error> {
         let mut cmd = self.cmd.clone();
         let duckdb_path = add_open(&self.partition_dir, &mut cmd, &partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_path)
-            .with_max_size(Some(10))
-            .with_min_idle(Some(10));
-        self.duckdb_factory
-            .get_or_init_instance_with_builder(pool_builder)
+        let pool = get_pool(&self.duckdb_factory, &duckdb_path)
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
@@ -240,10 +246,18 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e })?;
 
-        Ok(table_provider)
+        let partition = Partition {
+            partition_value,
+            pool,
+            table_provider,
+        };
+
+        Ok(partition)
     }
 
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+    async fn infer_existing_partitions(
+        &self,
+    ) -> Result<Vec<Partition<Self::ConnectionPool>>, creator::Error> {
         if !self.partition_dir.is_dir() {
             create_dir_all(&self.partition_dir)
                 .await
@@ -287,12 +301,18 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 add_open(&self.partition_dir, &mut cmd, &partition_value)
                     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
+                let duckdb_path = path.display().to_string();
+                let pool = get_pool(&self.duckdb_factory, &duckdb_path)
+                    .await
+                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
                 let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
                     .await
                     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
                 partitions.push(Partition {
                     partition_value,
+                    pool,
                     table_provider,
                 });
             }
@@ -320,4 +340,18 @@ fn add_open(
     cmd.options.insert("open".to_string(), duckdb_path.clone());
 
     Ok(duckdb_path)
+}
+
+async fn get_pool(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    duckdb_path: &str,
+) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
+    let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_path)
+        .with_max_size(Some(10))
+        .with_min_idle(Some(10));
+    Ok(Arc::new(
+        duckdb_factory
+            .get_or_init_instance_with_builder(pool_builder)
+            .await?,
+    ))
 }

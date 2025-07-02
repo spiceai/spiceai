@@ -43,7 +43,7 @@ use futures::StreamExt as _;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::{creator::PartitionCreator, expression::validate_scalar_compatibility};
+use crate::{Partition, creator::PartitionCreator, expression::validate_scalar_compatibility};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -64,14 +64,14 @@ pub enum Error {
 type ScalarValueString = String;
 
 #[derive(Debug)]
-pub struct PartitionTableProvider {
-    creator: Arc<dyn PartitionCreator>,
+pub struct PartitionTableProvider<ConnectionPool> {
+    creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
     partition_by: Vec<Expr>,
-    partitions: RwLock<HashMap<ScalarValueString, Arc<dyn TableProvider>>>,
+    partitions: RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>,
     schema: SchemaRef,
 }
 
-impl PartitionTableProvider {
+impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
     /// the first expression in `partition_by`.
     ///
@@ -79,7 +79,7 @@ impl PartitionTableProvider {
     /// This function will return an Error when the `partition_by` expression
     /// validation fails.
     pub async fn new(
-        creator: Arc<dyn PartitionCreator>,
+        creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
         partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
@@ -97,7 +97,7 @@ impl PartitionTableProvider {
             .into_iter()
             .map(|p| {
                 validate_scalar_compatibility(expr, &p.partition_value, &df_schema)?;
-                Ok((p.partition_value.to_string(), p.table_provider))
+                Ok((p.partition_value.to_string(), p))
             })
             .collect::<Result<HashMap<_, _>, _>>()
             .context(ValidatingExpressionsSnafu)?;
@@ -111,10 +111,25 @@ impl PartitionTableProvider {
             schema,
         })
     }
+
+    /// Get ConnectionPools for each partition.
+    ///
+    /// # Errors
+    pub async fn get_shared_pools(&self) -> Vec<Arc<ConnectionPool>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| p.pool.clone())
+            .collect()
+    }
 }
 
 #[async_trait]
-impl TableProvider for PartitionTableProvider {
+impl<ConnectionPool> TableProvider for PartitionTableProvider<ConnectionPool>
+where
+    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -140,8 +155,9 @@ impl TableProvider for PartitionTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
-        for table_provider in partitions.values() {
-            let plan = table_provider
+        for partition in partitions.values() {
+            let plan = partition
+                .table_provider
                 .scan(state, projection, filters, limit)
                 .await?;
             plans.push(plan);
@@ -189,22 +205,23 @@ impl TableProvider for PartitionTableProvider {
 
             let partition_groups = group_by_partition(expr, &[batch], &df_schema)?;
 
-            for (scalar_value, batch) in partition_groups {
-                let partition_key = scalar_value.to_string();
+            for (partition_value, batch) in partition_groups {
+                let partition_key = partition_value.to_string();
                 let table_provider = {
                     let partitions = self.partitions.read().await;
-                    if let Some(existing_provider) = partitions.get(&partition_key) {
-                        Arc::clone(existing_provider)
+                    if let Some(partition) = partitions.get(&partition_key) {
+                        Arc::clone(&partition.table_provider)
                     } else {
                         drop(partitions);
-                        let new_provider = self
+                        let partition = self
                             .creator
-                            .create_partition(scalar_value.clone())
+                            .create_partition(partition_value.clone())
                             .await
                             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                        let table_provider = Arc::clone(&partition.table_provider);
                         let mut partitions = self.partitions.write().await;
-                        partitions.insert(partition_key.clone(), Arc::clone(&new_provider));
-                        new_provider
+                        partitions.insert(partition_key.clone(), partition);
+                        table_provider
                     }
                 };
 
