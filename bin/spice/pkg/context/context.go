@@ -505,6 +505,10 @@ func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
 
 	args = append(args, "--http", c.HttpSocketAddress())
 
+	if otelEndpoint, err := c.flags.GetString("open_telemetry"); err == nil && otelEndpoint != "" {
+		args = append(args, "--open_telemetry", otelEndpoint)
+	}
+
 	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
 		args = append(args, "--metrics", endpoint)
 	}
