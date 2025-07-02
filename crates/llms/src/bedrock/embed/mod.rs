@@ -15,10 +15,12 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::bedrock::{
-    BedrockClient, CohereEmbedRequest, CohereEmbedResponse, CohereEmbeddingInputType,
-    CohereEmbeddingTruncate, CohereEmbeddingType, TitanEmbedRequest, TitanEmbedResponse,
+use crate::bedrock::BedrockClient;
+use crate::bedrock::embed::cohere::{
+    CohereConfig, CohereEmbedRequest, CohereEmbedResponse, CohereEmbeddingInputType,
+    CohereEmbeddingTruncate, CohereEmbeddingType,
 };
+use crate::bedrock::embed::titan::{TitanConfig, TitanEmbedRequest, TitanEmbedResponse};
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
@@ -27,215 +29,116 @@ use async_openai::types::{
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::primitives::Blob;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use snafu::ResultExt;
 use std::fmt::Debug;
-use std::str::FromStr;
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::warn;
+
+pub mod cohere;
+pub mod titan;
 
 const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
-const COHERE_EMBED_ENGLISH_V3: &str = "cohere.embed-english-v3";
-const COHERE_EMBED_MULTILINGUAL_V3: &str = "cohere.embed-multilingual-v3";
-
-const MAX_TITAN_INPUT_LENGTH: usize = 8192; // tokens
-const MAX_COHERE_INPUT_LENGTH: usize = 2048; // characters
-const MAX_COHERE_TEXTS_PER_REQUEST: usize = 96;
 
 #[derive(Debug, Clone)]
-pub struct BedrockEmbed {
+pub struct BedrockEmbed<Rq, Rsp>
+where
+    Rq: Serialize + Sized,
+    Rsp: DeserializeOwned,
+{
     client: BedrockClient,
-    model_id: String,
-    dimensions: Option<u32>,
-    normalize: bool,
-    truncate: Option<String>,
-    input_type: String,
+    config: Arc<dyn BedrockEmbeddingConfig<Rq, Rsp> + 'static>,
 }
 
-impl BedrockEmbed {
-    #[must_use]
-    pub fn new(
-        client: BedrockClient,
-        model_id: String,
-        dimensions: Option<u32>,
-        normalize: bool,
-        truncate: Option<String>,
-        input_type: Option<String>,
-    ) -> Self {
-        let default_input_type = if model_id.starts_with("cohere") {
-            "search_document".to_string()
-        } else {
-            "text".to_string()
-        };
+#[must_use]
+pub fn new_titan_v2(
+    client: BedrockClient,
+    normalize: bool,
+    dimensions: u32,
+) -> BedrockEmbed<TitanEmbedRequest, TitanEmbedResponse> {
+    let config = Arc::new(TitanConfig {
+        model_name: TITAN_TEXT_EMBED_V2.to_string(),
+        normalize,
+        dimensions,
+    }) as Arc<dyn BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse>>;
+    BedrockEmbed::<TitanEmbedRequest, TitanEmbedResponse> { client, config }
+}
 
-        Self {
-            client,
-            model_id,
-            dimensions,
-            normalize,
-            truncate,
-            input_type: input_type.unwrap_or(default_input_type),
-        }
-    }
+#[must_use]
+pub fn new_cohere(
+    client: BedrockClient,
+    model_name: String,
+    truncate: CohereEmbeddingTruncate,
+    input_type: CohereEmbeddingInputType,
+    embedding_type: CohereEmbeddingType,
+) -> BedrockEmbed<CohereEmbedRequest, CohereEmbedResponse> {
+    let config = Arc::new(CohereConfig {
+        model_name,
+        truncate,
+        input_type,
+        embedding_type,
+    }) as Arc<dyn BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse>>;
+    BedrockEmbed::<CohereEmbedRequest, CohereEmbedResponse> { client, config }
+}
 
-    fn is_titan_model(&self) -> bool {
-        self.model_id.starts_with("amazon.titan-embed")
-    }
-
-    fn is_cohere_model(&self) -> bool {
-        self.model_id.starts_with("cohere.embed")
-    }
-
-    async fn embed_titan(&self, texts: Vec<String>) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+impl<Rq, Rsp> BedrockEmbed<Rq, Rsp>
+where
+    Rq: Serialize + Sized,
+    Rsp: DeserializeOwned,
+{
+    async fn embed_texts(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, u32), OpenAIError> {
         let mut results = Vec::new();
         let mut num_tokens = 0;
-        for text in texts {
-            // For Titan models, we need to be more careful about token limits
-            // This is still an approximation as we don't have access to the actual tokenizer
-            let estimated_tokens = text.split_whitespace().count();
-            let truncated_text = if estimated_tokens > MAX_TITAN_INPUT_LENGTH {
-                warn!(
-                    "Truncating input text from estimated {} to {} tokens for Titan model",
-                    estimated_tokens, MAX_TITAN_INPUT_LENGTH
-                );
-                text.split_whitespace()
-                    .take(MAX_TITAN_INPUT_LENGTH)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else {
-                text
-            };
 
-            let request = TitanEmbedRequest {
-                input_text: truncated_text,
-                normalize: Some(self.normalize),
-                dimensions: self.dimensions,
-                embedding_types: Some(vec!["float".to_string()]),
-            };
+        let request_payloads = self.config.to_request_blobs(texts)?;
 
-            let body = serde_json::to_string(&request)
-                .boxed()
-                .map_err(|e| EmbedError::FailedToPrepareInput { source: e })?;
-
-            debug!(
-                "Invoking Titan model {} with request: {}",
-                self.model_id, body
-            );
-
-            let response = self
-                .client
-                .client
-                .invoke_model()
-                .model_id(&self.model_id)
-                .body(Blob::new(body.as_bytes()))
-                .content_type("application/json")
-                .send()
-                .await
-                .map_err(|e| EmbedError::FailedToCreateEmbedding {
-                    source: match e.into_source() {
-                        Ok(s_err) => s_err,
-                        Err(e) => Box::new(e),
-                    },
-                })?;
-
-            let response_body = response.body().as_ref();
-            let titan_response: TitanEmbedResponse = serde_json::from_slice(response_body)
-                .boxed()
-                .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
-
-            num_tokens += titan_response.input_text_token_count;
-
-            results.push(titan_response.embedding);
-        }
-
-        Ok((results, num_tokens))
-    }
-
-    async fn embed_cohere(&self, texts: Vec<String>) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
-        let mut all_results = Vec::new();
-        let mut num_tokens = 0;
-
-        // Process texts in batches to respect Cohere's limits
-        for batch in texts.chunks(MAX_COHERE_TEXTS_PER_REQUEST) {
-            let truncated_texts: Vec<String> = batch
-                .iter()
-                .map(|text| {
-                    if text.len() > MAX_COHERE_INPUT_LENGTH {
-                        warn!(
-                            "Truncating input text from {} to {} characters for Cohere model",
-                            text.len(),
-                            MAX_COHERE_INPUT_LENGTH
-                        );
-                        text.chars()
-                            .take(MAX_COHERE_INPUT_LENGTH)
-                            .collect::<String>()
-                    } else {
-                        text.clone()
-                    }
+        for req in request_payloads {
+            let body = serde_json::to_string(&req).boxed().map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
                 })
-                .collect();
-
-            let request = CohereEmbedRequest {
-                texts: truncated_texts.clone(),
-                input_type: CohereEmbeddingInputType::from_str(self.input_type.as_str())?,
-                truncate: self
-                    .truncate
-                    .as_deref()
-                    .map(CohereEmbeddingTruncate::from_str)
-                    .transpose()?,
-                embedding_types: Some(vec![CohereEmbeddingType::Float]),
-            };
-
-            let body = serde_json::to_string(&request)
-                .boxed()
-                .map_err(|e| EmbedError::FailedToPrepareInput { source: e })?;
-
-            debug!(
-                "Invoking Cohere model {} with request: {}",
-                self.model_id, body
-            );
+            })?;
 
             let response = self
                 .client
                 .client
                 .invoke_model()
-                .model_id(&self.model_id)
+                .model_id(self.config.model_id())
                 .body(Blob::new(body.as_bytes()))
                 .content_type("application/json")
                 .send()
                 .await
-                .map_err(|e| EmbedError::FailedToCreateEmbedding {
-                    source: match e.into_source() {
-                        Ok(s_err) => s_err,
-                        Err(e) => Box::new(e),
-                    },
+                .map_err(|e| {
+                    OpenAIError::ApiError(ApiError {
+                        message: match e.into_source() {
+                            Ok(s_err) => s_err.to_string(),
+                            Err(e) => e.to_string(),
+                        },
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    })
                 })?;
 
             let response_body = response.body().as_ref();
-            let mut cohere_response: CohereEmbedResponse = serde_json::from_slice(response_body)
-                .boxed()
-                .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
+            let response_obj = serde_json::from_slice(response_body).boxed().map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })?;
+            let (mut vectors, tokens) = self.config.extract_embeddings(response_obj)?;
+            num_tokens += tokens;
 
-            // Estimate token count for Cohere models (approximate)
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_precision_loss,
-                clippy::cast_sign_loss
-            )]
-            let estimated_tokens: u32 = truncated_texts
-                .iter()
-                .map(|text| (text.split_whitespace().count() as f32 * 1.3) as u32) // Rough estimate
-                .sum();
-
-            num_tokens += estimated_tokens;
-
-            if let Some(float_embedding) = cohere_response
-                .embeddings
-                .remove(&CohereEmbeddingType::Float)
-            {
-                all_results.extend(float_embedding);
-            }
+            results.append(&mut vectors);
         }
-
-        Ok((all_results, num_tokens))
+        Ok((results, num_tokens))
     }
 
     fn convert_input_to_texts(input: &EmbeddingInput) -> Vec<String> {
@@ -275,38 +178,35 @@ impl BedrockEmbed {
     }
 }
 
+/// [`BedrockEmbeddingConfig`] handles the model-specific request and response payloads expected by AWS Bedrock.
+///
+/// AWS Bedrock does not have a standard API interface for its models. For each model, or model family, a different API is exposed.
+pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized, Rsp: DeserializeOwned>:
+    Debug + Sync + Send
+{
+    fn model_id(&self) -> &String;
+    fn dimensions(&self) -> i32;
+
+    /// For given text to embed, construct a set of request payloads (i.e. [`Blob`]) to provider to Bedrock runtime.
+    fn to_request_blobs(&self, input_text: Vec<String>) -> Result<Vec<Rq>, OpenAIError>;
+
+    /// For responses content from AWS Bedrock, extract the embedding vectors and the number of tokens embedded.
+    fn extract_embeddings(&self, resp: Rsp) -> Result<(Vec<Vec<f32>>, u32), OpenAIError>;
+}
+
 #[async_trait]
-impl Embed for BedrockEmbed {
+impl<Rq, Rsp> Embed for BedrockEmbed<Rq, Rsp>
+where
+    Rq: Serialize + Sized + Send + Sync + Debug,
+    Rsp: DeserializeOwned + Send + Sync + Debug,
+{
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let texts = Self::convert_input_to_texts(&req.input);
 
-        let (vectors, num_tokens) = if self.is_titan_model() {
-            self.embed_titan(texts).await.map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?
-        } else if self.is_cohere_model() {
-            self.embed_cohere(texts).await.map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?
-        } else {
-            return Err(OpenAIError::InvalidArgument(format!(
-                "Invalid model: {}",
-                req.model
-            )));
-        };
+        let (vectors, num_tokens) = self.embed_texts(texts).await?;
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),
@@ -335,29 +235,16 @@ impl Embed for BedrockEmbed {
             return Ok(vec![]);
         }
 
-        let (vectors, _num_tokens) = if self.is_titan_model() {
-            self.embed_titan(texts).await?
-        } else if self.is_cohere_model() {
-            self.embed_cohere(texts).await?
-        } else {
-            return Err(EmbedError::UnsupportedTaskForModel {
-                from: self.model_id.clone(),
-                task: "embedding".to_string(),
-            });
-        };
+        let (vectors, _num_tokens) = self
+            .embed_texts(texts)
+            .await
+            .boxed()
+            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
 
         Ok(vectors)
     }
 
     fn size(&self) -> i32 {
-        match self.model_id.as_str() {
-            TITAN_TEXT_EMBED_V2 => match self.dimensions {
-                Some(256) => 256,
-                Some(512) => 512,
-                _ => 1024,
-            },
-            COHERE_EMBED_ENGLISH_V3 | COHERE_EMBED_MULTILINGUAL_V3 => 1024,
-            _ => -1, // Unknown model, size will be inferred
-        }
+        self.config.dimensions()
     }
 }

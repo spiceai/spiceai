@@ -120,7 +120,7 @@ mod bedrock_tests {
             },
             EmbeddingTestCase {
                 input: EmbeddingInput::StringArray(
-                    TEST_TEXTS.iter().map(|s| s.to_string()).collect(),
+                    TEST_TEXTS.iter().map(|s| (*s).to_string()).collect(),
                 ),
                 model_name: "titan-v1",
                 encoding_format: Some("float"),
@@ -150,7 +150,7 @@ mod bedrock_tests {
             },
             EmbeddingTestCase {
                 input: EmbeddingInput::StringArray(
-                    TEST_TEXTS.iter().map(|s| s.to_string()).collect(),
+                    TEST_TEXTS.iter().map(|s| (*s).to_string()).collect(),
                 ),
                 model_name: "titan-v2",
                 encoding_format: Some("float"),
@@ -180,7 +180,7 @@ mod bedrock_tests {
             },
             EmbeddingTestCase {
                 input: EmbeddingInput::StringArray(
-                    TEST_TEXTS.iter().map(|s| s.to_string()).collect(),
+                    TEST_TEXTS.iter().map(|s| (*s).to_string()).collect(),
                 ),
                 model_name: "cohere-english",
                 encoding_format: Some("float"),
@@ -285,7 +285,7 @@ mod bedrock_tests {
         let tests = vec![
             // Empty string test
             EmbeddingTestCase {
-                input: EmbeddingInput::String("".to_string()),
+                input: EmbeddingInput::String(String::new()),
                 model_name: "titan-v1",
                 encoding_format: Some("float"),
                 user: None,

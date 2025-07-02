@@ -20,14 +20,18 @@ use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
 use llms::HealthCheck;
+#[cfg(feature = "bedrock")]
+use llms::bedrock::{
+    self, BedrockClient,
+    embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
+};
+
 use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
 };
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
-#[cfg(feature = "bedrock")]
-use llms::bedrock::{BedrockClient, embed::BedrockEmbed};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -92,24 +96,24 @@ async fn bedrock(
 
     // Build AWS config
     let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
-    
+
     // Set region if provided
     if let Some(region) = extract_secret!(params, "aws_region") {
         config_builder = config_builder.region(aws_config::Region::new(region.to_owned()));
     }
-    
+
     // Set profile if provided
     if let Some(profile) = extract_secret!(params, "aws_profile") {
         config_builder = config_builder.profile_name(profile);
     }
-    
+
     // Set access key and secret key if provided
     if let (Some(access_key), Some(secret_key)) = (
         extract_secret!(params, "aws_access_key_id"),
         extract_secret!(params, "aws_secret_access_key"),
     ) {
         let session_token = extract_secret!(params, "aws_session_token");
-        
+
         let credentials = aws_credential_types::Credentials::new(
             access_key,
             secret_key,
@@ -117,83 +121,77 @@ async fn bedrock(
             None,
             "bedrock-embed",
         );
-        
+
         config_builder = config_builder.credentials_provider(credentials);
     }
-    
+
     let config = config_builder.load().await;
     let client = BedrockClient::new(&config);
-    
-    // Parse optional parameters
-    let dimensions = params
-        .get("dimensions")
-        .map(|s| s.expose_secret().parse::<u32>())
-        .transpose()
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
-        })?;
-    
-    // Validate dimensions for Titan models
+
     if model_id.starts_with("amazon.titan-embed") {
-        if let Some(dims) = dimensions {
-            if !matches!(dims, 256 | 512 | 1024) {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Invalid dimensions '{dims}' for Titan model. Must be 256, 512, or 1024").into(),
-                });
-            }
+        let normalize = params
+            .get("normalize")
+            .map(|s| s.expose_secret().parse::<bool>())
+            .transpose()
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'normalize' parameter: {e}").into(),
+            })?
+            .unwrap_or(true);
+
+        let Some(dimensions) = params
+            .get("dimensions")
+            .map(|s| s.expose_secret().parse::<u32>())
+            .transpose()
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
+            })?
+        else {
+            return Err(EmbedError::MissingParamError {
+                param_key: "dimensions",
+            });
+        };
+
+        if !matches!(dimensions, 256 | 512 | 1024) {
+            return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid dimensions '{dimensions}' for Titan model. Must be 256, 512, or 1024"
+                )
+                .into(),
+            });
         }
+
+        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
+    } else {
+        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
+            CohereEmbeddingTruncate::from_str(truncate_str)
+                .boxed()
+                .map_err(|e| EmbedError::InvalidParamError {
+                    param_key: "truncate",
+                    value: truncate_str.to_string(),
+                    reason: e.to_string(),
+                })?
+        } else {
+            CohereEmbeddingTruncate::default()
+        };
+        let input_type = if let Some(input_type_str) = extract_secret!(params, "input_type") {
+            CohereEmbeddingInputType::from_str(input_type_str).map_err(|e| {
+                EmbedError::InvalidParamError {
+                    param_key: "input_type",
+                    value: input_type_str.to_string(),
+                    reason: e.to_string(),
+                }
+            })?
+        } else {
+            CohereEmbeddingInputType::default()
+        };
+        Ok(Arc::new(bedrock::embed::new_cohere(
+            client,
+            model_id,
+            truncate,
+            input_type,
+            CohereEmbeddingType::Float,
+        )) as Arc<dyn Embed>)
     }
-    
-    let normalize = params
-        .get("normalize")
-        .map(|s| s.expose_secret().parse::<bool>())
-        .transpose()
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-            source: format!("Failed to parse 'normalize' parameter: {e}").into(),
-        })?
-        .unwrap_or(true);
-    
-    let truncate = extract_secret!(params, "truncate").map(std::string::ToString::to_string);
-    let input_type = extract_secret!(params, "input_type").map(std::string::ToString::to_string);
-    
-    // Validate input_type for Cohere models
-    if model_id.starts_with("cohere.embed") {
-        if let Some(ref input_type_val) = input_type {
-            let valid_input_types = ["search_document", "search_query", "classification", "clustering"];
-            if !valid_input_types.contains(&input_type_val.as_str()) {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Invalid input_type '{}' for Cohere model. Must be one of: {}", 
-                        input_type_val, 
-                        valid_input_types.join(", ")
-                    ).into(),
-                });
-            }
-        }
-    }
-    
-    // Validate truncate for Cohere models
-    if model_id.starts_with("cohere.embed") {
-        if let Some(ref truncate_val) = truncate {
-            let valid_truncate_values = ["NONE", "START", "END"];
-            if !valid_truncate_values.contains(&truncate_val.as_str()) {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Invalid truncate '{}' for Cohere model. Must be one of: {}", 
-                        truncate_val, 
-                        valid_truncate_values.join(", ")
-                    ).into(),
-                });
-            }
-        }
-    }
-    
-    Ok(Arc::new(BedrockEmbed::new(
-        client,
-        model_id,
-        dimensions,
-        normalize,
-        truncate,
-        input_type,
-    )))
 }
 
 async fn huggingface(
