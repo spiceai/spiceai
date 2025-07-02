@@ -103,7 +103,7 @@ impl ObjectStoreTextTable {
                         .parse(bytes)
                         .and_then(|doc| doc.as_flat_utf8())
                         .boxed()
-                        .map_err(|e| format!("Error parsing document {}: {e}", idx).into()),
+                        .map_err(|e| format!("Error parsing document {idx}: {e}").into()),
                     None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
                 };
                 utf8.map_err(ArrowError::from_external_error)
@@ -125,8 +125,7 @@ impl ObjectStoreTextTable {
             "location" => Ok(Self::get_location_value(meta_list)),
             "content" => Self::get_content_value(raw, formatter),
             _ => Err(ArrowError::SchemaError(format!(
-                "Unsupported field name: {}",
-                field_name
+                "Unsupported field name: {field_name}",
             ))),
         }
     }
@@ -147,7 +146,7 @@ impl ObjectStoreTextTable {
             .map(|field| {
                 let field_name = field.name();
                 Self::get_field_value(meta_list, raw, field_name, formatter).map_err(|e| {
-                    ArrowError::SchemaError(format!("Error getting field {}: {}", field_name, e))
+                    ArrowError::SchemaError(format!("Error getting field {field_name}: {e}"))
                 })
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
@@ -319,7 +318,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
                     let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), schema.clone()) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
                         Ok(batch) => {
                             let n = batch.num_rows();
                             yield Ok(batch);
