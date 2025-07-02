@@ -35,7 +35,7 @@ pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {
             "oracle_password".to_string(),
             ORACLE_ROOT_PASSWORD.to_string(),
         ),
-        ("oracle_service_name".to_string(), "XEPDB1".to_string()),
+        ("oracle_service_name".to_string(), "FREEPDB1".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -47,24 +47,22 @@ pub async fn start_oracle_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image("container-registry.oracle.com/database/express:21.3.0-xe".to_string())
-        .add_port_binding(1521, 15210)
-        .add_env_var("ORACLE_PWD", ORACLE_ROOT_PASSWORD)
+        .image("gvenzl/oracle-free:latest".to_string())
+        .add_port_binding(1521, port)
+        .add_env_var("ORACLE_PASSWORD", ORACLE_ROOT_PASSWORD)
         .healthcheck(HealthConfig {
             test: Some(vec![
-            "CMD-SHELL".to_string(),
-            format!(
-                "echo 'SELECT status FROM v$instance;' | /opt/oracle/product/21c/dbhomeXE/bin/sqlplus -S {ORACLE_USERNAME}/{ORACLE_ROOT_PASSWORD}@localhost:1521/XEPDB1 2>&1 | grep -q 'OPEN'"
-            ),
+                "CMD-SHELL".to_string(),
+                "healthcheck.sh".to_string()
             ]),
-            interval: Some(5_000_000_000),     // 5 seconds between checks
-            timeout: Some(30_000_000_000),     // 30 seconds max wait per check
-            retries: Some(24),                 // 24 retries × 5s = 120s max wait time
-            start_period: Some(5_000_000_000), // 5 seconds before first check
+            interval: Some(10_000_000_000),     // 10 seconds between checks
+            timeout: Some(5_000_000_000),       // 5 seconds max wait per check
+            retries: Some(10),                  // 10 retries
+            start_period: None,
             start_interval: None,
         })
         .build()?
-        // Average time to start container is 50s, we set longer timeout to ensure enough time for the container to start
+        // Average time to start container is 60s, we set longer timeout to ensure enough time for the container to start
         .run(Some(Duration::from_secs(120)))
         .await?;
 
