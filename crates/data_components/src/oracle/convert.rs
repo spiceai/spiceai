@@ -21,6 +21,7 @@ use crate::oracle::FailedToConvertNaiveDateTimeToNanosSnafu;
 use crate::oracle::FailedToParseBigDecimalSnafu;
 use arrow::array::BinaryBuilder;
 use arrow::array::Date32Builder;
+use arrow::array::Int64Builder;
 use arrow::array::LargeBinaryBuilder;
 use arrow::array::TimestampNanosecondBuilder;
 use arrow::array::TimestampSecondBuilder;
@@ -69,11 +70,18 @@ pub(crate) fn map_oracle_type_to_arrow_type(
         // Oracle types below max size is 32767 bytes
         "ROWID" | "CHAR" | "NCHAR" | "VARCHAR2" | "NVARCHAR2" | "LONG" => Some(DataType::Utf8),
         "CLOB" | "NCLOB" => Some(DataType::LargeUtf8),
-        "NUMBER" | "DECIMAL" => {
-            // In Oracle, default precision and scale are (38, 0).
-            let precision = precision.unwrap_or(38);
-            let scale = scale.unwrap_or(0);
-            Some(DataType::Decimal128(precision, scale))
+        "NUMBER" => {
+            // "The absence of precision and scale designators specifies the maximum range and precision for an Oracle number"
+            let p = precision.unwrap_or(38); // Oracle-defined max precision
+            let s = scale.unwrap_or(20); // Spice-default scale when not specified
+
+            // Integer types in Oracle are represented as NUMBER with 0 scale.
+            // Prefer Int64 over Decimal128 for integer types as it is much more efficient (including accelerators).
+            if s == 0 && p <= 18 {
+                return Some(DataType::Int64);
+            }
+
+            Some(DataType::Decimal128(p, s))
         }
         "DATE" => Some(DataType::Date32),
         "BINARY_FLOAT" => Some(DataType::Float32),
@@ -217,6 +225,18 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
+                (DataType::Int64, _) => {
+                    handle_primitive_type!(
+                        builder,
+                        native_type,
+                        col,
+                        Int64Builder,
+                        i64,
+                        row,
+                        idx,
+                        Result::Ok
+                    );
+                }
                 (DataType::Boolean, _) => {
                     handle_primitive_type!(
                         builder,
@@ -343,6 +363,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                 _ => {
                     return super::UnsupportedTypeSnafu {
                         data_type: format!("{native_type:?}"),
+                        column: col.to_string(),
                     }
                     .fail();
                 }
