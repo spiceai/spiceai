@@ -81,24 +81,19 @@ impl ObjectStoreTextTable {
         ])
     }
 
-    fn to_record_batch(
-        meta_list: &[ObjectMeta],
-        raw: &[Bytes],
-        formatter: Option<&Arc<dyn DocumentParser>>,
-    ) -> Result<RecordBatch, ArrowError> {
-        if meta_list.len() != raw.len() {
-            return Err(ArrowError::ParseError("Length mismatch".to_string()));
-        }
-
-        let schema = Self::table_schema();
-
-        let location_array: ArrayRef = Arc::new(StringArray::from(
+    fn get_location_value(meta_list: &[ObjectMeta]) -> ArrayRef {
+        Arc::new(StringArray::from(
             meta_list
                 .iter()
                 .map(|meta| meta.location.to_string())
                 .collect::<Vec<_>>(),
-        ));
+        ))
+    }
 
+    fn get_content_value(
+        raw: &[Bytes],
+        formatter: Option<&Arc<dyn DocumentParser>>,
+    ) -> Result<ArrayRef, ArrowError> {
         let utf8_strings: Result<Vec<_>, ArrowError> = raw
             .iter()
             .enumerate()
@@ -108,24 +103,56 @@ impl ObjectStoreTextTable {
                         .parse(bytes)
                         .and_then(|doc| doc.as_flat_utf8())
                         .boxed()
-                        .map_err(|e| {
-                            if let Some(meta) = meta_list.get(idx) {
-                                format!("Error parsing document {}: {e}", meta.location).into()
-                            } else {
-                                e
-                            }
-                        }),
+                        .map_err(|e| format!("Error parsing document {}: {e}", idx).into()),
                     None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
                 };
                 utf8.map_err(ArrowError::from_external_error)
             })
             .collect();
 
-        let content_array: ArrayRef = Arc::new(StringArray::from(
+        Ok(Arc::new(StringArray::from(
             utf8_strings?.into_iter().collect::<Vec<_>>(),
-        ));
+        )))
+    }
 
-        RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])
+    fn get_field_value(
+        meta_list: &[ObjectMeta],
+        raw: &[Bytes],
+        field_name: &str,
+        formatter: Option<&Arc<dyn DocumentParser>>,
+    ) -> Result<ArrayRef, ArrowError> {
+        match field_name {
+            "location" => Ok(Self::get_location_value(meta_list)),
+            "content" => Self::get_content_value(raw, formatter),
+            _ => Err(ArrowError::SchemaError(format!(
+                "Unsupported field name: {}",
+                field_name
+            ))),
+        }
+    }
+
+    fn to_record_batch(
+        meta_list: &[ObjectMeta],
+        raw: &[Bytes],
+        formatter: Option<&Arc<dyn DocumentParser>>,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch, ArrowError> {
+        if meta_list.len() != raw.len() {
+            return Err(ArrowError::ParseError("Length mismatch".to_string()));
+        }
+
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let field_name = field.name();
+                Self::get_field_value(meta_list, raw, field_name, formatter).map_err(|e| {
+                    ArrowError::SchemaError(format!("Error getting field {}: {}", field_name, e))
+                })
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+
+        RecordBatch::try_new(schema, columns)
     }
 }
 
@@ -237,7 +264,12 @@ impl ExecutionPlan for ObjectStoreTextExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(self.ctx.clone(), self.formatter.clone(), self.limit), // TODO get prefix from filters
+            to_sendable_stream(
+                self.ctx.clone(),
+                self.formatter.clone(),
+                self.limit,
+                self.schema(),
+            ), // TODO get prefix from filter
         )))
     }
 }
@@ -270,6 +302,7 @@ pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
     limit: Option<usize>,
+    schema: SchemaRef,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
@@ -286,7 +319,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
                     let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref()) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), schema.clone()) {
                         Ok(batch) => {
                             let n = batch.num_rows();
                             yield Ok(batch);
