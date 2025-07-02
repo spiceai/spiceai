@@ -13,6 +13,8 @@ version.workspace = true
 snafu.workspace = true
 
 async-openai.workspace = true
+aws-config.workspace = true
+aws-sdk-bedrockruntime = "1.55.0"
 async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

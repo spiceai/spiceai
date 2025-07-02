@@ -31,6 +31,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+mod bedrock;
 mod embedding;
 mod hf;
 mod local;
