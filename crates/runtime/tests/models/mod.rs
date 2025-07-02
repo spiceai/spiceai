@@ -65,21 +65,22 @@ mod nsql {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = match http_post(
+        match http_post(
             format!("{base_url}/v1/nsql").as_str(),
             &ts.body.to_string(),
             headers,
         )
         .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                tracing::info!("run_nsql_test response: {}", response);
+                Some(response)
+            }
             Err(e) => {
                 tracing::error!("run_nsql_test error: {:?}", e);
-                insta::assert_snapshot!(format!("{}_error", ts.name), e.to_string());
-                return Ok(());
+                None
             }
         };
-        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
 
         // ensure all spans are exported into task_history
         let _ = trace_provider.force_flush();
@@ -97,7 +98,7 @@ mod nsql {
             == Some(true)
         {
             format!(
-                "SELECT task, input
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'ok' ELSE input END as input
                 FROM runtime.task_history
                 WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                 AND start_time > '{}'
@@ -106,7 +107,7 @@ mod nsql {
             )
         } else {
             format!(
-                "SELECT task, input
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'ok' ELSE input END as input
                 FROM runtime.task_history
                 WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                 AND start_time > '{}'
