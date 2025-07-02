@@ -186,6 +186,7 @@ impl<'a> ContainerRunner<'a> {
         let (exposed_ports, port_bindings) = if port_bindings_map.is_empty() {
             (None, None)
         } else {
+            #[allow(clippy::zero_sized_map_values)]
             let exposed_ports = port_bindings_keys
                 .iter()
                 .map(|k| (k.as_str(), HashMap::new()))

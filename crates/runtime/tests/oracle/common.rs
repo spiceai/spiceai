@@ -51,13 +51,10 @@ pub async fn start_oracle_docker_container(
         .add_port_binding(1521, port)
         .add_env_var("ORACLE_PASSWORD", ORACLE_ROOT_PASSWORD)
         .healthcheck(HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                "healthcheck.sh".to_string()
-            ]),
-            interval: Some(10_000_000_000),     // 10 seconds between checks
-            timeout: Some(5_000_000_000),       // 5 seconds max wait per check
-            retries: Some(10),                  // 10 retries
+            test: Some(vec!["CMD-SHELL".to_string(), "healthcheck.sh".to_string()]),
+            interval: Some(10_000_000_000), // 10 seconds between checks
+            timeout: Some(5_000_000_000),   // 5 seconds max wait per check
+            retries: Some(10),              // 10 retries
             start_period: None,
             start_interval: None,
         })

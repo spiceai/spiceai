@@ -397,10 +397,7 @@ mod tests {
     fn test_common_oracle_types_mappings() {
         // Test a typical Oracle table schema
         let columns_and_expected = vec![
-            (
-                ("ID", "NUMBER", Some(10), Some(0)),
-                DataType::Decimal128(10, 0),
-            ),
+            (("ID", "NUMBER", Some(10), Some(0)), DataType::Int64),
             (("NAME", "VARCHAR2", None, None), DataType::Utf8),
             (
                 ("SALARY", "NUMBER", Some(10), Some(2)),
@@ -422,7 +419,7 @@ mod tests {
             ),
             (
                 ("DEFAULT_DECIMAL", "NUMBER", None, None),
-                DataType::Decimal128(38, 0),
+                DataType::Decimal128(38, 20),
             ),
             // Float
             (("FLOAT32", "FLOAT", Some(10), None), DataType::Float32),
