@@ -17,7 +17,10 @@ limitations under the License.
 use std::{
     any::Any,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -107,6 +110,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
     table_provider: Mutex<Option<Arc<PartitionTableProvider<DuckDbConnectionPool>>>>,
+    is_initialized: AtomicBool,
 }
 
 impl PartitionedDuckDBAccelerator {
@@ -115,6 +119,7 @@ impl PartitionedDuckDBAccelerator {
         Self {
             base_accelerator: DuckDBAccelerator::new(),
             table_provider: Mutex::new(None),
+            is_initialized: AtomicBool::new(false),
         }
     }
 
@@ -143,11 +148,19 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         "partitioned_duckdb"
     }
 
+    fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
+        self.is_initialized.load(Ordering::Acquire)
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         self.base_accelerator.valid_file_extensions()
     }
 
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        // There is no one file path but one for each partition
+        // This function is only internally used (within this trait) in the
+        // DuckDBAccelerator, for example, but is never used in this
+        // implementation.
         Ok(String::new())
     }
 
@@ -186,6 +199,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
         *table_provider_guard = Some(Arc::clone(&table_provider));
+        self.is_initialized.store(true, Ordering::Release);
 
         Ok(table_provider)
     }
