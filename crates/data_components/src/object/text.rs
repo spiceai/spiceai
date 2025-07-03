@@ -93,6 +93,7 @@ impl ObjectStoreTextTable {
     fn get_content_value(
         raw: &[Bytes],
         formatter: Option<&Arc<dyn DocumentParser>>,
+        meta_list: &[ObjectMeta],
     ) -> Result<ArrayRef, ArrowError> {
         let utf8_strings: Result<Vec<_>, ArrowError> = raw
             .iter()
@@ -103,7 +104,13 @@ impl ObjectStoreTextTable {
                         .parse(bytes)
                         .and_then(|doc| doc.as_flat_utf8())
                         .boxed()
-                        .map_err(|e| format!("Error parsing document {idx}: {e}").into()),
+                        .map_err(|e| {
+                            if let Some(meta) = meta_list.get(idx) {
+                                format!("Error parsing document {}: {e}", meta.location).into()
+                            } else {
+                                e
+                            }
+                        }),
                     None => std::str::from_utf8(bytes).boxed().map(ToString::to_string),
                 };
                 utf8.map_err(ArrowError::from_external_error)
@@ -123,7 +130,7 @@ impl ObjectStoreTextTable {
     ) -> Result<ArrayRef, ArrowError> {
         match field_name {
             "location" => Ok(Self::get_location_value(meta_list)),
-            "content" => Self::get_content_value(raw, formatter),
+            "content" => Self::get_content_value(raw, formatter, meta_list),
             _ => Err(ArrowError::SchemaError(format!(
                 "Unsupported field name: {field_name}",
             ))),
