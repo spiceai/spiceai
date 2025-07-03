@@ -160,16 +160,16 @@ where
             plans.push(plan);
         }
 
-        if plans.is_empty() {
-            let empty = EmptyExec::new(Arc::clone(&self.schema));
-            return Ok(Arc::new(empty));
-        }
-
-        let plan = if plans.len() > 1 {
-            Arc::new(UnionExec::new(plans))
-        } else {
-            #[allow(clippy::unwrap_used)]
-            plans.into_iter().next().unwrap()
+        let plan = match plans {
+            plans if plans.is_empty() => {
+                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+            }
+            mut plans if plans.len() == 1 => {
+                #[allow(clippy::unwrap_used)]
+                // NOTE: Unwrap is okay because we ensure the length is 1
+                plans.pop().unwrap()
+            }
+            plans => Arc::new(UnionExec::new(plans)),
         };
 
         if let Some(limit) = limit {
