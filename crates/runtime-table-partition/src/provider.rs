@@ -57,7 +57,7 @@ type ScalarValueString = String;
 #[derive(Debug)]
 pub struct PartitionTableProvider<ConnectionPool> {
     creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
-    partition_by: Vec<Expr>,
+    partition_by: Expr,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>>,
     schema: SchemaRef,
 }
@@ -71,12 +71,16 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
     /// validation fails.
     pub async fn new(
         creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
-        partition_by: Vec<Expr>,
+        mut partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let num_partition_by = partition_by.len();
-        let expr = partition_by
-            .first()
+        ensure!(
+            num_partition_by == 1,
+            PartitionByViolationSnafu { num_partition_by }
+        );
+        let partition_by = partition_by
+            .pop()
             .context(PartitionByViolationSnafu { num_partition_by })?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
@@ -87,7 +91,7 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
             .context(CreatingPartitionSnafu)?
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(expr, &p.partition_value, &df_schema)?;
+                validate_scalar_compatibility(&partition_by, &p.partition_value, &df_schema)?;
                 Ok((p.partition_value.to_string(), p))
             })
             .collect::<Result<HashMap<_, _>, _>>()
@@ -151,15 +155,10 @@ where
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let Some(partition_by) = self.partition_by.first() else {
-            return Err(DataFusionError::Execution(
-                "No 'partition_by' expression provided in the spicepod.yaml".to_string(),
-            ));
-        };
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            if prune_partition(filters, partition_by, &partition.partition_value) {
+            if prune_partition(filters, &self.partition_by, &partition.partition_value) {
                 continue;
             }
             let plan = partition
@@ -173,11 +172,9 @@ where
             plans if plans.is_empty() => {
                 return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
             }
-            mut plans if plans.len() == 1 => {
-                #[allow(clippy::unwrap_used)]
-                // NOTE: Unwrap is okay because we ensure the length is 1
-                plans.pop().unwrap()
-            }
+            mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
+                DataFusionError::Execution("expected an ExecutionPlan".to_string())
+            })?,
             plans => Arc::new(UnionExec::new(plans)),
         };
 
@@ -194,14 +191,9 @@ where
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let Some(partition_by) = self.partition_by.first() else {
-            return Err(DataFusionError::Execution(
-                "No 'partition_by' expression provided in the spicepod.yaml".to_string(),
-            ));
-        };
         Ok(Arc::new(PartitionInsertExec::new(
             input,
-            partition_by.clone(),
+            self.partition_by.clone(),
             Arc::clone(&self.creator),
             Arc::clone(&self.partitions),
             insert_op,
