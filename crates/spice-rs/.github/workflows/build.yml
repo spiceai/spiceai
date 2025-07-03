@@ -5,7 +5,7 @@ on:
     branches: ['trunk']
   pull_request:
     branches: ['trunk']
-  
+
   workflow_dispatch:
 
 env:
@@ -83,6 +83,8 @@ jobs:
 
       - name: Install Spice (https://install.spiceai.org) (MacOS)
         if: matrix.os == 'macos-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           brew install spiceai/spiceai/spice
           spice install
