@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::{path::Path, sync::Arc};
 
-use super::{AccelerationSource, partitioned_duckdb::PartitionedDuckDBAccelerator};
+use super::AccelerationSource;
 
 #[cfg(feature = "postgres")]
 use {
@@ -28,7 +28,7 @@ use {
 
 #[cfg(feature = "duckdb")]
 use {
-    super::duckdb::DuckDBAccelerator,
+    super::duckdb::DuckDBAccelerator, super::partitioned_duckdb::PartitionedDuckDBAccelerator,
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
