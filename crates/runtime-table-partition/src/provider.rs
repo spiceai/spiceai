@@ -185,10 +185,14 @@ where
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let partition_by = self.partition_by.first().unwrap().clone();
+        let Some(partition_by) = self.partition_by.first() else {
+            return Err(DataFusionError::Execution(
+                "No 'partition_by' expression provided in the spicepod.yaml".to_string(),
+            ));
+        };
         Ok(Arc::new(PartitionInsertExec::new(
             input,
-            partition_by,
+            partition_by.clone(),
             Arc::clone(&self.creator),
             Arc::clone(&self.partitions),
             insert_op,
