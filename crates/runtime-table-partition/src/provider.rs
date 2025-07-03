@@ -43,7 +43,10 @@ use futures::StreamExt as _;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::{Partition, creator::PartitionCreator, expression::validate_scalar_compatibility};
+use crate::{
+    Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
+    insert::PartitionInsertExec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -67,7 +70,7 @@ type ScalarValueString = String;
 pub struct PartitionTableProvider<ConnectionPool> {
     creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
     partition_by: Vec<Expr>,
-    partitions: RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>,
+    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>>,
     schema: SchemaRef,
 }
 
@@ -102,7 +105,7 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
             .collect::<Result<HashMap<_, _>, _>>()
             .context(ValidatingExpressionsSnafu)?;
 
-        let partitions = RwLock::new(partitions);
+        let partitions = Arc::new(RwLock::new(partitions));
 
         Ok(Self {
             creator,
@@ -188,122 +191,14 @@ where
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let expr = self.partition_by.first().ok_or_else(|| {
-            DataFusionError::Execution("Failed to get first partition expression".to_string())
-        })?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-
-        let task_ctx = Arc::new(TaskContext::from(state));
-        let mut stream = execute_stream(Arc::clone(&input), task_ctx)?;
-        let mut execution_plans = Vec::new();
-
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let partition_groups = group_by_partition(expr, &[batch], &df_schema)?;
-
-            for (partition_value, batch) in partition_groups {
-                let partition_key = partition_value.to_string();
-                let table_provider = {
-                    let partitions = self.partitions.read().await;
-                    if let Some(partition) = partitions.get(&partition_key) {
-                        Arc::clone(&partition.table_provider)
-                    } else {
-                        drop(partitions);
-                        let partition = self
-                            .creator
-                            .create_partition(partition_value.clone())
-                            .await
-                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                        let table_provider = Arc::clone(&partition.table_provider);
-                        let mut partitions = self.partitions.write().await;
-                        partitions.insert(partition_key.clone(), partition);
-                        table_provider
-                    }
-                };
-
-                let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-                    &[vec![batch]],
-                    Arc::clone(&self.schema),
-                    None,
-                )?));
-
-                let plan = table_provider
-                    .insert_into(state, Arc::new(mem_exec), insert_op)
-                    .await?;
-                execution_plans.push(plan);
-            }
-        }
-
-        if execution_plans.is_empty() {
-            let empty = EmptyExec::new(Arc::clone(&self.schema));
-            Ok(Arc::new(empty))
-        } else if execution_plans.len() == 1 {
-            #[allow(clippy::unwrap_used)]
-            Ok(execution_plans.into_iter().next().unwrap())
-        } else {
-            Ok(Arc::new(UnionExec::new(execution_plans)))
-        }
+        let partition_by = self.partition_by.first().unwrap().clone();
+        Ok(Arc::new(PartitionInsertExec::new(
+            input,
+            partition_by,
+            Arc::clone(&self.creator),
+            Arc::clone(&self.partitions),
+            insert_op,
+            Arc::clone(&self.schema),
+        )))
     }
-}
-
-fn group_by_partition(
-    expr: &Expr,
-    batches: &[RecordBatch],
-    df_schema: &DFSchema,
-) -> Result<HashMap<ScalarValue, RecordBatch>, DataFusionError> {
-    let props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(expr, df_schema, &props)?;
-    let mut partition_map = HashMap::new();
-
-    for batch in batches.iter().filter(|b| b.num_rows() > 0) {
-        let column = physical_expr.evaluate(batch)?;
-        let array = match column {
-            ColumnarValue::Array(array) => array,
-            ColumnarValue::Scalar(_) => return Err(Error::InvalidPartitionExpression).boxed()?,
-        };
-
-        let partitions = partition(&[Arc::clone(&array)])?;
-
-        for indices in partitions.ranges() {
-            if indices.is_empty() {
-                continue;
-            }
-            // Extract scalar value from the first row of the partition
-            let indices = indices.collect::<Vec<_>>();
-            let scalar = ScalarValue::try_from_array(&array, indices[0])?;
-            let partition_batches = partition_map.entry(scalar).or_insert_with(Vec::new);
-            // Create a single batch for the partition using indices
-            let new_batch = filter_batch_by_indices(batch, &indices)?;
-            partition_batches.push(new_batch);
-        }
-    }
-
-    let mut result = HashMap::with_capacity(partition_map.len());
-    for (scalar, batches) in partition_map {
-        if batches.is_empty() {
-            continue;
-        }
-        let concat_batch = concat_batches(&batches[0].schema(), &batches)?;
-        result.insert(scalar, concat_batch);
-    }
-
-    Ok(result)
-}
-
-fn filter_batch_by_indices(
-    batch: &RecordBatch,
-    indices: &[usize],
-) -> Result<RecordBatch, DataFusionError> {
-    let indices_array = UInt64Array::from_iter_values(indices.iter().map(|&i| i as u64));
-    let indices_array = Arc::new(indices_array) as Arc<dyn Array>;
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|col| take(col, &indices_array, None))
-        .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| DataFusionError::ArrowError(e, None))
 }

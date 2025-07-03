@@ -20,6 +20,7 @@ use datafusion::{catalog::TableProvider, scalar::ScalarValue};
 
 pub mod creator;
 pub mod expression;
+pub mod insert;
 pub mod provider;
 
 #[derive(Debug)]
