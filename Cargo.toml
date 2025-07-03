@@ -36,7 +36,8 @@ members = [
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",
-    "tools/testoperator", "tools/parsley",
+    "tools/testoperator",
+    "tools/parsley",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -101,7 +102,7 @@ futures = "0.3.30"
 globset = "0.4.16"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
-hf-hub = { version = "0.3.0", features = ["tokio"] }
+hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 iceberg = "0.4.0"
 iceberg-catalog-glue = "0.4.0"
