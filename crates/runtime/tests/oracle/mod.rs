@@ -21,7 +21,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
 use crate::oracle::common::{make_oracle_dataset, start_oracle_docker_container};
-use crate::utils::test_request_context;
+use crate::utils::{runtime_ready_check, test_request_context};
 
 pub mod common;
 
@@ -213,6 +213,8 @@ async fn oracle_integration_test() -> Result<(), anyhow::Error> {
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             run_and_snapshot_query(
                 &rt,
