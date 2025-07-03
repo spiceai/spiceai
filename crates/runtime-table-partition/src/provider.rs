@@ -19,27 +19,14 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::{
-        array::{Array, RecordBatch, UInt64Array},
-        compute::{concat_batches, partition, take},
-    },
-    catalog::{
-        Session, TableProvider,
-        memory::{DataSourceExec, MemorySourceConfig},
-    },
+    catalog::{Session, TableProvider},
     common::{Constraints, DFSchema},
     datasource::TableType,
     error::DataFusionError,
-    execution::{TaskContext, context::ExecutionProps},
-    logical_expr::{ColumnarValue, dml::InsertOp},
-    physical_expr::create_physical_expr,
-    physical_plan::{
-        ExecutionPlan, empty::EmptyExec, execute_stream, limit::GlobalLimitExec, union::UnionExec,
-    },
+    logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
-    scalar::ScalarValue,
 };
-use futures::StreamExt as _;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -149,6 +136,13 @@ where
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -187,7 +181,7 @@ where
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
