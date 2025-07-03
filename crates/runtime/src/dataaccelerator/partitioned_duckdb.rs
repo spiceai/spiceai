@@ -346,7 +346,7 @@ async fn get_pool(
     duckdb_factory: &DuckDBTableProviderFactory,
     duckdb_path: &str,
 ) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
-    let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_path)
+    let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
         .with_max_size(Some(10))
         .with_min_idle(Some(10));
     Ok(Arc::new(

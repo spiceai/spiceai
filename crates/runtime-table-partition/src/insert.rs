@@ -79,9 +79,9 @@ where
         );
         Self {
             input,
-            partition_by,
             creator,
             partitions,
+            partition_by,
             insert_op,
             schema,
             properties,
@@ -125,7 +125,7 @@ where
             ));
         }
         Ok(Arc::new(Self::new(
-            children[0].clone(),
+            Arc::clone(&children[0]),
             self.partition_by.clone(),
             Arc::clone(&self.creator),
             Arc::clone(&self.partitions),
@@ -274,7 +274,7 @@ where
         ))))
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "PartitionInsertExec"
     }
 

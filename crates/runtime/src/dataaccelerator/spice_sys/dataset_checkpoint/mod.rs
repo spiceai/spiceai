@@ -89,7 +89,7 @@ impl DatasetCheckpoint {
             AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
             #[cfg(feature = "duckdb")]
             AccelerationConnection::PartitionedDuckDB(pools) => {
-                pools.iter().try_for_each(|pool| Self::init_duckdb(pool))?
+                pools.iter().try_for_each(|pool| Self::init_duckdb(pool))?;
             }
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,

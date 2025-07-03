@@ -102,7 +102,7 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
         })
     }
 
-    /// Get ConnectionPools for each partition.
+    /// Get `ConnectionPool`s for each partition.
     ///
     /// # Errors
     pub async fn get_shared_pools(&self) -> Vec<Arc<ConnectionPool>> {
@@ -110,7 +110,7 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
             .read()
             .await
             .values()
-            .map(|p| p.pool.clone())
+            .map(|p| Arc::clone(&p.pool))
             .collect()
     }
 }
