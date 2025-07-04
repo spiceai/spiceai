@@ -98,9 +98,9 @@ mod nsql {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         {
-            // Use `ok` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
+            // Use `truncated` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
             format!(
-                "SELECT task, CASE WHEN task = 'sql_query' THEN 'ok' ELSE input END as input
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
                 WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                 AND start_time > '{}'
@@ -108,9 +108,9 @@ mod nsql {
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
         } else {
-            // Use `ok` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
+            // Use `truncated` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
             format!(
-                "SELECT task, CASE WHEN task = 'sql_query' THEN 'ok' ELSE input END as input
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
                 WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                 AND start_time > '{}'
