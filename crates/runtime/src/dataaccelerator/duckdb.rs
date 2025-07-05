@@ -131,82 +131,95 @@ impl DuckDBAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<DuckDbConnectionPool> {
-        let duckdb_file = self.duckdb_file_path(source);
-
         let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
             dataset: source.name().to_string(),
         })?;
 
-        let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => {
-                let num_accelerating_datasets = self.get_num_accelerating_datasets(
-                    Some(duckdb_file.as_str()),
-                    &source.app(),
-                    source.runtime(),
-                );
-                let max_size = Self::get_max_size(num_accelerating_datasets);
-                let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
-                    .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
-                self.duckdb_factory
-                    .get_or_init_instance_with_builder(pool_builder)
-                    .await
-                    .boxed()
-                    .context(AccelerationCreationFailedSnafu)?
-            }
-            (_, Mode::Memory) => {
-                let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
-                let max_size = Self::get_max_size(num_accelerating_datasets);
-                let pool_builder = DuckDbConnectionPoolBuilder::memory()
-                    .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
-                self.duckdb_factory
-                    .get_or_init_instance_with_builder(pool_builder)
-                    .await
-                    .boxed()
-                    .context(AccelerationCreationFailedSnafu)?
-            }
-            (Err(e), Mode::File) => {
-                return Err(Error::InvalidConfiguration {
-                    detail: Arc::from(e.to_string()),
-                });
-            }
-        };
-
-        Ok(pool)
+        match acceleration.mode {
+            Mode::File => self.build_file_pool(source).await,
+            Mode::Memory => self.build_memory_pool(source).await,
+        }
     }
 
+    async fn build_file_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<DuckDbConnectionPool> {
+        let duckdb_file = self
+            .duckdb_file_path(source)
+            .map_err(|e| Error::InvalidConfiguration {
+                detail: Arc::from(e.to_string()),
+            })?;
+            
+        let num_datasets = self.get_num_accelerating_datasets(
+            Some(&duckdb_file),
+            &source.app(),
+            source.runtime(),
+        );
+        let max_size = Self::get_max_size(num_datasets);
+
+        let builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+            .with_max_size(Some(max_size))
+            .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+
+        self.duckdb_factory
+            .get_or_init_instance_with_builder(builder)
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)
+    }
+
+    async fn build_memory_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<DuckDbConnectionPool> {
+        let num_datasets = self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
+        let max_size = Self::get_max_size(num_datasets);
+
+        let builder = DuckDbConnectionPoolBuilder::memory()
+            .with_max_size(Some(max_size))
+            .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+
+        self.duckdb_factory
+            .get_or_init_instance_with_builder(builder)
+            .await
+            .boxed()
+            .context(AccelerationCreationFailedSnafu)
+    }
+
+    // Calculate number of DuckDB-accelerated datasets sharing the same DuckDB instance.
+    // If in file mode (path == Some()), counts datasets using the same file path.
+    // If in memory mode (path == None), counts all in-memory DuckDB datasets.
     fn get_num_accelerating_datasets(
         &self,
         path: Option<&str>,
         app: &Arc<App>,
         rt: Arc<Runtime>,
     ) -> u32 {
-        let mut instance_usage: u32 = 1;
-
+        let is_file_mode = path.is_some();
         let datasets = rt.get_valid_datasets(app, crate::LogErrors(false));
-        for ds in datasets {
-            if let Some(acceleration) = &ds.acceleration {
-                if acceleration.engine != Engine::DuckDB {
-                    continue;
-                }
 
-                // If the path is Some, we're counting the number of file instances
-                if let Some(this_file_path) = path {
-                    if acceleration.mode == Mode::File {
-                        if let Ok(file_path) = self.file_path(ds.as_ref()) {
-                            if this_file_path == file_path {
-                                instance_usage += 1;
-                            }
+        let duckdb_datasets_with_acceleration = datasets.iter().filter(|ds| {
+            ds.acceleration.as_ref().is_some_and(|a| a.engine == Engine::DuckDB)
+        });
+
+        let mut instance_usage = 1;
+
+        for ds in duckdb_datasets_with_acceleration {
+            let acceleration = ds.acceleration.as_ref().unwrap();
+
+            match (is_file_mode, &acceleration.mode) {
+                (true, Mode::File) => {
+                    if let Ok(file_path) = self.file_path(ds.as_ref()) {
+                        if Some(file_path.as_str()) == path {
+                            instance_usage += 1;
                         }
                     }
-                } else {
-                    // If the path is None, we're just counting the number of memory instances
-                    if acceleration.mode == Mode::Memory {
-                        instance_usage += 1;
-                    }
                 }
+                (false, Mode::Memory) => {
+                    instance_usage += 1;
+                }
+                _ => {}
             }
         }
 
@@ -309,7 +322,7 @@ impl DataAccelerator for DuckDBAccelerator {
             num_partitions == 0,
             super::InvalidConfigurationSnafu {
                 msg: format!(
-                    "Sqlite data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
+                    "DuckDB data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
                 )
             }
         );
