@@ -19,29 +19,22 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::{
-        array::{Array, RecordBatch, UInt64Array},
-        compute::{concat_batches, partition, take},
-    },
-    catalog::{
-        Session, TableProvider,
-        memory::{DataSourceExec, MemorySourceConfig},
-    },
+    catalog::{Session, TableProvider},
     common::{Constraints, DFSchema},
     datasource::TableType,
     error::DataFusionError,
-    execution::{TaskContext, context::ExecutionProps},
-    logical_expr::{ColumnarValue, dml::InsertOp},
-    physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, execute_stream, union::UnionExec},
+    logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
     scalar::ScalarValue,
 };
-use futures::StreamExt as _;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::{creator::PartitionCreator, expression::validate_scalar_compatibility};
+use crate::{
+    Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
+    insert::PartitionInsertExec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -62,14 +55,14 @@ pub enum Error {
 type ScalarValueString = String;
 
 #[derive(Debug)]
-pub struct PartitionTableProvider {
-    creator: Arc<dyn PartitionCreator>,
-    partition_by: Vec<Expr>,
-    partitions: RwLock<HashMap<ScalarValueString, Arc<dyn TableProvider>>>,
+pub struct PartitionTableProvider<ConnectionPool> {
+    creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
+    partition_by: Expr,
+    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>>,
     schema: SchemaRef,
 }
 
-impl PartitionTableProvider {
+impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
     /// the first expression in `partition_by`.
     ///
@@ -77,13 +70,17 @@ impl PartitionTableProvider {
     /// This function will return an Error when the `partition_by` expression
     /// validation fails.
     pub async fn new(
-        creator: Arc<dyn PartitionCreator>,
-        partition_by: Vec<Expr>,
+        creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
+        mut partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let num_partition_by = partition_by.len();
-        let expr = partition_by
-            .first()
+        ensure!(
+            num_partition_by == 1,
+            PartitionByViolationSnafu { num_partition_by }
+        );
+        let partition_by = partition_by
+            .pop()
             .context(PartitionByViolationSnafu { num_partition_by })?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
@@ -94,13 +91,13 @@ impl PartitionTableProvider {
             .context(CreatingPartitionSnafu)?
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(expr, &p.partition_value, &df_schema)?;
-                Ok((p.partition_value.to_string(), p.table_provider))
+                validate_scalar_compatibility(&partition_by, &p.partition_value, &df_schema)?;
+                Ok((p.partition_value.to_string(), p))
             })
             .collect::<Result<HashMap<_, _>, _>>()
             .context(ValidatingExpressionsSnafu)?;
 
-        let partitions = RwLock::new(partitions);
+        let partitions = Arc::new(RwLock::new(partitions));
 
         Ok(Self {
             creator,
@@ -109,10 +106,25 @@ impl PartitionTableProvider {
             schema,
         })
     }
+
+    /// Get `ConnectionPool`s for each partition.
+    ///
+    /// # Errors
+    pub async fn get_shared_pools(&self) -> Vec<Arc<ConnectionPool>> {
+        self.partitions
+            .read()
+            .await
+            .values()
+            .map(|p| Arc::clone(&p.pool))
+            .collect()
+    }
 }
 
 #[async_trait]
-impl TableProvider for PartitionTableProvider {
+impl<ConnectionPool> TableProvider for PartitionTableProvider<ConnectionPool>
+where
+    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -129,143 +141,148 @@ impl TableProvider for PartitionTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
     async fn scan(
         &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Err(DataFusionError::Execution(
-            "PartitionedTableProvider::scan not implemented yet".to_string(),
-        ))
+        let partitions = self.partitions.read().await;
+        let mut plans = Vec::with_capacity(partitions.len());
+        for partition in partitions.values() {
+            if prune_partition(filters, &self.partition_by, &partition.partition_value) {
+                continue;
+            }
+            let plan = partition
+                .table_provider
+                .scan(state, projection, filters, limit)
+                .await?;
+            plans.push(plan);
+        }
+
+        let plan = match plans {
+            plans if plans.is_empty() => {
+                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+            }
+            mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
+                DataFusionError::Execution("expected an ExecutionPlan".to_string())
+            })?,
+            plans => Arc::new(UnionExec::new(plans)),
+        };
+
+        if let Some(limit) = limit {
+            return Ok(Arc::new(GlobalLimitExec::new(plan, limit, None)));
+        }
+
+        Ok(plan)
     }
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let expr = self.partition_by.first().ok_or_else(|| {
-            DataFusionError::Execution("Failed to get first partition expression".to_string())
-        })?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-
-        let task_ctx = Arc::new(TaskContext::from(state));
-        let mut stream = execute_stream(Arc::clone(&input), task_ctx)?;
-        let mut execution_plans = Vec::new();
-
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let partition_groups = group_by_partition(expr, &[batch], &df_schema)?;
-
-            for (scalar_value, batch) in partition_groups {
-                let partition_key = scalar_value.to_string();
-                let table_provider = {
-                    let partitions = self.partitions.read().await;
-                    if let Some(existing_provider) = partitions.get(&partition_key) {
-                        Arc::clone(existing_provider)
-                    } else {
-                        drop(partitions);
-                        let new_provider = self
-                            .creator
-                            .create_partition(scalar_value.clone())
-                            .await
-                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                        let mut partitions = self.partitions.write().await;
-                        partitions.insert(partition_key.clone(), Arc::clone(&new_provider));
-                        new_provider
-                    }
-                };
-
-                let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-                    &[vec![batch]],
-                    Arc::clone(&self.schema),
-                    None,
-                )?));
-
-                let plan = table_provider
-                    .insert_into(state, Arc::new(mem_exec), insert_op)
-                    .await?;
-                execution_plans.push(plan);
-            }
-        }
-
-        if execution_plans.is_empty() {
-            let mem_exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-                &[vec![]],
-                Arc::clone(&self.schema),
-                None,
-            )?));
-            Ok(Arc::new(mem_exec))
-        } else if execution_plans.len() == 1 {
-            #[allow(clippy::unwrap_used)]
-            Ok(execution_plans.into_iter().next().unwrap())
-        } else {
-            Ok(Arc::new(UnionExec::new(execution_plans)))
-        }
+        Ok(Arc::new(PartitionInsertExec::new(
+            input,
+            self.partition_by.clone(),
+            Arc::clone(&self.creator),
+            Arc::clone(&self.partitions),
+            insert_op,
+            Arc::clone(&self.schema),
+        )))
     }
 }
 
-fn group_by_partition(
-    expr: &Expr,
-    batches: &[RecordBatch],
-    df_schema: &DFSchema,
-) -> Result<HashMap<ScalarValue, RecordBatch>, DataFusionError> {
-    let props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(expr, df_schema, &props)?;
-    let mut partition_map = HashMap::new();
-
-    for batch in batches.iter().filter(|b| b.num_rows() > 0) {
-        let column = physical_expr.evaluate(batch)?;
-        let array = match column {
-            ColumnarValue::Array(array) => array,
-            ColumnarValue::Scalar(_) => return Err(Error::InvalidPartitionExpression).boxed()?,
-        };
-
-        let partitions = partition(&[Arc::clone(&array)])?;
-
-        for indices in partitions.ranges() {
-            if indices.is_empty() {
-                continue;
+/// Determine whether a partition should be pruned from the scan plan based on
+/// the query `filters`, the expression that the partition was created from,
+/// `partition_by`, and the `partition_value` produced by the `partition_by`
+/// `Expr` for this particular partition.
+fn prune_partition(filters: &[Expr], partition_by: &Expr, partition_value: &ScalarValue) -> bool {
+    for filter in filters {
+        if let Expr::BinaryExpr(BinaryExpr {
+            left,
+            right,
+            op: Operator::Eq,
+        }) = filter
+        {
+            if left.as_ref() == partition_by {
+                if let Expr::Literal(lit) = right.as_ref() {
+                    return lit != partition_value;
+                }
             }
-            // Extract scalar value from the first row of the partition
-            let indices = indices.collect::<Vec<_>>();
-            let scalar = ScalarValue::try_from_array(&array, indices[0])?;
-            let partition_batches = partition_map.entry(scalar).or_insert_with(Vec::new);
-            // Create a single batch for the partition using indices
-            let new_batch = filter_batch_by_indices(batch, &indices)?;
-            partition_batches.push(new_batch);
         }
     }
-
-    let mut result = HashMap::with_capacity(partition_map.len());
-    for (scalar, batches) in partition_map {
-        if batches.is_empty() {
-            continue;
-        }
-        let concat_batch = concat_batches(&batches[0].schema(), &batches)?;
-        result.insert(scalar, concat_batch);
-    }
-
-    Ok(result)
+    false
 }
 
-fn filter_batch_by_indices(
-    batch: &RecordBatch,
-    indices: &[usize],
-) -> Result<RecordBatch, DataFusionError> {
-    let indices_array = UInt64Array::from_iter_values(indices.iter().map(|&i| i as u64));
-    let indices_array = Arc::new(indices_array) as Arc<dyn Array>;
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|col| take(col, &indices_array, None))
-        .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| DataFusionError::ArrowError(e, None))
+#[cfg(test)]
+mod tests {
+    use datafusion::common::Column;
+
+    use super::*;
+
+    #[test]
+    fn test_prune_partition_exact_match() {
+        let region_expr = Expr::Column(Column::from_name("region"));
+        let partition_value = ScalarValue::Utf8(Some("us-east-1".to_string()));
+        let filters = &[region_expr
+            .clone()
+            .eq(Expr::Literal(partition_value.clone()))];
+
+        let partition_by = region_expr;
+        assert!(!prune_partition(filters, &partition_by, &partition_value));
+
+        let partition_value = ScalarValue::Utf8(Some("ap-northeast-2".to_string()));
+        assert!(prune_partition(filters, &partition_by, &partition_value));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_prune_partition_range() {
+        let column = Expr::Column(Column::from_name("fare_amount"));
+        let partition_by = column
+            .clone()
+            .gt(Expr::Literal(ScalarValue::Float64(Some(10.0))));
+
+        let filters = &[column
+            .clone()
+            .gt(Expr::Literal(ScalarValue::Float64(Some(10.0))))];
+        let partition_value = ScalarValue::Boolean(Some(true));
+        assert!(!prune_partition(filters, &partition_by, &partition_value));
+        let partition_value = ScalarValue::Boolean(Some(false));
+        assert!(prune_partition(filters, &partition_by, &partition_value));
+
+        let filters = &[column
+            .clone()
+            .gt(Expr::Literal(ScalarValue::Float64(Some(9.0))))];
+        let partition_value = ScalarValue::Boolean(Some(true));
+        assert!(!prune_partition(filters, &partition_by, &partition_value));
+        let partition_value = ScalarValue::Boolean(Some(false));
+        assert!(prune_partition(filters, &partition_by, &partition_value));
+
+        let filters = &[column
+            .clone()
+            .gt(Expr::Literal(ScalarValue::Float64(Some(11.0))))];
+        let partition_value = ScalarValue::Boolean(Some(true));
+        assert!(!prune_partition(filters, &partition_by, &partition_value));
+        let partition_value = ScalarValue::Boolean(Some(false));
+        assert!(prune_partition(filters, &partition_by, &partition_value));
+
+        let filters = &[column
+            .clone()
+            .lt(Expr::Literal(ScalarValue::Float64(Some(9.0))))];
+        let partition_value = ScalarValue::Boolean(Some(true));
+        assert!(prune_partition(filters, &partition_by, &partition_value));
+        let partition_value = ScalarValue::Boolean(Some(false));
+        assert!(!prune_partition(filters, &partition_by, &partition_value));
+    }
 }

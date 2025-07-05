@@ -87,6 +87,10 @@ impl DatasetCheckpoint {
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => {
+                pools.iter().try_for_each(|pool| Self::init_duckdb(pool))?;
+            }
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -99,6 +103,10 @@ impl DatasetCheckpoint {
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => pools
+                .iter()
+                .try_for_each(|pool| Self::migrate_duckdb(pool))?,
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => Self::migrate_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
@@ -123,6 +131,10 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => pools
+                .iter()
+                .all(|pool| self.exists_duckdb(pool).ok().unwrap_or(false)),
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
@@ -140,6 +152,11 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.last_checkpoint_time_duckdb(pool),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => Ok(pools
+                .iter()
+                .filter_map(|pool| self.last_checkpoint_time_duckdb(pool).ok().flatten())
+                .min()),
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => {
                 self.last_checkpoint_time_postgres(pool).await
@@ -155,6 +172,10 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool, schema),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => pools
+                .iter()
+                .try_for_each(|pool| self.checkpoint_duckdb(pool, schema)),
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool, schema).await,
             #[cfg(feature = "sqlite")]
@@ -168,6 +189,13 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::PartitionedDuckDB(pools) => {
+                if let Some(pool) = pools.first() {
+                    return self.get_schema_duckdb(pool);
+                }
+                Ok(None)
+            }
             #[cfg(feature = "postgres")]
             AccelerationConnection::Postgres(pool) => self.get_schema_postgres(pool).await,
             #[cfg(feature = "sqlite")]

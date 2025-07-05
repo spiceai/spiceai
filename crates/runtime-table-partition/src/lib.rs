@@ -20,10 +20,12 @@ use datafusion::{catalog::TableProvider, scalar::ScalarValue};
 
 pub mod creator;
 pub mod expression;
+pub mod insert;
 pub mod provider;
 
 #[derive(Debug)]
-pub struct Partition {
+pub struct Partition<Pool> {
     pub partition_value: ScalarValue,
+    pub pool: Arc<Pool>,
     pub table_provider: Arc<dyn TableProvider>,
 }

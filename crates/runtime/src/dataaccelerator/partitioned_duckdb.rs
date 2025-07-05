@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, path::Path, sync::Arc};
+use std::{
+    any::Any,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -23,19 +30,19 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
-    sql::db_connection_pool::duckdbpool::DuckDbConnectionPoolBuilder,
+    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{decode_scalar_value, encode_scalar_value},
+        filename::{self, decode_scalar_value, encode_scalar_value},
     },
     provider::PartitionTableProvider,
 };
 use snafu::prelude::*;
-use tokio::{fs::create_dir, sync::Mutex};
+use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
@@ -100,17 +107,27 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct PartitionedDuckDBAccelerator {
+pub(crate) struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
-    table_provider: Mutex<Option<Arc<PartitionTableProvider>>>,
+    table_provider: Mutex<Option<Arc<PartitionTableProvider<DuckDbConnectionPool>>>>,
+    is_initialized: AtomicBool,
 }
 
 impl PartitionedDuckDBAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base_accelerator: DuckDBAccelerator::new(),
             table_provider: Mutex::new(None),
+            is_initialized: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) async fn get_shared_pools(&self) -> Vec<Arc<DuckDbConnectionPool>> {
+        if let Some(provider) = self.table_provider.lock().await.as_ref() {
+            provider.get_shared_pools().await
+        } else {
+            vec![]
         }
     }
 }
@@ -131,11 +148,19 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         "partitioned_duckdb"
     }
 
+    fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
+        self.is_initialized.load(Ordering::Acquire)
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         self.base_accelerator.valid_file_extensions()
     }
 
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        // There is no one file path but one for each partition
+        // This function is only internally used (within this trait) in the
+        // DuckDBAccelerator, for example, but is never used in this
+        // implementation.
         Ok(String::new())
     }
 
@@ -174,6 +199,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
         *table_provider_guard = Some(Arc::clone(&table_provider));
+        self.is_initialized.store(true, Ordering::Release);
 
         Ok(table_provider)
     }
@@ -188,13 +214,18 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 }
 
 #[derive(Debug)]
-struct DuckDBPartitionCreator {
+pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
+    partition_dir: PathBuf,
 }
 
 impl DuckDBPartitionCreator {
-    fn new(cmd: CreateExternalTable) -> Self {
+    pub(crate) fn new(cmd: CreateExternalTable) -> Self {
+        let data_path = spice_data_base_path();
+        let table = cmd.name.table();
+        let partition_dir = Path::new(&data_path).join(table);
+
         Self {
             cmd,
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
@@ -202,56 +233,53 @@ impl DuckDBPartitionCreator {
                 .with_settings_registry(
                     DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
                 ),
+            partition_dir,
         }
     }
 }
 
 #[async_trait]
 impl PartitionCreator for DuckDBPartitionCreator {
+    type ConnectionPool = DuckDbConnectionPool;
+
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
-    ) -> Result<Arc<dyn TableProvider>, creator::Error> {
+    ) -> Result<Partition<Self::ConnectionPool>, creator::Error> {
         let mut cmd = self.cmd.clone();
-        let partition_value_str = encode_scalar_value(&partition_value)
+        let duckdb_path = add_open(&self.partition_dir, &mut cmd, &partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        let table = cmd.name.table();
-        let data_path = spice_data_base_path();
-
-        let duckdb_file = format!("{data_path}/{table}/{partition_value_str}.db");
-        let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
-            .with_max_size(Some(10))
-            .with_min_idle(Some(10));
-        self.duckdb_factory
-            .get_or_init_instance_with_builder(pool_builder)
+        let pool = get_pool(&self.duckdb_factory, &duckdb_path)
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-        cmd.options.insert("open".to_string(), duckdb_file);
-
-        tracing::debug!("creating partition at {}", &cmd.location);
+        tracing::debug!("creating partition at {duckdb_path}");
 
         let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e })?;
 
-        Ok(table_provider)
+        let partition = Partition {
+            partition_value,
+            pool,
+            table_provider,
+        };
+
+        Ok(partition)
     }
 
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
-        let data_path = spice_data_base_path();
-        let table = self.cmd.name.table();
-        let data_path = Path::new(&data_path).join(table);
-
-        if !data_path.is_dir() {
-            create_dir(data_path)
+    async fn infer_existing_partitions(
+        &self,
+    ) -> Result<Vec<Partition<Self::ConnectionPool>>, creator::Error> {
+        if !self.partition_dir.is_dir() {
+            create_dir_all(&self.partition_dir)
                 .await
                 .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
             return Ok(vec![]);
         }
 
-        let mut dir_entries = tokio::fs::read_dir(&data_path)
+        let mut dir_entries = tokio::fs::read_dir(&self.partition_dir)
             .await
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
@@ -284,25 +312,60 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 };
 
                 let mut cmd = self.cmd.clone();
-                cmd.options
-                    .insert("location".to_string(), path.to_string_lossy().into_owned());
+                add_open(&self.partition_dir, &mut cmd, &partition_value)
+                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-                let table_provider = create_table_provider(&self.duckdb_factory, &self.cmd)
+                let duckdb_path = path.display().to_string();
+                let pool = get_pool(&self.duckdb_factory, &duckdb_path)
+                    .await
+                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+                let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
                     .await
                     .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
                 partitions.push(Partition {
                     partition_value,
+                    pool,
                     table_provider,
                 });
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "inferred {} existing partitions from '{}'",
             partitions.len(),
-            data_path.display()
+            self.partition_dir.display().to_string(),
         );
         Ok(partitions)
     }
+}
+
+fn add_open(
+    partition_dir: &Path,
+    cmd: &mut CreateExternalTable,
+    partition_value: &ScalarValue,
+) -> Result<String, filename::Error> {
+    let partition_value_str = encode_scalar_value(partition_value)?;
+
+    let duckdb_file = format!("{partition_value_str}.db");
+    let duckdb_path = partition_dir.join(&duckdb_file);
+    let duckdb_path = duckdb_path.display().to_string();
+    cmd.options.insert("open".to_string(), duckdb_path.clone());
+
+    Ok(duckdb_path)
+}
+
+async fn get_pool(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    duckdb_path: &str,
+) -> Result<Arc<DuckDbConnectionPool>, datafusion_table_providers::duckdb::Error> {
+    let pool_builder = DuckDbConnectionPoolBuilder::file(duckdb_path)
+        .with_max_size(Some(10))
+        .with_min_idle(Some(10));
+    Ok(Arc::new(
+        duckdb_factory
+            .get_or_init_instance_with_builder(pool_builder)
+            .await?,
+    ))
 }
