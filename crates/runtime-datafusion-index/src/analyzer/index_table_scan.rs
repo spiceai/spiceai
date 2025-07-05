@@ -122,9 +122,12 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
                 let new_node =
                     IndexTableScanNode::new(LogicalPlan::TableScan(table_scan), available_indexes);
 
-                Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                let plan = LogicalPlan::Extension(Extension {
                     node: Arc::new(new_node),
-                })))
+                });
+
+                // We don't need to process the TableScan we just processed, so we jump to the next node.
+                Ok(Transformed::new(plan, true, TreeNodeRecursion::Jump))
             }
             _ => Ok(Transformed::no(plan)),
         })

@@ -44,7 +44,7 @@ use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
 pub(crate) mod settings;
 
@@ -469,7 +469,7 @@ mod tests {
         };
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
-        let table = duckdb_accelerator
+        let (table, _) = duckdb_accelerator
             .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");

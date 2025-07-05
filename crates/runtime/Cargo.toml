@@ -24,6 +24,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
+aws-sdk-bedrockruntime = { version = "1.55.0", optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-glue = "1"
 aws-sdk-secretsmanager = { version = "1", optional = true }
@@ -198,6 +199,10 @@ aws-secrets-manager = [
     "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
 ]
+bedrock = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+]
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
@@ -207,7 +212,7 @@ clickhouse = [
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
+default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint", "bedrock"]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []

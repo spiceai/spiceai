@@ -50,6 +50,8 @@ use self::postgres::PostgresAccelerator;
 use self::sqlite::SqliteAccelerator;
 
 pub mod arrow;
+pub mod behaviors;
+use behaviors::Behaviors;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
@@ -196,7 +198,7 @@ impl AcceleratorEngineRegistry {
         secrets: Arc<RwLock<Secrets>>,
         source: Option<&dyn AccelerationSource>,
         ctx: Arc<SessionContext>,
-    ) -> Result<Arc<dyn TableProvider>> {
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors)> {
         let engine = acceleration_settings.engine;
 
         let accelerator = self
@@ -315,12 +317,14 @@ pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
+    ///
+    /// Also returns the behaviors of the table provider created by the accelerator engine.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;

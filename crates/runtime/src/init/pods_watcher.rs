@@ -58,7 +58,9 @@ impl Runtime {
                 Arc::clone(&self)
                     .apply_dataset_diff(current_app, &new_app)
                     .await;
-                Arc::clone(&self).apply_view_diff(current_app, &new_app);
+                Arc::clone(&self)
+                    .apply_view_diff(current_app, &new_app)
+                    .await;
                 self.apply_model_diff(current_app, &new_app).await;
 
                 if !cfg!(feature = "models") {

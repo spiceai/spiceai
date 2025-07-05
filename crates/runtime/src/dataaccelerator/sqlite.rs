@@ -35,7 +35,7 @@ use crate::{
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -248,7 +248,7 @@ impl DataAccelerator for SqliteAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         let num_partitions = partition_by.len();
         ensure!(
             num_partitions == 0,
@@ -315,11 +315,13 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
         let cloned_writer = Arc::clone(&sqlite_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             sqlite_writer,
             read_provider,
-        )))
+        ));
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {
@@ -379,7 +381,7 @@ mod tests {
             temporary: false,
         };
         let ctx = SessionContext::new();
-        let table = SqliteAccelerator::new()
+        let (table, _) = SqliteAccelerator::new()
             .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");

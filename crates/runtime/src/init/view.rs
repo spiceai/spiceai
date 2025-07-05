@@ -38,7 +38,9 @@ impl Runtime {
         let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
         for view in views {
-            if let Err(e) = self.load_view(&view, self.secrets()) {
+            let runtime = Arc::clone(&self);
+            let secrets = runtime.secrets();
+            if let Err(e) = runtime.load_view(&view, secrets) {
                 tracing::error!("Unable to load view: {e}");
             }
         }
@@ -160,20 +162,58 @@ impl Runtime {
             .await
     }
 
-    fn load_view(&self, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+    fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
-        df.register_view(Arc::clone(view), secrets)
+        let register_task = df
+            .register_view(Arc::clone(view), secrets)
             .context(UnableToAttachViewSnafu)
             .inspect_err(|_| {
                 self.status
                     .update_view(&view.name, status::ComponentStatus::Error);
             })?;
+
+        let runtime = Arc::clone(&self);
+        let view = Arc::clone(view);
+
+        tokio::task::spawn(async move {
+            let view_name = view.name.clone();
+            let notifier = register_task.await;
+            match notifier {
+                Ok(Some(notifier)) => {
+                    notifier.notified().await;
+                    if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
+                        tracing::error!(
+                            "Failed to create refresh schedule for accelerated view '{view_name}': {e}."
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create refresh schedule for accelerated view '{view_name}': {e}"
+                    );
+                }
+            }
+        });
+
         Ok(())
     }
 
-    fn remove_view(&self, name: &TableReference) {
+    async fn remove_view(self: Arc<Self>, name: &TableReference) {
         if self.df.table_exists(name.clone()) {
-            if let Err(e) = self.df.remove_view(name) {
+            if self.df.is_accelerated(name).await {
+                if let Err(e) = Arc::clone(&self)
+                    .remove_dataset_or_view_schedule(name)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to remove refresh schedule for accelerated view {}: {e}",
+                        &name
+                    );
+                }
+            }
+
+            if let Err(e) = self.df.remove_view(name).await {
                 tracing::warn!("Unable to unload view {}: {}", name, e);
                 return;
             }
@@ -181,17 +221,22 @@ impl Runtime {
         tracing::info!("Unloaded view {}", name);
     }
 
-    fn update_view(&self, view: &Arc<View>) {
+    async fn update_view(self: Arc<Self>, view: &Arc<View>) {
         self.status
             .update_view(&view.name, status::ComponentStatus::Refreshing);
-        self.remove_view(&view.name);
-        let _ = self.load_view(view, self.secrets());
+        Arc::clone(&self).remove_view(&view.name).await;
+        let secrets = self.secrets();
+        let _ = self.load_view(view, secrets);
     }
 
     /// Update views based on changed between the current and new app.
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed.
-    pub(crate) fn apply_view_diff(self: Arc<Self>, current_app: &Arc<App>, new_app: &Arc<App>) {
+    pub(crate) async fn apply_view_diff(
+        self: Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
         let valid_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
         let existing_views = Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
 
@@ -223,7 +268,7 @@ impl Runtime {
                 };
                 self.status
                     .update_view(&view_builder.name, status::ComponentStatus::Disabled);
-                self.remove_view(&view_builder.name);
+                Arc::clone(&self).remove_view(&view_builder.name).await;
             }
         }
 
@@ -252,13 +297,16 @@ impl Runtime {
 
         for view_name in affected_views_in_order_of_dependencies {
             if let Some(view) = valid_views.iter().find(|v| v.name == view_name) {
+                let runtime = Arc::clone(&self);
                 if existing_views.iter().any(|v| v.name == view.name) {
                     // Update view even if unchanged, as it may have dependencies that have changed
-                    self.update_view(view);
+                    runtime.update_view(view).await;
                 } else {
-                    self.status
+                    runtime
+                        .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
-                    let _ = self.load_view(view, self.secrets());
+                    let secrets = runtime.secrets();
+                    let _ = runtime.load_view(view, secrets);
                 }
             }
         }

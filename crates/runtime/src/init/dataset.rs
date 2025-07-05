@@ -66,16 +66,12 @@ impl Runtime {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
-
-        if valid_datasets.is_empty() {
-            return;
-        }
-
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
+
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
 
@@ -448,7 +444,10 @@ impl Runtime {
         );
 
         if ds_acceleration.is_some() {
-            if let Err(e) = Arc::clone(&self).remove_dataset_schedule(&ds_name).await {
+            if let Err(e) = Arc::clone(&self)
+                .remove_dataset_or_view_schedule(&ds_name)
+                .await
+            {
                 tracing::warn!("Unable to remove dataset schedule for {}: {e}", &ds_name);
             }
         }
@@ -551,7 +550,9 @@ impl Runtime {
             FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
 
         // Remove the schedule if the dataset has one, to prevent scheduling while the dataset is being updated.
-        Arc::clone(&self).remove_dataset_schedule(&ds.name).await?;
+        Arc::clone(&self)
+            .remove_dataset_or_view_schedule(&ds.name)
+            .await?;
 
         // create new accelerated table for updated data connector
         let accelerated_table = self
@@ -571,7 +572,7 @@ impl Runtime {
 
         // recreate the scheduler, which also recreates with any updated parameters
         Arc::clone(&self)
-            .create_dataset_schedule(Arc::clone(&ds))
+            .create_dataset_or_view_schedule(Arc::clone(&ds))
             .await?;
 
         tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
@@ -713,7 +714,7 @@ impl Runtime {
             let dataset_name = ds.name.to_string();
             tokio::task::spawn(async move {
                 notifier.notified().await;
-                if let Err(e) = runtime.create_dataset_schedule(ds).await {
+                if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
                 }
             });

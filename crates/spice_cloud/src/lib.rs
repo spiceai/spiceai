@@ -35,6 +35,7 @@ use runtime::{
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
+    datafusion::handle_accelerated_table_behavior,
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
@@ -52,6 +53,13 @@ pub enum Error {
         "Unable to create data connector: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToCreateDataConnector {
+        source: Box<dyn std::error::Error + Sync + Send>,
+    },
+
+    #[snafu(display(
+        "Unable to create data accelerator: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnableToCreateDataAcceleratorTable {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
@@ -348,7 +356,7 @@ pub async fn create_synced_internal_accelerated_table(
             .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
 
-    let accelerated_table_provider = accelerator_engine_registry
+    let (accelerated_table_provider, accelerated_table_behaviors) = accelerator_engine_registry
         .create_accelerator_table(
             table_reference.clone(),
             federated_table.schema(),
@@ -360,6 +368,14 @@ pub async fn create_synced_internal_accelerated_table(
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+
+    handle_accelerated_table_behavior(
+        accelerated_table_behaviors,
+        &federated_table,
+        table_reference.table(),
+    )
+    .boxed()
+    .context(UnableToCreateDataAcceleratorTableSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,

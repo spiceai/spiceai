@@ -32,6 +32,7 @@ use crate::{
     accelerated_table::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
+    datafusion::handle_accelerated_table_behavior,
 };
 
 #[derive(Debug, Snafu)]
@@ -130,7 +131,7 @@ pub async fn create_internal_accelerated_table(
     let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
         &source_table_provider,
     )));
-    let accelerated_table_provider = runtime
+    let (accelerated_table_provider, accelerated_table_behaviors) = runtime
         .accelerator_engine_registry()
         .create_accelerator_table(
             name.clone(),
@@ -143,6 +144,12 @@ pub async fn create_internal_accelerated_table(
         )
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+
+    handle_accelerated_table_behavior(accelerated_table_behaviors, &federated_table, name.table())
+        .boxed()
+        .context(InternalSnafu {
+            code: "IT-CIA-HATB".to_string(), // InternalTable - CreateInternalAcceleratedTable - HandleAcceleratedTableBehavior
+        })?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,
