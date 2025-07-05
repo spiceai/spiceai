@@ -140,7 +140,7 @@ impl Runtime {
                 let Ok(_guard) = semaphore.acquire().await else {
                     unreachable!("Semaphore is never closed.");
                 };
-                tracing::info!("Initializing dataset {ds}");
+                tracing::info!("Initializing dataset {ds} and inferring schema");
                 dataset_load_future.await;
             });
             spawned_tasks.push(handle);
