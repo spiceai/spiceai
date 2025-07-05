@@ -303,7 +303,7 @@ impl DataAccelerator for DuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
@@ -367,7 +367,10 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        create_table_provider(&self.duckdb_factory, &cmd).await
+        Ok((
+            create_table_provider(&self.duckdb_factory, &cmd).await?,
+            Behaviors::default(),
+        ))
     }
 
     fn prefix(&self) -> &'static str {

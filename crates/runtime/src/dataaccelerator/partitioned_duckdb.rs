@@ -46,6 +46,7 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
+    behaviors::Behaviors,
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
@@ -153,7 +154,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {
-        self.base_accelerator.valid_file_extensions()
+        DuckDBPartitionCreator::valid_file_extensions()
     }
 
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
@@ -182,7 +183,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(source) = source {
             if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
                 cmd.options
@@ -201,7 +202,10 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         *table_provider_guard = Some(Arc::clone(&table_provider));
         self.is_initialized.store(true, Ordering::Release);
 
-        Ok(table_provider)
+        Ok((
+            table_provider as Arc<dyn TableProvider>,
+            Behaviors::default(),
+        ))
     }
 
     fn prefix(&self) -> &'static str {
@@ -235,6 +239,10 @@ impl DuckDBPartitionCreator {
                 ),
             partition_dir,
         }
+    }
+
+    fn valid_file_extensions() -> Vec<&'static str> {
+        vec!["db", "ddb", "duckdb"]
     }
 }
 
@@ -285,8 +293,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let mut partitions = Vec::new();
 
-        let valid_extensions = ["db"];
-
         while let Some(entry) = dir_entries
             .next_entry()
             .await
@@ -295,7 +301,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
             let path = entry.path();
             if path.is_file() {
                 let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-                if !valid_extensions.contains(&extension) {
+                if !Self::valid_file_extensions().contains(&extension) {
                     continue;
                 }
 
