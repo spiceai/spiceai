@@ -272,6 +272,7 @@ where
 
 fn handle_query_error(e: query::Error) -> Status {
     match e {
+        query::Error::BindingParameters { source } => handle_datafusion_error(source),
         query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
         _ => to_tonic_err(e),
     }
