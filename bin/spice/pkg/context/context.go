@@ -476,46 +476,75 @@ func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error)
 	return constants.OtherInstall, executableDir, nil
 }
 
-func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
-	if rootCertPath, err := c.flags.GetString(constants.TlsRootCertificateFile); err == nil && rootCertPath != "" {
-		args = append(args, "--tls-root-certificate-file", rootCertPath)
+func (c *RuntimeContext) configureFlag(args []string, flag string, defaultValue string) []string {
+	if value, err := c.flags.GetString(flag); err == nil && value != "" {
+		return append(args, "--"+flag, value)
+	} else {
+		if defaultValue == "" {
+			return args
+		}
+		return append(args, "--"+flag, defaultValue)
 	}
+}
 
-	if apiKey, err := c.flags.GetString(constants.ApiKeyFlag); err == nil && apiKey != "" {
-		args = append(args, "--api-key", apiKey)
+func (c *RuntimeContext) configureFlightFlag(args []string) []string {
+	if flight, err := c.flags.GetString("flight-endpoint"); err == nil && flight != "" {
+		if slices.Contains(args, "--repl") {
+			args = append(args, "--repl-flight-endpoint", flight)
+		} else {
+			args = appendIfAbsent(args, "--flight", flight)
+		}
 	}
+	return args
+}
 
+func (c *RuntimeContext) configureMetricsFlag(args []string) []string {
+	if metricsEndpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && metricsEndpoint != "" {
+		args = appendIfAbsent(args, "--metrics", metricsEndpoint)
+	}
+	return args
+}
+
+func (c *RuntimeContext) configureEndpoints(args []string) []string {
+	args = c.configureFlightFlag(args)
+	args = appendIfAbsent(args, "--http", c.HttpSocketAddress())
+	args = c.configureMetricsFlag(args)
+	return args
+}
+
+func (c *RuntimeContext) configureUserAgent(args []string) []string {
 	if c.userAgent != "" {
 		args = append(args, "--user-agent", c.userAgent)
 	} else if userAgent, err := c.flags.GetString(constants.UserAgentKeyFlag); err == nil && userAgent != "" {
 		args = append(args, "--user-agent", userAgent)
 	}
+	return args
+}
 
-	if cacheControl, err := c.flags.GetString("cache-control"); err == nil && cacheControl != "" {
-		args = append(args, "--cache-control", cacheControl)
-	}
-
-	if flight, err := c.flags.GetString("flight-endpoint"); err == nil && flight != "" {
-		if slices.Contains(args, "--repl") {
-			args = append(args, "--repl-flight-endpoint", flight)
-		} else {
-			args = append(args, "--flight", flight)
-		}
-	}
-
-	args = append(args, "--http", c.HttpSocketAddress())
-
-	if endpoint, err := c.flags.GetString("metrics-endpoint"); err == nil && endpoint != "" {
-		args = append(args, "--metrics", endpoint)
-	}
-
+func (c *RuntimeContext) configureCapturedOutput(args []string) []string {
 	if capturedOutput, err := c.flags.GetString("captured-output"); err == nil && capturedOutput != "" {
 		args = append(args, "--set-runtime", "task_history.captured_output="+capturedOutput)
 	} else {
 		// Set the default value for captured_output to truncated to provide a better local developer experience with spice trace.
 		args = append(args, "--set-runtime", "task_history.captured_output=truncated")
 	}
+	return args
+}
 
+func (c *RuntimeContext) getRuntimeArgsFromFlags(args []string) []string {
+	args = c.configureFlag(args, constants.TlsRootCertificateFile, "")
+	args = c.configureFlag(args, constants.ApiKeyFlag, "")
+	args = c.configureUserAgent(args)
+	args = c.configureFlag(args, "cache-control", "")
+	args = c.configureEndpoints(args)
+	args = c.configureCapturedOutput(args)
+	return args
+}
+
+func appendIfAbsent(args []string, flag string, value string) []string {
+	if !slices.Contains(args, flag) {
+		return append(args, flag, value)
+	}
 	return args
 }
 
