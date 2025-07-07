@@ -1,0 +1,29 @@
+---
+source: crates/runtime/tests/oracle/mod.rs
+expression: formatted
+---
++------------------------+------------------------------------+-------------+
+| column_name            | data_type                          | is_nullable |
++------------------------+------------------------------------+-------------+
+| ID                     | Decimal128(38, 20)                 | YES         |
+| VAL_NUMBER             | Decimal128(10, 2)                  | YES         |
+| VAL_INTEGER            | Int64                              | YES         |
+| VAL_DECIMAL            | Decimal128(18, 4)                  | YES         |
+| VAL_FLOAT              | Float32                            | YES         |
+| VAL_DOUBLE             | Float64                            | YES         |
+| VAL_CHAR               | Utf8                               | YES         |
+| VAL_NCHAR              | Utf8                               | YES         |
+| VAL_VARCHAR2           | Utf8                               | YES         |
+| VAL_NVARCHAR2          | Utf8                               | YES         |
+| VAL_CLOB               | LargeUtf8                          | YES         |
+| VAL_NCLOB              | LargeUtf8                          | YES         |
+| VAL_DATE               | Date32                             | YES         |
+| VAL_TIMESTAMP          | Timestamp(Nanosecond, None)        | YES         |
+| VAL_TIMESTAMP_TZ       | Timestamp(Nanosecond, Some("UTC")) | YES         |
+| VAL_TIMESTAMP_LOCAL_TZ | Timestamp(Second, Some("UTC"))     | YES         |
+| VAL_BINARY_FLOAT       | Float32                            | YES         |
+| VAL_BINARY_DOUBLE      | Float64                            | YES         |
+| VAL_RAW                | Binary                             | YES         |
+| VAL_BLOB               | LargeBinary                        | YES         |
+| VAL_BOOL               | Utf8                               | YES         |
++------------------------+------------------------------------+-------------+

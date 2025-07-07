@@ -69,6 +69,8 @@ mod mssql;
 mod mysql;
 #[cfg(feature = "odbc")]
 mod odbc;
+#[cfg(feature = "oracle")]
+mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod ready_state;

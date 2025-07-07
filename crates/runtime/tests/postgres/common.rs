@@ -95,7 +95,7 @@ pub async fn start_postgres_docker_container(
             start_interval: None,
         })
         .build()?
-        .run()
+        .run(None)
         .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(5000)).await;

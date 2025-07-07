@@ -21,6 +21,7 @@ use crate::oracle::FailedToConvertNaiveDateTimeToNanosSnafu;
 use crate::oracle::FailedToParseBigDecimalSnafu;
 use arrow::array::BinaryBuilder;
 use arrow::array::Date32Builder;
+use arrow::array::Int64Builder;
 use arrow::array::LargeBinaryBuilder;
 use arrow::array::TimestampNanosecondBuilder;
 use arrow::array::TimestampSecondBuilder;
@@ -36,6 +37,7 @@ use arrow::{
 use bigdecimal::BigDecimal;
 use chrono::FixedOffset;
 use oracle::Row;
+use oracle::sql_type::OracleType;
 use snafu::OptionExt;
 use snafu::ResultExt;
 
@@ -68,11 +70,18 @@ pub(crate) fn map_oracle_type_to_arrow_type(
         // Oracle types below max size is 32767 bytes
         "ROWID" | "CHAR" | "NCHAR" | "VARCHAR2" | "NVARCHAR2" | "LONG" => Some(DataType::Utf8),
         "CLOB" | "NCLOB" => Some(DataType::LargeUtf8),
-        "NUMBER" | "DECIMAL" => {
-            // In Oracle, default precision and scale are (38, 0).
-            let precision = precision.unwrap_or(38);
-            let scale = scale.unwrap_or(0);
-            Some(DataType::Decimal128(precision, scale))
+        "NUMBER" => {
+            // "The absence of precision and scale designators specifies the maximum range and precision for an Oracle number"
+            let p = precision.unwrap_or(38); // Oracle-defined max precision
+            let s = scale.unwrap_or(20); // Spice-default scale when not specified
+
+            // Integer types in Oracle are represented as NUMBER with 0 scale.
+            // Prefer Int64 over Decimal128 for integer types as it is much more efficient (including accelerators).
+            if s == 0 && p <= 18 {
+                return Some(DataType::Int64);
+            }
+
+            Some(DataType::Decimal128(p, s))
         }
         "DATE" => Some(DataType::Date32),
         "BINARY_FLOAT" => Some(DataType::Float32),
@@ -143,8 +152,8 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
             };
             let native_type = col.oracle_type();
 
-            match field.data_type() {
-                DataType::Utf8 => {
+            match (field.data_type(), col.oracle_type()) {
+                (DataType::Utf8, _) => {
                     handle_primitive_type!(
                         builder,
                         col,
@@ -156,7 +165,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::LargeUtf8 => {
+                (DataType::LargeUtf8, _) => {
                     handle_primitive_type!(
                         builder,
                         col,
@@ -168,7 +177,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::Decimal128(_precision, scale) => {
+                (DataType::Decimal128(_precision, scale), _) => {
                     handle_primitive_type!(
                         builder,
                         col,
@@ -192,7 +201,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Float32 => {
+                (DataType::Float32, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -204,7 +213,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::Float64 => {
+                (DataType::Float64, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -216,7 +225,19 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::Boolean => {
+                (DataType::Int64, _) => {
+                    handle_primitive_type!(
+                        builder,
+                        native_type,
+                        col,
+                        Int64Builder,
+                        i64,
+                        row,
+                        idx,
+                        Result::Ok
+                    );
+                }
+                (DataType::Boolean, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -228,7 +249,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::Date32 => {
+                (DataType::Date32, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -242,7 +263,9 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Timestamp(TimeUnit::Second, None) => {
+                // If TIMESTAMP WITH LOCAL TIME ZONE or TIMESTAMP WITHOUT TIME ZONE (seconds precision)
+                (DataType::Timestamp(TimeUnit::Second, _), OracleType::TimestampLTZ(_))
+                | (DataType::Timestamp(TimeUnit::Second, None), _) => {
                     handle_primitive_type!(
                         builder,
                         field,
@@ -258,7 +281,8 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Timestamp(TimeUnit::Second, Some(_)) => {
+                // TIMESTAMP WITH TIME ZONE (seconds precision)
+                (DataType::Timestamp(TimeUnit::Second, Some(_)), _) => {
                     handle_primitive_type!(
                         builder,
                         field,
@@ -274,7 +298,9 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                // If TIMESTAMP WITH LOCAL TIME ZONE or TIMESTAMP WITHOUT TIME ZONE (nanoseconds precision)
+                (DataType::Timestamp(TimeUnit::Nanosecond, _), OracleType::TimestampLTZ(_))
+                | (DataType::Timestamp(TimeUnit::Nanosecond, None), _) => {
                     handle_primitive_type!(
                         builder,
                         field,
@@ -291,7 +317,8 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
+                // TIMESTAMP WITH TIME ZONE (nanoseconds precision)
+                (DataType::Timestamp(TimeUnit::Nanosecond, Some(_)), _) => {
                     handle_primitive_type!(
                         builder,
                         field,
@@ -309,7 +336,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         }
                     );
                 }
-                DataType::Binary => {
+                (DataType::Binary, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -321,7 +348,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Result::Ok
                     );
                 }
-                DataType::LargeBinary => {
+                (DataType::LargeBinary, _) => {
                     handle_primitive_type!(
                         builder,
                         native_type,
@@ -336,6 +363,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                 _ => {
                     return super::UnsupportedTypeSnafu {
                         data_type: format!("{native_type:?}"),
+                        column: col.to_string(),
                     }
                     .fail();
                 }
@@ -369,10 +397,7 @@ mod tests {
     fn test_common_oracle_types_mappings() {
         // Test a typical Oracle table schema
         let columns_and_expected = vec![
-            (
-                ("ID", "NUMBER", Some(10), Some(0)),
-                DataType::Decimal128(10, 0),
-            ),
+            (("ID", "NUMBER", Some(10), Some(0)), DataType::Int64),
             (("NAME", "VARCHAR2", None, None), DataType::Utf8),
             (
                 ("SALARY", "NUMBER", Some(10), Some(2)),
@@ -394,7 +419,7 @@ mod tests {
             ),
             (
                 ("DEFAULT_DECIMAL", "NUMBER", None, None),
-                DataType::Decimal128(38, 0),
+                DataType::Decimal128(38, 20),
             ),
             // Float
             (("FLOAT32", "FLOAT", Some(10), None), DataType::Float32),

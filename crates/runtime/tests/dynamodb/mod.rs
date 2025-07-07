@@ -52,18 +52,6 @@ async fn dynamodb_federated() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            let mut query_result = rt
-                .datafusion()
-                .query_builder("describe test.sales_transactions;")
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let mut batches = vec![];
-            while let Some(batch) = query_result.data.next().await {
-                batches.push(batch?);
-            }
-
             // order of columns for dynamodb connector may vary, so we retrieve and sort them manually instead of using 'describe test.sales_transactions;'
             run_and_snapshot_query(
                 &rt,
