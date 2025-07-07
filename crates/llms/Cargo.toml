@@ -54,9 +54,6 @@ tei_backend_core = { package = "text-embeddings-backend-core", git = "https://gi
 tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "5bc9b9584dfda14f6fbccc645920b1abcbc2413a", optional = true }
 tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "5bc9b9584dfda14f6fbccc645920b1abcbc2413a", optional = true }
 
-cudarc = { version = "0.12.2", optional = true, features = [
-    "cuda-version-from-build-system",
-] }
 either = "1.15.0"
 indexmap.workspace = true
 tempfile.workspace = true
