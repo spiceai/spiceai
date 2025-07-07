@@ -14,7 +14,7 @@ limitations under the License.
 //!
 //! `vector_search(tbl`: `TableReference`, query: &str, col: Option<str>, limit: Option<usize>, `include_score`: Option<bool>)
 //!
-//! - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), and empty table is returned.
+//! - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), an empty table is returned.
 //! - query: Query to perform full text search against.
 //! - col: If provided, use this column to compare vector search results against.
 //! - limit:
