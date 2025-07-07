@@ -389,12 +389,12 @@ mod tests {
 
         unsafe {
             std::env::set_var(&upper_key, "UPPER_SECRET");
-            std::env::set_var(&lower_key, "lower_secret");
+            std::env::set_var(lower_key, "lower_secret");
         }
 
         let result_upper = secrets
             .inject_secrets(
-                &upper_key,
+                upper_key,
                 super::ParamStr(&format!("Upper: ${{ env:{upper_key} }}")),
             )
             .await;
@@ -402,7 +402,7 @@ mod tests {
 
         let result_lower = secrets
             .inject_secrets(
-                &lower_key,
+                lower_key,
                 super::ParamStr(&format!("Lower: ${{ env:{lower_key} }}")),
             )
             .await;
@@ -410,7 +410,7 @@ mod tests {
 
         unsafe {
             std::env::remove_var(&upper_key);
-            std::env::remove_var(&lower_key);
+            std::env::remove_var(lower_key);
         }
     }
 
@@ -424,7 +424,7 @@ mod tests {
 
         unsafe {
             std::env::set_var(&upper_key, "UPPER_SECRET");
-            std::env::set_var(&lower_key, "original_secret");
+            std::env::set_var(lower_key, "original_secret");
         }
 
         let result_upper = secrets
@@ -437,7 +437,7 @@ mod tests {
 
         let result_lower = secrets
             .inject_secrets(
-                &lower_key,
+                lower_key,
                 super::ParamStr(&format!("Lower: ${{ env:{lower_key} }}")),
             )
             .await;
@@ -445,7 +445,7 @@ mod tests {
 
         unsafe {
             std::env::remove_var(&upper_key);
-            std::env::remove_var(&lower_key);
+            std::env::remove_var(lower_key);
         }
     }
 
