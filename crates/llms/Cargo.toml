@@ -76,7 +76,6 @@ cuda = [
     "mistralrs-core/flash-attn",
     "mistralrs/cuda",
     "mistralrs/flash-attn",
-    "cudarc/cuda-version-from-build-system",
 ]
 local_embed = [
     "dep:tei_backend",
