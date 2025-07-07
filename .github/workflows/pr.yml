@@ -97,13 +97,19 @@ jobs:
       
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
+          echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+
+      # Re-enable when SCCache is back up
+      # - name: Check if sccache can be set up
+      #   run: |
+      #     if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+      #       echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+      #     else
+      #       echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      #     fi
 
       - name: Set up sccache
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
@@ -176,13 +182,19 @@ jobs:
 
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
+          echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+
+      # Re-enable when SCCache is back up
+      # - name: Check if sccache can be set up
+      #   run: |
+      #     if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+      #       echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+      #     else
+      #       echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+      #       echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      #     fi
 
       - name: Set up sccache
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
