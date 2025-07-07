@@ -53,7 +53,10 @@ use search::{
     },
 };
 
-use crate::{datafusion::DataFusion, search::full_text::index::FullTextDatabaseIndex};
+use crate::{
+    datafusion::DataFusion,
+    search::{full_text::index::FullTextDatabaseIndex, util::find_concrete_table_provider},
+};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 
@@ -174,15 +177,15 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let index_table_provider = table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Table '{}' does not have a full text search index.",
-                    args.tbl.clone()
-                ))
-            })?;
+        let index_table_provider = find_concrete_table_provider::<IndexedTableProvider>(
+            &table_provider,
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            ))
+        })?;
 
         let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
             return Err(DataFusionError::Plan(format!(
