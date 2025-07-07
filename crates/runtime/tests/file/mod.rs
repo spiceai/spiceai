@@ -182,12 +182,11 @@ async fn file_connector_projection_pushdown() -> Result<(), anyhow::Error> {
 
 
             for (query, _, validate_result) in queries {
-                let plan_checks = vec![
-                    ("TableScan", Box::new(|plan: &str| {
-                        plan.contains("docs") && plan.contains("projection=[content]")
-                    }) as Box<dyn Fn(&str) -> bool + 'static>),
-                ];
-                run_query_and_check_results_with_plan_checks(&mut rt, query, plan_checks, validate_result).await
+                let plan_check =
+                        ("TableScan", Box::new(|plan: &str| {
+                            plan.contains("docs") && plan.contains("projection=[content]")
+                        }) as Box<dyn Fn(&str) -> bool + 'static>);
+                run_query_and_check_results_with_plan_checks(&mut rt, query, vec![plan_check], validate_result).await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
 
