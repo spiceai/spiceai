@@ -388,7 +388,7 @@ mod tests {
         let lower_key = &format!("MY_LOWERCASE_SECRET_KEY_{}", rand::random::<u64>());
 
         unsafe {
-            std::env::set_var(&upper_key, "UPPER_SECRET");
+            std::env::set_var(upper_key, "UPPER_SECRET");
             std::env::set_var(lower_key, "lower_secret");
         }
 
@@ -409,7 +409,7 @@ mod tests {
         assert_eq!("Lower: lower_secret", result_lower.expose_secret());
 
         unsafe {
-            std::env::remove_var(&upper_key);
+            std::env::remove_var(upper_key);
             std::env::remove_var(lower_key);
         }
     }
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!("Lower: original_secret", result_lower.expose_secret());
 
         unsafe {
-            std::env::remove_var(&upper_key);
+            std::env::remove_var(upper_key);
             std::env::remove_var(lower_key);
         }
     }
