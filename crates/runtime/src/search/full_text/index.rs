@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::RecordBatch;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -55,6 +56,11 @@ impl Index for FullTextDatabaseIndex {
         required_columns.extend(self.primary_key.iter().cloned());
         required_columns.extend(self.search_fields.iter().cloned());
         required_columns.into_iter().collect()
+    }
+    async fn compute_index(&self, batches: Vec<RecordBatch>) {
+        if let Err(e) = self.update_index(batches.as_slice()) {
+            tracing::error!("Failed to update full text search index: {e}");
+        }
     }
 }
 
@@ -105,8 +111,7 @@ impl FullTextDatabaseIndex {
         };
 
         let index =
-            Self::create_index(Arc::clone(&inner), search_fields.as_slice(), pks.as_slice())
-                .await?;
+            Self::create_index(Arc::clone(&inner), search_fields.as_slice(), pks.as_slice())?;
 
         Ok(Self {
             base_table: inner,
@@ -114,6 +119,30 @@ impl FullTextDatabaseIndex {
             index,
             primary_key: pks,
         })
+    }
+
+    fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
+        // TODO: delete old values that are found in `batches`.
+
+        let doc_json = write_to_json_string(rb).context(InvalidIndexingSnafu {
+            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
+        })?;
+        let docs = parse_json_array(&self.index.schema(), doc_json.as_str())
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        let mut index_writer: tantivy::IndexWriter = self
+            .index
+            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+            .context(IndexCreationSnafu)?;
+
+        for doc in docs {
+            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        }
+        index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        Ok(())
     }
 
     #[must_use]
@@ -134,7 +163,7 @@ impl FullTextDatabaseIndex {
         }
     }
 
-    async fn create_index(
+    fn create_index(
         base_table: Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
@@ -185,7 +214,7 @@ impl FullTextDatabaseIndex {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
         let schema = schema_builder.build();
-        Self::create_and_init_index(base_table, schema).await
+        Ok(Arc::new(tantivy::Index::create_in_ram(schema)))
     }
 
     fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
@@ -195,47 +224,6 @@ impl FullTextDatabaseIndex {
         let ctx = SessionContext::new_with_config_rt(SessionConfig::default(), Arc::new(env));
 
         Ok(Arc::new(ctx))
-    }
-
-    async fn create_and_init_index(
-        table: Arc<dyn TableProvider>,
-        schema: tantivy::schema::Schema,
-    ) -> Result<Arc<tantivy::Index>, Error> {
-        let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
-        let ctx = Self::new_ctx().context(FailedToRetrieveDataFromSourceSnafu)?;
-        let _ = ctx
-            .register_table("temp_table", table)
-            .context(FailedToRetrieveDataFromSourceSnafu)?;
-
-        let rbs = ctx
-            .table("temp_table")
-            .await
-            .context(FailedToRetrieveDataFromSourceSnafu)?
-            .select_columns(cols.as_slice())
-            .context(FailedToRetrieveDataFromSourceSnafu)?
-            .collect()
-            .await
-            .context(FailedToRetrieveDataFromSourceSnafu)?;
-
-        let doc_json = write_to_json_string(rbs.as_slice()).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        let index = tantivy::Index::create_in_ram(schema);
-        let mut index_writer: tantivy::IndexWriter = index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .context(IndexCreationSnafu)?;
-
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
-        }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        Ok(Arc::new(index))
     }
 
     pub fn full_text_search_field_index(
