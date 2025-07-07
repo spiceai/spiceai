@@ -64,6 +64,10 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 // Running this test in local requires ODBC setup in local, check https://github.com/spiceai/spiceai/pull/1204 to see the details
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_odbc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -117,6 +121,10 @@ async fn databricks_odbc() -> Result<(), String> {
 
 #[tokio::test]
 #[instrument]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_odbc_with_acceleration() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
