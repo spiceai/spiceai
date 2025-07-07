@@ -76,7 +76,6 @@ cuda = [
     "mistralrs-core/flash-attn",
     "mistralrs/cuda",
     "mistralrs/flash-attn",
-    "dep:cudarc",
     "cudarc/cuda-version-from-build-system",
 ]
 local_embed = [
