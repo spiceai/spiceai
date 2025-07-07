@@ -112,6 +112,17 @@ impl Parameters {
                 );
                 // Insert without the prefix into the params
                 params.push((secret_key.name.to_string(), secret));
+            } else {
+                // Try to load the secret using an uppercased key, because env secret store is case sensitive
+                let secret_key_with_prefix_upper = secret_key_with_prefix.to_uppercase();
+                let secret = secret_guard.get_secret(&secret_key_with_prefix_upper).await;
+                if let Ok(Some(secret)) = secret {
+                    tracing::debug!(
+                        "Autoloading secret for {component_name}: {secret_key_with_prefix_upper}",
+                    );
+                    // Insert without the prefix into the params
+                    params.push((secret_key.name.to_string(), secret));
+                }
             }
         }
 
