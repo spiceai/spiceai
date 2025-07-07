@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::parquet::file::page_index::index_reader;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use logos::Source;
 use runtime_datafusion_index::Index;
@@ -30,7 +31,7 @@ use snafu::{ResultExt, Snafu};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tantivy::schema::DocParsingError;
-use tantivy::{TantivyDocument, TantivyError};
+use tantivy::{ReloadPolicy, TantivyDocument, TantivyError, Term};
 
 use crate::datafusion::query::write_to_json_string;
 use crate::object_store_registry::SpiceObjectStoreRegistry;
@@ -79,6 +80,9 @@ pub enum Error {
 
     #[snafu(display("Failed to create a full text search index: {source}.",))]
     IndexCreationError { source: TantivyError },
+
+    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
+    IndexInsertionError { source: TantivyError },
 
     #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
     FailedToRetrieveDataFromSource { source: DataFusionError },
@@ -130,6 +134,14 @@ impl FullTextDatabaseIndex {
         let docs = parse_json_array(&self.index.schema(), doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
+        let index_reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .context(IndexCreationSnafu)?;
+        index_reader.searcher().search(query, collector)
+
         let mut index_writer: tantivy::IndexWriter = self
             .index
             .writer(15_000_000) // cannot be less than 15_000_000 for in memory
@@ -180,10 +192,10 @@ impl FullTextDatabaseIndex {
             };
             match field.data_type() {
                 DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED );
                 }
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED );
                 }
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                     schema_builder.add_i64_field(p.as_str(), tantivy::schema::STORED);
@@ -196,10 +208,10 @@ impl FullTextDatabaseIndex {
                     schema_builder.add_date_field(p.as_str(), tantivy::schema::STORED);
                 }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED );
                 }
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED );
                 }
                 dt => {
                     return Err(Error::PrimaryKeyInvalidType {
