@@ -81,10 +81,7 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
 pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     let mut params: HashMap<String, SecretString> = HashMap::new();
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
-        params.insert(
-            "perplexity_auth_token".to_string(),
-            SecretString::from(api_key),
-        );
+        params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
     let sonar = PerplexitySonar::from_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
