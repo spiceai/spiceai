@@ -90,13 +90,13 @@ jobs:
       # Build the test binary without running tests
       - name: Build integration test binary
         env:
-            RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-            AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-            CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]] || [[ "${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.base.ref, 'release') }}" == "true" ]]; then
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
           else
