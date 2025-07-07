@@ -65,7 +65,7 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
         }
 
         if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
-            let current_tbl = accelerated_table
+            current_tbl = accelerated_table
                 .get_federated_table()
                 .try_table_provider_sync()?;
             continue;
