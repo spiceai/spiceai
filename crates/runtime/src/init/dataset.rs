@@ -66,16 +66,12 @@ impl Runtime {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
-
-        if valid_datasets.is_empty() {
-            return;
-        }
-
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
+
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
 
