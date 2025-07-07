@@ -31,9 +31,10 @@ use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
-
 use std::any::Any;
 use std::sync::Arc;
+
+pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
 
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{
@@ -101,7 +102,7 @@ impl ScalarUDFImpl for CosineDistance {
     }
 
     fn name(&self) -> &'static str {
-        "cosine_distance"
+        COSINE_DISTANCE_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {
