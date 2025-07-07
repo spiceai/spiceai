@@ -94,7 +94,7 @@ impl SecretStore for EnvSecretStore {
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         let uppercase_key = key.to_uppercase();
 
-        let result = [
+        [
             // First try looking for original prefixed `SPICE_my_key`
             format!("{ENV_SECRET_PREFIX}{key}"),
             // Then try looking for original `my_key`
@@ -112,8 +112,6 @@ impl SecretStore for EnvSecretStore {
                 Box::new(err) as Box<dyn std::error::Error + Send + Sync>
             )),
         })
-        .transpose();
-
-        result
+        .transpose()
     }
 }
