@@ -93,7 +93,12 @@ async fn acceleration_connection(
                     .downcast_ref::<PartitionedDuckDBAccelerator>()
                     .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
 
-                todo!()
+                let pool = duckdb_accelerator
+                    .get_shared_pool(source)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                Ok(AccelerationConnection::DuckDB(pool))
             }
         }
         #[cfg(not(feature = "duckdb"))]

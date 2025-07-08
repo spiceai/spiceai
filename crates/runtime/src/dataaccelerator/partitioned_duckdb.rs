@@ -97,6 +97,11 @@ pub enum Error {
     #[snafu(display("Unable to read directory: {source}"))]
     UnableToReadDirectory { source: std::io::Error },
 
+    #[snafu(display("Unable to create checkpointing pool: {source}"))]
+    FailedToCreateCheckpointingPool {
+        source: datafusion_table_providers::duckdb::Error,
+    },
+
     #[snafu(display("Unable to get file stem"))]
     UnableToGetFileStem,
 
@@ -112,6 +117,7 @@ pub(crate) struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
     table_provider: Mutex<Option<Arc<PartitionTableProvider>>>,
     is_initialized: AtomicBool,
+    duckdb_factory: DuckDBTableProviderFactory,
 }
 
 impl PartitionedDuckDBAccelerator {
@@ -121,7 +127,23 @@ impl PartitionedDuckDBAccelerator {
             base_accelerator: DuckDBAccelerator::new(),
             table_provider: Mutex::new(None),
             is_initialized: AtomicBool::new(false),
+            duckdb_factory: create_factory(),
         }
+    }
+
+    /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<Arc<DuckDbConnectionPool>> {
+        let data_path = spice_data_base_path();
+        let table = source.name().to_string();
+        let partition_dir = Path::new(&data_path).join(table);
+        let duckdb_path = partition_dir.join("checkpoint.db").display().to_string();
+
+        get_pool(&self.duckdb_factory, &duckdb_path)
+            .await
+            .context(FailedToCreateCheckpointingPoolSnafu)
     }
 }
 
@@ -221,14 +243,11 @@ impl DuckDBPartitionCreator {
         let data_path = spice_data_base_path();
         let table = cmd.name.table();
         let partition_dir = Path::new(&data_path).join(table);
+        let duckdb_factory = create_factory();
 
         Self {
             cmd,
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(new_duckdb_dialect())
-                .with_settings_registry(
-                    DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
-                ),
+            duckdb_factory,
             partition_dir,
         }
     }
@@ -342,6 +361,14 @@ fn add_open(
     cmd.options.insert("open".to_string(), duckdb_path.clone());
 
     Ok(duckdb_path)
+}
+
+fn create_factory() -> DuckDBTableProviderFactory {
+    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+        .with_dialect(new_duckdb_dialect())
+        .with_settings_registry(
+            DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
+        )
 }
 
 async fn get_pool(
