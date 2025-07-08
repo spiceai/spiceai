@@ -36,23 +36,15 @@ pub enum Error {
 
 #[async_trait]
 pub trait PartitionCreator: Debug + Send + Sync {
-    /// Connection pool to the partitioned data source
-    type ConnectionPool;
-
     /// Create a new [`Partition`] using the `partition_value`.
     ///
     /// # Errors
     /// Returns an error when creating a [`Partition`] is unsuccessful.
-    async fn create_partition(
-        &self,
-        partition_value: ScalarValue,
-    ) -> Result<Partition<Self::ConnectionPool>, Error>;
+    async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
     /// Find and load previously created [`Parition`]s.
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
-    async fn infer_existing_partitions(
-        &self,
-    ) -> Result<Vec<Partition<Self::ConnectionPool>>, Error>;
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
 }

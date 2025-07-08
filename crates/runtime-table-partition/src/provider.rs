@@ -57,14 +57,14 @@ pub enum Error {
 type ScalarValueString = String;
 
 #[derive(Debug)]
-pub struct PartitionTableProvider<ConnectionPool> {
-    creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
+pub struct PartitionTableProvider {
+    creator: Arc<dyn PartitionCreator>,
     partition_by: Expr,
-    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition<ConnectionPool>>>>,
+    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
 }
 
-impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
+impl PartitionTableProvider {
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
     /// the first expression in `partition_by`.
     ///
@@ -72,7 +72,7 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
     /// This function will return an Error when the `partition_by` expression
     /// validation fails.
     pub async fn new(
-        creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
+        creator: Arc<dyn PartitionCreator>,
         mut partition_by: Vec<Expr>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
@@ -108,25 +108,10 @@ impl<ConnectionPool> PartitionTableProvider<ConnectionPool> {
             schema,
         })
     }
-
-    /// Get `ConnectionPool`s for each partition.
-    ///
-    /// # Errors
-    pub async fn get_shared_pools(&self) -> Vec<Arc<ConnectionPool>> {
-        self.partitions
-            .read()
-            .await
-            .values()
-            .map(|p| Arc::clone(&p.pool))
-            .collect()
-    }
 }
 
 #[async_trait]
-impl<ConnectionPool> TableProvider for PartitionTableProvider<ConnectionPool>
-where
-    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
-{
+impl TableProvider for PartitionTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }

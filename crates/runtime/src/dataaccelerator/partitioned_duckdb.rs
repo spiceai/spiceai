@@ -110,7 +110,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) struct PartitionedDuckDBAccelerator {
     base_accelerator: DuckDBAccelerator,
-    table_provider: Mutex<Option<Arc<PartitionTableProvider<DuckDbConnectionPool>>>>,
+    table_provider: Mutex<Option<Arc<PartitionTableProvider>>>,
     is_initialized: AtomicBool,
 }
 
@@ -121,14 +121,6 @@ impl PartitionedDuckDBAccelerator {
             base_accelerator: DuckDBAccelerator::new(),
             table_provider: Mutex::new(None),
             is_initialized: AtomicBool::new(false),
-        }
-    }
-
-    pub(crate) async fn get_shared_pools(&self) -> Vec<Arc<DuckDbConnectionPool>> {
-        if let Some(provider) = self.table_provider.lock().await.as_ref() {
-            provider.get_shared_pools().await
-        } else {
-            vec![]
         }
     }
 }
@@ -248,18 +240,12 @@ impl DuckDBPartitionCreator {
 
 #[async_trait]
 impl PartitionCreator for DuckDBPartitionCreator {
-    type ConnectionPool = DuckDbConnectionPool;
-
     async fn create_partition(
         &self,
         partition_value: ScalarValue,
-    ) -> Result<Partition<Self::ConnectionPool>, creator::Error> {
+    ) -> Result<Partition, creator::Error> {
         let mut cmd = self.cmd.clone();
         let duckdb_path = add_open(&self.partition_dir, &mut cmd, &partition_value)
-            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
-        let pool = get_pool(&self.duckdb_factory, &duckdb_path)
-            .await
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         tracing::debug!("creating partition at {duckdb_path}");
@@ -270,16 +256,13 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let partition = Partition {
             partition_value,
-            pool,
             table_provider,
         };
 
         Ok(partition)
     }
 
-    async fn infer_existing_partitions(
-        &self,
-    ) -> Result<Vec<Partition<Self::ConnectionPool>>, creator::Error> {
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
         if !self.partition_dir.is_dir() {
             create_dir_all(&self.partition_dir)
                 .await
@@ -322,7 +305,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
                 let duckdb_path = path.display().to_string();
-                let pool = get_pool(&self.duckdb_factory, &duckdb_path)
+                get_pool(&self.duckdb_factory, &duckdb_path)
                     .await
                     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
@@ -332,7 +315,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
                 partitions.push(Partition {
                     partition_value,
-                    pool,
                     table_provider,
                 });
             }

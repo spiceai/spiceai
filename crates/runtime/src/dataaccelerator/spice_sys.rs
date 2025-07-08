@@ -46,8 +46,6 @@ pub mod debezium_kafka;
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
-    #[cfg(feature = "duckdb")]
-    PartitionedDuckDB(Vec<Arc<DuckDbConnectionPool>>),
     #[cfg(feature = "postgres")]
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
@@ -95,9 +93,7 @@ async fn acceleration_connection(
                     .downcast_ref::<PartitionedDuckDBAccelerator>()
                     .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
 
-                let pools = duckdb_accelerator.get_shared_pools().await;
-
-                Ok(AccelerationConnection::PartitionedDuckDB(pools))
+                todo!()
             }
         }
         #[cfg(not(feature = "duckdb"))]

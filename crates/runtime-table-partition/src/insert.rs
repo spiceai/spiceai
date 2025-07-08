@@ -49,25 +49,22 @@ use crate::Partition;
 use crate::creator::PartitionCreator;
 
 #[derive(Debug)]
-pub struct PartitionerExec<ConnectionPool> {
+pub struct PartitionerExec {
     input: Arc<dyn ExecutionPlan>,
-    creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
-    partitions: Arc<RwLock<HashMap<String, Partition<ConnectionPool>>>>,
+    creator: Arc<dyn PartitionCreator>,
+    partitions: Arc<RwLock<HashMap<String, Partition>>>,
     partition_by: Expr,
     insert_op: InsertOp,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl<ConnectionPool> PartitionerExec<ConnectionPool>
-where
-    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
-{
+impl PartitionerExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         partition_by: Expr,
-        creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
-        partitions: Arc<RwLock<HashMap<String, Partition<ConnectionPool>>>>,
+        creator: Arc<dyn PartitionCreator>,
+        partitions: Arc<RwLock<HashMap<String, Partition>>>,
         insert_op: InsertOp,
         schema: SchemaRef,
     ) -> Self {
@@ -89,10 +86,7 @@ where
     }
 }
 
-impl<ConnectionPool> DisplayAs for PartitionerExec<ConnectionPool>
-where
-    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
-{
+impl DisplayAs for PartitionerExec {
     fn fmt_as(
         &self,
         _t: datafusion::physical_plan::DisplayFormatType,
@@ -102,10 +96,7 @@ where
     }
 }
 
-impl<ConnectionPool> ExecutionPlan for PartitionerExec<ConnectionPool>
-where
-    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
-{
+impl ExecutionPlan for PartitionerExec {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -185,7 +176,9 @@ where
                     let batches = partition_batch(batch, physical_expr.as_ref())?;
 
                     for (partition_key, (partition_value, batch)) in batches {
-                        let tx = if let Some(tx) = partition_senders.get(&partition_key) { tx.clone() } else {
+                        let tx = if let Some(tx) = partition_senders.get(&partition_key) {
+                            tx.clone()
+                        } else {
                             // spawn the insertion task for this partition
                             let (tx, rx) = channel(10);
                             partition_senders.insert(partition_key.clone(), tx.clone());
@@ -409,9 +402,7 @@ fn partition_batch(
     for partition in partitions.ranges() {
         let partition_value = ScalarValue::try_from_array(&array, partition.start)?;
         let partition_key = partition_value.to_string();
-        let value_indices = value_to_indices
-            .entry(partition_key.clone())
-            .or_default();
+        let value_indices = value_to_indices.entry(partition_key.clone()).or_default();
         partition.into_iter().for_each(|i| value_indices.push(i));
     }
 
