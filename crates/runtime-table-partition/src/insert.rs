@@ -246,8 +246,10 @@ where
 
                 // Return the number of rows inserted
                 let array = Int64Array::from(vec![row_count as i64]);
-                RecordBatch::try_new(row_count_schema, vec![Arc::new(array)])
-                    .map_err(|e| DataFusionError::ArrowError(e, None))
+                Ok(RecordBatch::try_new(
+                    row_count_schema,
+                    vec![Arc::new(array)],
+                )?)
             })
         };
 
@@ -286,7 +288,7 @@ fn filter_batch_by_indices(
         .iter()
         .map(|col| compute::take(col, &indices_array, None))
         .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| DataFusionError::ArrowError(e, None))
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 struct PartitionInsertExec {
