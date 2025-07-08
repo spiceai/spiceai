@@ -163,6 +163,12 @@
             }
           ]
         },
+        "partition_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "primary_key": {
           "type": [
             "string",
@@ -373,7 +379,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CacheKeyType": {
       "type": "string",
@@ -405,7 +412,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Catalog": {
       "type": "object",
@@ -1292,7 +1300,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RouterConfig": {
       "anyOf": [
@@ -1480,7 +1489,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Secret": {
       "description": "The secrets configuration for a Spicepod.\n\n Example:\n ```yaml\n secrets:\n   - from: env\n     name: env\n   - from: kubernetes:my_secret_name\n     name: k8s\n ```",
