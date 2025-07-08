@@ -30,48 +30,38 @@ pub mod candle;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to run an Embedding health check. {source}. Verify the embedding configuration."
+        "Embedding health check failed. {source}. Verify the embedding configuration."
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to prepare input for embedding. {source}. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to prepare input for embedding. {source}"))]
     FailedToPrepareInput {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create embedding. {source}. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create embedding. {source}."))]
     FailedToCreateEmbedding {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Invalid value for `pooling` parameter: {value}. Specify a valid pooling value of `cls`, `mean`, `splade`, or `last_token`."
+        "Invalid `pooling` parameter value: {value}. Use `cls`, `mean`, `splade`, or `last_token`."
     ))]
     InvalidPoolingMode { value: String },
 
-    #[snafu(display(
-        "Failed to create chunker. {source}. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create chunker. {source}."))]
     FailedToCreateChunker {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create tokenizer. {source}. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create tokenizer. {source}."))]
     FailedToCreateTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create embedding model. {source}. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to load embedding model. {source}."))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
