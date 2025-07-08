@@ -173,7 +173,7 @@ impl ExecutionPlan for PartitionerExec {
 
                     // Partition the batch using the partition_by expression
                     // into multiple batches
-                    let batches = partition_batch(batch, physical_expr.as_ref())?;
+                    let batches = partition_batch(&batch, physical_expr.as_ref())?;
 
                     for (partition_key, (partition_value, batch)) in batches {
                         let tx = if let Some(tx) = partition_senders.get(&partition_key) {
@@ -235,7 +235,12 @@ impl ExecutionPlan for PartitionerExec {
                 }
 
                 // Return the number of rows inserted
-                let array = Int64Array::from(vec![row_count as i64]);
+                let row_count = i64::try_from(row_count).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Number of rows inserted exceeded i64::MAX: {e}"
+                    ))
+                })?;
+                let array = Int64Array::from(vec![row_count]);
                 Ok(RecordBatch::try_new(
                     row_count_schema,
                     vec![Arc::new(array)],
@@ -381,10 +386,10 @@ impl DisplayAs for PartitionInsertExec {
 /// created for each unique value produced by evaluating the expression
 /// containing the rows that produced that unique partition value.
 fn partition_batch(
-    batch: RecordBatch,
+    batch: &RecordBatch,
     physical_expr: &dyn PhysicalExpr,
 ) -> Result<HashMap<String, (ScalarValue, RecordBatch)>, DataFusionError> {
-    let column = physical_expr.evaluate(&batch)?;
+    let column = physical_expr.evaluate(batch)?;
     let array = match column {
         ColumnarValue::Array(array) => array,
         ColumnarValue::Scalar(_) => {
@@ -412,7 +417,7 @@ fn partition_batch(
             continue;
         }
         let partition_value = ScalarValue::try_from_array(&array, indices[0])?;
-        let new_batch = filter_batch_by_indices(&batch, &indices)?;
+        let new_batch = filter_batch_by_indices(batch, &indices)?;
         batches.insert(partition_key, (partition_value, new_batch));
     }
 
@@ -439,7 +444,7 @@ mod tests {
 
         let physical_expr = create_physical_expr(&expr, batch.schema())?;
 
-        let partitions = partition_batch(batch.clone(), physical_expr.as_ref())?;
+        let partitions = partition_batch(&batch, physical_expr.as_ref())?;
 
         assert_eq!(partitions.len(), 1);
 
@@ -473,7 +478,7 @@ mod tests {
 
         let physical_expr = create_physical_expr(&expr, batch.schema())?;
 
-        let partitions = partition_batch(batch.clone(), physical_expr.as_ref())?;
+        let partitions = partition_batch(&batch, physical_expr.as_ref())?;
 
         assert_eq!(partitions.len(), 2);
 
