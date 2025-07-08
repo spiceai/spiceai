@@ -1,5 +1,0 @@
----
-source: crates/runtime/tests/models/mod.rs
-expression: "&response"
----
-[{"total_records":10}]

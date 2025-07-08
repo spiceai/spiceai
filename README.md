@@ -163,8 +163,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `postgres`                         | PostgreSQL                            | Stable            |                              |
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
 | `mysql`                            | MySQL                                 | Stable            |                              |
+| `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
-| `spice.ai`                         | [Spice.ai][spiceai]                   | Release Candidate | Arrow Flight                 |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
