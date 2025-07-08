@@ -185,43 +185,40 @@ where
                     let batches = partition_batch(batch, physical_expr.as_ref())?;
 
                     for (partition_key, (partition_value, batch)) in batches {
-                        let tx = match partition_senders.get(&partition_key) {
-                            Some(tx) => tx.clone(),
-                            None => {
-                                // spawn the insertion task for this partition
-                                let (tx, rx) = channel(10);
-                                partition_senders.insert(partition_key.clone(), tx.clone());
+                        let tx = if let Some(tx) = partition_senders.get(&partition_key) { tx.clone() } else {
+                            // spawn the insertion task for this partition
+                            let (tx, rx) = channel(10);
+                            partition_senders.insert(partition_key.clone(), tx.clone());
 
-                                let partition = creator
-                                    .create_partition(partition_value)
-                                    .await
-                                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                                let new_provider = Arc::clone(&partition.table_provider);
-                                partition_providers
-                                    .write()
-                                    .await
-                                    .insert(partition_key.clone(), partition);
+                            let partition = creator
+                                .create_partition(partition_value)
+                                .await
+                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            let new_provider = Arc::clone(&partition.table_provider);
+                            partition_providers
+                                .write()
+                                .await
+                                .insert(partition_key.clone(), partition);
 
-                                let state = ctx.state();
-                                let context = Arc::clone(&context);
-                                let exec = PartitionInsertExec::new(rx, Arc::clone(&schema));
-                                let handle = tokio::spawn(async move {
-                                    let plan = new_provider
-                                        .insert_into(&state, Arc::new(exec), insert_op)
-                                        .await?;
+                            let state = ctx.state();
+                            let context = Arc::clone(&context);
+                            let exec = PartitionInsertExec::new(rx, Arc::clone(&schema));
+                            let handle = tokio::spawn(async move {
+                                let plan = new_provider
+                                    .insert_into(&state, Arc::new(exec), insert_op)
+                                    .await?;
 
-                                    let mut stream = execute_stream(plan, context)?;
-                                    while let Some(batch) = stream.next().await {
-                                        batch?;
-                                    }
+                                let mut stream = execute_stream(plan, context)?;
+                                while let Some(batch) = stream.next().await {
+                                    batch?;
+                                }
 
-                                    Result::<(), DataFusionError>::Ok(())
-                                });
+                                Result::<(), DataFusionError>::Ok(())
+                            });
 
-                                handles.push(handle);
+                            handles.push(handle);
 
-                                tx
-                            }
+                            tx
                         };
 
                         row_count += batch.num_rows();
@@ -414,7 +411,7 @@ fn partition_batch(
         let partition_key = partition_value.to_string();
         let value_indices = value_to_indices
             .entry(partition_key.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
         partition.into_iter().for_each(|i| value_indices.push(i));
     }
 
