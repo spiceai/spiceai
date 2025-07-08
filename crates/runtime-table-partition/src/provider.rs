@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
-    insert::PartitionInsertExec,
+    insert::PartitionerExec,
 };
 
 #[derive(Debug, Snafu)]
@@ -191,7 +191,7 @@ where
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionInsertExec::new(
+        Ok(Arc::new(PartitionerExec::new(
             input,
             self.partition_by.clone(),
             Arc::clone(&self.creator),

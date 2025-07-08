@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_schema::SchemaRef;
-use datafusion::arrow::array::{Array, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{Array, Int64Array, UInt64Array};
 use datafusion::arrow::compute;
 use datafusion::common::DFSchema;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_expr::{EquivalenceProperties, create_physical_expr};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::memory::LazyBatchGenerator;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, EmptyRecordBatchStream, Partitioning, PlanProperties, execute_stream,
+    DisplayAs, Partitioning, PhysicalExpr, PlanProperties, execute_stream,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
@@ -33,23 +33,23 @@ use datafusion::{
     arrow::record_batch::RecordBatch,
     error::DataFusionError,
     execution::context::TaskContext,
-    physical_plan::{ExecutionPlan, SendableRecordBatchStream, memory::LazyMemoryExec},
+    physical_plan::{ExecutionPlan, SendableRecordBatchStream},
     prelude::Expr,
 };
 use futures::stream::StreamExt;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::task::block_in_place;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Partition;
 use crate::creator::PartitionCreator;
 
 #[derive(Debug)]
-pub struct PartitionInsertExec<ConnectionPool> {
+pub struct PartitionerExec<ConnectionPool> {
     input: Arc<dyn ExecutionPlan>,
     creator: Arc<dyn PartitionCreator<ConnectionPool = ConnectionPool>>,
     partitions: Arc<RwLock<HashMap<String, Partition<ConnectionPool>>>>,
@@ -59,7 +59,7 @@ pub struct PartitionInsertExec<ConnectionPool> {
     properties: PlanProperties,
 }
 
-impl<ConnectionPool> PartitionInsertExec<ConnectionPool>
+impl<ConnectionPool> PartitionerExec<ConnectionPool>
 where
     ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
 {
@@ -89,17 +89,20 @@ where
     }
 }
 
-impl<ConnectionPool> DisplayAs for PartitionInsertExec<ConnectionPool> {
+impl<ConnectionPool> DisplayAs for PartitionerExec<ConnectionPool>
+where
+    ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
+{
     fn fmt_as(
         &self,
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "PartitionInsertExec")
+        write!(f, "{}", self.name())
     }
 }
 
-impl<ConnectionPool> ExecutionPlan for PartitionInsertExec<ConnectionPool>
+impl<ConnectionPool> ExecutionPlan for PartitionerExec<ConnectionPool>
 where
     ConnectionPool: std::fmt::Debug + Send + Sync + 'static,
 {
@@ -120,9 +123,10 @@ where
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         if children.len() != 1 {
-            return Err(DataFusionError::Plan(
-                "PartitionInsertExec requires exactly one child".to_string(),
-            ));
+            return Err(DataFusionError::Plan(format!(
+                "{} requires exactly one child",
+                self.name()
+            )));
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
@@ -139,143 +143,122 @@ where
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
-        // We want to stream the input RecordBatches, partition them into
-        // RecordBatches destined for a particular partitioned file, stream
-        // them into that partitioned file without buffering all of the data,
-        // and call `insert_into` on the DuckDB Table Providers only once
-        // because data are rewritten every call to `insert_into`.
-        //
-        // We also have an interesting mix of async/sync contexts here in
-        // `execute` which we deal with by using `block_in_place` and
-        // `Handle::block_on`.
-        //
-        // In one task, we stream the input RecordBatches and partition them
-        // according to the partition_by expression. If the partition has not
-        // yet been created, we create it. We also create a channel for sending
-        // RecordBatches. We make a LazyMemExec ExecutionPlan which we pass to
-        // that partition's `insert_into` one time. The LazyMemExec is passed
-        // a generator that we create which generates record batches out of the
-        // receiving end of the partition's RecordBatch channel. Each partition
-        // `insert_into` invokation is ran in a separate task. So we have one
-        // partitioning task and N insertion tasks where N is the number of
-        // partitions.
-
-        let session_config = context.session_config();
-        let ctx = SessionContext::new_with_config(session_config.clone());
-
         if partition != 0 {
             return Err(DataFusionError::Execution(
                 "PartitionInsertExec only supports single partition".to_string(),
             ));
         }
 
-        let insert_op = self.insert_op;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let props = ExecutionProps::new();
-        let physical_expr = create_physical_expr(&self.partition_by, &df_schema, &props)?;
-        let schema = Arc::clone(&self.schema);
-        let creator = Arc::clone(&self.creator);
-        let partition_providers = Arc::clone(&self.partitions);
-        let input = Arc::clone(&self.input);
-        let task_ctx = Arc::clone(&context);
+        let row_count_schema = Arc::new(Schema::new(vec![Field::new(
+            "row_count",
+            DataType::Int64,
+            false,
+        )]));
 
-        let mut partition_senders: HashMap<String, Sender<RecordBatch>> = HashMap::new();
+        let row_count_stream = {
+            let schema = self.schema();
+            let row_count_schema = Arc::clone(&row_count_schema);
+            let input = Arc::clone(&self.input);
+            let physical_expr = create_physical_expr(&self.partition_by, self.schema())?;
+            let creator = Arc::clone(&self.creator);
+            let partition_providers = Arc::clone(&self.partitions);
+            let insert_op = self.insert_op;
 
-        let mut stream = execute_stream(input, task_ctx)?;
+            futures::stream::once(async move {
+                let session_config = context.session_config();
+                let ctx = SessionContext::new_with_config(session_config.clone());
+                let task_ctx = Arc::clone(&context);
+                let mut incoming_stream = execute_stream(input, task_ctx)?;
 
-        block_in_place(move || {
-            Handle::current().block_on(async move {
-                while let Some(batch) = stream.next().await {
+                let mut row_count = 0;
+                let mut partition_senders = HashMap::<String, Sender<RecordBatch>>::new();
+                let mut handles = Vec::new();
+
+                while let Some(batch) = incoming_stream.next().await {
                     let batch = batch?;
                     if batch.num_rows() == 0 {
                         continue;
                     }
 
-                    let column = physical_expr.evaluate(&batch)?;
-                    let array = match column {
-                        ColumnarValue::Array(array) => array,
-                        ColumnarValue::Scalar(_) => {
-                            return Err(DataFusionError::Execution(
-                                "Invalid partition expression".to_string(),
-                            ));
-                        }
-                    };
+                    // Partition the batch using the partition_by expression
+                    // into multiple batches
+                    let batches = partition_batch(batch, physical_expr.as_ref())?;
 
-                    let partitions = compute::partition(&[Arc::clone(&array)])?;
-                    for indices in partitions.ranges() {
-                        if indices.is_empty() {
-                            continue;
-                        }
-                        let indices = indices.collect::<Vec<_>>();
-                        let partition_value = ScalarValue::try_from_array(&array, indices[0])?;
-                        let partition_key = partition_value.to_string();
-                        let new_batch = filter_batch_by_indices(&batch, &indices)?;
+                    for (partition_key, (partition_value, batch)) in batches {
+                        let tx = match partition_senders.get(&partition_key) {
+                            Some(tx) => tx.clone(),
+                            None => {
+                                // spawn the insertion task for this partition
+                                let (tx, rx) = channel(10);
+                                partition_senders.insert(partition_key.clone(), tx.clone());
 
-                        let tx = if let Some(tx) = partition_senders.get(&partition_key) {
-                            tx.clone()
-                        } else {
-                            // Create a new partition
-                            let partition = creator
-                                .create_partition(partition_value.clone())
-                                .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                            let new_provider = Arc::clone(&partition.table_provider);
-                            let mut partitions = partition_providers.write().await;
-                            partitions.insert(partition_key.clone(), partition);
+                                let partition = creator
+                                    .create_partition(partition_value)
+                                    .await
+                                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                let new_provider = Arc::clone(&partition.table_provider);
+                                partition_providers
+                                    .write()
+                                    .await
+                                    .insert(partition_key.clone(), partition);
 
-                            // Create a new channel
-                            let (tx, rx) = channel(100);
-                            partition_senders.insert(partition_key.clone(), tx.clone());
+                                let state = ctx.state();
+                                let context = Arc::clone(&context);
+                                let exec = PartitionInsertExec::new(rx, Arc::clone(&schema));
+                                let handle = tokio::spawn(async move {
+                                    let plan = new_provider
+                                        .insert_into(&state, Arc::new(exec), insert_op)
+                                        .await?;
 
-                            // Create the generator
-                            let generator = BatchGenerator {
-                                partition_value,
-                                rx,
-                            };
+                                    let mut stream = execute_stream(plan, context)?;
+                                    while let Some(batch) = stream.next().await {
+                                        batch?;
+                                    }
 
-                            // Create the Lazy execution plan for the table provider
-                            let exec = LazyMemoryExec::try_new(
-                                Arc::clone(&schema),
-                                vec![Arc::new(parking_lot::RwLock::new(generator))],
-                            )?;
+                                    Result::<(), DataFusionError>::Ok(())
+                                });
 
-                            let state = ctx.state();
-                            let context = Arc::clone(&context);
+                                handles.push(handle);
 
-                            // spawn the insertion task for this partition
-                            tokio::spawn(async move {
-                                let plan = new_provider
-                                    .insert_into(&state, Arc::new(exec), insert_op)
-                                    .await?;
-
-                                let mut stream = execute_stream(plan, context)?;
-                                while let Some(batch) = stream.next().await {
-                                    batch?;
-                                }
-
-                                Result::<(), DataFusionError>::Ok(())
-                            });
-
-                            tx
+                                tx
+                            }
                         };
 
-                        // Send the partitioned RecordBatch to the partition's
-                        // channel
-                        let _ = tx.send(new_batch).await;
+                        row_count += batch.num_rows();
+
+                        tx.send(batch).await.map_err(|_| {
+                            DataFusionError::Execution(
+                                "failed to send a RecordBatch to a partition".into(),
+                            )
+                        })?;
                     }
                 }
 
-                Ok(())
-            })
-        })?;
+                // Must drop the sending channels so that the receiving streams
+                // can terminate
+                drop(partition_senders);
 
-        Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
-            &self.schema,
-        ))))
+                for handle in handles {
+                    if let Ok(output) = handle.await {
+                        output?;
+                    }
+                }
+
+                // Return the number of rows inserted
+                let array = Int64Array::from(vec![row_count as i64]);
+                RecordBatch::try_new(row_count_schema, vec![Arc::new(array)])
+                    .map_err(|e| DataFusionError::ArrowError(e, None))
+            })
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            row_count_schema,
+            row_count_stream,
+        )))
     }
 
     fn name(&self) -> &'static str {
-        "PartitionInsertExec"
+        "PartitionerExec"
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -283,24 +266,13 @@ where
     }
 }
 
-#[derive(Debug)]
-struct BatchGenerator {
-    partition_value: ScalarValue,
-    rx: Receiver<RecordBatch>,
-}
-
-impl fmt::Display for BatchGenerator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchGenerator")
-            .field("partition_value", &self.partition_value)
-            .finish_non_exhaustive()
-    }
-}
-
-impl LazyBatchGenerator for BatchGenerator {
-    fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>, DataFusionError> {
-        block_in_place(|| Handle::current().block_on(async { Ok(self.rx.recv().await) }))
-    }
+fn create_physical_expr(
+    expr: &Expr,
+    schema: SchemaRef,
+) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+    let input_dfschema = DFSchema::try_from(schema)?;
+    let execution_props = ExecutionProps::new();
+    datafusion::physical_expr::create_physical_expr(expr, &input_dfschema, &execution_props)
 }
 
 fn filter_batch_by_indices(
@@ -315,4 +287,230 @@ fn filter_batch_by_indices(
         .map(|col| compute::take(col, &indices_array, None))
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(batch.schema(), columns).map_err(|e| DataFusionError::ArrowError(e, None))
+}
+
+struct PartitionInsertExec {
+    rx: Mutex<Option<Receiver<RecordBatch>>>,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl PartitionInsertExec {
+    fn new(rx: Receiver<RecordBatch>, schema: SchemaRef) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
+        Self {
+            rx: Mutex::new(Some(rx)),
+            schema,
+            properties,
+        }
+    }
+}
+
+impl fmt::Debug for PartitionInsertExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartitionInsertExec")
+            .field("properties", &self.properties)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecutionPlan for PartitionInsertExec {
+    fn name(&self) -> &'static str {
+        "PartitionInsertExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Err(DataFusionError::Plan(format!(
+            "{} expects no children",
+            self.name()
+        )))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let rx = {
+            let mut rx = self.rx.lock();
+            match rx.take() {
+                Some(rx) => rx,
+                None => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} can only be executed once",
+                        self.name()
+                    )));
+                }
+            }
+        };
+
+        let rx_stream = ReceiverStream::new(rx);
+        let stream = RecordBatchStreamAdapter::new(Arc::clone(&self.schema), rx_stream.map(Ok));
+        Ok(Box::pin(stream))
+    }
+}
+
+impl DisplayAs for PartitionInsertExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Evaluate the `physical_expr` for each row in `batch`. A partition batch is
+/// created for each unique value produced by evaluating the expression
+/// containing the rows that produced that unique partition value.
+fn partition_batch(
+    batch: RecordBatch,
+    physical_expr: &dyn PhysicalExpr,
+) -> Result<HashMap<String, (ScalarValue, RecordBatch)>, DataFusionError> {
+    let column = physical_expr.evaluate(&batch)?;
+    let array = match column {
+        ColumnarValue::Array(array) => array,
+        ColumnarValue::Scalar(_) => {
+            return Err(DataFusionError::Execution(
+                "Invalid partition expression".to_string(),
+            ));
+        }
+    };
+
+    let partitions = compute::partition(&[Arc::clone(&array)])?;
+    let mut batches = HashMap::with_capacity(partitions.len());
+
+    // Group indices by partition value
+    let mut value_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for partition in partitions.ranges() {
+        let partition_value = ScalarValue::try_from_array(&array, partition.start)?;
+        let partition_key = partition_value.to_string();
+        let value_indices = value_to_indices
+            .entry(partition_key.clone())
+            .or_insert_with(Vec::new);
+        partition.into_iter().for_each(|i| value_indices.push(i));
+    }
+
+    // Create batches for each partition
+    for (partition_key, indices) in value_to_indices {
+        if indices.is_empty() {
+            continue;
+        }
+        let partition_value = ScalarValue::try_from_array(&array, indices[0])?;
+        let new_batch = filter_batch_by_indices(&batch, &indices)?;
+        batches.insert(partition_key, (partition_value, new_batch));
+    }
+
+    Ok(batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::{
+        arrow::array::record_batch,
+        prelude::{col, lit},
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_partition_batch_single() -> Result<(), DataFusionError> {
+        let expr = col("region").eq(lit("us-east-1"));
+
+        let batch = record_batch!(
+            ("id", Int64, [1, 2, 3]),
+            ("region", Utf8, ["us-east-1", "us-east-1", "us-east-1"])
+        )?;
+
+        let physical_expr = create_physical_expr(&expr, batch.schema())?;
+
+        let partitions = partition_batch(batch.clone(), physical_expr.as_ref())?;
+
+        assert_eq!(partitions.len(), 1);
+
+        for (partition_value, partitioned_batch) in partitions.into_values() {
+            assert_eq!(partition_value, ScalarValue::Boolean(Some(true)));
+            assert_eq!(batch, partitioned_batch);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partition_batch_multiple() -> Result<(), DataFusionError> {
+        let expr = col("region").eq(lit("us-east-1"));
+
+        let batch = record_batch!(
+            ("id", Int64, [1, 2, 3, 4, 5, 6]),
+            (
+                "region",
+                Utf8,
+                [
+                    "us-east-1",
+                    "us-east-2",
+                    "us-west-1",
+                    "us-east-1",
+                    "us-east-2",
+                    "us-west-1"
+                ]
+            )
+        )?;
+
+        let physical_expr = create_physical_expr(&expr, batch.schema())?;
+
+        let partitions = partition_batch(batch.clone(), physical_expr.as_ref())?;
+
+        assert_eq!(partitions.len(), 2);
+
+        for (partition_value, partitioned_batch) in partitions.into_values() {
+            if partition_value == ScalarValue::Boolean(Some(true)) {
+                assert_eq!(
+                    record_batch!(
+                        ("id", Int64, [1, 4]),
+                        ("region", Utf8, ["us-east-1", "us-east-1"])
+                    )?,
+                    partitioned_batch
+                );
+            } else {
+                assert_eq!(
+                    record_batch!(
+                        ("id", Int64, [2, 3, 5, 6]),
+                        (
+                            "region",
+                            Utf8,
+                            ["us-east-2", "us-west-1", "us-east-2", "us-west-1"]
+                        )
+                    )?,
+                    partitioned_batch
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
