@@ -70,6 +70,10 @@ fn get_params() -> Params {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_spark_m2m_integration_test() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _ = rustls::crypto::CryptoProvider::install_default(
