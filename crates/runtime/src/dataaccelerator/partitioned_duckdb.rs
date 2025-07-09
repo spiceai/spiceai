@@ -316,7 +316,10 @@ impl PartitionCreator for DuckDBPartitionCreator {
         Ok(partition)
     }
 
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+    async fn infer_existing_partitions(
+        &self,
+        partition_by: &[Expr],
+    ) -> Result<Vec<Partition>, creator::Error> {
         if !self.partition_dir.is_dir() {
             create_dir_all(&self.partition_dir)
                 .await

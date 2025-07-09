@@ -45,11 +45,15 @@ pub trait PartitionCreator: Debug + Send + Sync {
     /// Returns an error when creating a [`Partition`] is unsuccessful.
     async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
-    /// Find and load previously created [`Parition`]s.
+    /// Find and load previously created [`Partition`]s based on the
+    /// `partition_by` expressions.
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
-    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+    async fn infer_existing_partitions(
+        &self,
+        partition_by: &[Expr],
+    ) -> Result<Vec<Partition>, Error>;
 
     /// See [`TableProvider::supports_filters_pushdown`].
     ///
