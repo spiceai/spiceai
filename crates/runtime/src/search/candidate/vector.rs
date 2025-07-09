@@ -15,10 +15,17 @@ limitations under the License.
 */
 use std::sync::Arc;
 
+use crate::embeddings::udtf::{
+    VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc, VectorSearchTableFuncArgs,
+};
 use crate::search::Error as VectorSearchError;
 use crate::{embedding_col, offset_col};
 use async_openai::types::EmbeddingInput;
+use datafusion::datasource::provider_as_source;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::logical_expr::sqlparser::ast::Expr;
+use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Ident;
 use datafusion::{execution::SendableRecordBatchStream, sql::TableReference};
 use itertools::Itertools;
@@ -246,6 +253,25 @@ impl VectorGeneration {
             VSS_TEMP_TABLE_NAME.to_string(),
         )
     }
+
+    async fn construct_table_fn(
+        &self,
+        args: &VectorSearchTableFuncArgs,
+    ) -> Result<DataFrame, DataFusionError> {
+        let expr_args = VectorSearchTableFunc::to_expr(args);
+        let provider = self
+            .df
+            .ctx
+            .table_function(VECTOR_SEARCH_UDTF_NAME)?
+            .create_table_provider(expr_args.as_slice())?;
+        let plan = LogicalPlanBuilder::scan(
+            format!("{VECTOR_SEARCH_UDTF_NAME}()"),
+            provider_as_source(provider),
+            None,
+        )?
+        .build()?;
+        Ok(DataFrame::new(self.df.ctx.state(), plan))
+    }
 }
 
 #[async_trait::async_trait]
@@ -284,6 +310,17 @@ impl CandidateGeneration for VectorGeneration {
                 .chain(addition_projection.iter().map(|&e| e.clone()))
                 .unique()
                 .collect();
+
+            let udtf = self
+                .construct_table_fn(&VectorSearchTableFuncArgs {
+                    tbl: self.tbl.clone(),
+                    query,
+                    column: Some(self.embedding_column.clone()),
+                    limit: Some(limit),
+                    include_score: Some(true),
+                })
+                .await
+                .map_err(|e| SearchGenerationError::InternalError { source: e })?;
 
             format!(
                 "SELECT * FROM (

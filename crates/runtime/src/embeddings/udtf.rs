@@ -131,6 +131,24 @@ impl VectorSearchTableFunc {
 }
 
 impl VectorSearchTableFunc {
+    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
+        let mut expr = vec![
+            Expr::Column(Column::new_unqualified(args.tbl)),
+            Expr::Literal(ScalarValue::Utf8(Some(args.query))),
+        ];
+
+        if let Some(col) = args.column.as_ref() {
+            expr.push(Expr::Literal(ScalarValue::Utf8(Some(col.clone()))));
+        }
+        if let Some(limit) = args.limit {
+            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit))));
+        }
+        if let Some(include_score) = args.include_score {
+            expr.push(Expr::Literal(ScalarValue::Boolean(Some(include_score))));
+        }
+        expr
+    }
+
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
         let mut args = args.iter();
 
