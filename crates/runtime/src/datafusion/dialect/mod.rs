@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
-use crate::embeddings::cosine_distance::COSINE_DISTANCE_UDF_NAME;
+use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 
 mod duckdb;
 

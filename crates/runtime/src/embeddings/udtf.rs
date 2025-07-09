@@ -47,16 +47,14 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::Itertools;
+use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
 
 use crate::{
     datafusion::DataFusion,
     embedding_col,
-    embeddings::{
-        cosine_distance::COSINE_DISTANCE_UDF_NAME,
-        table::{EmbeddingColumnConfig, EmbeddingTable},
-    },
+    embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
     search::util::find_concrete_table_provider,
 };
