@@ -201,7 +201,7 @@ impl ExecutionPlan for PartitionerExec {
 
                             let state = ctx.state();
                             let context = Arc::clone(&context);
-                            let exec = PartitionInsertExec::new(rx, Arc::clone(&schema));
+                            let exec = PartitionInputExec::new(rx, Arc::clone(&schema));
                             let handle = tokio::spawn(async move {
                                 let plan = new_provider
                                     .insert_into(&state, Arc::new(exec), insert_op)
@@ -292,13 +292,13 @@ fn filter_batch_by_indices(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-struct PartitionInsertExec {
+struct PartitionInputExec {
     rx: Mutex<Option<Receiver<RecordBatch>>>,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
-impl PartitionInsertExec {
+impl PartitionInputExec {
     fn new(rx: Receiver<RecordBatch>, schema: SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -315,7 +315,7 @@ impl PartitionInsertExec {
     }
 }
 
-impl fmt::Debug for PartitionInsertExec {
+impl fmt::Debug for PartitionInputExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PartitionInsertExec")
             .field("properties", &self.properties)
@@ -323,7 +323,7 @@ impl fmt::Debug for PartitionInsertExec {
     }
 }
 
-impl ExecutionPlan for PartitionInsertExec {
+impl ExecutionPlan for PartitionInputExec {
     fn name(&self) -> &'static str {
         "PartitionInsertExec"
     }
@@ -378,7 +378,7 @@ impl ExecutionPlan for PartitionInsertExec {
     }
 }
 
-impl DisplayAs for PartitionInsertExec {
+impl DisplayAs for PartitionInputExec {
     fn fmt_as(
         &self,
         _t: datafusion::physical_plan::DisplayFormatType,
