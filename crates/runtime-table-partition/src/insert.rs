@@ -189,15 +189,26 @@ impl ExecutionPlan for PartitionerExec {
                             let (tx, rx) = channel(10);
                             partition_senders.insert(partition_key.clone(), tx.clone());
 
-                            let partition = creator
-                                .create_partition(partition_value)
-                                .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                            let new_provider = Arc::clone(&partition.table_provider);
-                            partition_providers
-                                .write()
-                                .await
-                                .insert(partition_key.clone(), partition);
+                            let providers = partition_providers.read().await;
+
+                            // Get or init table provider
+                            let new_provider =
+                                if let Some(partition) = providers.get(&partition_key) {
+                                    Arc::clone(&partition.table_provider)
+                                } else {
+                                    drop(providers);
+
+                                    let partition = creator
+                                        .create_partition(partition_value)
+                                        .await
+                                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                    let new_provider = Arc::clone(&partition.table_provider);
+                                    partition_providers
+                                        .write()
+                                        .await
+                                        .insert(partition_key.clone(), partition);
+                                    new_provider
+                                };
 
                             let state = ctx.state();
                             let context = Arc::clone(&context);
