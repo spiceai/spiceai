@@ -83,15 +83,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub struct EngineVariant {
-    engine: Engine,
-    partitioned: bool,
-}
-
 #[derive(Default, Clone)]
 pub struct AcceleratorEngineRegistry {
-    pub accelerator_engine_registry: Arc<RwLock<HashMap<EngineVariant, Arc<dyn DataAccelerator>>>>,
+    pub accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl AcceleratorEngineRegistry {
@@ -107,12 +101,7 @@ impl AcceleratorEngineRegistry {
         acceleration_settings: &acceleration::Acceleration,
     ) -> Option<Arc<dyn DataAccelerator>> {
         let guard = self.accelerator_engine_registry.read().await;
-        let partitioned = !acceleration_settings.partition_by.is_empty();
-        let engine_variant = EngineVariant {
-            engine: acceleration_settings.engine,
-            partitioned,
-        };
-        let engine = guard.get(&engine_variant);
+        let engine = guard.get(&acceleration_settings.engine);
         match engine {
             Some(engine_ref) => Some(Arc::clone(engine_ref)),
             None => None,
@@ -121,66 +110,33 @@ impl AcceleratorEngineRegistry {
 
     async fn register_accelerator_engine(
         &self,
-        engine_variant: EngineVariant,
+        engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(engine_variant, accelerator_engine);
+        registry.insert(engine, accelerator_engine);
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::Arrow,
-                partitioned: false,
-            },
-            Arc::new(ArrowAccelerator::new()),
-        )
-        .await;
+        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
+            .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
+            .await;
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::DuckDB,
-                partitioned: false,
-            },
-            Arc::new(DuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::DuckDB,
-                partitioned: true,
-            },
+            Engine::PartitionedDuckDB,
             Arc::new(PartitionedDuckDBAccelerator::new()),
         )
         .await;
         #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::PostgreSQL,
-                partitioned: false,
-            },
-            Arc::new(PostgresAccelerator::new()),
-        )
-        .await;
+        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
+            .await;
         #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::Sqlite,
-                partitioned: false,
-            },
-            Arc::new(SqliteAccelerator::new()),
-        )
-        .await;
-        self.register_accelerator_engine(
-            EngineVariant {
-                engine: Engine::Void,
-                partitioned: false,
-            },
-            Arc::new(VoidAccelerator::new()),
-        )
-        .await;
+        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
+            .await;
+        self.register_accelerator_engine(Engine::Void, Arc::new(VoidAccelerator::new()))
+            .await;
     }
 
     pub async fn unregister_all(&self) {

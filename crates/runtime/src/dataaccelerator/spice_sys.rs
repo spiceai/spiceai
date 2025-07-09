@@ -70,39 +70,46 @@ async fn acceleration_connection(
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
 
-            if acceleration_settings.partition_by.is_empty() {
-                let duckdb_accelerator = accelerator
-                    .as_any()
-                    .downcast_ref::<DuckDBAccelerator>()
-                    .ok_or("Accelerator is not a DuckDBAccelerator")?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<DuckDBAccelerator>()
+                .ok_or("Accelerator is not a DuckDBAccelerator")?;
 
-                let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
-                if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
-                    return Err("DuckDB file does not exist.".into());
-                }
-
-                let pool = duckdb_accelerator
-                    .get_shared_pool(source)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
-            } else {
-                let duckdb_accelerator = accelerator
-                    .as_any()
-                    .downcast_ref::<PartitionedDuckDBAccelerator>()
-                    .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
-
-                let pool = duckdb_accelerator
-                    .get_shared_pool(source)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                Ok(AccelerationConnection::DuckDB(pool))
+            let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
+            if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
+                return Err("DuckDB file does not exist.".into());
             }
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
+        }
+        #[cfg(feature = "duckdb")]
+        Engine::PartitionedDuckDB => {
+            let accelerator = runtime
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration_settings)
+                .await
+                .ok_or("DuckDB accelerator engine not available")?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<PartitionedDuckDBAccelerator>()
+                .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(AccelerationConnection::DuckDB(pool))
         }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
+        Engine::DuckDB | Engine::PartitionedDuckDB => {
+            Err("Spice wasn't built with DuckDB support enabled".into())
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = runtime
