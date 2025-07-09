@@ -124,6 +124,7 @@ rmcp = { workspace = true, optional = true, features = [
 ] }
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true

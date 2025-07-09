@@ -19,6 +19,7 @@ members = [
     "crates/runtime",
     "crates/runtime-auth",
     "crates/runtime-datafusion-index",
+    "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",
     "crates/search",
     "crates/spice_cloud",
