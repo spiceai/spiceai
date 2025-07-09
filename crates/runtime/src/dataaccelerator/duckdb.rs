@@ -42,7 +42,13 @@ use duckdb::AccessMode;
 use itertools::Itertools;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
-use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
+use std::{
+    any::Any,
+    cmp::max,
+    collections::HashSet,
+    ffi::OsStr,
+    sync::{Arc, Once},
+};
 
 use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
@@ -110,9 +116,22 @@ impl DuckDBAccelerator {
             })
         } else if let Some(acceleration) = source.acceleration().as_ref() {
             let mut params = acceleration.params.clone();
-            params.insert("data_directory".to_string(), spice_data_base_path());
+            let mut using_duckdb_data_dir = true;
+            let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
+                using_duckdb_data_dir = false;
+                spice_data_base_path()
+            });
+            params.insert("data_directory".to_string(), data_directory);
 
             if let Some(duckdb_file) = params.remove("duckdb_file") {
+                if using_duckdb_data_dir {
+                    static WARN_ONCE: Once = Once::new();
+                    WARN_ONCE.call_once(|| {
+                        tracing::warn!(
+                            "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
+                        );
+                    });
+                }
                 params.insert("duckdb_open".to_string(), duckdb_file.to_string());
             }
 
@@ -226,6 +245,7 @@ impl Default for DuckDBAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
+    ParameterSpec::component("data_dir"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),

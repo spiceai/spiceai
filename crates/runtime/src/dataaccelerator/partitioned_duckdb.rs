@@ -153,15 +153,34 @@ impl PartitionedDuckDBAccelerator {
     }
 }
 
+fn parameter_validation(source: &dyn AccelerationSource) {
+    if let Some(acceleration) = source.acceleration() {
+        if acceleration.params.contains_key("duckdb_file") {
+            tracing::warn!(
+                "'duckdb_file' was specified and will be ignored because it is not applicable for partitioned DuckDB acceleration."
+            );
+        }
+
+        if !acceleration.params.contains_key("duckdb_data_dir") {
+            tracing::debug!(
+                "'duckdb_data_dir' was not specified. Defaulting to {} directory.",
+                spice_data_base_path()
+            );
+        }
+    }
+}
+
 fn partition_dir(source: &dyn AccelerationSource) -> PathBuf {
     let fallback = spice_data_base_path();
-    let base_dir =
-        source.acceleration()
-        .and_then(|a| a.params.get("duckdb_file"))
+    let base_dir = source
+        .acceleration()
+        .and_then(|a| a.params.get("duckdb_data_dir"))
         .filter(|dir| {
             let is_dir = Path::new(dir).is_dir();
             if !is_dir {
-                tracing::warn!("'duckdb_file' ({dir}) is not a directory but is required to be for partitioned duckdb acceleration. Using {fallback} instead");
+                if let Err(_) = std::fs::create_dir_all(dir) {
+                    tracing::warn!("'duckdb_data_dir' ({dir}) is not a directory and could not be created. Using default directory {fallback} instead.");
+                }
             }
             is_dir
         })
@@ -222,6 +241,8 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         partition_by: Vec<Expr>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
+
+        parameter_validation(source);
 
         let mut table_provider_guard = self.table_provider.lock().await;
         ensure!(table_provider_guard.is_none(), SingleTableSnafu);
