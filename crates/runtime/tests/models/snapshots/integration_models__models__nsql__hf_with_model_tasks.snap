@@ -7,5 +7,5 @@ expression: response
 +------------------------+-------------------------------------------------------------------------------+
 | nsql                   | how many records (as 'total_records') are in spice.public.taxi_trips dataset? |
 | tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                        |
-| sql_query              | SELECT COUNT(*) AS total_records FROM "spice"."public"."taxi_trips"           |
+| sql_query              | truncated                                                                     |
 +------------------------+-------------------------------------------------------------------------------+

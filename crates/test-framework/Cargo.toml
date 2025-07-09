@@ -28,7 +28,7 @@ flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.17.9"
 insta.workspace = true
-octocrab = "0.43.0"
+octocrab = "0.44.1"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }

@@ -22,6 +22,7 @@ use crate::{
     dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
+    embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc},
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
@@ -210,6 +211,10 @@ impl RuntimeBuilder {
         df.ctx.register_udtf(
             "text_search",
             Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
+        );
+        df.ctx.register_udtf(
+            VECTOR_SEARCH_UDTF_NAME,
+            Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&df))),
         );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
