@@ -275,7 +275,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
                 self.formatter.clone(),
                 self.limit,
                 self.schema(),
-            ), // TODO get prefix from filter
+            ),
         )))
     }
 }
