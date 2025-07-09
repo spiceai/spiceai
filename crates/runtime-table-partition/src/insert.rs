@@ -92,7 +92,13 @@ impl DisplayAs for PartitionerExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "{}", self.name())
+        write!(
+            f,
+            "{} (partition_by = {}, insert_op = {})",
+            self.name(),
+            self.partition_by,
+            self.insert_op
+        )
     }
 }
 
