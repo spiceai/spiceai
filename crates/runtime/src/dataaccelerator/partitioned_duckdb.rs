@@ -41,7 +41,7 @@ use runtime_table_partition::{
     },
     provider::PartitionTableProvider,
 };
-use snafu::prelude::*;
+use snafu::{prelude::*, OptionExt};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
@@ -105,6 +105,9 @@ pub enum Error {
     #[snafu(display("Unable to get file stem"))]
     UnableToGetFileStem,
 
+    #[snafu(display("Partitioned DuckDB expected an AccelerationSource"))]
+    ExpectedAccelerationSource,
+
     #[snafu(display("Unable to create partition: {source}"))]
     UnableToCreatePartition {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -136,15 +139,32 @@ impl PartitionedDuckDBAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<Arc<DuckDbConnectionPool>> {
-        let data_path = spice_data_base_path();
-        let table = source.name().to_string();
-        let partition_dir = Path::new(&data_path).join(table);
-        let duckdb_path = partition_dir.join("checkpoint.db").display().to_string();
+        let duckdb_path = partition_dir(source)
+            .join("checkpoint.db")
+            .display()
+            .to_string();
 
         get_pool(&self.duckdb_factory, &duckdb_path)
             .await
             .context(FailedToCreateCheckpointingPoolSnafu)
     }
+}
+
+fn partition_dir(source: &dyn AccelerationSource) -> PathBuf {
+    let fallback = spice_data_base_path();
+    let base_dir = 
+        source.acceleration()
+        .and_then(|a| a.params.get("duckdb_file"))
+        .filter(|dir| {
+            let is_dir = Path::new(dir).is_dir();
+            if !is_dir {
+                tracing::warn!("'duckdb_file' ({dir}) is not a directory but is required to be for partitioned duckdb acceleration. Using {fallback} instead");
+            }
+            is_dir
+        })
+        .unwrap_or(&fallback);
+
+    PathBuf::from(base_dir).join(source.name().to_string())
 }
 
 impl Default for PartitionedDuckDBAccelerator {
@@ -194,22 +214,17 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 
     async fn create_external_table(
         &self,
-        mut cmd: CreateExternalTable,
+        cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<Expr>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(source) = source {
-            if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
-                cmd.options
-                    .insert("temp_directory".to_string(), temp_directory.to_string());
-            }
-        }
+        let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
         let mut table_provider_guard = self.table_provider.lock().await;
         ensure!(table_provider_guard.is_none(), SingleTableSnafu);
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
-        let creator = Arc::new(DuckDBPartitionCreator::new(cmd));
+        let creator = Arc::new(DuckDBPartitionCreator::new(partition_dir(source), cmd));
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
@@ -239,10 +254,7 @@ pub(crate) struct DuckDBPartitionCreator {
 }
 
 impl DuckDBPartitionCreator {
-    pub(crate) fn new(cmd: CreateExternalTable) -> Self {
-        let data_path = spice_data_base_path();
-        let table = cmd.name.table();
-        let partition_dir = Path::new(&data_path).join(table);
+    pub(crate) fn new(partition_dir: PathBuf, cmd: CreateExternalTable) -> Self {
         let duckdb_factory = create_factory();
 
         Self {
