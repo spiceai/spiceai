@@ -177,10 +177,8 @@ fn partition_dir(source: &dyn AccelerationSource) -> PathBuf {
         .and_then(|a| a.params.get("duckdb_data_dir"))
         .filter(|dir| {
             let is_dir = Path::new(dir).is_dir();
-            if !is_dir {
-                if let Err(_) = std::fs::create_dir_all(dir) {
-                    tracing::warn!("'duckdb_data_dir' ({dir}) is not a directory and could not be created. Using default directory {fallback} instead.");
-                }
+            if !is_dir && std::fs::create_dir_all(dir).is_err() {
+                tracing::warn!("'duckdb_data_dir' ({dir}) is not a directory and could not be created. Using default directory {fallback} instead.");
             }
             is_dir
         })
