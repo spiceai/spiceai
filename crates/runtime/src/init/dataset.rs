@@ -326,7 +326,7 @@ impl Runtime {
                     FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector)).await
                 {
                     tracing::warn!(
-                        "Unable to connect to the remote source for {}. Data will be served from the pre-existing accelerated table for {} while attempting to establish the connection.\n\n{err}",
+                        "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
                         ds.name,
                         ds.name
                     );
