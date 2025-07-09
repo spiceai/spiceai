@@ -25,7 +25,10 @@ use std::{
 
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, logical_expr::CreateExternalTable, prelude::Expr,
+    datasource::TableProvider,
+    error::DataFusionError,
+    logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
+    prelude::Expr,
     scalar::ScalarValue,
 };
 use datafusion_table_providers::{
@@ -41,7 +44,7 @@ use runtime_table_partition::{
     },
     provider::PartitionTableProvider,
 };
-use snafu::{prelude::*, OptionExt};
+use snafu::{OptionExt, prelude::*};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
@@ -152,7 +155,7 @@ impl PartitionedDuckDBAccelerator {
 
 fn partition_dir(source: &dyn AccelerationSource) -> PathBuf {
     let fallback = spice_data_base_path();
-    let base_dir = 
+    let base_dir =
         source.acceleration()
         .and_then(|a| a.params.get("duckdb_file"))
         .filter(|dir| {
@@ -357,6 +360,13 @@ impl PartitionCreator for DuckDBPartitionCreator {
             self.partition_dir.display().to_string(),
         );
         Ok(partitions)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 }
 

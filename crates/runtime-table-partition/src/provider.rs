@@ -132,7 +132,7 @@ impl TableProvider for PartitionTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        self.creator.supports_filters_pushdown(filters)
     }
 
     async fn scan(
