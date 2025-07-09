@@ -105,7 +105,7 @@ impl Runtime {
             if let Some(acceleration_settings) = &view.acceleration {
                 let accelerator = match self
                     .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings)
+                    .get_accelerator_engine(acceleration_settings.engine)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
                         name: acceleration_settings.engine.to_string(),

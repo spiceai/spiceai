@@ -66,7 +66,7 @@ async fn acceleration_connection(
         Engine::DuckDB => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
 
@@ -91,7 +91,7 @@ async fn acceleration_connection(
         Engine::PartitionedDuckDB => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
             let duckdb_accelerator = accelerator
@@ -114,7 +114,7 @@ async fn acceleration_connection(
         Engine::Sqlite => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;
             let sqlite_accelerator = accelerator

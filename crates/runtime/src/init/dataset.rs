@@ -681,7 +681,7 @@ impl Runtime {
         }
 
         self.accelerator_engine_registry
-            .get_accelerator_engine(acceleration_settings)
+            .get_accelerator_engine(acceleration_settings.engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -795,7 +795,7 @@ impl Runtime {
             if let Some(acceleration_settings) = &ds.acceleration {
                 let accelerator = match self
                     .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings)
+                    .get_accelerator_engine(acceleration_settings.engine)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
                         name: acceleration_settings.engine.to_string(),

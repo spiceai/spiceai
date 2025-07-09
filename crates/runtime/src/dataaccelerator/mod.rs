@@ -96,12 +96,9 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub async fn get_accelerator_engine(
-        &self,
-        acceleration_settings: &acceleration::Acceleration,
-    ) -> Option<Arc<dyn DataAccelerator>> {
+    pub async fn get_accelerator_engine(&self, engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
         let guard = self.accelerator_engine_registry.read().await;
-        let engine = guard.get(&acceleration_settings.engine);
+        let engine = guard.get(&engine);
         match engine {
             Some(engine_ref) => Some(Arc::clone(engine_ref)),
             None => None,
@@ -158,7 +155,7 @@ impl AcceleratorEngineRegistry {
         let engine = acceleration_settings.engine;
 
         let accelerator = self
-            .get_accelerator_engine(acceleration_settings)
+            .get_accelerator_engine(acceleration_settings.engine)
             .await
             .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),

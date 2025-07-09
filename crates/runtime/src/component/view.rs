@@ -128,7 +128,7 @@ impl View {
             let Some(accelerator) = self
                 .runtime()
                 .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
             else {
                 return false; // if the accelerator engine is not found, it's impossible for it to be initialized
