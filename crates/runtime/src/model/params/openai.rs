@@ -26,7 +26,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] =
 const OPENAI_PARAM_LEN: usize = 4;
 
 pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
-    ParameterSpec::component("endpoint")
+    ParameterSpec::runtime("endpoint")
         .description("The OpenAI API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).")
         .default("https://api.openai.com/v1"),
     ParameterSpec::component("api_key")

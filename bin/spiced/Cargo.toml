@@ -72,6 +72,7 @@ default = [
   "dynamodb",
   "imap",
   "alloc-snmalloc",
+  "oracle",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]

@@ -35,7 +35,7 @@ use crate::search::full_text::index::FullTextDatabaseIndex;
 use super::{Error, Result};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
+pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<Arc<T>> {
     let mut current_tbl = Arc::clone(tbl);
@@ -65,11 +65,9 @@ pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'sta
         }
 
         if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
-            let federated_table = accelerated_table
+            current_tbl = accelerated_table
                 .get_federated_table()
-                .table_provider()
-                .await;
-            current_tbl = Arc::clone(&federated_table);
+                .try_table_provider_sync()?;
             continue;
         }
 
@@ -175,10 +173,7 @@ pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<Tab
             .await
             // we should not fail here, as we are iterating over the tables that we know exist
             .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
-        if find_concrete_table_provider::<EmbeddingTable>(&table_provider)
-            .await
-            .is_some()
-        {
+        if find_concrete_table_provider::<EmbeddingTable>(&table_provider).is_some() {
             tables_with_embeddings.push(t);
         }
     }
@@ -194,7 +189,7 @@ pub async fn embedding_columns_from_table(
 ) -> Option<Vec<String>> {
     let table_provider = df.get_table(tbl).await?;
 
-    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider).await?;
+    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider)?;
     Some(embedding_table.get_embedding_columns())
 }
 
@@ -211,8 +206,7 @@ pub async fn full_text_search_candidates(
     let table_provider = df.get_table(tbl).await?;
 
     // If the table exists, but does not have full text search support, return no candidates.
-    let Some(indexed_table) =
-        find_concrete_table_provider::<IndexedTableProvider>(&table_provider).await
+    let Some(indexed_table) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
     else {
         return Some(Ok(vec![]));
     };
@@ -242,11 +236,7 @@ mod tests {
             MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
         );
 
-        assert!(
-            find_concrete_table_provider::<EmbeddingTable>(&base)
-                .await
-                .is_none()
-        );
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
     }
 
     #[tokio::test]
@@ -275,16 +265,8 @@ mod tests {
         let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
             as Arc<dyn TableProvider>;
 
-        assert!(
-            find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table)
-                .await
-                .is_some()
-        );
+        assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
 
-        assert!(
-            find_concrete_table_provider::<EmbeddingTable>(&wrapped_table)
-                .await
-                .is_none()
-        );
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
     }
 }
