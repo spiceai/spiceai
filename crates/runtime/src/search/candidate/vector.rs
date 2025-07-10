@@ -21,11 +21,13 @@ use crate::embeddings::udtf::{
 use crate::search::Error as VectorSearchError;
 use crate::{embedding_col, offset_col};
 use async_openai::types::EmbeddingInput;
+use datafusion::common::Column;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::logical_expr::sqlparser::ast::Expr;
-use datafusion::prelude::DataFrame;
+use datafusion::logical_expr::{LogicalPlanBuilder, SortExpr};
+use datafusion::prelude::{DataFrame, Expr as LogicalExpr};
+
 use datafusion::sql::sqlparser::ast::Ident;
 use datafusion::{execution::SendableRecordBatchStream, sql::TableReference};
 use itertools::Itertools;
@@ -254,7 +256,7 @@ impl VectorGeneration {
         )
     }
 
-    async fn construct_table_fn(
+    fn construct_table_fn(
         &self,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<DataFrame, DataFusionError> {
@@ -271,6 +273,61 @@ impl VectorGeneration {
         )?
         .build()?;
         Ok(DataFrame::new(self.df.ctx.state(), plan))
+    }
+
+    /// For non-chunked vector query, Use the vector_search UDTF to create a ready [`DataFrame`].
+    async fn construct_udtf_sql_dataframe(
+        &self,
+        query: String,
+        opt_filters: &[&Expr],
+        addition_projection: &[&Expr],
+        limit: usize,
+    ) -> Result<DataFrame, DataFusionError> {
+        let mut udtf = self.construct_table_fn(&VectorSearchTableFuncArgs {
+            tbl: self.tbl.clone(),
+            query,
+            column: Some(self.embedding_column.clone()),
+            limit: Some(limit),
+            include_score: Some(true),
+        })?;
+
+        // Parsing logical [`Expr`] are schema dependent.
+        let filters: Vec<LogicalExpr> = opt_filters
+            .iter()
+            .map(|f| {
+                self.df
+                    .ctx
+                    .state()
+                    .create_logical_expr(f.to_string().as_str(), udtf.schema())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(filter) = filters.iter().cloned().reduce(LogicalExpr::and) {
+            udtf = udtf.filter(filter)?;
+        }
+
+        let projection: Vec<String> = self
+            .primary_keys
+            .iter()
+            .cloned()
+            .chain(addition_projection.iter().map(|&e| e.to_string()))
+            .chain([
+                self.embedding_column.clone(),
+                SEARCH_SCORE_COLUMN_NAME.to_string(),
+            ])
+            .unique()
+            .collect();
+        let projection_ref = projection.iter().map(String::as_str).collect::<Vec<_>>();
+
+        udtf = udtf.select_exprs(&projection_ref)?;
+        udtf = udtf.sort(vec![SortExpr::new(
+            LogicalExpr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
+            false,
+            false,
+        )])?;
+        udtf = udtf.limit(0, Some(limit))?;
+
+        Ok(udtf)
     }
 }
 
@@ -297,47 +354,15 @@ impl CandidateGeneration for VectorGeneration {
                 limit,
             )
         } else {
-            let projection: Vec<Expr> = self
-                .primary_keys
-                .iter()
-                .cloned()
-                .map(|s| Expr::Identifier(Ident::new(s)))
-                .chain(Some(Expr::Named {
-                    // `embedding_column as 'value'`
-                    expr: Box::new(Expr::Identifier(Ident::new(self.embedding_column.clone()))),
-                    name: Ident::new(SEARCH_VALUE_COLUMN_NAME),
-                }))
-                .chain(addition_projection.iter().map(|&e| e.clone()))
-                .unique()
-                .collect();
-
-            let udtf = self
-                .construct_table_fn(&VectorSearchTableFuncArgs {
-                    tbl: self.tbl.clone(),
-                    query,
-                    column: Some(self.embedding_column.clone()),
-                    limit: Some(limit),
-                    include_score: Some(true),
-                })
+            return self
+                .construct_udtf_sql_dataframe(query, opt_filters, addition_projection, limit)
                 .await
-                .map_err(|e| SearchGenerationError::InternalError { source: e })?;
-
-            format!(
-                "SELECT * FROM (
-                        SELECT
-                            {projection_str},
-                            1.0 - cosine_distance({embedding_column}_embedding, {embedding:?}) as {SEARCH_SCORE_COLUMN_NAME}
-                        FROM {tbl}
-                        {where_str}
-                    ) subq
-                    WHERE score IS NOT NULL
-                    ORDER BY score DESC
-                    LIMIT {limit}",
-                projection_str = projection.iter().map(|e| format!("{}", *e)).join(", "),
-                embedding_column = self.embedding_column,
-                tbl = self.tbl,
-                where_str = where_and(opt_filters),
-            )
+                .boxed()
+                .map_err(|e| SearchGenerationError::InternalError { source: e })?
+                .execute_stream()
+                .await
+                .boxed()
+                .map_err(|e| SearchGenerationError::InternalError { source: e });
         };
         tracing::trace!("running SQL: {query}");
 
