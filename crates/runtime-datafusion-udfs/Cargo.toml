@@ -1,0 +1,21 @@
+[package]
+name = "runtime-datafusion-udfs"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ahash.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+datafusion.workspace = true
+snafu.workspace = true
+tracing.workspace = true
+tract-core = "0.21.10"
+
+[dev-dependencies]
+insta.workspace = true

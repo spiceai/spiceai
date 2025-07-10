@@ -15,7 +15,6 @@ limitations under the License.
 */
 pub mod common;
 pub mod connector;
-pub mod cosine_distance;
 pub mod execution_plan;
 pub mod metrics;
 pub mod table;

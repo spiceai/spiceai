@@ -11155,6 +11155,7 @@ dependencies = [
  "rmcp",
  "runtime-auth",
  "runtime-datafusion-index",
+ "runtime-datafusion-udfs",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",
@@ -11226,6 +11227,20 @@ dependencies = [
  "async-trait",
  "datafusion",
  "futures",
+]
+
+[[package]]
+name = "runtime-datafusion-udfs"
+version = "1.5.0-unstable"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow",
+ "arrow-schema",
+ "datafusion",
+ "insta",
+ "snafu",
+ "tracing",
+ "tract-core",
 ]
 
 [[package]]
