@@ -184,8 +184,7 @@ fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array
                 .and_then(|n| i32::try_from(hash % n))
                 .expect("MAX_NUM_BUCKETS smaller than i32 positive maximum")
         },
-    )
-    .map_err(|e| DataFusionError::ArrowError(e, None))?;
+    )?;
 
     let result = Int32Array::new(bucket_array.values().clone(), array.nulls().cloned());
 
