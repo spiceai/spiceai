@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/oracle/mod.rs
+expression: formatted
+---
++------------+-------------+-----------+
+| VAL_NUMBER | VAL_DECIMAL | VAL_FLOAT |
++------------+-------------+-----------+
+| 123.45     | 555.1234    | 3.14      |
++------------+-------------+-----------+

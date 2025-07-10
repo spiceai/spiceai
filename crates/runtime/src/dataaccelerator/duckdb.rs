@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
@@ -42,11 +42,17 @@ use duckdb::AccessMode;
 use itertools::Itertools;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
-use std::{any::Any, cmp::max, collections::HashSet, ffi::OsStr, sync::Arc};
+use std::{
+    any::Any,
+    cmp::max,
+    collections::HashSet,
+    ffi::OsStr,
+    sync::{Arc, Once},
+};
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
-mod settings;
+pub(crate) mod settings;
 
 const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
@@ -110,9 +116,22 @@ impl DuckDBAccelerator {
             })
         } else if let Some(acceleration) = source.acceleration().as_ref() {
             let mut params = acceleration.params.clone();
-            params.insert("data_directory".to_string(), spice_data_base_path());
+            let mut using_duckdb_data_dir = true;
+            let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
+                using_duckdb_data_dir = false;
+                spice_data_base_path()
+            });
+            params.insert("data_directory".to_string(), data_directory);
 
             if let Some(duckdb_file) = params.remove("duckdb_file") {
+                if using_duckdb_data_dir {
+                    static WARN_ONCE: Once = Once::new();
+                    WARN_ONCE.call_once(|| {
+                        tracing::warn!(
+                            "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
+                        );
+                    });
+                }
                 params.insert("duckdb_open".to_string(), duckdb_file.to_string());
             }
 
@@ -226,6 +245,7 @@ impl Default for DuckDBAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
+    ParameterSpec::component("data_dir"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),
@@ -302,12 +322,14 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        _partition_by: Vec<Expr>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
         }
 
+        // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
             if let Some(temp_directory) = &source.app().runtime.temp_directory.clone() {
                 cmd.options
@@ -365,26 +387,10 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
-        let table_provider = TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), &cmd)
-            .await
-            .context(UnableToCreateTableSnafu)
-            .boxed()?;
-
-        let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>()
-        else {
-            unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
-        };
-
-        let read_provider = Arc::clone(&duckdb_writer.read_provider);
-        let duckdb_writer = Arc::new(duckdb_writer.clone());
-        let cloned_writer = Arc::clone(&duckdb_writer);
-
-        Ok(Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            duckdb_writer,
-            read_provider,
-        )))
+        Ok((
+            create_table_provider(&self.duckdb_factory, &cmd).await?,
+            Behaviors::default(),
+        ))
     }
 
     fn prefix(&self) -> &'static str {
@@ -394,6 +400,34 @@ impl DataAccelerator for DuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+}
+
+pub(crate) async fn create_table_provider(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    cmd: &CreateExternalTable,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    let ctx = SessionContext::new();
+    let table_provider = duckdb_factory
+        .create(&ctx.state(), cmd)
+        .await
+        .context(UnableToCreateTableSnafu)
+        .boxed()?;
+
+    let Some(duckdb_writer) = table_provider.as_any().downcast_ref::<DuckDBTableWriter>() else {
+        unreachable!("DuckDBTableWriter should be returned from DuckDBTableProviderFactory")
+    };
+
+    let read_provider = Arc::clone(&duckdb_writer.read_provider);
+    let duckdb_writer = Arc::new(duckdb_writer.clone());
+    let cloned_writer = Arc::clone(&duckdb_writer);
+
+    let table_provider = Arc::new(PolyTableProvider::new(
+        cloned_writer,
+        duckdb_writer,
+        read_provider,
+    ));
+
+    Ok(table_provider)
 }
 
 #[cfg(test)]
@@ -458,8 +492,8 @@ mod tests {
         };
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
-        let table = duckdb_accelerator
-            .create_external_table(external_table, None)
+        let (table, _) = duckdb_accelerator
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 

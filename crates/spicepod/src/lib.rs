@@ -30,11 +30,13 @@ use component::{
     runtime::Runtime, secret::Secret, tool::Tool, view::View, worker::Worker,
 };
 
+use crate::component::Nameable;
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod acceleration;
 pub mod component;
 pub mod extension;
+mod keywords;
 pub mod metric;
 pub mod param;
 pub mod reader;
@@ -78,6 +80,11 @@ pub enum Error {
         source: object_store_aws_sdk::Error,
         path: String,
     },
+
+    #[snafu(display(
+        "The name '{keyword}' is reserved and cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
+    ))]
+    UseOfReservedKeyword { keyword: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -128,6 +135,17 @@ fn detect_duplicate_component_names(
             });
         }
         component_names.push(component.name());
+    }
+    Ok(())
+}
+
+fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
+    for component in components {
+        if keywords::is_reserved_keyword(component.name()) {
+            return Err(Error::UseOfReservedKeyword {
+                keyword: component.name().to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -248,6 +266,8 @@ impl Spicepod {
         detect_duplicate_component_names("eval", &resolved_evals[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
+
+        check_for_reserved_keywords(&resolved_datasets[..])?;
 
         Ok(from_definition(
             spicepod_definition,

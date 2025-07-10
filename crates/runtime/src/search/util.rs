@@ -20,6 +20,7 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::CandidateGeneration;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
@@ -29,11 +30,12 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
+use crate::search::full_text::index::FullTextDatabaseIndex;
 
-use super::{Error, Result, full_text::table::TableWithFullText};
+use super::{Error, Result};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
+pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<Arc<T>> {
     let mut current_tbl = Arc::clone(tbl);
@@ -47,8 +49,8 @@ pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'sta
         }
 
         // Handle specific table wrapping logic.
-        if let Some(fts_table) = current_tbl.as_any().downcast_ref::<TableWithFullText>() {
-            current_tbl = fts_table.underlying_table();
+        if let Some(index_table) = current_tbl.as_any().downcast_ref::<IndexedTableProvider>() {
+            current_tbl = index_table.get_underlying();
             continue;
         }
 
@@ -63,11 +65,9 @@ pub(super) async fn find_concrete_table_provider<T: TableProvider + Clone + 'sta
         }
 
         if let Some(accelerated_table) = current_tbl.as_any().downcast_ref::<AcceleratedTable>() {
-            let federated_table = accelerated_table
+            current_tbl = accelerated_table
                 .get_federated_table()
-                .table_provider()
-                .await;
-            current_tbl = Arc::clone(&federated_table);
+                .try_table_provider_sync()?;
             continue;
         }
 
@@ -84,42 +84,20 @@ pub async fn parse_explicit_primary_keys(
         app.datasets
             .iter()
             .filter_map(|d| {
-                let pks_from_embeddings: Option<Vec<String>> =
-                    d.embeddings.iter().find_map(|e| e.primary_keys.clone());
-
-                let mut pks_from_columns: Option<Vec<String>> = d
-                    .columns
-                    .iter()
-                    .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
-
-                let pks_from_fts: Option<Vec<String>> = d
-                    .columns
-                    .iter()
-                    .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
-
-                pks_from_columns = pks_from_columns.or(pks_from_fts);
-
-                let primary_keys = match (pks_from_columns, pks_from_embeddings) {
-                    (Some(pks), None) | (None, Some(pks)) => pks,
-                    (Some(pks), Some(_)) => {
-                        tracing::warn!("Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.", d.name);
-                        pks
-                    }
-                    (None, None) => return None,
-                };
-
-                Some((
-                    TableReference::parse_str(&d.name)
-                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                        .into(),
-                    primary_keys,
-                ))
+                d.primary_key_override().map(|pks| {
+                    (
+                        TableReference::parse_str(&d.name)
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                            .into(),
+                        pks,
+                    )
+                })
             })
             .collect::<HashMap<TableReference, Vec<_>>>()
     })
 }
 
-pub(crate) async fn get_primary_keys(tbl: Arc<dyn TableProvider>) -> Result<Vec<String>> {
+pub(crate) async fn get_primary_keys(tbl: &Arc<dyn TableProvider>) -> Result<Vec<String>> {
     let constraint_idx = tbl
         .constraints()
         .map(|c| c.iter())
@@ -155,7 +133,7 @@ pub(crate) async fn get_primary_keys_from_table(
             data_source: vec![table.clone()],
         })?;
 
-    get_primary_keys(tbl_ref).await
+    get_primary_keys(&tbl_ref).await
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
@@ -195,10 +173,7 @@ pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<Tab
             .await
             // we should not fail here, as we are iterating over the tables that we know exist
             .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
-        if find_concrete_table_provider::<EmbeddingTable>(&table_provider)
-            .await
-            .is_some()
-        {
+        if find_concrete_table_provider::<EmbeddingTable>(&table_provider).is_some() {
             tables_with_embeddings.push(t);
         }
     }
@@ -214,7 +189,7 @@ pub async fn embedding_columns_from_table(
 ) -> Option<Vec<String>> {
     let table_provider = df.get_table(tbl).await?;
 
-    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider).await?;
+    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider)?;
     Some(embedding_table.get_embedding_columns())
 }
 
@@ -229,7 +204,16 @@ pub async fn full_text_search_candidates(
     tbl: &TableReference,
 ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
     let table_provider = df.get_table(tbl).await?;
-    let fts = find_concrete_table_provider::<TableWithFullText>(&table_provider).await?;
+
+    // If the table exists, but does not have full text search support, return no candidates.
+    let Some(indexed_table) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
+    else {
+        return Some(Ok(vec![]));
+    };
+
+    let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() else {
+        return Some(Ok(vec![]));
+    };
 
     Some(
         fts.with_new_base(table_provider)
@@ -240,7 +224,7 @@ pub async fn full_text_search_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::TableWithFullText;
+    use super::FullTextDatabaseIndex;
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
@@ -252,11 +236,7 @@ mod tests {
             MemTable::try_new(Arc::new(Schema::empty()), vec![]).expect("failed to make table"),
         );
 
-        assert!(
-            find_concrete_table_provider::<EmbeddingTable>(&base)
-                .await
-                .is_none()
-        );
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
     }
 
     #[tokio::test]
@@ -272,22 +252,21 @@ mod tests {
             )
             .expect("failed to make table"),
         );
-        let wrapped_table = Arc::new(
-            TableWithFullText::try_new(base_table, vec!["search_field".to_string()], vec![].into())
-                .await
-                .expect("cannot make full text table"),
-        ) as Arc<dyn TableProvider>;
-
-        assert!(
-            find_concrete_table_provider::<TableWithFullText>(&wrapped_table)
-                .await
-                .is_some()
+        let index = Arc::new(
+            FullTextDatabaseIndex::try_new(
+                Arc::clone(&base_table),
+                vec!["search_field".to_string()],
+                vec![].into(),
+            )
+            .await
+            .expect("cannot make full text table"),
         );
 
-        assert!(
-            find_concrete_table_provider::<EmbeddingTable>(&wrapped_table)
-                .await
-                .is_none()
-        );
+        let wrapped_table = Arc::new(IndexedTableProvider::new(base_table).add_index(index))
+            as Arc<dyn TableProvider>;
+
+        assert!(find_concrete_table_provider::<IndexedTableProvider>(&wrapped_table).is_some());
+
+        assert!(find_concrete_table_provider::<EmbeddingTable>(&wrapped_table).is_none());
     }
 }

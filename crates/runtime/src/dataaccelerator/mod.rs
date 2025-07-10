@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
+use crate::dataaccelerator::void::VoidAccelerator;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::Constraint;
+use datafusion::common::{Constraint, DFSchema};
+use datafusion::prelude::{Expr, SessionContext};
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -30,6 +32,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use runtime_table_partition::expression::partition_by_expressions;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -39,18 +42,25 @@ use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
 use self::sqlite::SqliteAccelerator;
 
 pub mod arrow;
+pub mod behaviors;
+use behaviors::Behaviors;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod partitioned_duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod void;
 
 pub mod spice_sys;
 
@@ -97,11 +107,11 @@ impl AcceleratorEngineRegistry {
 
     async fn register_accelerator_engine(
         &self,
-        name: Engine,
+        engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(name, accelerator_engine);
+        registry.insert(engine, accelerator_engine);
     }
 
     pub(crate) async fn register_all(&self) {
@@ -110,11 +120,19 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
             .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::PartitionedDuckDB,
+            Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "postgres")]
         self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
             .await;
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
+            .await;
+        self.register_accelerator_engine(Engine::Void, Arc::new(VoidAccelerator::new()))
             .await;
     }
 
@@ -123,6 +141,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -131,14 +150,16 @@ impl AcceleratorEngineRegistry {
         acceleration_settings: &acceleration::Acceleration,
         secrets: Arc<RwLock<Secrets>>,
         source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>> {
+        ctx: Arc<SessionContext>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors)> {
         let engine = acceleration_settings.engine;
 
-        let accelerator = self.get_accelerator_engine(engine).await.ok_or_else(|| {
-            Error::InvalidConfiguration {
+        let accelerator = self
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
-            }
-        })?;
+            })?;
 
         if let Err(e) = acceleration_settings.validate_indexes(&schema) {
             InvalidConfigurationSnafu {
@@ -227,8 +248,15 @@ impl AcceleratorEngineRegistry {
 
         let external_table = external_table_builder.build()?;
 
+        let df_schema = DFSchema::try_from(schema)
+            .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+
+        let partition_by =
+            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+
         let table_provider = accelerator
-            .create_external_table(external_table, source)
+            .create_external_table(external_table, source, partition_by)
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -242,11 +270,14 @@ pub trait DataAccelerator: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
+    ///
+    /// Also returns the behaviors of the table provider created by the accelerator engine.
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+        partition_by: Vec<Expr>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;
@@ -490,6 +521,7 @@ mod test {
         let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
@@ -507,6 +539,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");
@@ -525,6 +558,7 @@ mod test {
         let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: params.clone(),
@@ -543,6 +577,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");
@@ -564,6 +599,7 @@ mod test {
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: HashMap::new(),
@@ -581,6 +617,7 @@ mod test {
                 &acceleration_settings,
                 Arc::new(RwLock::new(Secrets::new())),
                 None,
+                ctx,
             )
             .await
             .expect("accelerator table created");

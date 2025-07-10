@@ -21,14 +21,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Result, anyhow};
-use arrow_flight::error::FlightError;
+use anyhow::Result;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
-use spiceai::Client as SpiceClient;
+use spiceai::{Client as SpiceClient, SpiceClientError};
 use tokio::task::JoinHandle;
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
 
 use crate::{
     metrics::QueryStatus,
@@ -40,34 +37,6 @@ use crate::{
 };
 
 use super::EndCondition;
-
-pub(crate) const MAX_RETRIES: usize = 5;
-
-#[derive(Debug)]
-pub enum QueryError {
-    Retryable { source: anyhow::Error },
-    NonRetryable { source: anyhow::Error },
-}
-
-impl QueryError {
-    pub fn retryable<E>(error: E) -> Self
-    where
-        E: Into<anyhow::Error>,
-    {
-        Self::Retryable {
-            source: error.into(),
-        }
-    }
-
-    pub fn nonretryable<E>(error: E) -> Self
-    where
-        E: Into<anyhow::Error>,
-    {
-        Self::NonRetryable {
-            source: error.into(),
-        }
-    }
-}
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
@@ -410,8 +379,11 @@ impl SpiceTestQueryWorker {
                     })
                 } else {
                     eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.name, e
+                        "{} FAIL - Worker {} - Query '{}' failed: {}",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name,
+                        e
                     );
                     query_durations.entry(Arc::clone(&query.name)).or_default();
                     Ok(QueryRunResult {
@@ -423,6 +395,7 @@ impl SpiceTestQueryWorker {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_query(
         &self,
         query: &Query,
@@ -431,35 +404,106 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
-        let retry_strategy = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_RETRIES))
-            .build();
+        let query_start = Instant::now();
+        let mut result_stream = self
+            .spice_client
+            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
+            .await?;
 
-        let (duration, row_count) = match retry(retry_strategy, || async {
-            match self
-                .execute_query_internal(query, results_snapshot, validate)
-                .await
-            {
-                Ok((duration, row_count)) => Ok((duration, row_count)),
-                Err(e) => match e {
-                    QueryError::Retryable { source } => Err(RetryError::transient(source)),
-                    QueryError::NonRetryable { source } => Err(RetryError::permanent(source)),
-                },
+        let mut row_count: usize = 0;
+        let mut limited_records = vec![];
+        let mut validation_records = vec![];
+
+        loop {
+            let batch = result_stream.try_next().await;
+            match batch {
+                Ok(None) => break,
+                Err(e) => {
+                    if let SpiceClientError::ConnectionReset { .. } = e {
+                        row_count = 0;
+                        limited_records.clear();
+                        validation_records.clear();
+                    } else {
+                        eprintln!(
+                            "{} FAIL - Worker {} - Query '{}' failed: {}",
+                            chrono::Utc::now(),
+                            self.id,
+                            query.name,
+                            e
+                        );
+                        query_durations.entry(Arc::clone(&query.name)).or_default();
+                        return Err(e.into());
+                    }
+                }
+                Ok(Some(batch)) => {
+                    if validate {
+                        validation_records.push(batch.clone());
+                    }
+                    if batch.num_rows() == 0 {
+                        println!(
+                            "Worker {} - Query '{}' returned 0 rows",
+                            self.id, query.name
+                        );
+                    }
+                    row_count += batch.num_rows();
+                    if limited_records.len() < 10 {
+                        let required_rows = 10 - limited_records.len();
+                        let end = if batch.num_rows() > required_rows {
+                            required_rows
+                        } else {
+                            batch.num_rows()
+                        };
+                        for i in 0..end {
+                            limited_records.push(batch.slice(i, 1));
+                        }
+                    }
+                }
             }
-        })
-        .await
-        {
-            Ok((duration, row_count)) => (duration, row_count),
-            Err(e) => {
+        }
+
+        if validate {
+            // Validate the query results
+            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+            if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "FAIL - Worker {} - Query '{}' failed: {}",
-                    self.id, query.name, e
+                    "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    chrono::Utc::now(),
+                    self.id,
+                    query.name
                 );
-                query_durations.entry(Arc::clone(&query.name)).or_default();
-                return Err(e);
+                return Err(anyhow::anyhow!(
+                    "Query validation failed: {validation_reason:?}"
+                ));
             }
-        };
+        }
 
+        if results_snapshot {
+            let query_name = Arc::clone(&query.name);
+            let name = self.name.clone();
+            let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
+                format!("{name}_{query_name}")
+            } else {
+                format!("{name}_{query_name}_sf{}", self.scale_factor)
+            };
+
+            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
+            let result = panic::catch_unwind(|| {
+                insta::with_settings!({
+                     description => format!("Query: {query_name}"),
+                                         omit_expression => true,
+                    snapshot_path => "../../snapshot/snapshots/results"
+                }, {
+                    insta::assert_snapshot!(snapshot_name, records_pretty);
+                });
+            });
+            if result.is_err() {
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
+                eprintln!("{error_str}");
+                return Err(anyhow::anyhow!(error_str));
+            }
+        }
+
+        let duration = query_start.elapsed();
         query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
@@ -473,128 +517,6 @@ impl SpiceTestQueryWorker {
         if let Some(pb) = self.progress_bar.as_ref() {
             pb.inc(1);
         }
-
         Ok(())
     }
-
-    async fn execute_query_internal(
-        &self,
-        query: &Query,
-        results_snapshot: bool,
-        validate: bool,
-    ) -> std::result::Result<(Duration, usize), QueryError> {
-        let query_start = Instant::now();
-        let mut result_stream = self
-            .spice_client
-            .query_with_params(
-                &query.sql,
-                query
-                    .get_parameters_batch()
-                    .transpose()
-                    .map_err(QueryError::nonretryable)?,
-            )
-            .await
-            .map_err(|e| QueryError::nonretryable(anyhow!(e)))?;
-
-        let mut row_count: usize = 0;
-        let mut limited_records = vec![];
-        let mut validation_records = vec![];
-        loop {
-            let batch = result_stream.try_next().await;
-            match batch {
-                Ok(None) => break,
-                Err(e) => match e {
-                    FlightError::Tonic(e) => {
-                        if is_transient_error(&e) {
-                            return Err(QueryError::retryable(anyhow!("{e}")));
-                        }
-                    }
-                    _ => {
-                        return Err(QueryError::nonretryable(anyhow!("{e}")));
-                    }
-                },
-                Ok(Some(batch)) => {
-                    if validate {
-                        validation_records.push(batch.clone());
-                    }
-
-                    if batch.num_rows() == 0 {
-                        println!(
-                            "Worker {} - Query '{}' returned 0 rows",
-                            self.id, query.name
-                        );
-                    }
-
-                    row_count += batch.num_rows();
-
-                    if limited_records.len() < 10 {
-                        let required_rows = 10 - limited_records.len();
-                        let end = if batch.num_rows() > required_rows {
-                            required_rows
-                        } else {
-                            batch.num_rows()
-                        };
-
-                        for i in 0..end {
-                            limited_records.push(batch.slice(i, 1));
-                        }
-                    }
-                }
-            }
-        }
-
-        if validate {
-            // Validate the query results
-            let validation_result = validation::validate_tpch_query(query, &validation_records)
-                .map_err(QueryError::nonretryable)?;
-            if let QueryValidationResult::Fail(validation_reason) = validation_result {
-                eprintln!(
-                    "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
-                    self.id, query.name
-                );
-                return Err(QueryError::nonretryable(anyhow!(
-                    "Query validation failed: {validation_reason:?}"
-                )));
-            }
-        }
-
-        if results_snapshot {
-            let query_name = Arc::clone(&query.name);
-            let name = self.name.clone();
-
-            let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
-                format!("{name}_{query_name}")
-            } else {
-                format!("{name}_{query_name}_sf{}", self.scale_factor)
-            };
-
-            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)
-                .map_err(QueryError::nonretryable)?;
-            let result = panic::catch_unwind(|| {
-                insta::with_settings!({
-                    description => format!("Query: {query_name}"),
-                    omit_expression => true,
-                    snapshot_path => "../../snapshot/snapshots/results"
-                }, {
-                    insta::assert_snapshot!(snapshot_name, records_pretty);
-                });
-            });
-
-            if result.is_err() {
-                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
-                eprintln!("{error_str}");
-                return Err(QueryError::nonretryable(anyhow!(error_str)));
-            }
-        }
-
-        let duration = query_start.elapsed();
-        Ok((duration, row_count))
-    }
-}
-
-pub(crate) fn is_transient_error(e: &tonic::Status) -> bool {
-    if e.metadata().get("spiceai-retryable").is_some() {
-        return true;
-    }
-    false
 }

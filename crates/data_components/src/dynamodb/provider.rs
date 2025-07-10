@@ -17,13 +17,14 @@ limitations under the License.
 use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
 use arrow::{
-    datatypes::{Field, SchemaRef},
+    datatypes::SchemaRef,
     json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
-    operation::scan::{ScanError, builders::ScanFluentBuilder},
+    error::SdkError,
+    operation::scan::builders::ScanFluentBuilder,
     types::{AttributeValue, TableStatus},
 };
 use datafusion::{
@@ -40,7 +41,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use itertools::Itertools;
+
 use serde_json::Value;
 use snafu::prelude::*;
 
@@ -55,7 +56,7 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     ScanError {
-        source: aws_sdk_dynamodb::error::SdkError<ScanError>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Table does not exist: {table_name}"))]
@@ -98,33 +99,7 @@ impl DynamoDBTableProvider {
             .table_name(table_name.to_string())
             .send()
             .await
-            .map_err(|err| {
-                // Convert the SdkError to a more user-friendly error
-                let source = match err.into_source() {
-                    Ok(source) => source,
-                    Err(err) => {
-                        // If there is no error source, then original instance of SdkError is returned
-                        return err.into();
-                    }
-                };
-
-                if let Some(err) = source.downcast_ref::<aws_sdk_dynamodb::operation::describe_table::DescribeTableError>() {
-                    // Error metadata message (if present) contains a specific error message
-                    if let Some(err_msg) = err.meta().message() {
-                        return err_msg.into();
-                    }
-                }
-
-                // If a connection error occurs, provide detailed information available via Debug format.
-                // This happens when the request failed during dispatch. An HTTP response was not received, thus no error code or message is available.
-                if let Some(conn_error) = source.downcast_ref::<aws_sdk_dynamodb::error::ConnectorError>() {
-                    return format!(
-                        "Connection error. This may indicate an invalid region setting, connectivity, or access issue.\nDetails: {conn_error:?}"
-                    ).into();
-                }
-
-                source
-            })
+            .map_err(map_sdk_error)
             .context(DescribeTableSnafu)?;
 
         let Some(table) = response.table() else {
@@ -152,7 +127,11 @@ impl DynamoDBTableProvider {
             request = request.limit(limit);
         }
 
-        let response = request.send().await.context(ScanSnafu)?;
+        let response = request
+            .send()
+            .await
+            .map_err(map_sdk_error)
+            .context(ScanSnafu)?;
 
         let mut result = Vec::new();
         for item in response.items() {
@@ -205,25 +184,39 @@ fn attribute_value_to_json(av: &AttributeValue) -> Value {
     }
 }
 
-/// Create a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
-fn projection_expression(projection: Option<&Vec<usize>>, schema: &SchemaRef) -> Option<String> {
-    // If no projection is provided, return None to get all attributes
+/// Creates a projection expression for a `DynamoDB` scan request based on the provided schema and projection indices.
+/// Because projection expressions may use reserved words in `DynamoDB`, this function automatically generates expression attribute names for each column to avoid conflicts.
+/// The expression format used is `#c{idx}` for each projected column, where `{idx}` is the column projection index.
+/// See: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ExpressionAttributeNames.html#Expressions.ExpressionAttributeNames.ReservedWords>
+/// Returns a tuple of (`projection_expression`, `expression_attribute_names`) for the `DynamoDB` scan.
+/// Returns None if no projection is required.
+fn projection_expression(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> Option<(String, HashMap<String, String>)> {
     let projection = projection?;
-
-    // If projection is empty, return None
     if projection.is_empty() {
         return None;
     }
 
-    // Create the comma-separated list of attribute names
-    let expr = projection
-        .iter()
-        .map(|&idx| schema.field(idx))
-        .map(Field::name)
-        .join(", ");
+    // For each projected field, generate a placeholder and mapping
+    let mut expr_parts = Vec::with_capacity(projection.len());
+    let mut attr_names = HashMap::with_capacity(projection.len());
 
-    // If we couldn't find any valid field names, return None
-    if expr.is_empty() { None } else { Some(expr) }
+    for (i, &idx) in projection.iter().enumerate() {
+        let field = schema.field(idx);
+        let name = field.name();
+        let placeholder = format!("#c{i}");
+        expr_parts.push(placeholder.clone());
+        attr_names.insert(placeholder, name.clone());
+    }
+
+    let expr = expr_parts.join(", ");
+    if expr.is_empty() {
+        None
+    } else {
+        Some((expr, attr_names))
+    }
 }
 
 #[async_trait]
@@ -254,8 +247,11 @@ impl TableProvider for DynamoDBTableProvider {
                     .map_err(|_| DataFusionError::Execution("Limit is too large".to_string()))?,
             );
         }
-        if let Some(projection) = projection_expression(projection, &self.table_schema) {
+        if let Some((projection, names)) = projection_expression(projection, &self.table_schema) {
             request = request.projection_expression(projection);
+            for (placeholder, name) in &names {
+                request = request.expression_attribute_names(placeholder, name);
+            }
         }
         let projected_schema = project_schema(&self.table_schema, projection)?;
         Ok(Arc::new(DynamoDBTableProviderExec::new(
@@ -342,7 +338,8 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
             let mut stream = request.send();
 
             while let Some(item) = stream.next().await {
-                let scan_output = item.map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                let scan_output =
+                    item.map_err(|e| DataFusionError::Execution(map_sdk_error(e).to_string()))?;
                 for scan_item in scan_output.items() {
                     let json_value = attribute_map_to_json(scan_item).to_string();
                     let batches = ReaderBuilder::new(Arc::clone(&schema))
@@ -365,4 +362,43 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
         Ok(builder.build())
     }
+}
+
+fn map_sdk_error<E>(err: SdkError<E>) -> Box<dyn std::error::Error + Send + Sync>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let source = match err.into_source() {
+        Ok(source) => source,
+        Err(err) => {
+            // If there is no error source, then original instance of SdkError is returned
+            return err.into();
+        }
+    };
+
+    if let Some(err) = source.downcast_ref::<aws_sdk_dynamodb::operation::scan::ScanError>() {
+        // Error metadata message (if present) contains a specific error message
+        if let Some(err_msg) = err.meta().message() {
+            return err_msg.into();
+        }
+    }
+
+    if let Some(err) =
+        source.downcast_ref::<aws_sdk_dynamodb::operation::describe_table::DescribeTableError>()
+    {
+        // Error metadata message (if present) contains a specific error message
+        if let Some(err_msg) = err.meta().message() {
+            return err_msg.into();
+        }
+    }
+
+    // If a connection error occurs, provide detailed information available via Debug format.
+    // This happens when the request failed during dispatch. An HTTP response was not received, thus no error code or message is available.
+    if let Some(conn_error) = source.downcast_ref::<aws_sdk_dynamodb::error::ConnectorError>() {
+        return format!(
+            "Connection error. This may indicate an invalid region setting, connectivity, or access issue.\nDetails: {conn_error:?}"
+        ).into();
+    }
+
+    source
 }

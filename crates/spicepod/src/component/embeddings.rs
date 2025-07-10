@@ -147,6 +147,10 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("databricks:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Bedrock) => {
+                let from = &self.from;
+                from.strip_prefix("bedrock:").map(ToString::to_string)
+            }
             None => None,
         }
     }
@@ -158,6 +162,7 @@ pub enum EmbeddingPrefix {
     HuggingFace,
     File,
     Databricks,
+    Bedrock,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -174,6 +179,8 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::Azure)
         } else if value.starts_with("databricks") {
             Ok(EmbeddingPrefix::Databricks)
+        } else if value.starts_with("bedrock") {
+            Ok(EmbeddingPrefix::Bedrock)
         } else {
             Err("Unknown prefix")
         }
@@ -188,6 +195,7 @@ impl Display for EmbeddingPrefix {
             EmbeddingPrefix::HuggingFace => write!(f, "huggingface"),
             EmbeddingPrefix::File => write!(f, "file"),
             EmbeddingPrefix::Databricks => write!(f, "databricks"),
+            EmbeddingPrefix::Bedrock => write!(f, "bedrock"),
         }
     }
 }

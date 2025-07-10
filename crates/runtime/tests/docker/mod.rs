@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use bollard::{
@@ -145,7 +146,10 @@ pub struct ContainerRunner<'a> {
 }
 
 impl<'a> ContainerRunner<'a> {
-    pub async fn run(self) -> Result<RunningContainer<'a>, anyhow::Error> {
+    pub async fn run(
+        self,
+        start_timeout: Option<Duration>,
+    ) -> Result<RunningContainer<'a>, anyhow::Error> {
         if self.container_exist().await? {
             remove(&self.docker, self.name).await?;
         }
@@ -171,16 +175,23 @@ impl<'a> ContainerRunner<'a> {
                 format!("{container_port}/tcp"),
                 Some(vec![PortBinding {
                     host_ip: Some("127.0.0.1".to_string()),
-                    host_port: Some(format!("{host_port}/tcp")),
+                    host_port: Some(format!("{host_port}")),
                 }]),
             );
         }
         tracing::debug!("Port bindings: {:?}", port_bindings_map);
 
-        let port_bindings = if port_bindings_map.is_empty() {
-            None
+        let port_bindings_keys: Vec<String> = port_bindings_map.keys().cloned().collect();
+
+        let (exposed_ports, port_bindings) = if port_bindings_map.is_empty() {
+            (None, None)
         } else {
-            Some(port_bindings_map)
+            #[allow(clippy::zero_sized_map_values)]
+            let exposed_ports = port_bindings_keys
+                .iter()
+                .map(|k| (k.as_str(), HashMap::new()))
+                .collect::<HashMap<_, _>>();
+            (Some(exposed_ports), Some(port_bindings_map))
         };
 
         let host_config = Some(HostConfig {
@@ -200,6 +211,7 @@ impl<'a> ContainerRunner<'a> {
             env: Some(env_vars_str),
             host_config,
             healthcheck: self.healthcheck,
+            exposed_ports,
             ..Default::default()
         };
 
@@ -209,6 +221,7 @@ impl<'a> ContainerRunner<'a> {
             .start_container(self.name, None::<StartContainerOptions<String>>)
             .await?;
 
+        let start_timeout = start_timeout.unwrap_or_else(|| Duration::from_secs(60));
         let start_time = std::time::Instant::now();
         loop {
             let inspect_container = self.docker.inspect_container(self.name, None).await?;
@@ -228,8 +241,10 @@ impl<'a> ContainerRunner<'a> {
                 break;
             }
 
-            if start_time.elapsed().as_secs() > 60 {
-                return Err(anyhow::anyhow!("Container failed to start"));
+            if start_time.elapsed() > start_timeout {
+                return Err(anyhow::anyhow!(
+                    "Container failed to start (timeout waiting for healthy state)"
+                ));
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
