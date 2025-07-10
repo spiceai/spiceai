@@ -162,10 +162,7 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
 }
 
 #[allow(clippy::missing_panics_doc)]
-pub fn compute_bucket_array(
-    array: &ArrayRef,
-    num_buckets: i64,
-) -> Result<Int32Array, DataFusionError> {
+fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
     let mut hashes = vec![0u64; array.len()];
