@@ -77,6 +77,17 @@ enum SupportedScalarValue {
     Utf8(Option<String>),
     Utf8View(Option<String>),
     LargeUtf8(Option<String>),
+    Date32(Option<i32>),
+    Date64(Option<i64>),
+    Time32Second(Option<i32>),
+    Time32Millisecond(Option<i32>),
+    Time64Microsecond(Option<i64>),
+    Time64Nanosecond(Option<i64>),
+    TimestampSecond(Option<i64>, Option<String>),
+    TimestampMillisecond(Option<i64>, Option<String>),
+    TimestampMicrosecond(Option<i64>, Option<String>),
+    TimestampNanosecond(Option<i64>, Option<String>),
+    IntervalYearMonth(Option<i32>),
 }
 
 impl TryFrom<ScalarValue> for SupportedScalarValue {
@@ -96,6 +107,25 @@ impl TryFrom<ScalarValue> for SupportedScalarValue {
             ScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             ScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             ScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
+            ScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
+            ScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
+            ScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
+            ScalarValue::Time32Millisecond(maybe_value) => Self::Time32Millisecond(maybe_value),
+            ScalarValue::Time64Microsecond(maybe_value) => Self::Time64Microsecond(maybe_value),
+            ScalarValue::Time64Nanosecond(maybe_value) => Self::Time64Nanosecond(maybe_value),
+            ScalarValue::TimestampSecond(maybe_value, maybe_str) => {
+                Self::TimestampSecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
+                Self::TimestampMillisecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
+                Self::TimestampMicrosecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
+                Self::TimestampNanosecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::IntervalYearMonth(maybe_value) => Self::IntervalYearMonth(maybe_value),
             _ => {
                 return UnsupportedTypeSnafu {
                     data_type: value.data_type(),
@@ -123,6 +153,33 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
             SupportedScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             SupportedScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             SupportedScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
+            SupportedScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
+            SupportedScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
+            SupportedScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
+            SupportedScalarValue::Time32Millisecond(maybe_value) => {
+                Self::Time32Millisecond(maybe_value)
+            }
+            SupportedScalarValue::Time64Microsecond(maybe_value) => {
+                Self::Time64Microsecond(maybe_value)
+            }
+            SupportedScalarValue::Time64Nanosecond(maybe_value) => {
+                Self::Time64Nanosecond(maybe_value)
+            }
+            SupportedScalarValue::TimestampSecond(maybe_value, maybe_str) => {
+                Self::TimestampSecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
+                Self::TimestampMillisecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
+                Self::TimestampMicrosecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
+                Self::TimestampNanosecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::IntervalYearMonth(maybe_value) => {
+                Self::IntervalYearMonth(maybe_value)
+            }
         })
     }
 }
