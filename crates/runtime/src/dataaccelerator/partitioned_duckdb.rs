@@ -30,6 +30,7 @@ use datafusion::{
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
+    sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
@@ -385,7 +386,16 @@ impl PartitionCreator for DuckDBPartitionCreator {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if expr_to_sql(expr).is_ok() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
 
