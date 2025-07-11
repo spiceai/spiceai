@@ -165,6 +165,10 @@ assignees: ''
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
 
+- [ ] Update the spicepod schema on the release branch, if there are any updates:
+  - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
+  - [ ] Spicepod schema cherry-picked onto release branch
+
 - [ ] Add references to any SDK releases in the release notes:
 
   - [ ] [spice.js](https://github.com/spiceai/spice.js/releases)
@@ -197,7 +201,6 @@ assignees: ''
 ## Post-Release Housekeeping
 
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
-  - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
