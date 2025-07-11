@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use datafusion::common::ParamValues;
 use uuid::Uuid;
@@ -56,7 +56,19 @@ impl<'a> QueryBuilder<'a> {
     pub fn build(self) -> Query {
         let sql: Arc<str> = self.sql.into();
         let tracker = if self.df.task_history_enabled {
-            Some(QueryTracker::empty_from_now())
+            Some(QueryTracker {
+                schema: None,
+                query_duration_secs: None,
+                query_execution_duration_secs: None,
+                rows_produced: 0,
+                results_cache_hit: None,
+                is_accelerated: None,
+                error_message: None,
+                error_code: None,
+                query_duration_timer: Instant::now(),
+                query_execution_duration_timer: Instant::now(),
+                datasets: Arc::new(HashSet::default()),
+            })
         } else {
             None
         };

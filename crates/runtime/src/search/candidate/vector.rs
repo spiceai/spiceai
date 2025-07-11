@@ -256,26 +256,7 @@ impl VectorGeneration {
         )
     }
 
-    fn construct_table_fn(
-        &self,
-        args: &VectorSearchTableFuncArgs,
-    ) -> Result<DataFrame, DataFusionError> {
-        let expr_args = VectorSearchTableFunc::to_expr(args);
-        let provider = self
-            .df
-            .ctx
-            .table_function(VECTOR_SEARCH_UDTF_NAME)?
-            .create_table_provider(expr_args.as_slice())?;
-        let plan = LogicalPlanBuilder::scan(
-            format!("{VECTOR_SEARCH_UDTF_NAME}()"),
-            provider_as_source(provider),
-            None,
-        )?
-        .build()?;
-        Ok(DataFrame::new(self.df.ctx.state(), plan))
-    }
-
-    /// For non-chunked vector query, Use the `vector_search` UDTF to create a ready [`DataFrame`].
+    /// For non-chunked vector query, Use the `vector_search` UDTF to create a [`DataFrame`] with appropriate filters, columns and limits.
     fn construct_udtf_sql_dataframe(
         &self,
         query: String,
@@ -283,13 +264,27 @@ impl VectorGeneration {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> Result<DataFrame, DataFusionError> {
-        let mut udtf = self.construct_table_fn(&VectorSearchTableFuncArgs {
+        let udtf_args = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
             tbl: self.tbl.clone(),
             query,
             column: Some(self.embedding_column.clone()),
             limit: Some(limit),
             include_score: Some(true),
-        })?;
+        });
+        let udtf_provider = self
+            .df
+            .ctx
+            .table_function(VECTOR_SEARCH_UDTF_NAME)?
+            .create_table_provider(udtf_args.as_slice())?;
+        let mut udtf = DataFrame::new(
+            self.df.ctx.state(),
+            LogicalPlanBuilder::scan(
+                format!("{VECTOR_SEARCH_UDTF_NAME}()"),
+                provider_as_source(udtf_provider),
+                None,
+            )?
+            .build()?,
+        );
 
         // Parsing logical [`Expr`] are schema dependent.
         let filters: Vec<LogicalExpr> = opt_filters
@@ -319,15 +314,13 @@ impl VectorGeneration {
             .collect();
         let projection_ref = projection.iter().map(String::as_str).collect::<Vec<_>>();
 
-        udtf = udtf.select_exprs(&projection_ref)?;
-        udtf = udtf.sort(vec![SortExpr::new(
-            LogicalExpr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
-            false,
-            false,
-        )])?;
-        udtf = udtf.limit(0, Some(limit))?;
-
-        Ok(udtf)
+        udtf.select_exprs(&projection_ref)?
+            .sort(vec![SortExpr::new(
+                LogicalExpr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
+                false,
+                false,
+            )])?
+            .limit(0, Some(limit))
     }
 }
 

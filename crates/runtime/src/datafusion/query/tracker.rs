@@ -40,22 +40,6 @@ pub(crate) struct QueryTracker {
 }
 
 impl QueryTracker {
-    pub fn empty_from_now() -> Self {
-        Self {
-            schema: None,
-            query_duration_secs: None,
-            query_execution_duration_secs: None,
-            rows_produced: 0,
-            results_cache_hit: None,
-            is_accelerated: None,
-            error_message: None,
-            error_code: None,
-            query_duration_timer: Instant::now(),
-            query_execution_duration_timer: Instant::now(),
-            datasets: Arc::new(HashSet::default()),
-        }
-    }
-
     pub fn finish_with_error(
         mut self,
         request_context: &RequestContext,

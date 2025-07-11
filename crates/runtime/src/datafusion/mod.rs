@@ -1613,6 +1613,9 @@ impl DataFusion {
             .table_names())
     }
 
+    /// Create a [`Query`] based on a constructed [`LogicalPlan`].
+    ///
+    /// The `plan` should be valid, constructed off the [`DataFusion`]'s [`SessionContext`].
     pub fn query_from_logical_plan(self: &Arc<Self>, plan: &LogicalPlan) -> Query {
         Query::from_logical_plan(self, plan)
     }

@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use cache::key::SearchKey;
-use datafusion::sql::sqlparser::{
-    self,
-    ast::{Expr, SelectItem, TableFactor, TableWithJoins},
-    dialect::GenericDialect,
-    keywords::Keyword,
-    parser::Parser,
-    tokenizer::Token,
+use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{
+    Expr, SelectItem, TableFactor, TableWithJoins, Value, ValueWithSpan,
 };
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::Token;
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,7 @@ impl SearchRequest {
                     });
                 }
 
-                let Some(SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident {
+                let Some(SelectItem::UnnamedExpr(Expr::Identifier(sqlparser::ast::Ident {
                     value,
                     ..
                 }))) = expr.projection.first()
@@ -279,6 +279,84 @@ impl SearchRequest {
                 Ok(c.clone())
             })
             .collect::<Result<Vec<String>>>()
+    }
+
+    pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr> {
+        let expression = format!("{target_column} ILIKE '%{}%'", k.to_lowercase());
+        let parser = Parser::new(&GenericDialect {});
+        let mut parser = parser.try_with_sql(&expression).map_err(|err| {
+            tracing::trace!("vector_search keyword parsing failed. {err}");
+            Error::InvalidKeyword {
+                keyword: k.to_string(),
+            }
+        })?;
+
+        // The keyword will exist on its own if nothing else is present.
+        let ilike_expr = parser.parse_expr().map_err(|err| {
+            tracing::trace!("vector_search keyword parsing failed. {err}");
+            Error::InvalidKeyword {
+                keyword: k.to_string(),
+            }
+        })?;
+
+        let Expr::ILike { expr, pattern, .. } = &ilike_expr else {
+            tracing::trace!(
+                "vector_search keyword parsing failed. expected ILIKE, but got {ilike_expr:?}"
+            );
+            return Err(Error::InvalidKeyword {
+                keyword: k.to_string(),
+            });
+        };
+
+        if let (
+            Expr::Identifier(id),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(v),
+                ..
+            }),
+        ) = (*expr.clone(), *pattern.clone())
+        {
+            if id.value.to_lowercase() != target_column {
+                tracing::trace!(
+                    "vector_search keyword parsing failed. expected 'target_column', but got {}",
+                    id.value
+                );
+                return Err(Error::InvalidKeyword {
+                    keyword: k.to_string(),
+                });
+            }
+
+            if v != format!("%{}%", k.to_lowercase()) {
+                tracing::trace!(
+                    "vector_search keyword parsing failed. expected '%{}%', but got {}",
+                    k.to_lowercase(),
+                    v
+                );
+                return Err(Error::InvalidKeyword {
+                    keyword: k.to_string(),
+                });
+            }
+        } else {
+            tracing::trace!(
+                "vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}"
+            );
+            return Err(Error::InvalidKeyword {
+                keyword: k.to_string(),
+            });
+        }
+
+        // Ensure the expression is the last token.
+        let next_token = parser.next_token();
+        if next_token != Token::EOF {
+            tracing::trace!(
+                "vector_search keyword parsing failed. expected EOF, but got {next_token:?}"
+            );
+            return Err(Error::InvalidKeyword {
+                keyword: k.to_string(),
+            });
+        }
+
+        Ok(ilike_expr)
     }
 }
 

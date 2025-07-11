@@ -158,6 +158,7 @@ impl Query {
         ))
     }
 
+    /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
     pub(super) fn plan_hasher(df: &DataFusion) -> Box<dyn Hasher> {
         df.plans_cache_provider().map_or(
             Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher>,

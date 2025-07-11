@@ -171,8 +171,7 @@ impl Query {
                 QueryMethod::Plan(logical_plan) => {
                     let cache_manager = RequestCacheManager::new(
                         CacheStatus::CacheMiss,
-                        CacheKey::LogicalPlan(logical_plan)
-                            .as_raw_key(Query::plan_hasher(&ctx.df)),
+                        CacheKey::LogicalPlan(logical_plan).as_raw_key(Query::plan_hasher(&ctx.df)),
                     );
                     (logical_plan.clone(), None, cache_manager)
                 }
@@ -191,7 +190,6 @@ impl Query {
                 )
             }
 
-            // Essentially I need to bypass down to here.
             let input_tables = get_logical_plan_input_tables(&plan);
             if input_tables
                 .iter()
@@ -296,7 +294,8 @@ impl Query {
         }
     }
 
-    #[must_use] pub fn display_sql(&self) -> String {
+    #[must_use]
+    pub fn display_sql(&self) -> String {
         format!("{}", self.sql)
     }
 
