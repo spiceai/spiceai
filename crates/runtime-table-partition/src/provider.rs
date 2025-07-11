@@ -84,7 +84,7 @@ impl PartitionTableProvider {
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
-            .infer_existing_partitions(&partition_by)
+            .infer_existing_partitions()
             .await
             .context(CreatingPartitionSnafu)?;
 
