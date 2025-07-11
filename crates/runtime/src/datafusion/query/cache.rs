@@ -52,7 +52,7 @@ pub(super) struct RequestCacheManager {
 }
 
 impl RequestCacheManager {
-    fn new(cache_status: CacheStatus, raw_cache_key: RawCacheKey) -> Self {
+    pub(super) fn new(cache_status: CacheStatus, raw_cache_key: RawCacheKey) -> Self {
         Self {
             cache_status,
             raw_cache_key,
@@ -99,13 +99,8 @@ impl Query {
             }
         };
 
-        let plan_hasher = df.plans_cache_provider().map_or(
-            Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher>,
-            |p| p.hasher(),
-        );
-
         let sql_raw_cache_key =
-            sql_raw_cache_key.unwrap_or_else(|| sql_cache_key.as_raw_key(plan_hasher));
+            sql_raw_cache_key.unwrap_or_else(|| sql_cache_key.as_raw_key(Self::plan_hasher(df)));
 
         let plan = match df
             .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
@@ -161,6 +156,14 @@ impl Query {
             tracker,
             RequestCacheManager::new(cache_status, raw_cache_key),
         ))
+    }
+
+    /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
+    pub(super) fn plan_hasher(df: &DataFusion) -> Box<dyn Hasher> {
+        df.plans_cache_provider().map_or(
+            Box::new(std::hash::DefaultHasher::new()) as Box<dyn Hasher>,
+            |p| p.hasher(),
+        )
     }
 
     async fn try_get_cached_result(
@@ -227,7 +230,7 @@ impl Query {
         ))
     }
 
-    fn should_cache_results(
+    pub(super) fn should_cache_results(
         df: &DataFusion,
         plan: &LogicalPlan,
         cache_status: CacheStatus,
@@ -252,6 +255,7 @@ impl Query {
     }
 }
 
+#[allow(clippy::large_futures)]
 #[cfg(test)]
 mod tests {
     use super::*;

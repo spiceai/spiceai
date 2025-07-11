@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{cell::LazyCell, fmt::Display, sync::Arc};
 
-use ::cache::{get_logical_plan_input_tables, result::query::QueryResult};
+use ::cache::{
+    get_logical_plan_input_tables,
+    key::CacheKey,
+    result::{CacheStatus, query::QueryResult},
+};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -49,7 +53,10 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::request::{AsyncMarker, RequestContext};
+use crate::{
+    datafusion::{DataFusion, query::cache::RequestCacheManager},
+    request::{AsyncMarker, RequestContext},
+};
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
@@ -86,10 +93,26 @@ thread_local! {
     });
 }
 
+pub enum QueryMethod {
+    Plan(LogicalPlan),
+    Text {
+        sql: Arc<str>,
+        parameters: Option<ParamValues>,
+    },
+}
+
+impl Display for QueryMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text { sql, .. } => write!(f, "{sql}"),
+            Self::Plan(plan) => write!(f, "{}", plan.display()),
+        }
+    }
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
-    sql: Arc<str>,
-    parameters: Option<ParamValues>,
+    sql: QueryMethod,
     tracker: Option<QueryTracker>,
 }
 
@@ -127,18 +150,31 @@ impl Query {
                 .set_extension(Arc::clone(&request_context));
 
             // Get the `LogicalPlan` or cached results
-            let (plan, mut tracker, cache_manager) = match Self::get_plan_or_cached(
-                &ctx.df,
-                &session,
-                Arc::clone(&request_context),
-                &ctx.sql,
-                ctx.parameters.clone(),
-                tracker,
-            )
-            .await?
-            {
-                PlanOrCached::Plan(plan, tracker, cache_manager) => (plan, tracker, cache_manager),
-                PlanOrCached::Cached(query_result) => return Ok(query_result),
+            let (plan, mut tracker, cache_manager) = match &ctx.sql {
+                QueryMethod::Text { sql, parameters } => {
+                    match Self::get_plan_or_cached(
+                        &ctx.df,
+                        &session,
+                        Arc::clone(&request_context),
+                        sql,
+                        parameters.clone(),
+                        tracker,
+                    )
+                    .await?
+                    {
+                        PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            (plan, tracker, cache_manager)
+                        }
+                        PlanOrCached::Cached(query_result) => return Ok(query_result),
+                    }
+                }
+                QueryMethod::Plan(logical_plan) => {
+                    let cache_manager = RequestCacheManager::new(
+                        CacheStatus::CacheMiss,
+                        CacheKey::LogicalPlan(logical_plan).as_raw_key(Query::plan_hasher(&ctx.df)),
+                    );
+                    (logical_plan.clone(), None, cache_manager)
+                }
             };
 
             if let Err(e) =
@@ -250,6 +286,19 @@ impl Query {
         }
     }
 
+    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: &LogicalPlan) -> Self {
+        Self {
+            df: Arc::clone(df),
+            sql: QueryMethod::Plan(plan.clone()),
+            tracker: None,
+        }
+    }
+
+    #[must_use]
+    pub fn display_sql(&self) -> String {
+        format!("{}", self.sql)
+    }
+
     pub fn finish_with_error(
         self,
         request_context: &RequestContext,
@@ -265,13 +314,16 @@ impl Query {
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        let plan = match session.create_logical_plan(&self.sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                let e = find_datafusion_root(e);
-                self.handle_schema_error(&request_context, &e);
-                return Err(e);
-            }
+        let plan = match self.sql {
+            QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            },
         };
 
         // Verify the plan against the restricted options
