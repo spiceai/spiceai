@@ -2397,7 +2397,7 @@ dependencies = [
  "byteorder",
  "candle-kernels 0.8.4",
  "candle-metal-kernels 0.8.4",
- "cudarc 0.12.1",
+ "cudarc 0.12.2",
  "gemm",
  "half",
  "memmap2",
@@ -2418,12 +2418,11 @@ dependencies = [
 
 [[package]]
 name = "candle-cublaslt"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695315e349373a2af3dbcfca0a388340fdc3a695a4e4e559eaf5fee7fc98d63"
+version = "0.2.2"
+source = "git+https://github.com/spiceai/candle-cublaslt?rev=147f4424b0567131c41cf1ee667645120682170b#147f4424b0567131c41cf1ee667645120682170b"
 dependencies = [
  "candle-core 0.8.4",
- "cudarc 0.13.9",
+ "cudarc 0.12.2",
  "half",
 ]
 
@@ -2457,8 +2456,7 @@ dependencies = [
 [[package]]
 name = "candle-layer-norm"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b7f796928d4ddd47add2a545f74ff1f40a4277b24ce1a567722ee6aee41a4c0"
+source = "git+https://github.com/spiceai/candle-layer-norm?rev=88b9ffdd7077fce11d3f6cb77bbe7093269631fe#88b9ffdd7077fce11d3f6cb77bbe7093269631fe"
 dependencies = [
  "anyhow",
  "candle-core 0.8.4",
@@ -2525,8 +2523,7 @@ dependencies = [
 [[package]]
 name = "candle-rotary"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "203e1892ad326119ca5b7f1edcaa0dab75243e7ab73446ca0da622edaa2fe440"
+source = "git+https://github.com/spiceai/candle-rotary?rev=8a437f99881bd4803f61c7c16ed4367f7cab76fc#8a437f99881bd4803f61c7c16ed4367f7cab76fc"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
@@ -3228,9 +3225,8 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+version = "0.12.2"
+source = "git+https://github.com/EricLBuehler/cudarc?rev=f6e5bf51153d40e34eb1262b98895ac1235b6422#f6e5bf51153d40e34eb1262b98895ac1235b6422"
 dependencies = [
  "half",
  "libloading",
@@ -7387,6 +7383,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockruntime",
  "bytes",
+ "cudarc 0.12.2",
  "dotenvy",
  "either",
  "futures",
@@ -13589,7 +13586,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=5bc9b9584dfda14f6fbccc645920b1abcbc2413a#5bc9b9584dfda14f6fbccc645920b1abcbc2413a"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
 dependencies = [
  "hf-hub",
  "rand 0.9.1",
@@ -13603,7 +13600,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=5bc9b9584dfda14f6fbccc645920b1abcbc2413a#5bc9b9584dfda14f6fbccc645920b1abcbc2413a"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
 dependencies = [
  "anyhow",
  "candle-core 0.8.4",
@@ -13626,7 +13623,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=5bc9b9584dfda14f6fbccc645920b1abcbc2413a#5bc9b9584dfda14f6fbccc645920b1abcbc2413a"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
 dependencies = [
  "nohash-hasher",
  "serde",
@@ -13636,7 +13633,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=5bc9b9584dfda14f6fbccc645920b1abcbc2413a#5bc9b9584dfda14f6fbccc645920b1abcbc2413a"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
@@ -14804,7 +14801,7 @@ version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c4dcab280ad0ef3957e153a82dcad608c954d02cf253b695322f502d1f8902e"
 dependencies = [
- "cudarc 0.12.1",
+ "cudarc 0.12.2",
  "half",
  "serde",
  "serde_json",
