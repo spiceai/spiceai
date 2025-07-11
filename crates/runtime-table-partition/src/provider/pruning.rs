@@ -33,34 +33,27 @@ pub(crate) fn prune_partition(
     partition_by: &Expr,
     partition_value: &ScalarValue,
 ) -> Result<bool, DataFusionError> {
-    for filter in filters {
-        let filter_columns = filter.column_refs();
-        let partition_by_columns = partition_by.column_refs();
+    let partition_by_columns = partition_by.column_refs();
 
-        // Skip filters referencing columns not in partition_by
-        if filter_columns
+    for filter in filters {
+        // Skip filters with columns not in partition_by
+        if filter
+            .column_refs()
             .iter()
-            .any(|filter_column| !partition_by_columns.contains(filter_column))
+            .any(|col| !partition_by_columns.contains(col))
         {
             continue;
         }
 
         match filter {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                if let Operator::Eq = op {
-                    match (left.as_ref(), right.as_ref()) {
-                        (column @ Expr::Column(_), Expr::Literal(lit)) => {
-                            let is_match = filter_or_udf_value_matches(
-                                column,
-                                partition_by,
-                                partition_value,
-                                lit,
-                            )?;
-                            if !is_match {
-                                return Ok(true);
-                            }
-                        }
-                        _ => continue,
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => {
+                if let (Expr::Column(_), Expr::Literal(lit)) = (left.as_ref(), right.as_ref()) {
+                    if !filter_or_udf_value_matches(left, partition_by, partition_value, lit)? {
+                        return Ok(true); // Prune if equality doesn't match
                     }
                 }
             }
@@ -93,7 +86,7 @@ pub(crate) fn prune_partition(
                     }
                 }
             }
-            _ => continue,
+            _ => {}
         }
     }
 
@@ -106,31 +99,29 @@ fn filter_or_udf_value_matches(
     partition_value: &ScalarValue,
     filter_value: &ScalarValue,
 ) -> Result<bool, DataFusionError> {
-    Ok(
-        if let Expr::ScalarFunction(ScalarFunction { func, args }) = partition_by {
-            let Ok(args) = args
+    match partition_by {
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            let args = args
                 .iter()
                 .map(|arg| {
+                    // if we find the column expression, replace it with the filter
+                    // value
                     if arg == column {
-                        Ok(filter_value.clone())
+                        Ok(filter_value.to_owned())
                     } else if let Expr::Literal(lit) = arg {
-                        Ok(lit.clone())
+                        Ok(lit.to_owned())
                     } else {
-                        Err(())
+                        Err(DataFusionError::Plan(
+                            "Invalid argument: expected column or literal".into(),
+                        ))
                     }
                 })
-                .collect::<Result<Vec<_>, ()>>()
-            else {
-                return Ok(false); // Args must be literals or the matching column
-            };
+                .collect::<Result<Vec<_>, _>>()?;
 
-            let udf_value = call(func.as_ref(), args)?;
-
-            &udf_value == partition_value
-        } else {
-            filter_value == partition_value
-        },
-    )
+            Ok(call(func.as_ref(), args)? == *partition_value)
+        }
+        _ => Ok(filter_value == partition_value),
+    }
 }
 
 fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusionError> {
