@@ -11155,6 +11155,7 @@ dependencies = [
  "rmcp",
  "runtime-auth",
  "runtime-datafusion-index",
+ "runtime-datafusion-udfs",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",
@@ -11229,16 +11230,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-datafusion-udfs"
+version = "1.5.0-unstable"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow",
+ "arrow-schema",
+ "datafusion",
+ "insta",
+ "snafu",
+ "tracing",
+ "tract-core",
+]
+
+[[package]]
 name = "runtime-table-partition"
 version = "1.5.0-unstable"
 dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "futures",
+ "parking_lot 0.12.3",
  "serde",
  "serde_qs 1.0.0-rc.3",
  "snafu",
  "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

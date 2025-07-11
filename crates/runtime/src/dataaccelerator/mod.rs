@@ -42,6 +42,8 @@ use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
@@ -52,6 +54,8 @@ pub mod behaviors;
 use behaviors::Behaviors;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod partitioned_duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
@@ -103,11 +107,11 @@ impl AcceleratorEngineRegistry {
 
     async fn register_accelerator_engine(
         &self,
-        name: Engine,
+        engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(name, accelerator_engine);
+        registry.insert(engine, accelerator_engine);
     }
 
     pub(crate) async fn register_all(&self) {
@@ -116,6 +120,12 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
             .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::PartitionedDuckDB,
+            Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "postgres")]
         self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
             .await;
@@ -144,11 +154,12 @@ impl AcceleratorEngineRegistry {
     ) -> Result<(Arc<dyn TableProvider>, Behaviors)> {
         let engine = acceleration_settings.engine;
 
-        let accelerator = self.get_accelerator_engine(engine).await.ok_or_else(|| {
-            Error::InvalidConfiguration {
+        let accelerator = self
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
-            }
-        })?;
+            })?;
 
         if let Err(e) = acceleration_settings.validate_indexes(&schema) {
             InvalidConfigurationSnafu {

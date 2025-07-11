@@ -28,7 +28,7 @@ use {
 
 #[cfg(feature = "duckdb")]
 use {
-    super::duckdb::DuckDBAccelerator,
+    super::duckdb::DuckDBAccelerator, super::partitioned_duckdb::PartitionedDuckDBAccelerator,
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
@@ -60,15 +60,16 @@ async fn acceleration_connection(
 ) -> Result<AccelerationConnection> {
     let runtime = source.runtime();
 
-    let acceleration = source.acceleration().ok_or("Acceleration is not enabled")?;
-    match acceleration.engine {
+    let acceleration_settings = source.acceleration().ok_or("Acceleration is not enabled")?;
+    match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(Engine::DuckDB)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
+
             let duckdb_accelerator = accelerator
                 .as_any()
                 .downcast_ref::<DuckDBAccelerator>()
@@ -86,13 +87,34 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
+        #[cfg(feature = "duckdb")]
+        Engine::PartitionedDuckDB => {
+            let accelerator = runtime
+                .accelerator_engine_registry()
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .ok_or("DuckDB accelerator engine not available")?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<PartitionedDuckDBAccelerator>()
+                .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(AccelerationConnection::DuckDB(pool))
+        }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
+        Engine::DuckDB | Engine::PartitionedDuckDB => {
+            Err("Spice wasn't built with DuckDB support enabled".into())
+        }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
             let accelerator = runtime
                 .accelerator_engine_registry()
-                .get_accelerator_engine(Engine::Sqlite)
+                .get_accelerator_engine(acceleration_settings.engine)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;
             let sqlite_accelerator = accelerator
@@ -113,7 +135,7 @@ async fn acceleration_connection(
         Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
         #[cfg(feature = "postgres")]
         Engine::PostgreSQL => {
-            let secret_map = to_secret_map(acceleration.params.clone());
+            let secret_map = to_secret_map(acceleration_settings.params.clone());
 
             let pool = PostgresConnectionPool::new(secret_map)
                 .await
