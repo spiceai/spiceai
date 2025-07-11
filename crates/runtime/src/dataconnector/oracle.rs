@@ -17,7 +17,9 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::oracle::OracleTableProvider;
-use data_components::oracle::connection::{OracleConnectionParamsBuilder, OracleConnectionPool};
+use data_components::oracle::connection::{
+    OracleConnectionParams, OracleConnectionPool, OracleOnPremConnectionParamsBuilder,
+};
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
 use std::pin::Pin;
@@ -55,6 +57,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("host"),
     ParameterSpec::component("port"),
     ParameterSpec::component("service_name"),
+    ParameterSpec::component("connection_string").secret(),
+    ParameterSpec::component("tns_admin"),
 ];
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -66,36 +70,61 @@ pub struct Oracle {
 
 impl Oracle {
     async fn new(params: &Parameters) -> Result<Self> {
-        let mut conn_params = OracleConnectionParamsBuilder::new(
-            params
-                .get("host")
-                .expose()
-                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
-            params
-                .get("username")
-                .expose()
-                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
-            params
-                .get("password")
-                .expose()
-                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
-        );
+        let username = params
+            .get("username")
+            .expose()
+            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-        if let Some(port_str) = params.get("port").expose().ok() {
-            let port = port_str.parse::<u16>().map_err(|_| {
-                FailedToParsePortSnafu {
-                    port: port_str.to_string(),
+        let password = params
+            .get("password")
+            .expose()
+            .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+
+        let connect_params: OracleConnectionParams = if let Some(connect_string) =
+            params.get("connection_string").expose().ok()
+        {
+            // verify that no conflicting parameters are used
+            for param in ["host", "port", "service_name"] {
+                if params.get(param).expose().ok().is_some() {
+                    tracing::warn!(
+                        "'oracle_{}' parameter is not supported together with 'oracle_connection_string' and will be ignored.",
+                        param
+                    );
                 }
-                .build()
-            })?;
-            conn_params.port(port);
-        }
+            }
 
-        if let Some(service_name) = params.get("service_name").expose().ok() {
-            conn_params.service_name(service_name);
-        }
+            OracleConnectionParams::new(username, password, connect_string)
+        } else {
+            let mut conn_params = OracleOnPremConnectionParamsBuilder::new(
+                params
+                    .get("host")
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?,
+                username,
+                password,
+            );
 
-        let conn = data_components::oracle::connection::connect(&conn_params.build())
+            if let Some(port_str) = params.get("port").expose().ok() {
+                let port = port_str.parse::<u16>().map_err(|_| {
+                    FailedToParsePortSnafu {
+                        port: port_str.to_string(),
+                    }
+                    .build()
+                })?;
+                conn_params.port(port);
+            }
+
+            if let Some(service_name) = params.get("service_name").expose().ok() {
+                conn_params.service_name(service_name);
+            }
+
+            conn_params.build()
+        };
+
+        // Optional parameter to specify mTLS Wallet directory
+        let tns_admin = params.get("tns_admin").expose().ok();
+
+        let conn = data_components::oracle::connection::connect(&connect_params, tns_admin)
             .await
             .context(UnableToCreateConnectionPoolSnafu)?;
 
