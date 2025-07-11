@@ -131,7 +131,7 @@ pub async fn connect(
 ) -> super::Result<OracleConnectionPool> {
     if let Some(tns_admin) = tns_admin {
         // Initializes Oracle client library with the specified TNS_ADMIN directory
-        // Note: this is applied for the first connection only, if library is already initialized, dyanmically changing TNS_ADMIN  has no affect
+        // Note: this is applied for the first connection only, if library is already initialized, dynamically changing TNS_ADMIN has no effect
         let _ = oracle::InitParams::new()
             .oracle_client_config_dir(tns_admin)
             .context(OracleInitSnafu)?
