@@ -24,10 +24,38 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-/// Determine whether a partition should be pruned from the scan plan based on
-/// the query `filters`, the expression that the partition was created from,
-/// `partition_by`, and the `partition_value` produced by the `partition_by`
-/// `Expr` for this particular partition.
+/// Collects equality conditions from nested OR expressions, ensuring they are on the same column.
+fn collect_or_equalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
+            let left_result = collect_or_equalities(left);
+            let right_result = collect_or_equalities(right);
+            match (left_result, right_result) {
+                (Some((col_left, mut lits_left)), Some((col_right, lits_right)))
+                    if col_left == col_right =>
+                {
+                    lits_left.extend(lits_right);
+                    Some((col_left, lits_left))
+                }
+                _ => None,
+            }
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(lit)) => {
+                    Some((col.name().to_string(), vec![lit.clone()]))
+                }
+                (Expr::Literal(lit), Expr::Column(col)) => {
+                    Some((col.name().to_string(), vec![lit.clone()]))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Determine whether a partition should be pruned based on filters, partition_by, and partition_value.
 pub(crate) fn prune_partition(
     filters: &[Expr],
     partition_by: &Expr,
@@ -53,7 +81,24 @@ pub(crate) fn prune_partition(
             }) => {
                 if let (Expr::Column(_), Expr::Literal(lit)) = (left.as_ref(), right.as_ref()) {
                     if !filter_or_udf_value_matches(left, partition_by, partition_value, lit)? {
-                        return Ok(true); // Prune if equality doesn't match
+                        return Ok(true); // Prune if equality does not match
+                    }
+                }
+            }
+            Expr::BinaryExpr(_) => {
+                if let Some((col_name, literals)) = collect_or_equalities(filter) {
+                    let mut any_matches = false;
+                    for lit in literals {
+                        let is_match = filter_or_udf_value_matches(
+                            &Expr::Column(col_name.clone().into()),
+                            partition_by,
+                            partition_value,
+                            &lit,
+                        )?;
+                        any_matches |= is_match;
+                    }
+                    if !any_matches {
+                        return Ok(true);
                     }
                 }
             }
@@ -72,17 +117,14 @@ pub(crate) fn prune_partition(
                                 partition_value,
                                 lit_val,
                             )?;
-
                             if is_match && *negated {
                                 return Ok(true); // prune if match in NOT IN
                             }
-
                             any_matches |= is_match;
                         }
                     }
-
                     if !any_matches && !negated {
-                        return Ok(true); // prune if no matches in IN
+                        return Ok(true);
                     }
                 }
             }
@@ -104,8 +146,7 @@ fn filter_or_udf_value_matches(
             let args = args
                 .iter()
                 .map(|arg| {
-                    // if we find the column expression, replace it with the filter
-                    // value
+                    // replace the column expression with the filter value
                     if arg == column {
                         Ok(filter_value.to_owned())
                     } else if let Expr::Literal(lit) = arg {
@@ -117,7 +158,6 @@ fn filter_or_udf_value_matches(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-
             Ok(call(func.as_ref(), args)? == *partition_value)
         }
         _ => Ok(filter_value == partition_value),
@@ -169,11 +209,7 @@ mod tests {
     fn test_prune_partition_multiple_columns() -> Result<(), DataFusionError> {
         let partition_by = col("region");
         let filters = &[col("col2").eq(partition_by.clone())];
-
-        // Filter contains multiple column references that are not `partition_by`
-        // so we cannot prune it
         assert_prune_partition!(filters, &partition_by, Utf8, [("us-east-1".into(), false)]);
-
         Ok(())
     }
 
@@ -182,14 +218,12 @@ mod tests {
         let partition_by = col("region");
         let region = "us-east-2";
         let filters = &[col("region").eq(lit(region))];
-
         assert_prune_partition!(
             filters,
             &partition_by,
             Utf8,
             [("us-east-2".into(), false), ("ap-northeast-2".into(), true)]
         );
-
         Ok(())
     }
 
@@ -201,7 +235,6 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             false,
         )];
-
         assert_prune_partition!(
             filters,
             &partition_by,
@@ -215,7 +248,6 @@ mod tests {
                 (6, true)
             ]
         );
-
         Ok(())
     }
 
@@ -227,7 +259,6 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             true,
         )];
-
         assert_prune_partition!(
             filters,
             &partition_by,
@@ -241,7 +272,44 @@ mod tests {
                 (6, false)
             ]
         );
+        Ok(())
+    }
 
+    #[test]
+    fn test_prune_partition_or_2_items() -> Result<(), DataFusionError> {
+        let partition_by = col("account_id");
+        let filter = col("account_id")
+            .eq(lit(1))
+            .or(col("account_id").eq(lit(2)));
+        assert_prune_partition!(
+            &[filter.clone()],
+            &partition_by,
+            Int32,
+            [(1, false), (2, false), (3, true), (4, true)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_or_3_items() -> Result<(), DataFusionError> {
+        let partition_by = col("account_id");
+        let filter = col("account_id")
+            .eq(lit(1))
+            .or(col("account_id").eq(lit(2)))
+            .or(col("account_id").eq(lit(3)));
+        assert_prune_partition!(
+            &[filter.clone()],
+            &partition_by,
+            Int32,
+            [
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, true),
+                (5, true),
+                (6, true)
+            ]
+        );
         Ok(())
     }
 
@@ -255,9 +323,7 @@ mod tests {
         let partition_by = bucket_expr(vec![lit(10i64), col("region")]);
         let region = "us-east-2";
         let filters = &[col("region").eq(lit(region))];
-
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-
         let ScalarValue::Int32(Some(us_east_2)) = call(
             &f,
             vec![
@@ -268,7 +334,6 @@ mod tests {
         else {
             panic!("expected Int32");
         };
-
         let ScalarValue::Int32(Some(ap_northeast_2)) = call(
             &f,
             vec![
@@ -279,14 +344,12 @@ mod tests {
         else {
             panic!("expected Int32");
         };
-
         assert_prune_partition!(
             filters,
             &partition_by,
             Int32,
             [(us_east_2, false), (ap_northeast_2, true)]
         );
-
         Ok(())
     }
 
@@ -298,9 +361,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             false,
         )];
-
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-
         let hashed_values = (1..=6)
             .map(|i| {
                 let ScalarValue::Int32(Some(val)) = call(
@@ -313,7 +374,6 @@ mod tests {
                 Ok(val)
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;
-
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i > 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
@@ -322,7 +382,6 @@ mod tests {
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
         }
-
         Ok(())
     }
 
@@ -334,9 +393,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3)],
             true,
         )];
-
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
-
         let hashed_values = (1..=6)
             .map(|i| {
                 let ScalarValue::Int32(Some(val)) = call(
@@ -349,7 +406,6 @@ mod tests {
                 Ok(val)
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;
-
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
@@ -358,7 +414,6 @@ mod tests {
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
         }
-
         Ok(())
     }
 }
