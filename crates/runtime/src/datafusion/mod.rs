@@ -35,6 +35,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
+use crate::datafusion::query::Query;
 use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -1610,6 +1611,13 @@ impl DataFusion {
                 schema: SPICE_DEFAULT_SCHEMA.to_string(),
             })?
             .table_names())
+    }
+
+    /// Create a [`Query`] based on a constructed [`LogicalPlan`].
+    ///
+    /// The `plan` should be valid, constructed off the [`DataFusion`]'s [`SessionContext`].
+    pub fn query_from_logical_plan(self: &Arc<Self>, plan: &LogicalPlan) -> Query {
+        Query::from_logical_plan(self, plan)
     }
 
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
