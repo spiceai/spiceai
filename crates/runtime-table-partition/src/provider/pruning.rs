@@ -42,10 +42,8 @@ fn collect_or_equalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(lit)) => {
-                    Some((col.name().to_string(), vec![lit.clone()]))
-                }
-                (Expr::Literal(lit), Expr::Column(col)) => {
+                (Expr::Column(col), Expr::Literal(lit))
+                | (Expr::Literal(lit), Expr::Column(col)) => {
                     Some((col.name().to_string(), vec![lit.clone()]))
                 }
                 _ => None,
@@ -73,10 +71,8 @@ fn collect_and_inequalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::NotEq => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(lit)) => {
-                    Some((col.name().to_string(), vec![lit.clone()]))
-                }
-                (Expr::Literal(lit), Expr::Column(col)) => {
+                (Expr::Column(col), Expr::Literal(lit))
+                | (Expr::Literal(lit), Expr::Column(col)) => {
                     Some((col.name().to_string(), vec![lit.clone()]))
                 }
                 _ => None,
@@ -86,7 +82,7 @@ fn collect_and_inequalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
     }
 }
 
-/// Determine whether a partition should be pruned based on filters, partition_by, and partition_value.
+/// Determine whether a partition should be pruned based on filters, `partition_by`, and `partition_value`.
 pub(crate) fn prune_partition(
     filters: &[Expr],
     partition_by: &Expr,
