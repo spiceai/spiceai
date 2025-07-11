@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::common::ParamValues;
-use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, tracker::QueryTracker};
 
@@ -57,27 +56,17 @@ impl<'a> QueryBuilder<'a> {
     pub fn build(self) -> Query {
         let sql: Arc<str> = self.sql.into();
         let tracker = if self.df.task_history_enabled {
-            Some(QueryTracker {
-                schema: None,
-                query_duration_secs: None,
-                query_execution_duration_secs: None,
-                rows_produced: 0,
-                results_cache_hit: None,
-                is_accelerated: None,
-                error_message: None,
-                error_code: None,
-                query_duration_timer: Instant::now(),
-                query_execution_duration_timer: Instant::now(),
-                datasets: Arc::new(HashSet::default()),
-            })
+            Some(QueryTracker::empty_from_now())
         } else {
             None
         };
 
         Query {
             df: Arc::clone(&self.df),
-            sql: Arc::clone(&sql),
-            parameters: self.parameters,
+            sql: QueryMethod::Text {
+                sql: Arc::clone(&sql),
+                parameters: self.parameters,
+            },
             tracker,
         }
     }

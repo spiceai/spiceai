@@ -275,8 +275,8 @@ impl VectorGeneration {
         Ok(DataFrame::new(self.df.ctx.state(), plan))
     }
 
-    /// For non-chunked vector query, Use the vector_search UDTF to create a ready [`DataFrame`].
-    async fn construct_udtf_sql_dataframe(
+    /// For non-chunked vector query, Use the `vector_search` UDTF to create a ready [`DataFrame`].
+    fn construct_udtf_sql_dataframe(
         &self,
         query: String,
         opt_filters: &[&Expr],
@@ -312,8 +312,8 @@ impl VectorGeneration {
             .cloned()
             .chain(addition_projection.iter().map(|&e| e.to_string()))
             .chain([
-                self.embedding_column.clone(),
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
+                format!("{} as {SEARCH_VALUE_COLUMN_NAME}", self.embedding_column),
             ])
             .unique()
             .collect();
@@ -347,29 +347,23 @@ impl CandidateGeneration for VectorGeneration {
             .map_err(|e| SearchGenerationError::InternalError { source: e })?;
 
         let query = if self.is_chunked {
-            self.chunked_sql(
+            let query = self.chunked_sql(
                 addition_projection,
                 embedding.as_slice(),
                 opt_filters,
                 limit,
-            )
+            );
+            self.df.query_builder(&query).build()
         } else {
-            return self
+            let dataframe = self
                 .construct_udtf_sql_dataframe(query, opt_filters, addition_projection, limit)
-                .await
                 .boxed()
-                .map_err(|e| SearchGenerationError::InternalError { source: e })?
-                .execute_stream()
-                .await
-                .boxed()
-                .map_err(|e| SearchGenerationError::InternalError { source: e });
+                .map_err(|e| SearchGenerationError::InternalError { source: e })?;
+            self.df.query_from_logical_plan(dataframe.logical_plan())
         };
-        tracing::trace!("running SQL: {query}");
+        tracing::trace!("running SQL: {}", query.display_sql());
 
-        Ok(self
-            .df
-            .query_builder(&query)
-            .build()
+        Ok(query
             .run()
             .await
             .boxed()
