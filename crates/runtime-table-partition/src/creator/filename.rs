@@ -49,7 +49,7 @@ struct SerializablePair {
     exprs_hash: u64,
 }
 
-/// Encodes a [`ScalarValue`] and a hash of the partition_by expressions
+/// Encodes a [`ScalarValue`] and a hash of the `partition_by` expressions
 ///
 /// # Errors
 /// Returns an error if the [`ScalarValue`] is not supported or cannot be
@@ -65,7 +65,7 @@ pub fn encode_pair(scalar: &ScalarValue, exprs_hash: u64) -> Result<String, Erro
 }
 
 /// Decodes a [`String`] back into a [`ScalarValue`] and the hash of the
-/// partition_by expressions.
+/// `partition_by` expressions.
 ///
 /// # Errors
 /// Returns an error if the str cannot be deserialized or converted to a

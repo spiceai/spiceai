@@ -94,9 +94,7 @@ impl DataAccelerator for PostgresAccelerator {
         ensure!(
             partition_by.is_none(),
             super::InvalidConfigurationSnafu {
-                msg: format!(
-                    "Postgres data accelerator does not support the `partition_by` parameter but it was provided"
-                )
+                msg: "Postgres data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
 

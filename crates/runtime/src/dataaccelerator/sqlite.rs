@@ -253,9 +253,7 @@ impl DataAccelerator for SqliteAccelerator {
         ensure!(
             partition_by.is_none(),
             super::InvalidConfigurationSnafu {
-                msg: format!(
-                    "Sqlite data accelerator does not support the `partition_by` parameter but it was provided"
-                )
+                msg: "Sqlite data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
 
@@ -382,7 +380,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let (table, _) = SqliteAccelerator::new()
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, None)
             .await
             .expect("table should be created");
 
