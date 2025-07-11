@@ -55,6 +55,37 @@ fn collect_or_equalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
     }
 }
 
+/// Collects inequality conditions from nested AND expressions, ensuring they are on the same column.
+fn collect_and_inequalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
+            let left_result = collect_and_inequalities(left);
+            let right_result = collect_and_inequalities(right);
+            match (left_result, right_result) {
+                (Some((col_left, mut lits_left)), Some((col_right, lits_right)))
+                    if col_left == col_right =>
+                {
+                    lits_left.extend(lits_right);
+                    Some((col_left, lits_left))
+                }
+                _ => None,
+            }
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::NotEq => {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(lit)) => {
+                    Some((col.name().to_string(), vec![lit.clone()]))
+                }
+                (Expr::Literal(lit), Expr::Column(col)) => {
+                    Some((col.name().to_string(), vec![lit.clone()]))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Determine whether a partition should be pruned based on filters, partition_by, and partition_value.
 pub(crate) fn prune_partition(
     filters: &[Expr],
@@ -99,6 +130,18 @@ pub(crate) fn prune_partition(
                     }
                     if !any_matches {
                         return Ok(true);
+                    }
+                } else if let Some((col_name, literals)) = collect_and_inequalities(filter) {
+                    for lit in literals {
+                        let is_match = filter_or_udf_value_matches(
+                            &Expr::Column(col_name.clone().into()),
+                            partition_by,
+                            partition_value,
+                            &lit,
+                        )?;
+                        if is_match {
+                            return Ok(true); // Prune if match for NOT IN-like condition
+                        }
                     }
                 }
             }
@@ -276,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_partition_or_2_items() -> Result<(), DataFusionError> {
+    fn test_prune_partition_or_equalities_2_items() -> Result<(), DataFusionError> {
         let partition_by = col("account_id");
         let filter = col("account_id")
             .eq(lit(1))
@@ -291,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_partition_or_3_items() -> Result<(), DataFusionError> {
+    fn test_prune_partition_or_equalities_3_items() -> Result<(), DataFusionError> {
         let partition_by = col("account_id");
         let filter = col("account_id")
             .eq(lit(1))
@@ -308,6 +351,44 @@ mod tests {
                 (4, true),
                 (5, true),
                 (6, true)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_and_inequalities_2_items() -> Result<(), DataFusionError> {
+        let partition_by = col("account_id");
+        let filter = col("account_id")
+            .not_eq(lit(1))
+            .and(col("account_id").not_eq(lit(2)));
+        assert_prune_partition!(
+            &[filter.clone()],
+            &partition_by,
+            Int32,
+            [(1, true), (2, true), (3, false), (4, false)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_and_inequalities_3_items() -> Result<(), DataFusionError> {
+        let partition_by = col("account_id");
+        let filter = col("account_id")
+            .not_eq(lit(1))
+            .and(col("account_id").not_eq(lit(2)))
+            .and(col("account_id").not_eq(lit(3)));
+        assert_prune_partition!(
+            &[filter.clone()],
+            &partition_by,
+            Int32,
+            [
+                (1, true),
+                (2, true),
+                (3, true),
+                (4, false),
+                (5, false),
+                (6, false)
             ]
         );
         Ok(())
@@ -410,6 +491,37 @@ mod tests {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
                 prune_partition(filters, &partition_by, &partition_value)?,
+                should_prune,
+                "partition_value = {partition_value:?}, should_prune = {should_prune}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_hash_and_inequalities_3_items() -> Result<(), DataFusionError> {
+        let partition_by = bucket_expr(vec![lit(10i64), col("account_id")]);
+        let filter = col("account_id")
+            .not_eq(lit(1))
+            .and(col("account_id").not_eq(lit(2)))
+            .and(col("account_id").not_eq(lit(3)));
+        let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
+        let hashed_values = (1..=6)
+            .map(|i| {
+                let ScalarValue::Int32(Some(val)) = call(
+                    &f,
+                    vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(i))],
+                )?
+                else {
+                    panic!("expected Int32");
+                };
+                Ok(val)
+            })
+            .collect::<Result<Vec<_>, DataFusionError>>()?;
+        for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
+            let partition_value = ScalarValue::Int32(Some(val));
+            assert_eq!(
+                prune_partition(&[filter.clone()], &partition_by, &partition_value)?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
