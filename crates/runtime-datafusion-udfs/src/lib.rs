@@ -14,17 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use datafusion::{catalog::TableProvider, scalar::ScalarValue};
-
-pub mod creator;
-pub mod expression;
-pub mod insert;
-pub mod provider;
-
-#[derive(Debug)]
-pub struct Partition {
-    pub partition_value: ScalarValue,
-    pub table_provider: Arc<dyn TableProvider>,
-}
+pub mod alias;
+pub mod bucket;
+pub mod cosine_distance;
+pub mod truncate;

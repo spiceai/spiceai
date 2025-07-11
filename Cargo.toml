@@ -19,6 +19,7 @@ members = [
     "crates/runtime",
     "crates/runtime-auth",
     "crates/runtime-datafusion-index",
+    "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",
     "crates/search",
     "crates/spice_cloud",
@@ -138,7 +139,7 @@ paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
 pin-project = "1.1"
-postcard = { version = "1.1.1", features = ["use-std"] }
+postcard = { version = "1.1.2", features = ["use-std"] }
 prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"

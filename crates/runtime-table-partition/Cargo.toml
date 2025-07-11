@@ -12,7 +12,11 @@ version.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
+futures.workspace = true
+parking_lot = "0.12"
 serde.workspace = true
 serde_qs = { git = "https://github.com/samscott89/serde_qs.git", rev = "f24f916a6420cf500c97fb85dc5e64015fdb6b40" }
 snafu.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+tokio-stream.workspace = true
+tracing.workspace = true
