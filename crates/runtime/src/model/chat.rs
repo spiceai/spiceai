@@ -124,8 +124,8 @@ pub async fn construct_model(
     })?;
 
     let model = match prefix {
-        ModelSource::HuggingFace => huggingface(model_id, component, params),
-        ModelSource::File => file(component, params),
+        ModelSource::HuggingFace => huggingface(model_id, component, params).await,
+        ModelSource::File => file(component, params).await,
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
@@ -206,7 +206,7 @@ fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
 }
 
-fn huggingface(
+async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &Parameters,
@@ -241,7 +241,7 @@ fn huggingface(
             path.display()
         );
     }
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
+    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token).await
 }
 
 async fn databricks(
@@ -434,7 +434,7 @@ fn azure(
     )) as Arc<dyn Chat>)
 }
 
-fn file(
+async fn file(
     component: &spicepod::component::model::Model,
     params: &Parameters,
 ) -> Result<Arc<dyn Chat>, LlmError> {
@@ -460,6 +460,7 @@ fn file(
         generation_config.as_deref(),
         chat_template_literal,
     )
+    .await
 }
 
 // Get OpenAI compatible request parameter overrides.
