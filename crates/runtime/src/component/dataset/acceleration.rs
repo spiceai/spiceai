@@ -127,6 +127,7 @@ pub enum Engine {
     #[default]
     Arrow,
     DuckDB,
+    PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
     Void,
@@ -136,7 +137,7 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Void => write!(f, "void"),
@@ -310,6 +311,7 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -354,7 +356,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
+        let engine =
+            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
+                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                    Engine::PartitionedDuckDB
+                }
+                engine => engine,
+            };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(

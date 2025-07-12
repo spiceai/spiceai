@@ -90,6 +90,17 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions
 
+lint-rust-fix:
+	cargo fmt --all -- --check
+	## All except metal, cuda
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions
+
 lint-go:
 	go vet ./...
 	golangci-lint run
