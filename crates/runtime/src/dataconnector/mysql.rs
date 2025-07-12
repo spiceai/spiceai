@@ -88,6 +88,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections to allow in the pool.")
         .default("100"),
+    ParameterSpec::component("time_zone")
+        .description("The time zone to use for the connection. Default is '+00:00' (UTC)."),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
@@ -147,6 +149,25 @@ impl DataConnectorFactory for MySQLFactory {
                 params
                     .parameters
                     .insert("pool_max".to_string(), pool_max.to_string().into());
+            }
+
+            if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
+                // "LOCAL_SYSTEM" value must be replaced with the actual system time zone information.
+                if time_zone.to_uppercase() == "LOCAL_SYSTEM" {
+                    let local_offset = format!("{}", chrono::Local::now().offset());
+                    tracing::debug!(
+                        "Using local system time zone '{local_offset}' to connect to MySQL table '{}'",
+                        params.component
+                    );
+                    params
+                        .parameters
+                        .insert("time_zone".to_string(), local_offset.into());
+                } else {
+                    tracing::debug!(
+                        "Using time zone '{time_zone}' to connect to MySQL table '{}'",
+                        params.component
+                    );
+                }
             }
 
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
