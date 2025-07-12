@@ -17,12 +17,13 @@ use arrow_schema::DataType;
 use snafu::Snafu;
 use tantivy::TantivyError;
 
-use crate::datafusion::Error as DataFusionError;
+use datafusion::error::DataFusionError;
 
 pub mod analyzer_rule;
 pub mod connector;
 pub mod index;
 pub mod udtf;
+mod util;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
