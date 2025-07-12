@@ -13,12 +13,9 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::{
-        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
-        EmbeddingVector, EncodingFormat,
-    },
+use async_openai::types::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
+    EmbeddingVector, EncodingFormat,
 };
 use async_trait::async_trait;
 use hf_hub::api::tokio::ApiError as HfApiError;
@@ -143,19 +140,9 @@ pub trait Embed: Debug + Sync + Send {
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
     #[allow(clippy::cast_possible_truncation)]
-    async fn embed_request(
-        &self,
-        req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         let format = req.encoding_format.unwrap_or_default();
-        let result = self.embed(req.input).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let result = self.embed(req.input).await?;
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),

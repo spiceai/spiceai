@@ -203,10 +203,14 @@ where
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
         let texts = Self::convert_input_to_texts(&req.input);
 
-        let (vectors, num_tokens) = self.embed_texts(texts).await?;
+        let (vectors, num_tokens) = self
+            .embed_texts(texts)
+            .await
+            .boxed()
+            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),

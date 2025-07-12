@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::Instant};
 
-use async_openai::{
-    error::OpenAIError,
-    types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat},
+use async_openai::types::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
 use llms::{
@@ -118,7 +117,7 @@ impl Embed for TaskEmbed {
     async fn embed_request<'b>(
         &'b self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
         let start = Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&req.input).unwrap_or_default());
 

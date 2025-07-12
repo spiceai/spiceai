@@ -36,7 +36,7 @@ use crate::{
     HealthCheck,
     chat::{Chat, nsql::SqlGeneration},
     config::{GenericAuthMechanism, HostedModelConfig},
-    embeddings::Embed,
+    embeddings::{Embed, Error, Result},
 };
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
@@ -169,18 +169,18 @@ impl Embed for Databricks {
         Ok(())
     }
 
-    async fn embed_request(
-        &self,
-        req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
-        self.client.post("", req).await
+        self.client
+            .post("", req)
+            .await
+            .map_err(|e| Error::FailedToCreateEmbedding { source: e.into() })
     }
     fn size(&self) -> i32 {
         -1
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> crate::embeddings::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         let resp = self
             .embed_request(CreateEmbeddingRequest {
                 model: self.model.clone(),
@@ -191,7 +191,7 @@ impl Embed for Databricks {
             })
             .await
             .boxed()
-            .map_err(|e| crate::embeddings::Error::FailedToCreateEmbedding { source: e })?;
+            .map_err(|e| Error::FailedToCreateEmbedding { source: e })?;
 
         Ok(resp
             .data
