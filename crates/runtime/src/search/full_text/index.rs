@@ -38,14 +38,22 @@ use runtime_datafusion_index::Index;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
-use snafu::{ResultExt, Snafu};
+use snafu::ResultExt;
 use std::collections::HashSet;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
 
-use crate::datafusion::query::write_to_json_string;
-use crate::object_store_registry::SpiceObjectStoreRegistry;
 use crate::search::util::get_primary_keys;
+use crate::{datafusion::query::write_to_json_string, search::full_text::Error};
+use crate::{
+    object_store_registry::SpiceObjectStoreRegistry,
+    search::full_text::{
+        FailedToInsertDataIntoIndexSnafu, IndexCreationSnafu, InvalidIndexingSnafu,
+    },
+};
+
+/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
+pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
 
 #[derive(Clone, Debug)]
 pub struct FullTextDatabaseIndex {
@@ -77,43 +85,6 @@ impl Index for FullTextDatabaseIndex {
             tracing::error!("Failed to update full text search index: {e}");
         }
     }
-}
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Full text search requires a primary key, and the table did not have one.",))]
-    NoPrimaryKey,
-
-    #[snafu(display(
-        "Primary key column '{column}' used in search index has unsupported data type: '{data_type}'",
-    ))]
-    PrimaryKeyInvalidType { column: String, data_type: DataType },
-
-    #[snafu(display("Primary key column '{column}' not found in table.",))]
-    PrimaryKeyNotFound { column: String },
-
-    #[snafu(display("Failed to create a full text search index: {source}.",))]
-    IndexCreationError { source: TantivyError },
-
-    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
-    IndexInsertionError { source: TantivyError },
-
-    #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
-    FailedToRetrieveDataFromIndex { source: TantivyError },
-
-    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
-    FailedToRetrieveDataFromSource { source: DataFusionError },
-
-    #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
-    FailedToInsertDataIntoIndex { source: TantivyError },
-
-    #[snafu(display(
-        "Failed to create the full text search index. Context: {context}. Error: {source}.",
-    ))]
-    InvalidIndexingError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-        context: String,
-    },
 }
 
 impl FullTextDatabaseIndex {
@@ -190,11 +161,14 @@ impl FullTextDatabaseIndex {
         })
     }
 
+    /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
+    /// columns present will be ignored.
+    ///
+    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
     fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
-        // TODO: delete old values that are found in `batches`.
         let mut index_writer: tantivy::IndexWriter = self
             .index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
             .context(IndexCreationSnafu)?;
 
         self.delete_existing_from_primary_key(&index_writer, rb)?;
@@ -357,6 +331,8 @@ fn parse_json_array(
 }
 
 /// Macro to downcast an `ArrayRef` to concrete Arrow array type or return Err.
+///
+/// Users should check type-compatibility beforehand using [`ArrayRef::data_type`].
 macro_rules! downcast_array {
     ($ARRAY:expr, $TY:ty) => {
         $ARRAY.as_any().downcast_ref::<$TY>().ok_or_else(|| {
