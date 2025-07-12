@@ -30,8 +30,9 @@ use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::ResultExt;
 use std::collections::HashSet;
+use tantivy::query::TermQuery;
 use tantivy::schema::DocParsingError;
-use tantivy::{TantivyDocument, TantivyError};
+use tantivy::{ReloadPolicy, TantivyDocument, TantivyError};
 
 use crate::search::{
     full_text::util::{array_to_terms, with_json_subset_column},
@@ -113,19 +114,21 @@ impl FullTextDatabaseIndex {
         })
     }
 
+    /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
+    /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
     fn existing_terms_to_delete(&self, rb: &[RecordBatch]) -> Result<Vec<tantivy::Term>, Error> {
         let Some(pk) = self.primary_key.first() else {
             // Should not occur, but no primary key implies none must be deleted.
             return Ok(vec![]);
         };
 
-        let pk_field = if self.primary_key.len() == 1 {
+        let (pk_field, pk) = if self.primary_key.len() == 1 {
             let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
                 return Err(Error::FailedToRetrieveDataFromIndex {
                     source: TantivyError::FieldNotFound(pk.clone()),
                 });
             };
-            pk_field
+            (pk_field, pk.clone())
         } else {
             // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
             let Some((pk_field, _)) = self.index.schema().find_field(INDEX_UNIQUE_FIELD_NAME)
@@ -137,12 +140,12 @@ impl FullTextDatabaseIndex {
                     ),
                 });
             };
-            pk_field
+            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
         };
 
         Ok(rb
             .iter()
-            .filter_map(|r| r.column_by_name(pk))
+            .filter_map(|r| r.column_by_name(pk.as_str()))
             .map(|arr| array_to_terms(pk_field, arr))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Error::FailedToRetrieveDataFromSource {
@@ -158,15 +161,6 @@ impl FullTextDatabaseIndex {
     ///
     /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
     fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
-        let mut index_writer: tantivy::IndexWriter = self
-            .index
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        for t in self.existing_terms_to_delete(rb)? {
-            index_writer.delete_term(t);
-        }
-
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if self.primary_key.len() > 1 {
             rb.iter()
@@ -178,6 +172,19 @@ impl FullTextDatabaseIndex {
         } else {
             rb.to_vec()
         };
+
+        // Updates in tantivy are a deletion then insertion.
+        let mut index_writer: tantivy::IndexWriter = self
+            .index
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+            .context(IndexCreationSnafu)?;
+
+        // Deletion.
+        for t in self.existing_terms_to_delete(&rb)? {
+            index_writer.delete_term(t);
+        }
+
+        // Insertion.
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
@@ -229,26 +236,42 @@ impl FullTextDatabaseIndex {
             };
             match field.data_type() {
                 DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_f64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_u64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    schema_builder.add_i64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_i64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::Boolean => {
-                    schema_builder.add_bool_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_bool_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
 
-                DataType::Date32 | DataType::Date64 => {
-                    schema_builder.add_date_field(p.as_str(), tantivy::schema::STORED);
-                }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED);
+                    // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
+                    schema_builder.add_text_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::STRING,
+                    );
                 }
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_bytes_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 dt => {
                     return Err(Error::PrimaryKeyInvalidType {
@@ -261,7 +284,7 @@ impl FullTextDatabaseIndex {
 
         // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
         if primary_key.len() > 1 {
-            schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STORED);
+            schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STRING);
         }
 
         for s in search_fields {

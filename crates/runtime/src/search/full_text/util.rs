@@ -43,7 +43,7 @@ pub fn with_json_subset_column(
     let mut subset_arrays = Vec::with_capacity(subset_columns.len());
     for col_name in subset_columns {
         let idx = batch.schema().index_of(col_name.as_str()).boxed()?;
-        subset_fields.push(Arc::clone(&batch.schema().field(idx)));
+        subset_fields.push(batch.schema().field(idx).clone());
         subset_arrays.push(Arc::clone(&batch.column(idx)));
     }
 
