@@ -54,6 +54,7 @@ use crate::{
 
 /// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
 pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
+pub static INDEX_UNIQUE_FIELD_NAME: &'static str = "__spice.unique_field";
 
 #[derive(Clone, Debug)]
 pub struct FullTextDatabaseIndex {
@@ -102,6 +103,13 @@ impl FullTextDatabaseIndex {
             }
         };
 
+        // INDEX_UNIQUE_FIELD_NAME is a reserved field name.
+        if pks.contains(INDEX_UNIQUE_FIELD_NAME) {
+            return Err(Error::PrimaryKeyInvalidName {
+                column: INDEX_UNIQUE_FIELD_NAME,
+            });
+        }
+
         let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
 
         Ok(Self {
@@ -112,53 +120,44 @@ impl FullTextDatabaseIndex {
         })
     }
 
-    fn delete_existing_from_primary_key(
-        &self,
-        writer: &tantivy::IndexWriter,
-        rb: &[RecordBatch],
-    ) -> Result<(), Error> {
-        if let Some(pk) = self.primary_key.first() {
-            if self.primary_key.len() == 1 {
-                let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
-                    return Err(Error::FailedToRetrieveDataFromIndex {
-                        source: TantivyError::FieldNotFound(pk.clone()),
-                    });
-                };
-                let terms: Vec<tantivy::Term> = rb
-                    .iter()
-                    .filter_map(|r| r.column_by_name(pk))
-                    .map(|arr| array_to_terms(pk_field, arr))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Error::FailedToRetrieveDataFromSource {
-                        source: DataFusionError::ArrowError(e, None),
-                    })?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                for t in terms {
-                    writer.delete_term(t);
-                }
-                return Ok(());
-            }
-        }
+    fn existing_terms_to_delete(&self, rb: &[RecordBatch]) -> Result<Vec<tantivy::Term>, Error> {
+        let Some(pk) = self.primary_key.first() else {
+            // Should not occur, but no primary key implies none must be deleted.
+            return Ok(vec![]);
+        };
 
-        // let column: Vec<&ArrayRef> =
-        //     rb.iter().filter_map(|rb| {
-        //         let rb_schema = rb.schema();
-        //         let proj: Vec<usize> = self.primary_key.iter().filter_map(|p| rb_schema.column_with_name(p.as_str())?.0).collect();
-        //         let pks = rb.project(&proj).expect("bad");
-        //         arrow_json::writer
+        let pk_field = if self.primary_key.len() == 1 {
+            let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
+                return Err(Error::FailedToRetrieveDataFromIndex {
+                    source: TantivyError::FieldNotFound(pk.clone()),
+                });
+            };
+            pk_field
+        } else {
+            // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
+            let Some((pk_field, _)) = self.index.schema().find_field(INDEX_UNIQUE_FIELD_NAME)
+            else {
+                return Err(Error::InvalidIndexingError {
+                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
+                    context: format!(
+                        "Full text search has multiple primary key columns, so the column '{INDEX_UNIQUE_FIELD_NAME}' should be present, but is not.",
+                    ),
+                });
+            };
+            pk_field
+        };
 
-        //     }).collect();
-        // arrow_json
-        // writer.delete_term(term)
-
-        // TODO handle multi column case
-        Err(Error::FailedToRetrieveDataFromIndex {
-            source: TantivyError::InternalError(
-                "currently not handling multiple columns".to_string(),
-            ),
-        })
+        Ok(rb
+            .iter()
+            .filter_map(|r| r.column_by_name(pk))
+            .map(|arr| array_to_terms(pk_field, arr))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::FailedToRetrieveDataFromSource {
+                source: DataFusionError::ArrowError(e, None),
+            })?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
@@ -171,8 +170,11 @@ impl FullTextDatabaseIndex {
             .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
             .context(IndexCreationSnafu)?;
 
-        self.delete_existing_from_primary_key(&index_writer, rb)?;
+        for t in self.existing_terms_to_delete(rb)? {
+            index_writer.delete_term(t);
+        }
 
+        // TODO: need to add INDEX_UNIQUE_FIELD_NAME when needed.
         let doc_json = write_to_json_string(rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
@@ -254,6 +256,11 @@ impl FullTextDatabaseIndex {
             }
         }
 
+        // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
+        if primary_key.len() > 1 {
+            schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STORED);
+        }
+
         for s in search_fields {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
@@ -262,12 +269,14 @@ impl FullTextDatabaseIndex {
     }
 
     fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
-        let env = RuntimeEnvBuilder::default()
-            .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
-            .build()?;
-        let ctx = SessionContext::new_with_config_rt(SessionConfig::default(), Arc::new(env));
-
-        Ok(Arc::new(ctx))
+        Ok(Arc::new(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnvBuilder::default()
+                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+                    .build()?,
+            ),
+        )))
     }
 
     pub fn full_text_search_field_index(

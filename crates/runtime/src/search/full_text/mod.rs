@@ -35,6 +35,9 @@ pub enum Error {
     ))]
     PrimaryKeyInvalidType { column: String, data_type: DataType },
 
+    #[snafu(display("Primary key column '{column}' used in search index is not allowed.",))]
+    PrimaryKeyInvalidName { column: String },
+
     #[snafu(display("Primary key column '{column}' not found in table.",))]
     PrimaryKeyNotFound { column: String },
 
