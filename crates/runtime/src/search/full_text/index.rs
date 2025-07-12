@@ -131,8 +131,7 @@ impl FullTextDatabaseIndex {
             }
         };
 
-        let index =
-            Self::create_index(Arc::clone(&inner), search_fields.as_slice(), pks.as_slice())?;
+        let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
 
         Ok(Self {
             base_table: inner,
@@ -157,7 +156,7 @@ impl FullTextDatabaseIndex {
                 let terms: Vec<tantivy::Term> = rb
                     .iter()
                     .filter_map(|r| r.column_by_name(pk))
-                    .map(|arr| array_to_terms(pk_field.clone(), arr))
+                    .map(|arr| array_to_terms(pk_field, arr))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Error::FailedToRetrieveDataFromSource {
                         source: DataFusionError::ArrowError(e, None),
@@ -169,8 +168,8 @@ impl FullTextDatabaseIndex {
                     writer.delete_term(t);
                 }
                 return Ok(());
-            };
-        };
+            }
+        }
 
         // let column: Vec<&ArrayRef> =
         //     rb.iter().filter_map(|rb| {
@@ -185,7 +184,9 @@ impl FullTextDatabaseIndex {
 
         // TODO handle multi column case
         Err(Error::FailedToRetrieveDataFromIndex {
-            source: TantivyError::InternalError(format!("currently not handling multiple columns")),
+            source: TantivyError::InternalError(
+                "currently not handling multiple columns".to_string(),
+            ),
         })
     }
 
@@ -233,7 +234,7 @@ impl FullTextDatabaseIndex {
     }
 
     fn create_index(
-        base_table: Arc<dyn TableProvider>,
+        base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
     ) -> Result<Arc<tantivy::Index>, Error> {
@@ -364,6 +365,7 @@ macro_rules! downcast_array {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowError> {
     let mut terms = Vec::with_capacity(arr.len());
 
@@ -373,7 +375,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, Float16Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    let v = a.value(i).to_f32() as f64;
+                    let v = f64::from(a.value(i).to_f32());
                     terms.push(Term::from_field_f64(field, v));
                 }
             }
@@ -382,7 +384,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, Float32Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    let v = a.value(i) as f64;
+                    let v = f64::from(a.value(i));
                     terms.push(Term::from_field_f64(field, v));
                 }
             }
@@ -401,7 +403,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, UInt8Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
                 }
             }
         }
@@ -409,7 +411,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, UInt16Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
                 }
             }
         }
@@ -417,7 +419,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, UInt32Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                    terms.push(Term::from_field_u64(field, u64::from(a.value(i))));
                 }
             }
         }
@@ -435,7 +437,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, Int8Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
                 }
             }
         }
@@ -443,7 +445,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, Int16Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
                 }
             }
         }
@@ -451,7 +453,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
             let a = downcast_array!(arr, Int32Array);
             for i in 0..a.len() {
                 if a.is_valid(i) {
-                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                    terms.push(Term::from_field_i64(field, i64::from(a.value(i))));
                 }
             }
         }
@@ -481,7 +483,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
                 if a.is_valid(i) {
                     terms.push(Term::from_field_date(
                         field,
-                        tantivy::DateTime::from_timestamp_secs((a.value(i) as i64) * 86_400),
+                        tantivy::DateTime::from_timestamp_secs(i64::from(a.value(i)) * 86_400),
                     ));
                 }
             }
@@ -537,8 +539,7 @@ pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowEr
         // --- Everything else is unsupported
         other => {
             return Err(ArrowError::NotYetImplemented(format!(
-                "Cannot use primary key of arrow type {:?} for full-text search",
-                other
+                "Cannot use primary key of arrow type {other:?} for full-text search"
             )));
         }
     }
