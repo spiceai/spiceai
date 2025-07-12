@@ -75,7 +75,14 @@ impl OracleConnectionParams {
     }
 }
 
-pub struct OracleOnPremConnectionParamsBuilder {
+/// Default TCP port for Oracle Database (commonly used in on-prem/self-managed installations).
+const DEFAULT_PORT: u16 = 1521;
+
+/// `XEPDB1` is the default pluggable database (PDB) name in Oracle Database XE 18c/21c and later versions.
+static DEFAULT_SERVICE_NAME: &str = "XEPDB1";
+
+/// Builds Oracle connection parameters for direct TCP connections using host, port, and service name.
+pub struct OracleDirectConnectionParamsBuilder {
     host: String,
     username: String,
     password: String,
@@ -83,7 +90,7 @@ pub struct OracleOnPremConnectionParamsBuilder {
     service_name: Option<String>,
 }
 
-impl OracleOnPremConnectionParamsBuilder {
+impl OracleDirectConnectionParamsBuilder {
     pub fn new(
         host: impl Into<String>,
         username: impl Into<String>,
@@ -112,9 +119,10 @@ impl OracleOnPremConnectionParamsBuilder {
     pub fn build(self) -> OracleConnectionParams {
         let connect_string = format!(
             "//{}:{}/{}",
-            self.port.unwrap_or(1521),
             self.host,
-            self.service_name.unwrap_or_else(|| "XEPDB1".to_string())
+            self.port.unwrap_or(DEFAULT_PORT),
+            self.service_name
+                .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string())
         );
 
         OracleConnectionParams {
@@ -127,16 +135,24 @@ impl OracleOnPremConnectionParamsBuilder {
 
 pub async fn connect(
     params: &OracleConnectionParams,
-    tns_admin: Option<&str>,
+    wallet_path: Option<&str>,
 ) -> super::Result<OracleConnectionPool> {
-    if let Some(tns_admin) = tns_admin {
-        // Initializes Oracle client library with the specified TNS_ADMIN directory
-        // Note: this is applied for the first connection only, if library is already initialized, dynamically changing TNS_ADMIN has no effect
-        let _ = oracle::InitParams::new()
-            .oracle_client_config_dir(tns_admin)
+    if let Some(wallet_path) = wallet_path {
+        // Initializes Oracle client library with the specified wallet directory
+        // Note: this is applied for the first connection only, if library is already initialized, dynamically changing wallet directory has no effect
+        let initialized_here = oracle::InitParams::new()
+            .oracle_client_config_dir(wallet_path)
             .context(OracleInitSnafu)?
             .init()
             .context(OracleInitSnafu)?;
+
+        if initialized_here {
+            tracing::info!("Using wallet directory for Oracle data connector: {wallet_path}");
+        } else {
+            tracing::debug!(
+                "Oracle client library was already initialized, using existing configuration"
+            );
+        }
     }
 
     let connector = Connector::new(
