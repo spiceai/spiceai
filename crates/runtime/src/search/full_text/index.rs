@@ -14,13 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::RecordBatch;
-use arrow_schema::DataType;
+use std::{any::Any, sync::Arc};
+
+use arrow::{
+    array::{
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float16Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
+    },
+    datatypes::DataType,
+    error::ArrowError,
+};
+use tantivy::{Term, schema::Field};
+
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::parquet::file::page_index::index_reader;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use logos::Source;
 use runtime_datafusion_index::Index;
@@ -29,9 +40,8 @@ use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashSet;
-use std::sync::Arc;
 use tantivy::schema::DocParsingError;
-use tantivy::{ReloadPolicy, TantivyDocument, TantivyError, Term};
+use tantivy::{TantivyDocument, TantivyError};
 
 use crate::datafusion::query::write_to_json_string;
 use crate::object_store_registry::SpiceObjectStoreRegistry;
@@ -49,6 +59,10 @@ pub struct FullTextDatabaseIndex {
 impl Index for FullTextDatabaseIndex {
     fn name(&self) -> &'static str {
         "full_text"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn required_columns(&self) -> Vec<String> {
@@ -83,6 +97,9 @@ pub enum Error {
 
     #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
     IndexInsertionError { source: TantivyError },
+
+    #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
+    FailedToRetrieveDataFromIndex { source: TantivyError },
 
     #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
     FailedToRetrieveDataFromSource { source: DataFusionError },
@@ -125,27 +142,67 @@ impl FullTextDatabaseIndex {
         })
     }
 
+    fn delete_existing_from_primary_key(
+        &self,
+        writer: &tantivy::IndexWriter,
+        rb: &[RecordBatch],
+    ) -> Result<(), Error> {
+        if let Some(pk) = self.primary_key.first() {
+            if self.primary_key.len() == 1 {
+                let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
+                    return Err(Error::FailedToRetrieveDataFromIndex {
+                        source: TantivyError::FieldNotFound(pk.clone()),
+                    });
+                };
+                let terms: Vec<tantivy::Term> = rb
+                    .iter()
+                    .filter_map(|r| r.column_by_name(pk))
+                    .map(|arr| array_to_terms(pk_field.clone(), arr))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Error::FailedToRetrieveDataFromSource {
+                        source: DataFusionError::ArrowError(e, None),
+                    })?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                for t in terms {
+                    writer.delete_term(t);
+                }
+                return Ok(());
+            };
+        };
+
+        // let column: Vec<&ArrayRef> =
+        //     rb.iter().filter_map(|rb| {
+        //         let rb_schema = rb.schema();
+        //         let proj: Vec<usize> = self.primary_key.iter().filter_map(|p| rb_schema.column_with_name(p.as_str())?.0).collect();
+        //         let pks = rb.project(&proj).expect("bad");
+        //         arrow_json::writer
+
+        //     }).collect();
+        // arrow_json
+        // writer.delete_term(term)
+
+        // TODO handle multi column case
+        Err(Error::FailedToRetrieveDataFromIndex {
+            source: TantivyError::InternalError(format!("currently not handling multiple columns")),
+        })
+    }
+
     fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
         // TODO: delete old values that are found in `batches`.
+        let mut index_writer: tantivy::IndexWriter = self
+            .index
+            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
+            .context(IndexCreationSnafu)?;
+
+        self.delete_existing_from_primary_key(&index_writer, rb)?;
 
         let doc_json = write_to_json_string(rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
         let docs = parse_json_array(&self.index.schema(), doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        let index_reader = self
-            .index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .context(IndexCreationSnafu)?;
-        index_reader.searcher().search(query, collector)
-
-        let mut index_writer: tantivy::IndexWriter = self
-            .index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .context(IndexCreationSnafu)?;
 
         for doc in docs {
             index_writer.add_document(doc).context(IndexCreationSnafu)?;
@@ -192,10 +249,10 @@ impl FullTextDatabaseIndex {
             };
             match field.data_type() {
                 DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED );
+                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED);
                 }
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED );
+                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED);
                 }
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                     schema_builder.add_i64_field(p.as_str(), tantivy::schema::STORED);
@@ -208,10 +265,10 @@ impl FullTextDatabaseIndex {
                     schema_builder.add_date_field(p.as_str(), tantivy::schema::STORED);
                 }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED );
+                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED);
                 }
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED );
+                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED);
                 }
                 dt => {
                     return Err(Error::PrimaryKeyInvalidType {
@@ -296,4 +353,195 @@ fn parse_json_array(
         .into_iter()
         .map(|obj| TantivyDocument::from_json_object(schema, obj))
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Macro to downcast an `ArrayRef` to concrete Arrow array type or return Err.
+macro_rules! downcast_array {
+    ($ARRAY:expr, $TY:ty) => {
+        $ARRAY.as_any().downcast_ref::<$TY>().ok_or_else(|| {
+            ArrowError::CastError(format!("Expected arrow array of type {}", stringify!($TY)))
+        })?
+    };
+}
+
+pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowError> {
+    let mut terms = Vec::with_capacity(arr.len());
+
+    match arr.data_type() {
+        // --- Floats → f64
+        DataType::Float16 => {
+            let a = downcast_array!(arr, Float16Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    let v = a.value(i).to_f32() as f64;
+                    terms.push(Term::from_field_f64(field, v));
+                }
+            }
+        }
+        DataType::Float32 => {
+            let a = downcast_array!(arr, Float32Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    let v = a.value(i) as f64;
+                    terms.push(Term::from_field_f64(field, v));
+                }
+            }
+        }
+        DataType::Float64 => {
+            let a = downcast_array!(arr, Float64Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_f64(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Unsigned ints → u64
+        DataType::UInt8 => {
+            let a = downcast_array!(arr, UInt8Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                }
+            }
+        }
+        DataType::UInt16 => {
+            let a = downcast_array!(arr, UInt16Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                }
+            }
+        }
+        DataType::UInt32 => {
+            let a = downcast_array!(arr, UInt32Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_u64(field, a.value(i) as u64));
+                }
+            }
+        }
+        DataType::UInt64 => {
+            let a = downcast_array!(arr, UInt64Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_u64(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Signed ints → i64
+        DataType::Int8 => {
+            let a = downcast_array!(arr, Int8Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                }
+            }
+        }
+        DataType::Int16 => {
+            let a = downcast_array!(arr, Int16Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                }
+            }
+        }
+        DataType::Int32 => {
+            let a = downcast_array!(arr, Int32Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_i64(field, a.value(i) as i64));
+                }
+            }
+        }
+        DataType::Int64 => {
+            let a = downcast_array!(arr, Int64Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_i64(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Boolean
+        DataType::Boolean => {
+            let a = downcast_array!(arr, BooleanArray);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_bool(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Dates
+        DataType::Date32 => {
+            let a = downcast_array!(arr, Date32Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_date(
+                        field,
+                        tantivy::DateTime::from_timestamp_secs((a.value(i) as i64) * 86_400),
+                    ));
+                }
+            }
+        }
+        DataType::Date64 => {
+            let a = downcast_array!(arr, Date64Array);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_date(
+                        field,
+                        tantivy::DateTime::from_timestamp_millis(a.value(i)),
+                    ));
+                }
+            }
+        }
+
+        // --- UTF8 text
+        DataType::Utf8 => {
+            let a = downcast_array!(arr, StringArray);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_text(field, a.value(i)));
+                }
+            }
+        }
+        DataType::LargeUtf8 => {
+            let a = downcast_array!(arr, LargeStringArray);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_text(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Binary blobs
+        DataType::Binary => {
+            let a = downcast_array!(arr, BinaryArray);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_bytes(field, a.value(i)));
+                }
+            }
+        }
+        DataType::LargeBinary => {
+            let a = downcast_array!(arr, LargeBinaryArray);
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    terms.push(Term::from_field_bytes(field, a.value(i)));
+                }
+            }
+        }
+
+        // --- Everything else is unsupported
+        other => {
+            return Err(ArrowError::NotYetImplemented(format!(
+                "Cannot use primary key of arrow type {:?} for full-text search",
+                other
+            )));
+        }
+    }
+
+    Ok(terms)
 }
