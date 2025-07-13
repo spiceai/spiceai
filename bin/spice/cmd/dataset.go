@@ -71,17 +71,22 @@ spice dataset configure
 			datasetName = defaultDatasetName
 		}
 
-		match, err := regexp.MatchString("^[a-zA-Z0-9_]+$", datasetName)
+		match, err := regexp.MatchString("^[a-zA-Z0-9_-]+$", datasetName)
 		if err != nil {
 			slog.Error("Error validating dataset name", "error", err)
 			os.Exit(1)
 		}
 
 		if !match {
-			slog.Error(fmt.Sprintf("%v", aurora.BrightRed("Dataset name can only contain letters, numbers and underscores.")))
+			slog.Error(fmt.Sprintf("%v", aurora.BrightRed("Dataset name can only contain letters, numbers, underscores and hyphens.")))
 			os.Exit(1)
 		}
 
+		if strings.Contains(datasetName, "-") {
+			// warn that dataset name with hyphen should be quoted in queries
+			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
+		}
+	
 		cmd.Print("description: ")
 		description, err := reader.ReadString('\n')
 		if err != nil {
