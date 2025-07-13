@@ -19,6 +19,8 @@ use std::sync::Arc;
 use common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use mysql_async::prelude::Queryable;
 
+use spicepod::component::dataset::Dataset;
+use spicepod::param::ParamValue;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
@@ -36,6 +38,7 @@ use tracing::instrument;
 
 const MYSQL_PORT1: u16 = 13316;
 const MYSQL_PORT2: u16 = 13317;
+const MYSQL_PORT3: u16 = 13318;
 
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -394,4 +397,148 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
             Ok(())
         })
         .await
+}
+
+#[tokio::test]
+async fn mysql_timezone_test() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_PORT3)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_tz_test_db(MYSQL_PORT3)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL timezone database: {e}");
+                e.to_string()
+            })?;
+
+            let mut ds_system = make_mysql_dataset("tz_test", "tz_system_tbl", MYSQL_PORT3, false);
+            set_dataset_time_zone(&mut ds_system, "system")?;
+
+            let mut ds_custom = make_mysql_dataset("tz_test", "tz_custom_tbl", MYSQL_PORT3, false);
+            set_dataset_time_zone(&mut ds_custom, "+02:00")?;
+
+            let app = AppBuilder::new("mysql_timezone_test")
+                .with_dataset(ds_system)
+                .with_dataset(ds_custom)
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "mysql_timezone_test",
+                "SELECT * FROM tz_system_tbl ORDER BY id",
+                false,
+                Some(Box::new(
+                    |result_batches: Vec<arrow::array::RecordBatch>| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+
+                        insta::assert_snapshot!("system_time_zone", results);
+                    },
+                )),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "mysql_timezone_test",
+                "SELECT * FROM tz_custom_tbl ORDER BY id",
+                false,
+                Some(Box::new(
+                    |result_batches: Vec<arrow::array::RecordBatch>| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+
+                        insta::assert_snapshot!("custom_time_zone", results);
+                    },
+                )),
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[instrument]
+async fn init_mysql_tz_test_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+
+    // Set timezone to UTC
+    conn.query_drop("SET time_zone = '+00:00'").await?;
+
+    tracing::debug!("DROP TABLE IF EXISTS tz_test");
+    let _: Vec<Row> = conn
+        .exec("DROP TABLE IF EXISTS tz_test", Params::Empty)
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "CREATE TABLE tz_test (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                ts TIMESTAMP
+            )",
+            Params::Empty,
+        )
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO tz_test (ts) VALUES 
+                ('2024-06-01 08:00:00'),
+                ('2024-06-01 12:00:00'),
+                ('2024-06-01 16:00:00')",
+            Params::Empty,
+        )
+        .await?;
+
+    Ok(())
+}
+
+fn set_dataset_time_zone(ds: &mut Dataset, tz: &str) -> Result<(), String> {
+    let Some(params) = ds.params.as_mut() else {
+        return Err("Dataset params are missing".to_string());
+    };
+    params.data.insert(
+        "mysql_time_zone".to_string(),
+        ParamValue::String(tz.to_string()),
+    );
+    Ok(())
 }
