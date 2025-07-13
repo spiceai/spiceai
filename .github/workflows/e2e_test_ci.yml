@@ -5,7 +5,7 @@ on:
     branches:
       - trunk
       - release-*
-      - release/* 
+      - release/*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -1176,11 +1176,12 @@ jobs:
         working-directory: test_app
         run: |
           echo "runtime:" >> spicepod.yaml
-          echo "  results_cache:" >> spicepod.yaml
-          echo "    enabled: true" >> spicepod.yaml
-          echo "    eviction_policy: lru" >> spicepod.yaml
-          echo "    cache_max_size: 128MiB" >> spicepod.yaml
-          echo "    item_ttl: 300s" >> spicepod.yaml
+          echo "  caching:" >> spicepod.yaml
+          echo "    sql_results:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      max_size: 128MiB" >> spicepod.yaml
+          echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
           echo "  - from: s3://spiceai-demo-datasets/tpch/customer/" >> spicepod.yaml
           echo "    name: customer" >> spicepod.yaml
@@ -1625,7 +1626,12 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        spicepod: [duckdb_append_with_pk_and_indexes.yaml, duckdb_append_with_pk.yaml, duckdb_append_with_indexes.yaml]
+        spicepod:
+          [
+            duckdb_append_with_pk_and_indexes.yaml,
+            duckdb_append_with_pk.yaml,
+            duckdb_append_with_indexes.yaml,
+          ]
         # run only on "Linux x64"
         exclude:
           - target:
@@ -1780,7 +1786,12 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        spicepod: [duckdb_full_with_pk_and_indexes.yaml, duckdb_full_with_pk.yaml, duckdb_full_with_indexes.yaml]
+        spicepod:
+          [
+            duckdb_full_with_pk_and_indexes.yaml,
+            duckdb_full_with_pk.yaml,
+            duckdb_full_with_indexes.yaml,
+          ]
         # run only on "Linux x64"
         exclude:
           - target:

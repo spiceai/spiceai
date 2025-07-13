@@ -202,6 +202,9 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_by: Vec<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -241,6 +244,7 @@ impl Default for Acceleration {
             primary_key: None,
             on_conflict: HashMap::default(),
             metrics: None,
+            partition_by: vec![],
         }
     }
 }

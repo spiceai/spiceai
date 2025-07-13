@@ -25,6 +25,7 @@ mod embed;
 pub(crate) mod eval;
 mod metrics;
 mod model_context;
+mod params;
 mod tool_use;
 mod wrapper;
 

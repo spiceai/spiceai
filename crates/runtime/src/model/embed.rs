@@ -20,6 +20,12 @@ use crate::{get_params_with_secrets, secrets::Secrets};
 use bytes::Bytes;
 use itertools::Itertools;
 use llms::HealthCheck;
+#[cfg(feature = "bedrock")]
+use llms::bedrock::{
+    self, BedrockClient,
+    embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
+};
+
 use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
@@ -68,6 +74,127 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Databricks => {
             databricks(model_id, &params, Arc::clone(&token_provider_registry)).await
         }
+        #[cfg(feature = "bedrock")]
+        EmbeddingPrefix::Bedrock => bedrock(model_id, &params).await,
+        #[cfg(not(feature = "bedrock"))]
+        EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
+            from: "bedrock".to_string(),
+        }),
+    }
+}
+
+#[cfg(feature = "bedrock")]
+async fn bedrock(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "bedrock".to_string(),
+        });
+    };
+
+    // Build AWS config
+    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
+
+    // Set region if provided
+    if let Some(region) = extract_secret!(params, "aws_region") {
+        config_builder = config_builder.region(aws_config::Region::new(region.to_owned()));
+    }
+
+    // Set profile if provided
+    if let Some(profile) = extract_secret!(params, "aws_profile") {
+        config_builder = config_builder.profile_name(profile);
+    }
+
+    // Set access key and secret key if provided
+    if let (Some(access_key), Some(secret_key)) = (
+        extract_secret!(params, "aws_access_key_id"),
+        extract_secret!(params, "aws_secret_access_key"),
+    ) {
+        let session_token = extract_secret!(params, "aws_session_token");
+
+        let credentials = aws_credential_types::Credentials::new(
+            access_key,
+            secret_key,
+            session_token.map(std::string::ToString::to_string),
+            None,
+            "bedrock-embed",
+        );
+
+        config_builder = config_builder.credentials_provider(credentials);
+    }
+
+    let config = config_builder.load().await;
+    let client = BedrockClient::new(&config);
+
+    if model_id.starts_with("amazon.titan-embed") {
+        let normalize = params
+            .get("normalize")
+            .map(|s| s.expose_secret().parse::<bool>())
+            .transpose()
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'normalize' parameter: {e}").into(),
+            })?
+            .unwrap_or(true);
+
+        let Some(dimensions) = params
+            .get("dimensions")
+            .map(|s| s.expose_secret().parse::<u32>())
+            .transpose()
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
+            })?
+        else {
+            return Err(EmbedError::MissingParamError {
+                param_key: "dimensions",
+            });
+        };
+
+        if !matches!(dimensions, 256 | 512 | 1024) {
+            return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid dimensions '{dimensions}' for Titan model. Must be 256, 512, or 1024"
+                )
+                .into(),
+            });
+        }
+
+        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
+    } else if model_id.starts_with("cohere.embed") {
+        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
+            CohereEmbeddingTruncate::from_str(truncate_str)
+                .boxed()
+                .map_err(|e| EmbedError::InvalidParamError {
+                    param_key: "truncate",
+                    value: truncate_str.to_string(),
+                    reason: e.to_string(),
+                })?
+        } else {
+            CohereEmbeddingTruncate::default()
+        };
+        let input_type = if let Some(input_type_str) = extract_secret!(params, "input_type") {
+            CohereEmbeddingInputType::from_str(input_type_str).map_err(|e| {
+                EmbedError::InvalidParamError {
+                    param_key: "input_type",
+                    value: input_type_str.to_string(),
+                    reason: e.to_string(),
+                }
+            })?
+        } else {
+            CohereEmbeddingInputType::default()
+        };
+        Ok(Arc::new(bedrock::embed::new_cohere(
+            client,
+            model_id,
+            truncate,
+            input_type,
+            CohereEmbeddingType::Float,
+        )) as Arc<dyn Embed>)
+    } else {
+        Err(EmbedError::ModelDoesNotExist {
+            model_name: model_id,
+        })
     }
 }
 

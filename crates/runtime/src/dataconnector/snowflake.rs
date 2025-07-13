@@ -76,6 +76,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("auth_type"),
 ];
 
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d190734c7b978e8252b110c9529d7a93a30cf0/src/keywords.rs#L1061
+const RESERVED_KEYWORDS: &[&str] = &[
+    "START",
+    "CONNECT",
+    "MATCH_RECOGNIZE",
+    "SAMPLE",
+    "TABLESAMPLE",
+    "FROM",
+];
+
 impl DataConnectorFactory for SnowflakeFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -106,6 +116,10 @@ impl DataConnectorFactory for SnowflakeFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 

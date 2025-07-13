@@ -316,7 +316,32 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 to_tonic_err(e)
             }
         }
-        _ => to_tonic_err(e),
+        DataFusionError::ResourcesExhausted(source) => Status::resource_exhausted(source),
+        DataFusionError::Diagnostic(_, source) | DataFusionError::Context(_, source) => {
+            handle_datafusion_error(*source)
+        }
+        DataFusionError::Shared(source) => {
+            // Since DataFusionError doesn't implement Clone, we can't extract it from Arc
+            // Just treat it as a generic error
+            Status::internal(format!("Shared DataFusion error: {source}"))
+        }
+        DataFusionError::Collection(sources) => {
+            let first_error = sources.into_iter().next();
+            if let Some(first_error) = first_error {
+                handle_datafusion_error(first_error)
+            } else {
+                Status::internal("Several DataFusion errors occurred, but no details available")
+            }
+        }
+        DataFusionError::Internal(_)
+        | DataFusionError::NotImplemented(_)
+        | DataFusionError::ArrowError(..)
+        | DataFusionError::IoError(_)
+        | DataFusionError::ObjectStore(_)
+        | DataFusionError::ParquetError(_)
+        | DataFusionError::Substrait(_)
+        | DataFusionError::Configuration(_)
+        | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
     }
 }
 
@@ -335,9 +360,25 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display(
+        "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
+    ))]
+    AddressAlreadyInUse { addr: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        source = e.source();
+    }
+    false
+}
 
 pub async fn start(
     bind_address: std::net::SocketAddr,
@@ -388,7 +429,14 @@ pub async fn start(
     } else {
         server.serve(bind_address).await
     }
-    .context(UnableToStartFlightServerSnafu)?;
+    .map_err(|e| {
+        if is_address_in_use_error(&e) {
+            return Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            };
+        }
+        Error::UnableToStartFlightServer { source: e }
+    })?;
 
     tracing::debug!("Spice Runtime Flight stopped");
 

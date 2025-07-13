@@ -23,6 +23,7 @@ use std::{
 use crate::{
     dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA,
     object_store_registry::SpiceObjectStoreRegistry,
+    search::full_text::analyzer_rule::FullTextUDTFAnalyzerRule,
 };
 use cache::Caching;
 use datafusion::{
@@ -248,6 +249,7 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(federation_analyzer_rule()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
+        Arc::new(FullTextUDTFAnalyzerRule {}),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
     ]

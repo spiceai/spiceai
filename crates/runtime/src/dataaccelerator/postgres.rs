@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
@@ -28,7 +28,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, Behaviors, DataAccelerator};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -88,7 +88,18 @@ impl DataAccelerator for PostgresAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        partition_by: Vec<Expr>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        let num_partitions = partition_by.len();
+        ensure!(
+            num_partitions == 0,
+            super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Postgres data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
+                )
+            }
+        );
+
         let ctx = SessionContext::new();
 
         cmd.options.insert(
@@ -113,11 +124,13 @@ impl DataAccelerator for PostgresAccelerator {
         let postgres_writer = Arc::new(postgres_writer.clone());
         let cloned_writer = Arc::clone(&postgres_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             postgres_writer,
             read_provider,
-        )))
+        ));
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {

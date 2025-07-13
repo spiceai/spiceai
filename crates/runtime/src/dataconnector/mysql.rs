@@ -90,6 +90,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("100"),
 ];
 
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d19073/src/keywords.rs#L1053
+const RESERVED_KEYWORDS: &[&str] = &["PARTITION"];
+
 impl DataConnectorFactory for MySQLFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -195,6 +198,10 @@ impl DataConnectorFactory for MySQLFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 

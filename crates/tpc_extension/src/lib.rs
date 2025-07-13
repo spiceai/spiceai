@@ -114,7 +114,7 @@ impl Extension for TpcExtension {
             .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
 
         tracing::info!(
-            "Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}"
+            "Setting up {benchmark} benchmark datasets with scale factor {scale_factor}, using file {path}"
         );
 
         let gen_func = match benchmark.as_str() {

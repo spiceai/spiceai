@@ -72,6 +72,7 @@ default = [
   "dynamodb",
   "imap",
   "alloc-snmalloc",
+  "oracle",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -88,6 +89,7 @@ models = ["runtime/models"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
 odbc = ["runtime/odbc"]
+oracle = ["runtime/oracle"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []

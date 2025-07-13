@@ -51,15 +51,23 @@ impl bb8::ManageConnection for SqlServerConnectionManager {
     type Connection = Client<Compat<TcpStream>>;
     type Error = tiberius::error::Error;
 
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let tcp = TcpStream::connect(&self.config.get_addr()).await?;
-        tcp.set_nodelay(true)?;
-        Client::connect(self.config.clone(), tcp.compat_write()).await
+    fn connect(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
+        Box::pin(async move {
+            let tcp = TcpStream::connect(&self.config.get_addr()).await?;
+            tcp.set_nodelay(true)?;
+            let client = Client::connect(self.config.clone(), tcp.compat_write()).await?;
+            Ok(client)
+        })
     }
 
-    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.simple_query("SELECT 1").await?.into_row().await?;
-        Ok(())
+    fn is_valid(
+        &self,
+        conn: &mut Self::Connection,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        Box::pin(async move {
+            conn.simple_query("SELECT 1").await?.into_row().await?;
+            Ok(())
+        })
     }
 
     fn has_broken(&self, _: &mut Self::Connection) -> bool {

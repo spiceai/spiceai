@@ -127,17 +127,20 @@ pub enum Engine {
     #[default]
     Arrow,
     DuckDB,
+    PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
+    Void,
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Void => write!(f, "void"),
         }
     }
 }
@@ -151,6 +154,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "void" => Ok(Engine::Void),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -283,6 +287,8 @@ pub struct Acceleration {
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
     pub disable_federation: bool,
+
+    pub partition_by: Vec<String>,
 }
 
 impl Acceleration {
@@ -305,6 +311,7 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -349,7 +356,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
+        let engine =
+            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
+                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                    Engine::PartitionedDuckDB
+                }
+                engine => engine,
+            };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -416,6 +429,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            partition_by: acceleration.partition_by,
         })
     }
 }
@@ -446,6 +460,7 @@ impl Default for Acceleration {
             on_conflict: HashMap::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
+            partition_by: vec![],
         }
     }
 }

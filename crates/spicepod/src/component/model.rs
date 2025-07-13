@@ -188,6 +188,23 @@ impl Display for ModelSource {
     }
 }
 
+impl ModelSource {
+    #[must_use]
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            ModelSource::OpenAi => "openai",
+            ModelSource::Azure => "azure",
+            ModelSource::Xai => "xai",
+            ModelSource::Anthropic => "anthropic",
+            ModelSource::Perplexity => "perplexity",
+            ModelSource::HuggingFace => "hf",
+            ModelSource::File => "file",
+            ModelSource::SpiceAI => "spiceai",
+            ModelSource::Databricks => "databricks",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ModelType {
@@ -385,22 +402,6 @@ impl Model {
         }
 
         None
-    }
-
-    /// Returns the subset of [`Self::params`] that are `OpenAI` request overrides. These will be
-    /// used as the default values in the request payload, instead of the provider's defaults.
-    ///
-    /// `OpenAI` request overrides are parameters that start with `openai_`. The returned keys will be
-    /// without the `openai_` prefix.
-    #[must_use]
-    pub fn get_openai_request_overrides(&self) -> Vec<(String, Value)> {
-        self.params
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("openai_")
-                    .map(|new_k| (new_k.to_string(), v.clone()))
-            })
-            .collect()
     }
 }
 

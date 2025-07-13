@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    logical_expr::CreateExternalTable, prelude::Expr,
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
@@ -35,7 +35,7 @@ use crate::{
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -247,7 +247,18 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        partition_by: Vec<Expr>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        let num_partitions = partition_by.len();
+        ensure!(
+            num_partitions == 0,
+            super::InvalidConfigurationSnafu {
+                msg: format!(
+                    "Sqlite data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
+                )
+            }
+        );
+
         if let Some(source) = source {
             if source.is_file_accelerated() {
                 // If the user didn't specify a SQLite file and this is a file-mode SQLite,
@@ -304,11 +315,13 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
         let cloned_writer = Arc::clone(&sqlite_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             sqlite_writer,
             read_provider,
-        )))
+        ));
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {
@@ -368,8 +381,8 @@ mod tests {
             temporary: false,
         };
         let ctx = SessionContext::new();
-        let table = SqliteAccelerator::new()
-            .create_external_table(external_table, None)
+        let (table, _) = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![])
             .await
             .expect("table should be created");
 

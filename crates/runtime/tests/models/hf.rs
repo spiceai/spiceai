@@ -307,7 +307,7 @@ mod search {
                         "limit": 1,
                     }),
                 },
-            ],
+            ], vec![]
         ).await
     }
 }

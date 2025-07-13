@@ -95,8 +95,7 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let Some(embedding_table) =
-            find_concrete_table_provider::<EmbeddingTable>(&table_provider).await
+        let Some(embedding_table) = find_concrete_table_provider::<EmbeddingTable>(&table_provider)
         else {
             return Err(Error::CannotVectorSearchDataset {
                 data_source: tbl.clone(),
