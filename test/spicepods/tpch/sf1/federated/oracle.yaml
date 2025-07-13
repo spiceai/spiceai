@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: oracle-federated
+datasets:
+  - from: oracle:"TPCH_SF1"."CUSTOMER"
+    name: customer
+    params: &params
+      # Oracle test container from integration tests
+      oracle_username: system
+      oracle_password: "S3cret_Pass123"
+      oracle_host: "localhost"
+      oracle_port: 15210
+      oracle_service_name: FREEPDB1
+  - from: oracle:"TPCH_SF1"."LINEITEM"
+    name: lineitem
+    params: *params
+  - from: oracle:"TPCH_SF1"."NATION"
+    name: nation
+    params: *params
+  - from: oracle:"TPCH_SF1"."ORDERS"
+    name: orders
+    params: *params
+  - from: oracle:"TPCH_SF1"."PART"
+    name: part
+    params: *params
+  - from: oracle:"TPCH_SF1"."PARTSUPP"
+    name: partsupp
+    params: *params
+  - from: oracle:"TPCH_SF1"."REGION"
+    name: region
+    params: *params
+  - from: oracle:"TPCH_SF1"."SUPPLIER"
+    name: supplier
+    params: *params
