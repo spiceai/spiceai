@@ -361,9 +361,11 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
 
     // Check if model is already cached
     {
-        let guard = model_cache.lock().unwrap();
+        let guard = model_cache
+            .lock()
+            .ok_or_else(|| anyhow::anyhow!("model cache could not be unlocked"))?;
         if let Some(model) = guard.as_ref() {
-            return Ok(model.clone());
+            return Ok(Arc::clone(&model));
         }
     }
 
@@ -377,8 +379,10 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
 
     // Cache the model
     {
-        let mut guard = model_cache.lock().unwrap();
-        *guard = Some(model.clone());
+        let mut guard = model_cache
+            .lock()
+            .ok_or_else(|| anyhow::anyhow!("model cache could not be locked"))?;
+        *guard = Some(Arc::clone(&model));
     }
 
     Ok(model)
@@ -415,7 +419,7 @@ async fn run_single_test(
     // Get and run model
     let model = get_or_create_model(model_name)
         .await
-        .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {}", e));
+        .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
 
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
