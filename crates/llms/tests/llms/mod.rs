@@ -363,7 +363,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     {
         let guard = model_cache
             .lock()
-            .ok_or_else(|| anyhow::anyhow!("model cache could not be unlocked"))?;
+            .map_err(|_| anyhow::anyhow!("model cache could not be unlocked"))?;
         if let Some(model) = guard.as_ref() {
             return Ok(Arc::clone(&model));
         }
@@ -381,7 +381,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     {
         let mut guard = model_cache
             .lock()
-            .ok_or_else(|| anyhow::anyhow!("model cache could not be locked"))?;
+            .map_err(|_| anyhow::anyhow!("model cache could not be locked"))?;
         *guard = Some(Arc::clone(&model));
     }
 
