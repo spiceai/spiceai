@@ -30,9 +30,8 @@ use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
 use snafu::ResultExt;
 use std::collections::HashSet;
-use tantivy::query::TermQuery;
 use tantivy::schema::DocParsingError;
-use tantivy::{ReloadPolicy, TantivyDocument, TantivyError};
+use tantivy::{TantivyDocument, TantivyError};
 
 use crate::search::{
     full_text::util::{array_to_terms, with_json_subset_column},

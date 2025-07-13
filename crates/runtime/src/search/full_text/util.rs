@@ -44,11 +44,11 @@ pub fn with_json_subset_column(
     for col_name in subset_columns {
         let idx = batch.schema().index_of(col_name.as_str()).boxed()?;
         subset_fields.push(batch.schema().field(idx).clone());
-        subset_arrays.push(Arc::clone(&batch.column(idx)));
+        subset_arrays.push(Arc::clone(batch.column(idx)));
     }
 
     let subset_schema: SchemaRef = Arc::new(Schema::new(subset_fields));
-    let subset_batch = RecordBatch::try_new(subset_schema.clone(), subset_arrays).boxed()?;
+    let subset_batch = RecordBatch::try_new(Arc::clone(&subset_schema), subset_arrays).boxed()?;
 
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
