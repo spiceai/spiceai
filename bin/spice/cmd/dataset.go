@@ -78,7 +78,7 @@ spice dataset configure
 		}
 
 		if !match {
-			slog.Error(fmt.Sprintf("%v", aurora.BrightRed("Dataset name can only contain letters, numbers, underscores and hyphens.")))
+			slog.Error(fmt.Sprintf("%v", aurora.BrightRed("Dataset name can only contain letters, numbers, underscores, and hyphens")))
 			os.Exit(1)
 		}
 
@@ -86,7 +86,7 @@ spice dataset configure
 			// warn that dataset name with hyphen should be quoted in queries
 			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
 		}
-	
+
 		cmd.Print("description: ")
 		description, err := reader.ReadString('\n')
 		if err != nil {
