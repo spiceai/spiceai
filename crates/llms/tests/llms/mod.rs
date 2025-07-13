@@ -365,7 +365,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
             .lock()
             .map_err(|_| anyhow::anyhow!("model cache could not be unlocked"))?;
         if let Some(model) = guard.as_ref() {
-            return Ok(Arc::clone(&model));
+            return Ok(Arc::clone(model));
         }
     }
 
