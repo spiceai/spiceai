@@ -47,16 +47,14 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::Itertools;
+use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
 
 use crate::{
     datafusion::DataFusion,
     embedding_col,
-    embeddings::{
-        cosine_distance::COSINE_DISTANCE_UDF_NAME,
-        table::{EmbeddingColumnConfig, EmbeddingTable},
-    },
+    embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
     search::util::find_concrete_table_provider,
 };
@@ -131,6 +129,25 @@ impl VectorSearchTableFunc {
 }
 
 impl VectorSearchTableFunc {
+    #[must_use]
+    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
+        let mut expr = vec![
+            Expr::Column(Column::new_unqualified(args.tbl.to_string())),
+            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone()))),
+        ];
+
+        if let Some(col) = args.column.as_ref() {
+            expr.push(Expr::Literal(ScalarValue::Utf8(Some(col.clone()))));
+        }
+        if let Some(limit) = args.limit {
+            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit as u64))));
+        }
+        if let Some(include_score) = args.include_score {
+            expr.push(Expr::Literal(ScalarValue::Boolean(Some(include_score))));
+        }
+        expr
+    }
+
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
         let mut args = args.iter();
 

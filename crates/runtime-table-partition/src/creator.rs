@@ -17,7 +17,10 @@ limitations under the License.
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr,
+    scalar::ScalarValue,
+};
 use snafu::prelude::*;
 
 use crate::Partition;
@@ -47,4 +50,13 @@ pub trait PartitionCreator: Debug + Send + Sync {
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+
+    /// See [`TableProvider::supports_filters_pushdown`].
+    ///
+    /// # Errors
+    /// See [`TableProvider::supports_filters_pushdown`].
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
 }

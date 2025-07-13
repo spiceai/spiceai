@@ -144,7 +144,7 @@ impl ScalarUDFImpl for CosineDistance {
     }
 }
 
-pub fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
+fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     if args.len() != 2 {
         return exec_err!("cosine_distance expects exactly two arguments");
     }

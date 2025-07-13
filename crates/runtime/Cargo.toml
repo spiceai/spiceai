@@ -67,7 +67,7 @@ headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.3"
 hyper = "1.6.0"
-hyper-util = { version = "0.1.6", features = ["service"] }
+hyper-util = { version = "0.1.15", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
@@ -124,6 +124,7 @@ rmcp = { workspace = true, optional = true, features = [
 ] }
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
