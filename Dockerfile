@@ -48,7 +48,10 @@ RUN mkdir -p /spice_sandbox/bin && \
     mkdir -p /spice_sandbox/etc && \
     mkdir -p /spice_sandbox/etc/ssl && \
     mkdir -p /spice_sandbox/dev && \
-    mkdir -p /spice_sandbox/app
+    mkdir -p /spice_sandbox/app && \
+    mkdir -p /spice_sandbox/.cache && \
+    mkdir -p /spice_sandbox/.cache/huggingface
+
 
 # Copy the binary
 COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
