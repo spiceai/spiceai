@@ -79,8 +79,9 @@ RUN chown -R 65534:65534 /spice_sandbox/app
 # Create HuggingFace cache directory in sandbox
 RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
 RUN chown -R 65534:65534 /spice_sandbox/.cache
-RUN chmod 755 /spice_sandbox/.cache
+RUN chmod -R 755 /spice_sandbox/.cache
 ENV HF_HOME=/spice_sandbox/.cache/huggingface
+ENV HF_HUB_CACHE=/spice_sandbox/.cache/huggingface/hub
 
 FROM scratch
 
