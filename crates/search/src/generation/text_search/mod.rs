@@ -15,7 +15,7 @@ use std::{cmp::min, collections::HashMap, sync::Arc};
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use arrow::{
     array::RecordBatch,
-    datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
+    datatypes::{Field, FieldRef, Schema, SchemaRef},
     error::ArrowError,
 };
 use arrow_json::reader::Decoder;
@@ -168,6 +168,7 @@ impl FullTextSearchFieldIndex {
         self.type_hints.insert(name.into(), field.into());
     }
 
+    #[must_use]
     pub fn get_type_hint(&self, name: &String) -> Option<&FieldRef> {
         self.type_hints.get(name)
     }
