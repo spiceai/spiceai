@@ -107,7 +107,9 @@ pub(crate) fn prune_partition(
                 op: Operator::Eq,
                 right,
             }) => {
-                if let (Expr::Column(_), Expr::Literal(lit)) = (left.as_ref(), right.as_ref()) {
+                if let (Expr::Column(_), Expr::Literal(lit))
+                | (Expr::Literal(lit), Expr::Column(_)) = (left.as_ref(), right.as_ref())
+                {
                     if !filter_or_udf_value_matches(left, partition_by, partition_value, lit)? {
                         return Ok(true); // Prune if equality does not match
                     }
