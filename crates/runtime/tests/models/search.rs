@@ -357,8 +357,8 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     .await
 }
 
+// Ensure that if there is no primary key inferrable or available, that search results for multiple columns are not returned.
 #[tokio::test]
-#[ignore]
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
