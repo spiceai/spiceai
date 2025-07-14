@@ -77,6 +77,7 @@ RUN chmod 755 /spice_sandbox/.duckdb
 
 # Give the nobody user ownership of app dir
 RUN chown -R 65534:65534 /spice_sandbox/app
+RUN chown -R 65534:65534 /spice_sandbox/.cache
 
 FROM scratch
 
