@@ -20,8 +20,10 @@ use data_components::oracle::oracle_connector;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::oracle::common::{make_oracle_dataset, start_oracle_docker_container};
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::oracle::common::{
+    make_oracle_cloud_dataset, make_oracle_dataset, start_oracle_docker_container,
+};
+use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
 
 pub mod common;
 
@@ -162,7 +164,7 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn oracle_integration_test() -> Result<(), anyhow::Error> {
+async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -270,6 +272,59 @@ async fn oracle_integration_test() -> Result<(), anyhow::Error> {
                 tracing::error!("running_container.remove: {e}");
                  e
             })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    for env_var in [
+        "ORACLE_CLOUD_CONNECTION_STRING",
+        "ORACLE_CLOUD_USERNAME",
+        "ORACLE_CLOUD_PASSWORD",
+        "ORACLE_CLOUD_WALLET_SSO_CERT",
+    ] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    test_request_context()
+        .scope(async {
+            let ds = make_oracle_cloud_dataset("\"NATION\"", "nation");
+
+            let app = AppBuilder::new("oracle_cloud_test")
+                .with_dataset(ds)
+                .build();
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_and_snapshot_query(
+                &rt,
+                "select N_NAME, N_COMMENT from nation order by N_NAME limit 5",
+                "oracle_cloud_query_result",
+            )
+            .await?;
 
             Ok(())
         })

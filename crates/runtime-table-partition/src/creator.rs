@@ -35,6 +35,10 @@ pub enum Error {
     CreatePartition { source: StdError },
     #[snafu(display("Failed to infer accelerated partitions: {source}"))]
     InferringPartitions { source: StdError },
+    #[snafu(display(
+        "The 'partition_by' expressions are different from the expressions used to create the existing partition files. Revert the 'partition_by' expressions, delete the partition files, or change the location the partition files are stored to create new partitions."
+    ))]
+    PartitionByExpressionsChanged,
 }
 
 #[async_trait]
@@ -45,7 +49,7 @@ pub trait PartitionCreator: Debug + Send + Sync {
     /// Returns an error when creating a [`Partition`] is unsuccessful.
     async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
-    /// Find and load previously created [`Parition`]s.
+    /// Find and load previously created [`Partition`]s
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.

@@ -17,20 +17,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 12.843
-    },
-    {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "catalog_page",
-      "matches": {
-        "cp_description": "Close times adopt only in a interests. Far strings might say slowly. Times go strictly cattle. Sign"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 21
-      },
-      "score": 2.205
+      "score": 8.124
     }
   ]
 }

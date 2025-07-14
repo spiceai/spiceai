@@ -23,7 +23,7 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
-use datafusion::prelude::{Expr, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -32,7 +32,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_table_partition::expression::partition_by_expressions;
+use runtime_table_partition::expression::{PartitionBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -251,9 +251,14 @@ impl AcceleratorEngineRegistry {
         let df_schema = DFSchema::try_from(schema)
             .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
-        let partition_by =
-            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
-                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+        let partition_by = if acceleration_settings.partition_by.is_empty() {
+            None
+        } else {
+            Some(
+                partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                    .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
+            )
+        };
 
         let table_provider = accelerator
             .create_external_table(external_table, source, partition_by)
@@ -276,7 +281,7 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator

@@ -14,17 +14,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 12.843
-    },
-    {
-      "dataset": "catalog_page",
-      "matches": {
-        "cp_description": "Levels will attend ago general, basic ideas. Physical, "
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 3404
-      },
-      "score": 10.345
+      "score": 8.124
     }
   ]
 }
