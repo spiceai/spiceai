@@ -463,7 +463,6 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_hybrid_search",
