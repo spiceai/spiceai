@@ -15,11 +15,11 @@ limitations under the License.
 */
 pub mod common;
 pub mod connector;
-pub mod cosine_distance;
 pub mod execution_plan;
 pub mod metrics;
 pub mod table;
 pub mod task;
+pub mod udtf;
 
 /// Converts string-like Arrow types into an iterator [`Option<Box<dyn Iterator<Item = Option<&str>>>>`]. If the downcast conversion
 /// fails, returns `None`.

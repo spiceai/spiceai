@@ -380,6 +380,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inject_secrets_case_sensitive() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        let upper_key = &format!("MY_UPPERCASE_SECRET_KEY_{}", rand::random::<u64>());
+        let lower_key = &format!("MY_LOWERCASE_SECRET_KEY_{}", rand::random::<u64>());
+
+        unsafe {
+            std::env::set_var(upper_key, "UPPER_SECRET");
+            std::env::set_var(lower_key, "lower_secret");
+        }
+
+        let result_upper = secrets
+            .inject_secrets(
+                upper_key,
+                super::ParamStr(&format!("Upper: ${{ env:{upper_key} }}")),
+            )
+            .await;
+        assert_eq!("Upper: UPPER_SECRET", result_upper.expose_secret());
+
+        let result_lower = secrets
+            .inject_secrets(
+                lower_key,
+                super::ParamStr(&format!("Lower: ${{ env:{lower_key} }}")),
+            )
+            .await;
+        assert_eq!("Lower: lower_secret", result_lower.expose_secret());
+
+        unsafe {
+            std::env::remove_var(upper_key);
+            std::env::remove_var(lower_key);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_original_key_takes_precedence() {
+        let mut secrets = super::Secrets::new();
+        secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
+
+        let lower_key = &format!("my_secret_key_{}", rand::random::<u64>());
+        let upper_key = lower_key.to_uppercase();
+
+        unsafe {
+            std::env::set_var(&upper_key, "UPPER_SECRET");
+            std::env::set_var(lower_key, "original_secret");
+        }
+
+        let result_upper = secrets
+            .inject_secrets(
+                &upper_key,
+                super::ParamStr(&format!("Upper: ${{ env:{upper_key} }}")),
+            )
+            .await;
+        assert_eq!("Upper: UPPER_SECRET", result_upper.expose_secret());
+
+        let result_lower = secrets
+            .inject_secrets(
+                lower_key,
+                super::ParamStr(&format!("Lower: ${{ env:{lower_key} }}")),
+            )
+            .await;
+        assert_eq!("Lower: original_secret", result_lower.expose_secret());
+
+        unsafe {
+            std::env::remove_var(upper_key);
+            std::env::remove_var(lower_key);
+        }
+    }
+
+    #[tokio::test]
     async fn test_inject_secrets_no_env() {
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default

@@ -52,6 +52,8 @@ mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;
@@ -67,6 +69,8 @@ mod mssql;
 mod mysql;
 #[cfg(feature = "odbc")]
 mod odbc;
+#[cfg(feature = "oracle")]
+mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod ready_state;

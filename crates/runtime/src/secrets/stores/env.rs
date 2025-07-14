@@ -89,23 +89,29 @@ impl SecretStore for EnvSecretStore {
     /// The key for std::env::var is case-sensitive. Calling `std::env::var("my_key")` is distinct from `std::env::var("MY_KEY")`.
     ///
     /// However, the convention is to use uppercase for environment variables - so to make the experience
-    /// consistent across secret stores that don't have this convention we will uppercase the key before
-    /// looking up the environment variable.
+    /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
-        let upper_key = key.to_uppercase();
+        let uppercase_key = key.to_uppercase();
 
-        // First try looking for `SPICE_MY_KEY` and then `MY_KEY`
-        let prefixed_key = format!("{ENV_SECRET_PREFIX}{upper_key}");
-        match std::env::var(prefixed_key) {
-            Ok(value) => Ok(Some(SecretString::from(value))),
-            // If the prefixed key is not found, try the original key
-            Err(std::env::VarError::NotPresent) => match std::env::var(upper_key) {
-                Ok(value) => Ok(Some(SecretString::from(value))),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(err) => Err(Box::new(err)),
-            },
-            Err(err) => Err(Box::new(err)),
-        }
+        [
+            // First try looking for original prefixed `SPICE_my_key`
+            format!("{ENV_SECRET_PREFIX}{key}"),
+            // Then try looking for original `my_key`
+            key.to_string(),
+            // Then try looking for prefixed `SPICE_MY_KEY` in uppercase
+            format!("{ENV_SECRET_PREFIX}{uppercase_key}"),
+            // Then try looking for `MY_KEY` in uppercase
+            uppercase_key,
+        ]
+        .iter()
+        .find_map(|variant| match std::env::var(variant) {
+            Ok(value) => Some(Ok(SecretString::from(value))),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(err) => Some(Err(
+                Box::new(err) as Box<dyn std::error::Error + Send + Sync>
+            )),
+        })
+        .transpose()
     }
 }

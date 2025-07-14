@@ -210,6 +210,7 @@ mod search {
                     }),
                 },
             ],
+            vec![],
         )
         .await
     }
@@ -278,6 +279,7 @@ mod search {
                     }),
                 },
             ],
+            vec![],
         )
         .await
     }

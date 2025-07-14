@@ -60,9 +60,9 @@ pub enum Error {
 pub struct EmbeddingTable {
     base_table: Arc<dyn TableProvider>,
 
-    embedded_columns: HashMap<String, EmbeddingColumnConfig>,
+    pub embedded_columns: HashMap<String, EmbeddingColumnConfig>,
 
-    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl std::fmt::Debug for EmbeddingTable {

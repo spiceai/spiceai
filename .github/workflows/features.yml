@@ -5,10 +5,10 @@ on:
     branches:
       - trunk
     paths:
-      - "**/Cargo.toml"
+      - '**/Cargo.toml'
   pull_request:
     paths:
-      - "**/Cargo.toml"
+      - '**/Cargo.toml'
   workflow_dispatch:
 
 concurrency:
@@ -27,7 +27,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
+          os: 'linux'
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -182,6 +182,15 @@ jobs:
 
       - name: Build with only dynamodb
         run: cargo check --no-default-features --features dynamodb
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+      - name: Build with only oracle
+        run: cargo check --no-default-features --features oracle
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}

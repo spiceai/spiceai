@@ -24,6 +24,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_federation::FederatedPlanner;
+use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use std::sync::Arc;
 
 pub mod bytes_processed;
@@ -48,6 +49,7 @@ impl QueryPlanner for SpiceQueryPlanner {
         let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![
             Arc::new(FederatedPlanner::new()),
             Arc::new(SpiceExtensionPlanner::new()),
+            Arc::new(IndexTableScanExtensionPlanner::new()),
         ]);
         physical_planner
             .create_physical_plan(logical_plan, session_state)

@@ -6,8 +6,9 @@ runtime:
   task_history:
     enabled: true
     captured_output: truncated
-  results_cache:
-    enabled: false
+  caching:
+    sql_results:
+      enabled: false
 
 datasets:
   - from: duckdb:read_parquet('.spice/service_data.parquet')

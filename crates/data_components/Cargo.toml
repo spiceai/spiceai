@@ -20,6 +20,7 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { version = "1.65.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
+bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
@@ -52,6 +53,8 @@ itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
+oracle = { version = "0.6", optional = true }
+bb8-oracle = { version = "0.3", features = ["chrono"], optional = true}
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
 reqwest.workspace = true
@@ -97,6 +100,12 @@ imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
+oracle = [
+    "dep:oracle",
+    "dep:bb8",
+    "dep:bb8-oracle",
+    "dep:bigdecimal",
+]
 postgres = [
     "dep:tokio-postgres",
     "datafusion-table-providers/postgres",

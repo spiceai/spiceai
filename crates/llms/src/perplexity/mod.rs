@@ -45,7 +45,7 @@ impl PerplexitySonar {
         model: Option<&str>,
         params: &HashMap<String, SecretString>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(auth_token) = params.get("perplexity_auth_token") else {
+        let Some(auth_token) = params.get("auth_token") else {
             return Err(Box::from(
                 "No `perplexity_auth_token` provided for Perplexity model.",
             ));
@@ -54,10 +54,8 @@ impl PerplexitySonar {
         let overrides: Vec<(String, String)> = params
             .iter()
             .filter_map(|(k, v)| {
-                if k != "perplexity_auth_token" {
-                    if let Some(p) = k.strip_prefix("perplexity_") {
-                        return Some((p.to_string(), v.expose_secret().to_string()));
-                    }
+                if k != "auth_token" {
+                    return Some((k.to_string(), v.expose_secret().to_string()));
                 }
                 None
             })

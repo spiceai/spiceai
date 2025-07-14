@@ -81,6 +81,3 @@ embeddings:
     params:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
     metadata: {}
-  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-    name: hf_minilm
-    metadata: {}

@@ -20,12 +20,13 @@ use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
-use snafu::ResultExt;
+use runtime_table_partition::expression::PartitionBy;
+use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, Behaviors, DataAccelerator};
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -63,11 +64,21 @@ impl DataAccelerator for ArrowAccelerator {
         &self,
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        partition_by: Option<PartitionBy>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        ensure!(
+            partition_by.is_none(),
+            super::InvalidConfigurationSnafu {
+                msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
+            }
+        );
+
         let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
+        let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
             .await
-            .boxed()
+            .boxed()?;
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {
