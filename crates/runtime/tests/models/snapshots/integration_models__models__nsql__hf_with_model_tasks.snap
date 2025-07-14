@@ -8,4 +8,14 @@ expression: response
 | nsql                   | how many records (as 'total_records') are in spice.public.taxi_trips dataset? |
 | tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                        |
 | sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
+| sql_query              | truncated                                                                     |
 +------------------------+-------------------------------------------------------------------------------+
