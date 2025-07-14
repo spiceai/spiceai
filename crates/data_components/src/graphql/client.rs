@@ -884,8 +884,8 @@ impl GraphQLClient {
 
             while let Some(next_cursor_val) = result.cursor {
                 if let Some(p) = query.pagination_parameters.as_ref() {
-                    if limit.is_some() {
-                        limit = Some(p.reduce_limit(result.record_count));
+                    if let Some(value) = limit {
+                        limit = Some(p.reduce_limit(value));
                     }
                 }
 
@@ -904,10 +904,6 @@ impl GraphQLClient {
                     tx.send(Ok(batch)).await.map_err(|_| {
                         DataFusionError::Execution("Failed to send record batch".to_string())
                     })?;
-                }
-
-                if result.limit_reached {
-                    break;
                 }
             }
             Ok(())
