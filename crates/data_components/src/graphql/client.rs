@@ -905,6 +905,10 @@ impl GraphQLClient {
                         DataFusionError::Execution("Failed to send record batch".to_string())
                     })?;
                 }
+
+                if result.limit_reached {
+                    break;
+                }
             }
             Ok(())
         });
