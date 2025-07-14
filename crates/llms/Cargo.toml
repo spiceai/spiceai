@@ -13,10 +13,10 @@ version.workspace = true
 snafu.workspace = true
 
 async-openai.workspace = true
-aws-config.workspace = true
-aws-sdk-bedrockruntime = "1.55.0"
 async-stream.workspace = true
 async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-bedrockruntime = "1.55.0"
 bytes.workspace = true
 futures = { workspace = true }
 hf-hub.workspace = true
@@ -28,7 +28,7 @@ schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokenizers = { version = "0.21.0" }
+tokenizers = "0.21.2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
@@ -43,15 +43,17 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
 pulldown-cmark = "0.13.0"
 tiktoken-rs = "0.6.0"
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "027c8da1a8fbd3a65bcf8e60d6e30264f41bc194" , optional = true}
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "027c8da1a8fbd3a65bcf8e60d6e30264f41bc194", package = "mistralrs-core" , optional = true}
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
 rand = "0.9.1"
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", features = [
+
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ca078993e4597172dcbf5857d846be81c6679e4f", features = [
     "candle",
 ] }
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", optional = true}
+
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
 
 cudarc = { version = "0.12.2", optional = true, features = [
     "cuda-version-from-build-system",
@@ -78,23 +80,20 @@ cuda = [
     "mistralrs-core/flash-attn",
     "mistralrs/cuda",
     "mistralrs/flash-attn",
-    "dep:cudarc",
     "cudarc/cuda-version-from-build-system",
 ]
+local_embed = [
+    "dep:tei_backend",
+    "dep:tei_backend_core",
+    "dep:tei_candle",
+    "dep:tei_core",
+]
+local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
     "mistralrs/metal",
-]
-local_llm = [
-"dep:mistralrs", "dep:mistralrs-core"
-]
-local_embed = [
-"dep:tei_backend",
-"dep:tei_backend_core",
-"dep:tei_candle",
-"dep:tei_core",
 ]
 
 default = ["local_llm", "local_embed"]

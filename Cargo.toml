@@ -37,7 +37,8 @@ members = [
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",
-    "tools/testoperator", "tools/parsley",
+    "tools/testoperator",
+    "tools/parsley",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -102,7 +103,7 @@ futures = "0.3.30"
 globset = "0.4.16"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
-hf-hub = { version = "0.3.0", features = ["tokio"] }
+hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
 iceberg = "0.4.0"
 iceberg-catalog-glue = "0.4.0"
@@ -212,6 +213,7 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
+
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" }              # spiceai-0.4.0-df-47
 iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" } # spiceai-0.4.0-df-47

@@ -69,7 +69,7 @@ pub async fn try_to_embedding(
     match prefix {
         EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
         EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
-        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
+        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params).await,
         EmbeddingPrefix::HuggingFace => huggingface(model_id, &params).await,
         EmbeddingPrefix::Databricks => {
             databricks(model_id, &params, Arc::clone(&token_provider_registry)).await
@@ -317,7 +317,7 @@ async fn databricks(
     }
 }
 
-fn file(
+async fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
@@ -346,13 +346,16 @@ fn file(
         .map(SecretBox::expose_secret)
         .map(String::from);
     let max_seq_len = max_seq_length_from_params(params)?;
-    Ok(Arc::new(TeiEmbed::from_local(
-        Path::new(&weights_path),
-        Path::new(&config_path),
-        Path::new(&tokenizer_path),
-        pooling,
-        max_seq_len,
-    )?))
+    Ok(Arc::new(
+        TeiEmbed::from_local(
+            Path::new(&weights_path),
+            Path::new(&config_path),
+            Path::new(&tokenizer_path),
+            pooling,
+            max_seq_len,
+        )
+        .await?,
+    ))
 }
 
 fn azure(

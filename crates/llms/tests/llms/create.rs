@@ -66,7 +66,7 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, 
     Ok(Arc::new(Anthropic::new(auth, model_id, None, None)?))
 }
 
-pub(crate) fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
+pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
     create_hf_model(
         model_id,
         None,
@@ -76,6 +76,7 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
             .map(SecretString::from)
             .as_ref(),
     )
+    .await
 }
 
 pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
@@ -89,7 +90,7 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     Ok(Arc::new(sonar))
 }
 
-pub(crate) fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let (temp_dir, model_weights) =
         download_hf_model_artifacts(model_id, None, std::env::var("HF_TOKEN").ok())?;
 
@@ -101,6 +102,7 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Erro
         None,
         None,
     )
+    .await
     .map_err(anyhow::Error::from)?;
     Ok(model)
 }

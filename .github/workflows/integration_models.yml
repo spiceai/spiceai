@@ -53,6 +53,10 @@ jobs:
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features flightsql,models,metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./ai_integration_test

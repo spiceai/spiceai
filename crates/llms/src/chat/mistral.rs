@@ -68,7 +68,7 @@ fn to_openai_response(
 }
 
 impl MistralLlama {
-    pub fn from(
+    pub async fn from(
         model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
@@ -136,7 +136,7 @@ impl MistralLlama {
             _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
         };
 
-        Ok(Self::from_pipeline(pipeline))
+        Ok(Self::from_pipeline(pipeline).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -301,7 +301,7 @@ impl MistralLlama {
         }
     }
 
-    pub fn from_hf(
+    pub async fn from_hf(
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&SecretString>,
@@ -364,11 +364,11 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline))
+        Ok(Self::from_pipeline(pipeline).await)
     }
 
     #[allow(clippy::expect_used)]
-    fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
+    async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
         Self {
             pipeline: MistralRsBuilder::new(
                 p,
@@ -380,7 +380,8 @@ impl MistralLlama {
                 false,
                 None,
             )
-            .build(),
+            .build()
+            .await,
             counter: AtomicUsize::new(0),
         }
     }
@@ -395,7 +396,7 @@ impl MistralLlama {
         tool_choice: Option<ToolChoice>,
         sampling: Option<SamplingParams>,
     ) -> MistralRequest {
-        MistralRequest::Normal(NormalRequest {
+        MistralRequest::Normal(Box::new(NormalRequest {
             messages: message,
             sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
             response: tx,
@@ -409,7 +410,8 @@ impl MistralLlama {
             tool_choice,
             logits_processors: None,
             return_raw_logits: false,
-        })
+            model_id: None, // Not actually needed.
+        }))
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
@@ -418,12 +420,14 @@ impl MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<Receiver<MistralResponse>> {
-        let message = RequestMessage::Chat(
-            req.messages
+        let message = RequestMessage::Chat {
+            messages: req
+                .messages
                 .iter()
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
-        );
+            enable_thinking: None,
+        };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
@@ -449,7 +453,7 @@ impl MistralLlama {
 
         tracing::trace!("Sending request to pipeline");
         self.pipeline
-            .get_sender()
+            .get_sender(None) // Only one model running in this pipeline.
             .boxed()
             .context(FailedToRunModelSnafu)?
             .send(self.to_mistralrs_request(
@@ -646,9 +650,17 @@ fn stream_from_response(
                         code: None,
                     }));
                 },
+                MistralResponse::Speech{..} => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Speech generation is not supported".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                },
                 MistralResponse::ImageGeneration(_) => {
                     yield Err(OpenAIError::ApiError(ApiError {
-                        message: "image generation".to_string(),
+                        message: "image generation is not supported".to_string(),
                         r#type: None,
                         param: None,
                         code: None,
