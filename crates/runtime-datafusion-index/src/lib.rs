@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use datafusion::arrow::array::RecordBatch;
 
@@ -31,4 +31,6 @@ pub trait Index: Debug + Send + Sync + 'static {
     fn required_columns(&self) -> Vec<String>;
 
     async fn compute_index(&self, _batches: Vec<RecordBatch>) {}
+
+    fn as_any(&self) -> &dyn Any;
 }

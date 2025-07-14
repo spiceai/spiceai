@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_schema::DataType;
+use std::{any::Any, sync::Arc};
+
+use arrow::{array::RecordBatch, datatypes::DataType};
+
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
@@ -25,15 +28,26 @@ use runtime_datafusion_index::Index;
 use search::generation::CandidateGeneration;
 use search::generation::post_apply::PostApplyCandidateGeneration;
 use search::generation::text_search::FullTextSearchFieldIndex;
-use snafu::{ResultExt, Snafu};
+use snafu::ResultExt;
 use std::collections::HashSet;
-use std::sync::Arc;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
 
-use crate::datafusion::query::write_to_json_string;
-use crate::object_store_registry::SpiceObjectStoreRegistry;
-use crate::search::util::get_primary_keys;
+use crate::search::{
+    full_text::util::{array_to_terms, with_json_subset_column},
+    util::get_primary_keys,
+};
+use crate::{datafusion::query::write_to_json_string, search::full_text::Error};
+use crate::{
+    object_store_registry::SpiceObjectStoreRegistry,
+    search::full_text::{
+        FailedToInsertDataIntoIndexSnafu, IndexCreationSnafu, InvalidIndexingSnafu,
+    },
+};
+
+/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
+pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
+pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 #[derive(Clone, Debug)]
 pub struct FullTextDatabaseIndex {
@@ -49,6 +63,10 @@ impl Index for FullTextDatabaseIndex {
         "full_text"
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn required_columns(&self) -> Vec<String> {
         // Return both the primary key and search fields, deduplicated.
         let mut required_columns = HashSet::new();
@@ -56,37 +74,11 @@ impl Index for FullTextDatabaseIndex {
         required_columns.extend(self.search_fields.iter().cloned());
         required_columns.into_iter().collect()
     }
-}
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Full text search requires a primary key, and the table did not have one.",))]
-    NoPrimaryKey,
-
-    #[snafu(display(
-        "Primary key column '{column}' used in search index has unsupported data type: '{data_type}'",
-    ))]
-    PrimaryKeyInvalidType { column: String, data_type: DataType },
-
-    #[snafu(display("Primary key column '{column}' not found in table.",))]
-    PrimaryKeyNotFound { column: String },
-
-    #[snafu(display("Failed to create a full text search index: {source}.",))]
-    IndexCreationError { source: TantivyError },
-
-    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
-    FailedToRetrieveDataFromSource { source: DataFusionError },
-
-    #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
-    FailedToInsertDataIntoIndex { source: TantivyError },
-
-    #[snafu(display(
-        "Failed to create the full text search index. Context: {context}. Error: {source}.",
-    ))]
-    InvalidIndexingError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-        context: String,
-    },
+    async fn compute_index(&self, batches: Vec<RecordBatch>) {
+        if let Err(e) = self.update_index(batches.as_slice()) {
+            tracing::error!("Failed to update full text search index: {e}");
+        }
+    }
 }
 
 impl FullTextDatabaseIndex {
@@ -104,9 +96,14 @@ impl FullTextDatabaseIndex {
             }
         };
 
-        let index =
-            Self::create_index(Arc::clone(&inner), search_fields.as_slice(), pks.as_slice())
-                .await?;
+        // INDEX_UNIQUE_FIELD_NAME is a reserved field name.
+        if pks.contains(&INDEX_UNIQUE_FIELD_NAME.to_string()) {
+            return Err(Error::PrimaryKeyInvalidName {
+                column: INDEX_UNIQUE_FIELD_NAME.to_string(),
+            });
+        }
+
+        let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
 
         Ok(Self {
             base_table: inner,
@@ -114,6 +111,93 @@ impl FullTextDatabaseIndex {
             index,
             primary_key: pks,
         })
+    }
+
+    /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
+    /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
+    fn existing_terms_to_delete(&self, rb: &[RecordBatch]) -> Result<Vec<tantivy::Term>, Error> {
+        let Some(pk) = self.primary_key.first() else {
+            // Should not occur, but no primary key implies none must be deleted.
+            return Ok(vec![]);
+        };
+
+        let (pk_field, pk) = if self.primary_key.len() == 1 {
+            let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
+                return Err(Error::FailedToRetrieveDataFromIndex {
+                    source: TantivyError::FieldNotFound(pk.clone()),
+                });
+            };
+            (pk_field, pk.clone())
+        } else {
+            // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
+            let Some((pk_field, _)) = self.index.schema().find_field(INDEX_UNIQUE_FIELD_NAME)
+            else {
+                return Err(Error::InvalidIndexingError {
+                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
+                    context: format!(
+                        "Full text search has multiple primary key columns, so the column '{INDEX_UNIQUE_FIELD_NAME}' should be present, but is not.",
+                    ),
+                });
+            };
+            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
+        };
+
+        Ok(rb
+            .iter()
+            .filter_map(|r| r.column_by_name(pk.as_str()))
+            .map(|arr| array_to_terms(pk_field, arr))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::FailedToRetrieveDataFromSource {
+                source: DataFusionError::ArrowError(e, None),
+            })?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
+    /// columns present will be ignored.
+    ///
+    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
+    fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
+        // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
+        let rb = if self.primary_key.len() > 1 {
+            rb.iter()
+                .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
+                .collect::<Result<Vec<RecordBatch>, _>>()
+                .context(InvalidIndexingSnafu {
+                    context: "An error occured creating the a unique column for the full text search index".to_string(),
+                })?
+        } else {
+            rb.to_vec()
+        };
+
+        // Updates in tantivy are a deletion then insertion.
+        let mut index_writer: tantivy::IndexWriter = self
+            .index
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+            .context(IndexCreationSnafu)?;
+
+        // Deletion.
+        for t in self.existing_terms_to_delete(&rb)? {
+            index_writer.delete_term(t);
+        }
+
+        // Insertion.
+        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
+            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
+        })?;
+        let docs = parse_json_array(&self.index.schema(), doc_json.as_str())
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        for doc in docs {
+            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        }
+        index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        Ok(())
     }
 
     #[must_use]
@@ -134,8 +218,8 @@ impl FullTextDatabaseIndex {
         }
     }
 
-    async fn create_index(
-        base_table: Arc<dyn TableProvider>,
+    fn create_index(
+        base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
     ) -> Result<Arc<tantivy::Index>, Error> {
@@ -151,26 +235,42 @@ impl FullTextDatabaseIndex {
             };
             match field.data_type() {
                 DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_f64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_u64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    schema_builder.add_i64_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_i64_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 DataType::Boolean => {
-                    schema_builder.add_bool_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_bool_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
 
-                DataType::Date32 | DataType::Date64 => {
-                    schema_builder.add_date_field(p.as_str(), tantivy::schema::STORED);
-                }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    schema_builder.add_text_field(p.as_str(), tantivy::schema::STORED);
+                    // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
+                    schema_builder.add_text_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::STRING,
+                    );
                 }
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(p.as_str(), tantivy::schema::STORED);
+                    schema_builder.add_bytes_field(
+                        p.as_str(),
+                        tantivy::schema::STORED | tantivy::schema::INDEXED,
+                    );
                 }
                 dt => {
                     return Err(Error::PrimaryKeyInvalidType {
@@ -181,61 +281,27 @@ impl FullTextDatabaseIndex {
             }
         }
 
+        // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
+        if primary_key.len() > 1 {
+            schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STRING);
+        }
+
         for s in search_fields {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
         let schema = schema_builder.build();
-        Self::create_and_init_index(base_table, schema).await
+        Ok(Arc::new(tantivy::Index::create_in_ram(schema)))
     }
 
     fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
-        let env = RuntimeEnvBuilder::default()
-            .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
-            .build()?;
-        let ctx = SessionContext::new_with_config_rt(SessionConfig::default(), Arc::new(env));
-
-        Ok(Arc::new(ctx))
-    }
-
-    async fn create_and_init_index(
-        table: Arc<dyn TableProvider>,
-        schema: tantivy::schema::Schema,
-    ) -> Result<Arc<tantivy::Index>, Error> {
-        let cols: Vec<_> = schema.fields().map(|(_, ent)| ent.name()).collect();
-        let ctx = Self::new_ctx().context(FailedToRetrieveDataFromSourceSnafu)?;
-        let _ = ctx
-            .register_table("temp_table", table)
-            .context(FailedToRetrieveDataFromSourceSnafu)?;
-
-        let rbs = ctx
-            .table("temp_table")
-            .await
-            .context(FailedToRetrieveDataFromSourceSnafu)?
-            .select_columns(cols.as_slice())
-            .context(FailedToRetrieveDataFromSourceSnafu)?
-            .collect()
-            .await
-            .context(FailedToRetrieveDataFromSourceSnafu)?;
-
-        let doc_json = write_to_json_string(rbs.as_slice()).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        let index = tantivy::Index::create_in_ram(schema);
-        let mut index_writer: tantivy::IndexWriter = index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .context(IndexCreationSnafu)?;
-
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
-        }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        Ok(Arc::new(index))
+        Ok(Arc::new(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnvBuilder::default()
+                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+                    .build()?,
+            ),
+        )))
     }
 
     pub fn full_text_search_field_index(
