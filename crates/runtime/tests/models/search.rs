@@ -580,7 +580,6 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset(
             "catalog_page",
@@ -648,16 +647,16 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         vec![
             (
                 "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ),
             // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
             (
                 "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic') LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
             ),
             (
                 "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
                 "SELECT cp_catalog_page_sk, score, cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"

@@ -1,0 +1,35 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "cp_catalog_page_sk": 7,
+    "score": 0.02409752830862999,
+    "cp_department": "DEPARTMENT",
+    "cp_description": "Years must understand. Well fat thousands take. Good police l",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 16,
+    "score": 0.02409752830862999,
+    "cp_department": "DEPARTMENT",
+    "cp_description": "Social pictures welcome almost british teams. Awful preparations leave ga",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 19,
+    "score": 0.02409752830862999,
+    "cp_department": "DEPARTMENT",
+    "cp_description": "Good questions borrow only base children. Remarkably present e",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 10,
+    "score": 0.02409752830862999,
+    "cp_department": "DEPARTMENT",
+    "cp_description": "Human, successive tears highlight also as radical produ",
+    "cp_catalog_number": 1
+  }
+]
