@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use datafusion::{
+    common::tree_node::{Transformed, TreeNode as _},
     error::DataFusionError,
     logical_expr::{
         BinaryExpr, ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF,
@@ -180,27 +181,46 @@ fn filter_or_udf_value_matches(
     partition_value: &ScalarValue,
     filter_value: &ScalarValue,
 ) -> Result<bool, DataFusionError> {
-    match partition_by {
+    let Expr::Column(col) = column else {
+        return Err(DataFusionError::Plan("Expected column expression".into()));
+    };
+
+    // Replace column reference with filter value in partition_by expression
+    let transformed_expr = partition_by
+        .clone()
+        .transform(|e| {
+            Ok(match e {
+                Expr::Column(expr_col) if expr_col == *col => {
+                    Transformed::yes(Expr::Literal(filter_value.clone()))
+                }
+                _ => Transformed::no(e),
+            })
+        })
+        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {}", e)))?
+        .data;
+
+    let result = match transformed_expr {
+        Expr::Literal(lit) => lit,
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let args = args
-                .iter()
-                .map(|arg| {
-                    // replace the column expression with the filter value
-                    if arg == column {
-                        Ok(filter_value.to_owned())
-                    } else if let Expr::Literal(lit) = arg {
-                        Ok(lit.to_owned())
-                    } else {
-                        Err(DataFusionError::Plan(
-                            "Invalid argument: expected column or literal".into(),
-                        ))
-                    }
+                .into_iter()
+                .map(|arg| match arg {
+                    Expr::Literal(lit) => Ok(lit),
+                    _ => Err(DataFusionError::Plan(
+                        "Expected literal after transformation".into(),
+                    )),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(call(func.as_ref(), args)? == *partition_value)
+            call(func.as_ref(), args)?
         }
-        _ => Ok(filter_value == partition_value),
-    }
+        _ => {
+            return Err(DataFusionError::Plan(
+                "Unexpected expression type after transformation".into(),
+            ));
+        }
+    };
+
+    Ok(&result == partition_value)
 }
 
 fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusionError> {
