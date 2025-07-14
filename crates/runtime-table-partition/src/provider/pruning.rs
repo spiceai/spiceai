@@ -198,7 +198,7 @@ fn filter_or_udf_value_matches(
                 _ => Transformed::no(e),
             })
         })
-        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {}", e)))?
+        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {e}")))?
         .data;
 
     let result = match transformed_expr {
