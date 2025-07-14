@@ -528,7 +528,6 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset("item", Some("item"), None);
     ds.columns = vec![Column {
