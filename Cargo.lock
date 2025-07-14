@@ -11252,6 +11252,7 @@ dependencies = [
  "datafusion",
  "futures",
  "parking_lot 0.12.3",
+ "runtime-datafusion-udfs",
  "serde",
  "serde_qs 1.0.0-rc.3",
  "snafu",

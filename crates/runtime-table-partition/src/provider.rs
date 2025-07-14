@@ -147,7 +147,7 @@ impl TableProvider for PartitionTableProvider {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            if prune_partition(filters, &self.partition_by, &partition.partition_value) {
+            if prune_partition(filters, &self.partition_by, &partition.partition_value)? {
                 continue;
             }
             let plan = partition

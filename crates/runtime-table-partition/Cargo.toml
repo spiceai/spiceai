@@ -14,6 +14,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 parking_lot = "0.12"
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 serde.workspace = true
 serde_qs = { git = "https://github.com/samscott89/serde_qs.git", rev = "f24f916a6420cf500c97fb85dc5e64015fdb6b40" }
 snafu.workspace = true
