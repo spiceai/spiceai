@@ -395,7 +395,6 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "hybrid_column_search",
@@ -449,15 +448,15 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         vec![
             (
                 "hybrid_column_sql_text_search_basic",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_projection",
-                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_filters",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
             )
-        ]
+        ],
     )
     .await
 }

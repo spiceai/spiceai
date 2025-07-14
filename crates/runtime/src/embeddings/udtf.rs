@@ -137,7 +137,7 @@ impl VectorSearchTableFunc {
         ];
 
         if let Some(col) = args.column.as_ref() {
-            expr.push(Expr::Literal(ScalarValue::Utf8(Some(col.clone()))));
+            expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
             expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit as u64))));
