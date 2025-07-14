@@ -43,16 +43,17 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
 pulldown-cmark = "0.13.0"
 tiktoken-rs = "0.6.0"
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "a9407965b5c79a5e8dbf94b24d64c88094ba8d04", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "a9407965b5c79a5e8dbf94b24d64c88094ba8d04", package = "mistralrs-core", optional = true }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
 rand = "0.9.1"
 
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "b9d8a17c7534d93b82b74bb776617c9de0787a88", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ca078993e4597172dcbf5857d846be81c6679e4f", features = [
     "candle",
 ] }
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b9d8a17c7534d93b82b74bb776617c9de0787a88", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b9d8a17c7534d93b82b74bb776617c9de0787a88", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b9d8a17c7534d93b82b74bb776617c9de0787a88", optional = true }
+
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ca078993e4597172dcbf5857d846be81c6679e4f", optional = true }
 
 cudarc = { version = "0.12.2", optional = true, features = [
     "cuda-version-from-build-system",

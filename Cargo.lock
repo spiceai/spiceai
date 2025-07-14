@@ -7890,7 +7890,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7912,7 +7912,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "anyhow",
  "apodize",
@@ -7923,7 +7923,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -8022,7 +8022,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8042,7 +8042,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.7",
@@ -8057,7 +8057,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "bindgen_cuda 0.1.7",
  "byteorder",
@@ -8085,7 +8085,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.6.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=a9407965b5c79a5e8dbf94b24d64c88094ba8d04#a9407965b5c79a5e8dbf94b24d64c88094ba8d04"
+source = "git+https://github.com/spiceai/mistral.rs?rev=cf3749e243ebdd2d9dfa1b895261147ff9ba64e3#cf3749e243ebdd2d9dfa1b895261147ff9ba64e3"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.6",
@@ -13586,7 +13586,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
 dependencies = [
  "hf-hub",
  "rand 0.9.1",
@@ -13600,7 +13600,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
 dependencies = [
  "anyhow",
  "candle-core 0.8.4",
@@ -13623,7 +13623,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
 dependencies = [
  "nohash-hasher",
  "serde",
@@ -13633,7 +13633,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.7.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b9d8a17c7534d93b82b74bb776617c9de0787a88#b9d8a17c7534d93b82b74bb776617c9de0787a88"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ca078993e4597172dcbf5857d846be81c6679e4f#ca078993e4597172dcbf5857d846be81c6679e4f"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
