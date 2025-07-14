@@ -30,6 +30,7 @@ pub mod filename;
 type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to create an accelerated partition: {source}"))]
     CreatePartition { source: StdError },
