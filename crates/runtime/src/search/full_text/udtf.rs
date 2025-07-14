@@ -303,13 +303,12 @@ impl TextSearchUDTFProvider {
             .all_columns()
             .iter()
             .filter_map(|field_name| {
-                let (data_type, nullable) = match field_index.get_type_hint(field_name) {
-                    Some(f) => (f.data_type().clone(), f.is_nullable()),
-                    None => {
-                        let f = tantivy_schema.get_field(field_name).ok()?;
-                        let entry = tantivy_schema.get_field_entry(f);
-                        (tantivy_to_arrow_type(entry.field_type())?, false)
-                    }
+                let (data_type, nullable) = if let Some(f) = field_index.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = tantivy_schema.get_field(field_name).ok()?;
+                    let entry = tantivy_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
                 };
                 Some(Field::new(field_name, data_type, nullable))
             })
