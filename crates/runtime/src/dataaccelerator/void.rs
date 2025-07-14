@@ -41,6 +41,7 @@ use datafusion::{
 };
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
+use runtime_table_partition::expression::PartitionBy;
 
 use super::{
     AccelerationSource, Behaviors, DataAccelerator,
@@ -77,7 +78,7 @@ impl DataAccelerator for VoidAccelerator {
         &self,
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-        _partition_by: Vec<Expr>,
+        _partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         let (table_provider, underlying_provider_cb) =
             VoidTable::new(Arc::clone(cmd.schema.inner()));

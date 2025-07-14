@@ -41,6 +41,30 @@ pub fn make_oracle_dataset(path: &str, name: &str, port: u16) -> Dataset {
     dataset
 }
 
+pub fn make_oracle_cloud_dataset(path: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("oracle:{path}"), name.to_string());
+    let params = HashMap::from([
+        (
+            "oracle_connection_string".to_string(),
+            "${ env:ORACLE_CLOUD_CONNECTION_STRING }".to_string(),
+        ),
+        (
+            "oracle_username".to_string(),
+            "${ env:ORACLE_CLOUD_USERNAME }".to_string(),
+        ),
+        (
+            "oracle_password".to_string(),
+            "${ env:ORACLE_CLOUD_PASSWORD }".to_string(),
+        ),
+        (
+            "oracle_wallet_sso_cert".to_string(),
+            "${ env:ORACLE_CLOUD_WALLET_SSO_CERT }".to_string(),
+        ),
+    ]);
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset
+}
+
 #[instrument]
 pub async fn start_oracle_docker_container(
     container_name: &'static str,
