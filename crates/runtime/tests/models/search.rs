@@ -357,8 +357,8 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     .await
 }
 
+// Ensure that if there is no primary key inferrable or available, that search results for multiple columns are not returned.
 #[tokio::test]
-#[ignore]
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
@@ -395,7 +395,6 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "hybrid_column_search",
@@ -449,21 +448,20 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         vec![
             (
                 "hybrid_column_sql_text_search_basic",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_projection",
-                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_filters",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
             )
-        ]
+        ],
     )
     .await
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_hybrid_search",
@@ -528,7 +526,6 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset("item", Some("item"), None);
     ds.columns = vec![Column {
@@ -581,7 +578,6 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset(
             "catalog_page",
@@ -649,16 +645,16 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         vec![
             (
                 "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ),
             // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
             (
                 "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic') LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
             ),
             (
                 "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
                 "SELECT cp_catalog_page_sk, score, cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
