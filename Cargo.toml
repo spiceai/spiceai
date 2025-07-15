@@ -105,10 +105,10 @@ graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
-iceberg = "0.4.0"
-iceberg-catalog-glue = "0.4.0"
-iceberg-catalog-rest = "0.4.0"
-iceberg-datafusion = "0.4.0"
+iceberg = "0.5.1"
+iceberg-catalog-glue = "0.5.1"
+iceberg-catalog-rest = "0.5.1"
+iceberg-datafusion = "0.5.1"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
@@ -215,9 +215,9 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" }              # spiceai-0.4.0-df-47
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" } # spiceai-0.4.0-df-47
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a56b803272db4a7351b2807f412abfbfd3cfd422" }   # spiceai-0.4.0-df-47
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff38b47ccb66349214708e573a61f8b48d8d1bcf" }              # spiceai-0.5.1
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff38b47ccb66349214708e573a61f8b48d8d1bcf" } # spiceai-0.5.1
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff38b47ccb66349214708e573a61f8b48d8d1bcf" }   # spiceai-0.5.1
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
