@@ -182,7 +182,7 @@ impl QueryRoot {
 
     async fn single_paginated_users(&self, first: usize, after: Option<String>) -> UsersPaginated {
         let users_service = UserService::new();
-        let users = users_service.paginated_users(std::cmp::max(first, 1), after);
+        let users = users_service.paginated_users(std::cmp::min(first, 1), after);
         let all_users = users_service.users();
         let last_id = unsafe { all_users.last().unwrap_unchecked().id.clone() };
 
