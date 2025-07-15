@@ -455,6 +455,16 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
             ), (
                 "hybrid_column_sql_text_search_filters",
                 format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+            ),
+            (
+                "hybrid_column_sql_vector_search_basic",
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM vector_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_projection",
+                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM vector_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_filters",
+                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM vector_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
             )
         ],
     )
