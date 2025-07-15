@@ -1,6 +1,6 @@
 # Oracle TPC-H Benchmark Setup
 
-Steps to load the TPC-H SF1 dataset into Oracle database.
+Steps to load the TPC-H SF1 dataset into the Oracle database.
 
 ## Prerequisites
 
