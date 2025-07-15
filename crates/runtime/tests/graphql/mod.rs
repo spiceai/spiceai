@@ -205,6 +205,8 @@ async fn graphql_handler(schema: Extension<ServiceSchema>, req: GraphQLRequest) 
 
     // Append query to log for snapshot testing
     if let Ok(mut log) = QUERY_LOG.lock() {
+        // Push_str works because MutexGuard<String> implements DerefMut
+        // and allows us to modify the underlying String.
         log.push_str(query);
         log.push_str("\n---\n");
     }
@@ -467,7 +469,9 @@ async fn test_graphql_pagination_with_limit() -> Result<(), String> {
             assert_eq!(total, 3);
 
             if let Ok(log) = QUERY_LOG.lock() {
-                // No need to get the whole query, just snapshot the pagination since that's what's relevant
+                // We want to snapshot the `first` and `after` parameters to ensure pagination is working correctly with a `LIMIT`
+                // We don't need the body of the query to do so, so we can split on all lines and only take the ones containing `singlePaginatedUsers`
+                // This way, we know the lines we take have the `first` and `after` parameters and no other irrelevant details.
                 let filtered_log = log.lines()
                     .filter(|line| line.contains("singlePaginatedUsers"))
                     .collect::<Vec<_>>()
