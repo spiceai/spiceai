@@ -1,0 +1,19 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q6"
+---
++---------------+-----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                          |
++---------------+-----------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                                              |
+|               |   Projection: orders.O_ORDERKEY + Int64(1) AS KEY                                             |
+|               |     Limit: skip=0, fetch=10                                                                   |
+|               |       BytesProcessedNode                                                                      |
+|               |         TableScan: orders projection=[O_ORDERKEY], fetch=10                                   |
+| physical_plan | ProjectionExec: expr=[O_ORDERKEY@0 + 1 as KEY]                                                |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                       |
+|               |     GlobalLimitExec: skip=0, fetch=10                                                         |
+|               |       BytesProcessedExec                                                                      |
+|               |         OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS"  FETCH FIRST 10 ROWS ONLY |
+|               |                                                                                               |
++---------------+-----------------------------------------------------------------------------------------------+

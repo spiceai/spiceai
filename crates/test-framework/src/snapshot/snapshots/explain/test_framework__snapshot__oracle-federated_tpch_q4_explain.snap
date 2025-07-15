@@ -1,0 +1,43 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_q4"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                  |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: orders.O_ORDERPRIORITY ASC NULLS LAST                                                                                           |
+|               |   Projection: orders.O_ORDERPRIORITY, count(Int64(1)) AS ORDER_COUNT                                                                  |
+|               |     Aggregate: groupBy=[[orders.O_ORDERPRIORITY]], aggr=[[count(Int64(1))]]                                                           |
+|               |       Projection: orders.O_ORDERPRIORITY                                                                                              |
+|               |         LeftSemi Join: orders.O_ORDERKEY = __correlated_sq_1.L_ORDERKEY                                                               |
+|               |           Projection: orders.O_ORDERKEY, orders.O_ORDERPRIORITY                                                                       |
+|               |             BytesProcessedNode                                                                                                        |
+|               |               Filter: orders.O_ORDERDATE >= Date32("1993-07-01") AND orders.O_ORDERDATE < Date32("1993-10-01")                        |
+|               |                 TableScan: orders projection=[O_ORDERKEY, O_ORDERDATE, O_ORDERPRIORITY]                                               |
+|               |           SubqueryAlias: __correlated_sq_1                                                                                            |
+|               |             BytesProcessedNode                                                                                                        |
+|               |               TableScan: lineitem projection=[L_ORDERKEY], full_filters=[lineitem.L_RECEIPTDATE > lineitem.L_COMMITDATE]              |
+| physical_plan | SortPreservingMergeExec: [O_ORDERPRIORITY@0 ASC NULLS LAST]                                                                           |
+|               |   SortExec: expr=[O_ORDERPRIORITY@0 ASC NULLS LAST], preserve_partitioning=[true]                                                     |
+|               |     ProjectionExec: expr=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY, count(Int64(1))@1 as ORDER_COUNT]                                     |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                        |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                   |
+|               |           RepartitionExec: partitioning=Hash([O_ORDERPRIORITY@0], 14), input_partitions=14                                            |
+|               |             AggregateExec: mode=Partial, gby=[O_ORDERPRIORITY@0 as O_ORDERPRIORITY], aggr=[count(Int64(1))]                           |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                             |
+|               |                 HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(O_ORDERKEY@0, L_ORDERKEY@0)], projection=[O_ORDERPRIORITY@1] |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
+|               |                     RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 14), input_partitions=14                                       |
+|               |                       ProjectionExec: expr=[O_ORDERKEY@0 as O_ORDERKEY, O_ORDERPRIORITY@2 as O_ORDERPRIORITY]                         |
+|               |                         BytesProcessedExec                                                                                            |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
+|               |                             FilterExec: O_ORDERDATE@1 >= 1993-07-01 AND O_ORDERDATE@1 < 1993-10-01                                    |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                   |
+|               |                                 OracleExec sql=SELECT "O_ORDERKEY", "O_ORDERDATE", "O_ORDERPRIORITY" FROM "TPCH_SF1"."ORDERS"         |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
+|               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 14), input_partitions=14                                       |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                           |
+|               |                         BytesProcessedExec                                                                                            |
+|               |                           OracleExec sql=SELECT "L_ORDERKEY" FROM "TPCH_SF1"."LINEITEM" WHERE ("L_RECEIPTDATE" > "L_COMMITDATE")      |
+|               |                                                                                                                                       |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+
