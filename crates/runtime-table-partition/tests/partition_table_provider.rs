@@ -15,18 +15,22 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, StringArray};
+use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
+use datafusion::common::DFSchema;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::execution::context::{ExecutionProps, SessionContext};
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::{ColumnarValue, ScalarUDF, TableProviderFilterPushDown};
+use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use runtime_datafusion_udfs::bucket;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -217,6 +221,7 @@ impl PartitionCreator for TestPartitionCreator {
     }
 }
 
+/// Get the partition values out of the execution plan
 fn collect_partition_values(plan: &Arc<dyn ExecutionPlan>) -> Vec<ScalarValue> {
     let mut values = Vec::new();
     if let Some(partition_exec) = plan.as_any().downcast_ref::<PartitionMemTableExec>() {
@@ -356,6 +361,127 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
         partition_values.contains(&ScalarValue::Utf8(Some("us-west-1".to_string()))),
         "Expected 'us-west-1' in unfiltered plan"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let partition_by = Expr::ScalarFunction(ScalarFunction {
+        func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+        args: vec![lit(4i64), col("id")],
+    });
+    let table_provider =
+        PartitionTableProvider::new(creator.clone(), vec![partition_by.clone()], schema.clone())
+            .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(bucket::Bucket::new().into());
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+            Arc::new(StringArray::from(vec![
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80])),
+        ],
+    )?;
+
+    let df_schema = DFSchema::try_from(schema.clone())?;
+    let execution_props = ExecutionProps::new();
+    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let batch_values = physical_expr.evaluate(&batch)?;
+    let bucket_values = match batch_values {
+        ColumnarValue::Array(array) => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Expected Int32Array from bucket function")
+            .values()
+            .to_vec(),
+        _ => panic!("Expected array from bucket expression"),
+    };
+
+    // Map bucket values to corresponding id values
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Expected Int64Array for id column");
+    let mut bucket_to_ids: HashMap<i32, Vec<i64>> = HashMap::new();
+    for (id, bucket) in id_array.values().iter().zip(bucket_values.iter()) {
+        bucket_to_ids
+            .entry(*bucket)
+            .or_insert_with(Vec::new)
+            .push(*id);
+    }
+
+    // Collect unique bucket values
+    let unique_buckets: Vec<i32> = bucket_to_ids.keys().copied().collect();
+    assert!(
+        unique_buckets.len() >= 2,
+        "Expected at least two distinct buckets, got {}",
+        unique_buckets.len()
+    );
+
+    // Select first two buckets and their corresponding id values
+    let selected_buckets = &unique_buckets[..2.min(unique_buckets.len())];
+    let selected_ids: Vec<i64> = selected_buckets
+        .iter()
+        .flat_map(|bucket| bucket_to_ids.get(bucket).unwrap_or(&vec![]).clone())
+        .collect();
+
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    let in_list_str = selected_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT * FROM test_table WHERE id IN ({in_list_str})");
+    let df = ctx.sql(&query).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+
+    // Verify partition pruning
+    assert_eq!(
+        partition_values.len(),
+        selected_buckets.len(),
+        "Expected {} partitions for IN list query",
+        selected_buckets.len()
+    );
+    for bucket in selected_buckets {
+        assert!(
+            partition_values.contains(&ScalarValue::Int32(Some(*bucket))),
+            "Expected bucket {bucket} in filtered plan",
+        );
+    }
+    for bucket in 0..4 {
+        if !selected_buckets.contains(&bucket) {
+            assert!(
+                !partition_values.contains(&ScalarValue::Int32(Some(bucket))),
+                "Bucket {bucket} should be pruned",
+            );
+        }
+    }
 
     Ok(())
 }
