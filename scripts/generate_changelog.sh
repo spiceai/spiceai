@@ -32,8 +32,8 @@ jq -r '.[] | .mergeCommit.oid + " " + (.number | tostring) + " " + .author.login
 jq -r '.[] | .mergeCommit.oid + " " + (.number | tostring) + " " + .author.login' pr_data_branch.json > pr_mapping_branch.txt
 
 # Get commits in the release branch
-git cherry "$release_branch" origin/trunk "$tag" | grep '^-' | awk '{print $2}' > cherry_commits_in_release_branch.txt
-git cherry "$release_branch" origin/trunk "$tag" | grep '^+' | awk '{print $2}' > commits_in_trunk_not_in_release_branch.txt
+git cherry "origin/$release_branch" origin/trunk "$tag" | grep '^-' | awk '{print $2}' > cherry_commits_in_release_branch.txt
+git cherry "origin/$release_branch" origin/trunk "$tag" | grep '^+' | awk '{print $2}' > commits_in_trunk_not_in_release_branch.txt
 
 # Generate changelog
 echo "### Changelog"
