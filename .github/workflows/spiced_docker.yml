@@ -348,7 +348,6 @@ jobs:
               docker buildx imagetools inspect localhost:5000/spiceai-enterprise:latest${suffix}
             fi
           done
-
   publish-cuda:
     if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
     needs: [setup, build-cuda]
