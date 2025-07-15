@@ -39,16 +39,15 @@ pub enum Error {
     FieldNotNullable { field: String },
 }
 
-impl Into<DataFusionError> for Error {
-    fn into(self) -> DataFusionError {
-        match self {
-            Self::UnableToConvertRecordBatch {
+impl From<Error> for DataFusionError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::UnableToConvertRecordBatch {
                 source: arrow_error,
             } => DataFusionError::ArrowError(arrow_error, None),
-            Self::FieldNotNullable { .. } => {
-                DataFusionError::ArrowError(ArrowError::SchemaError(self.to_string()), None)
+            Error::FieldNotNullable { .. } => {
+                DataFusionError::ArrowError(ArrowError::SchemaError(e.to_string()), None)
             }
-            _ => DataFusionError::External(Box::new(self)),
         }
     }
 }

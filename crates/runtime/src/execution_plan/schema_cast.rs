@@ -140,7 +140,7 @@ impl ExecutionPlan for SchemaCastScanExec {
             {
                 stream! {
                     while let Some(batch) = stream.next().await {
-                        yield record_batch::try_cast_to(batch?, Arc::clone(&schema)).map_err(Into::into);
+                        yield record_batch::try_cast_to(batch?, Arc::clone(&schema)).map_err(From::from);
                     }
                 }
             },
