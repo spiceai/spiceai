@@ -703,6 +703,7 @@ impl GraphQLQuery {
 
 pub(crate) struct GraphQLQueryResult {
     pub(crate) records: Vec<RecordBatch>,
+    #[allow(dead_code)]
     record_count: usize,
     limit_reached: bool,
     pub(crate) schema: SchemaRef,
