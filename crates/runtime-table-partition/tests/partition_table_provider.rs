@@ -30,7 +30,7 @@ use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
-use runtime_datafusion_udfs::bucket;
+use runtime_datafusion_udfs::{bucket, truncate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -286,8 +286,7 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
                 assert_eq!(
                     region_array.value(i),
                     partition_key,
-                    "Data in partition {} should match its key",
-                    partition_key
+                    "Data in partition {partition_key} should match its key",
                 );
             }
         }
@@ -418,7 +417,6 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         _ => panic!("Expected array from bucket expression"),
     };
 
-    // Map bucket values to corresponding id values
     let id_array = batch
         .column(0)
         .as_any()
@@ -432,7 +430,6 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
             .push(*id);
     }
 
-    // Collect unique bucket values
     let unique_buckets: Vec<i32> = bucket_to_ids.keys().copied().collect();
     assert!(
         unique_buckets.len() >= 2,
@@ -440,7 +437,6 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         unique_buckets.len()
     );
 
-    // Select first two buckets and their corresponding id values
     let selected_buckets = &unique_buckets[..2.min(unique_buckets.len())];
     let selected_ids: Vec<i64> = selected_buckets
         .iter()
@@ -479,6 +475,123 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
             assert!(
                 !partition_values.contains(&ScalarValue::Int32(Some(bucket))),
                 "Bucket {bucket} should be pruned",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let partition_by = Expr::ScalarFunction(ScalarFunction {
+        func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
+        args: vec![lit(10i64), col("id")],
+    });
+    let table_provider =
+        PartitionTableProvider::new(creator.clone(), vec![partition_by.clone()], schema.clone())
+            .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(truncate::Truncate::new().into());
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![11, 12, 23, 24, 35, 36, 47, 48])),
+            Arc::new(StringArray::from(vec![
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80])),
+        ],
+    )?;
+
+    let df_schema = DFSchema::try_from(schema.clone())?;
+    let execution_props = ExecutionProps::new();
+    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let batch_values = physical_expr.evaluate(&batch)?;
+    let truncated_values = match batch_values {
+        ColumnarValue::Array(array) => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array from truncate function")
+            .values()
+            .to_vec(),
+        _ => panic!("Expected array from truncate expression"),
+    };
+
+    let id_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Expected Int64Array for id column");
+    let mut truncate_to_ids: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (id, truncated) in id_array.values().iter().zip(truncated_values.iter()) {
+        truncate_to_ids
+            .entry(*truncated)
+            .or_insert_with(Vec::new)
+            .push(*id);
+    }
+
+    let unique_truncated: Vec<i64> = truncate_to_ids.keys().copied().collect();
+    assert!(
+        unique_truncated.len() >= 2,
+        "Expected at least two distinct truncated values, got {}",
+        unique_truncated.len()
+    );
+
+    let selected_truncated = &unique_truncated[..2.min(unique_truncated.len())];
+    let selected_ids: Vec<i64> = selected_truncated
+        .iter()
+        .flat_map(|truncated| truncate_to_ids.get(truncated).unwrap_or(&vec![]).clone())
+        .collect();
+
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    let in_list_str = selected_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT * FROM test_table WHERE id IN ({in_list_str})");
+    let df = ctx.sql(&query).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+
+    assert_eq!(
+        partition_values.len(),
+        selected_truncated.len(),
+        "Expected {} partitions for IN list query",
+        selected_truncated.len()
+    );
+    for truncated in selected_truncated {
+        assert!(
+            partition_values.contains(&ScalarValue::Int64(Some(*truncated))),
+            "Expected truncated value {truncated} in filtered plan",
+        );
+    }
+    for truncated in [0, 10, 20, 30, 40, 50, 60, 70].iter() {
+        if !selected_truncated.contains(truncated) {
+            assert!(
+                !partition_values.contains(&ScalarValue::Int64(Some(*truncated))),
+                "Truncated value {truncated} should be pruned",
             );
         }
     }
