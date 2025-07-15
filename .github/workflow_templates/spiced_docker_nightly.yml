@@ -20,6 +20,10 @@ on:
           - "release-lto"
         default: "release"
 
+permissions:
+  packages: write
+  contents: write
+
 jobs:
   check_commits:
     runs-on: ubuntu-latest
@@ -76,95 +80,6 @@ jobs:
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
-  build-arm64:
-    needs: [check_commits, setup]
-    if: needs.check_commits.outputs.has_new_commits == 'true'
-
-    runs-on: hosted-linux-arm-runner
-    env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Add nightly postfix to version in Cargo.toml
-        env:
-          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
-        run: |
-          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
-            new_version="${current_version}.$NIGHTLY_LABEL"
-          else
-            new_version="${current_version}-$NIGHTLY_LABEL"
-          fi
-          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
-          grep '^version =' Cargo.toml
-
-      - name: Install docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg lsb-release
-          sudo mkdir -m 0755 -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-      - name: Start Docker service
-        run: |
-          sudo systemctl start docker
-          sudo systemctl status docker
-
-      - name: chown /var/run/docker.sock to current user
-        run: |
-          sudo chown $USER /var/run/docker.sock
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-
-      - name: default
-        run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
-      - &build-arm64-image
-        name: Build ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - *build-arm64-image
-
-      - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: images-arm64
-          path: /tmp/image-arm64-*.tar
-
   build-amd64:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -207,28 +122,13 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          outputs: type=docker,name=localhost:5000/spiceai-enterprise-nightly:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: models-jemalloc
-        run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: models-mimalloc
-        run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: models-sysalloc
-        run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - *build-amd64-image
 
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
@@ -237,7 +137,7 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   publish:
-    needs: [check_commits, setup, build-amd64, build-arm64]
+    needs: [check_commits, setup, build-amd64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
     runs-on: ubuntu-latest
@@ -252,7 +152,6 @@ jobs:
         run: |
           ls -l /tmp
           ls -l /tmp/images-amd64
-          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -276,7 +175,7 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
-          variants=("models" "models-jemalloc" "models-mimalloc" "models-sysalloc")
+          variants=("models")
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
@@ -286,34 +185,29 @@ jobs:
             # Load both architecture images
             echo "Loading AMD64 image"
             docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
-            echo "Loading ARM64 image"
-            docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
 
             # Push images to local registry
             echo "Pushing images to local registry"
-            docker push localhost:5000/spiceai:${variant}-amd64
-            docker push localhost:5000/spiceai:${variant}-arm64
+            docker push localhost:5000/spiceai-enterprise-nightly:${variant}-amd64
 
             if [[ "${PUBLISH}" == "true" ]]; then
               # Push to GitHub Container Registry
               echo "Pushing to GHCR"
               docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai-nightly:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                -t ghcr.io/spicehq/spiceai-enterprise-nightly:${REL_VERSION}${suffix} \
+                -t ghcr.io/spicehq/spiceai-enterprise-nightly:latest${suffix} \
+                localhost:5000/spiceai-enterprise-nightly:${variant}-amd64
 
               echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix}
+              docker buildx imagetools inspect ghcr.io/spicehq/spiceai-enterprise-nightly:${REL_VERSION}${suffix}
             else
               echo "Skipping push for non-tag build"
               echo "Creating local manifest for testing:"
               docker buildx imagetools create \
-                -t localhost:5000/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                -t localhost:5000/spiceai-enterprise-nightly:latest${suffix} \
+                localhost:5000/spiceai-enterprise-nightly:${variant}-amd64
 
-              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
+              docker buildx imagetools inspect localhost:5000/spiceai-enterprise-nightly:latest${suffix}
             fi
           done
 
@@ -329,3 +223,38 @@ jobs:
           git push origin nightly --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get spicehq scoped GitHub access token
+        uses: actions/create-github-app-token@v2
+        id: github-app-token
+        with:
+          app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
+          private-key: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ai-platform
+
+      # triggers https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise-nightly.yaml workflow
+      - name: Trigger platform images promotion
+        if: github.event_name == 'schedule' || inputs.publish
+        env:
+          GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+        run: |
+          # create and push current nightly tag
+          if git ls-remote --tags origin | grep -q "${{ env.REL_VERSION }}$"; then
+            echo "Tag ${{ env.REL_VERSION }} already exists. Skipping tag creation."
+          else
+            git config --global user.name 'Spice Nightly Bot'
+            git config --global user.email 'nightly-bot@spice.ai'
+            git tag "nightly-${{ env.REL_VERSION }}"
+            git push origin "nightly-${{ env.REL_VERSION }}"
+          fi
+
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/spicehq/ai-platform/dispatches \
+            -f 'event_type=publish-spiceai-enterprise-nightly' \
+            -F "client_payload[tag]=${{ env.REL_VERSION }}-models"
