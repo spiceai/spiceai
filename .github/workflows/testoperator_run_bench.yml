@@ -137,6 +137,16 @@ jobs:
         if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
         uses: ./.github/actions/setup-odbc
 
+      - name: Install Oracle ODPI-C
+        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'oracle') }}
+        run: |
+          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
+          mkdir linux
+          unzip basic.zip -d linux -x "META-INF/*"
+          IC_DIR=$PWD/$(ls -d linux/instantclient*)
+          ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
+          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
