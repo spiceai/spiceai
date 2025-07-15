@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
+    array::{new_null_array, Array, ArrayRef, ListArray, RecordBatch, StructArray},
     buffer::{Buffer, OffsetBuffer},
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
@@ -23,10 +23,10 @@ use arrow::{
 use arrow_cast::cast;
 use arrow_schema::Schema;
 use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
-use snafu::{ResultExt, prelude::*};
+use snafu::{prelude::*, ResultExt};
 use std::sync::Arc;
 
-use crate::format::{FormatOperation, format_column_data};
+use crate::format::{format_column_data, FormatOperation};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -37,6 +37,21 @@ pub enum Error {
 
     #[snafu(display("Field is not nullable: {field}"))]
     FieldNotNullable { field: String },
+}
+
+impl Into<DataFusionError> for Error {
+    fn into(self) -> DataFusionError {
+        match self {
+            Self::UnableToConvertRecordBatch { source: arrow_error } =>
+                DataFusionError::ArrowError(arrow_error, None),
+            Self::FieldNotNullable { .. } =>
+                DataFusionError::ArrowError(
+                    ArrowError::SchemaError(self.to_string()),
+                    None
+                ),
+            _ => DataFusionError::External(Box::new(self))
+        }
+    }
 }
 
 /// Cast a given record batch into a new record batch with the given schema.
@@ -263,7 +278,6 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
 
 #[cfg(test)]
 mod test {
-
     use std::collections::HashMap;
 
     use arrow::{
