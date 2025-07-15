@@ -206,7 +206,7 @@ async fn query_arrow(
         .build()
         .context(QuerySnafu)
         .map_err(to_datafusion_err)?;
-    
+
     let query_res = stmt
         .into_result_set(&[])
         .context(QuerySnafu)
