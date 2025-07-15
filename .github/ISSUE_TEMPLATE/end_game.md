@@ -164,6 +164,11 @@ assignees: ''
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
+  - [ ] Run [Generate Changelog](https://github.com/spiceai/spiceai/actions/workflows/generate_changelog.yml) to update the release notes.
+    - Use parameters:
+      - Previous Release Tag: the previous release tag (e.g. `v1.4.0`). This is the tag of the previous release we want to compare against.
+      - Release Branch: the release branch (e.g. `release/1.5`). This is the branch that contains the new changes that are based on the release branch. If this is a prep branch, use that branch here.
+      - The script will generate the changes it believes are in the release. It also generates a list of changes that are only in trunk but not in the release branch, but this is not always accurate. Please review the changes and copy any changes that are missing into the release notes changelog.
 
 - [ ] Add references to any SDK releases in the release notes:
 
