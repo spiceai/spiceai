@@ -121,7 +121,7 @@ impl ExecutionPlan for PartitionMemTableExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let partition_value = self.partition_value.clone();
-        let new_mem_table_exec = self.mem_table_exec.clone().with_new_children(children)?;
+        let new_mem_table_exec = Arc::clone(&self.mem_table_exec).with_new_children(children)?;
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec: new_mem_table_exec,
             partition_value,
@@ -182,7 +182,7 @@ impl PartitionCreator for TestPartitionCreator {
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
         let empty_batch = RecordBatch::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             vec![
                 Arc::new(Int64Array::new(vec![].into(), None)),
                 Arc::new(StringArray::from(Vec::<String>::new())),
@@ -192,17 +192,17 @@ impl PartitionCreator for TestPartitionCreator {
         .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         let mem_table = Arc::new(
-            MemTable::try_new(self.schema.clone(), vec![vec![empty_batch]])
+            MemTable::try_new(Arc::clone(&self.schema), vec![vec![empty_batch]])
                 .map_err(|e| creator::Error::CreatePartition { source: e.into() })?,
         );
         let partition_mem_table = Arc::new(PartitionMemTable {
             mem_table,
             partition_value: partition_value.clone(),
         });
-        self.partitions
-            .write()
-            .await
-            .insert(partition_value.to_string(), partition_mem_table.clone());
+        self.partitions.write().await.insert(
+            partition_value.to_string(),
+            Arc::clone(&partition_mem_table),
+        );
         Ok(Partition {
             partition_value,
             table_provider: partition_mem_table,
@@ -241,16 +241,20 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
         Field::new("value", DataType::Int64, false),
     ]));
 
-    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
     let partition_by = vec![col("region")];
-    let table_provider =
-        PartitionTableProvider::new(creator.clone(), partition_by, schema.clone()).await?;
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
 
     let ctx = SessionContext::new();
     ctx.register_table("test_table", Arc::new(table_provider))?;
 
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
@@ -271,7 +275,7 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(partitions.len(), 2, "Expected two partitions");
 
     for (partition_key, partition_mem_table) in partitions {
-        let df = ctx.read_table(partition_mem_table.clone())?;
+        let df = ctx.read_table(Arc::clone(&partition_mem_table) as Arc<dyn TableProvider>)?;
         let batches = df.collect().await?;
         for batch in batches {
             if batch.num_rows() == 0 {
@@ -281,7 +285,7 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
                 .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
+                .expect("StringArray");
             for i in 0..batch.num_rows() {
                 assert_eq!(
                     region_array.value(i),
@@ -303,16 +307,20 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
         Field::new("value", DataType::Int64, false),
     ]));
 
-    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
     let partition_by = vec![col("region")];
-    let table_provider =
-        PartitionTableProvider::new(creator.clone(), partition_by, schema.clone()).await?;
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
 
     let ctx = SessionContext::new();
     ctx.register_table("test_table", Arc::new(table_provider))?;
 
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
             Arc::new(StringArray::from(vec![
@@ -365,6 +373,7 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -372,21 +381,24 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         Field::new("value", DataType::Int64, false),
     ]));
 
-    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
     let partition_by = Expr::ScalarFunction(ScalarFunction {
         func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
         args: vec![lit(4i64), col("id")],
     });
-    let table_provider =
-        PartitionTableProvider::new(creator.clone(), vec![partition_by.clone()], schema.clone())
-            .await?;
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        vec![partition_by.clone()],
+        Arc::clone(&schema),
+    )
+    .await?;
 
     let ctx = SessionContext::new();
     ctx.register_udf(bucket::Bucket::new().into());
     ctx.register_table("test_table", Arc::new(table_provider))?;
 
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
             Arc::new(StringArray::from(vec![
@@ -403,7 +415,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         ],
     )?;
 
-    let df_schema = DFSchema::try_from(schema.clone())?;
+    let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
     let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
@@ -414,7 +426,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
             .expect("Expected Int32Array from bucket function")
             .values()
             .to_vec(),
-        _ => panic!("Expected array from bucket expression"),
+        ColumnarValue::Scalar(_) => panic!("Expected array from bucket expression"),
     };
 
     let id_array = batch
@@ -424,10 +436,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
         .expect("Expected Int64Array for id column");
     let mut bucket_to_ids: HashMap<i32, Vec<i64>> = HashMap::new();
     for (id, bucket) in id_array.values().iter().zip(bucket_values.iter()) {
-        bucket_to_ids
-            .entry(*bucket)
-            .or_insert_with(Vec::new)
-            .push(*id);
+        bucket_to_ids.entry(*bucket).or_default().push(*id);
     }
 
     let unique_buckets: Vec<i32> = bucket_to_ids.keys().copied().collect();
@@ -449,7 +458,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 
     let in_list_str = selected_ids
         .iter()
-        .map(|id| id.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!("SELECT * FROM test_table WHERE id IN ({in_list_str})");
@@ -483,6 +492,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -490,21 +500,24 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
         Field::new("value", DataType::Int64, false),
     ]));
 
-    let creator = Arc::new(TestPartitionCreator::new(schema.clone()));
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
     let partition_by = Expr::ScalarFunction(ScalarFunction {
         func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
         args: vec![lit(10i64), col("id")],
     });
-    let table_provider =
-        PartitionTableProvider::new(creator.clone(), vec![partition_by.clone()], schema.clone())
-            .await?;
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        vec![partition_by.clone()],
+        Arc::clone(&schema),
+    )
+    .await?;
 
     let ctx = SessionContext::new();
     ctx.register_udf(truncate::Truncate::new().into());
     ctx.register_table("test_table", Arc::new(table_provider))?;
 
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![11, 12, 23, 24, 35, 36, 47, 48])),
             Arc::new(StringArray::from(vec![
@@ -521,7 +534,7 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
         ],
     )?;
 
-    let df_schema = DFSchema::try_from(schema.clone())?;
+    let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
     let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
@@ -532,7 +545,7 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
             .expect("Expected Int64Array from truncate function")
             .values()
             .to_vec(),
-        _ => panic!("Expected array from truncate expression"),
+        ColumnarValue::Scalar(_) => panic!("Expected array from truncate expression"),
     };
 
     let id_array = batch
@@ -542,10 +555,7 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
         .expect("Expected Int64Array for id column");
     let mut truncate_to_ids: HashMap<i64, Vec<i64>> = HashMap::new();
     for (id, truncated) in id_array.values().iter().zip(truncated_values.iter()) {
-        truncate_to_ids
-            .entry(*truncated)
-            .or_insert_with(Vec::new)
-            .push(*id);
+        truncate_to_ids.entry(*truncated).or_default().push(*id);
     }
 
     let unique_truncated: Vec<i64> = truncate_to_ids.keys().copied().collect();
@@ -567,7 +577,7 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
 
     let in_list_str = selected_ids
         .iter()
-        .map(|id| id.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!("SELECT * FROM test_table WHERE id IN ({in_list_str})");
@@ -587,7 +597,7 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
             "Expected truncated value {truncated} in filtered plan",
         );
     }
-    for truncated in [0, 10, 20, 30, 40, 50, 60, 70].iter() {
+    for truncated in &[0, 10, 20, 30, 40, 50, 60, 70] {
         if !selected_truncated.contains(truncated) {
             assert!(
                 !partition_values.contains(&ScalarValue::Int64(Some(*truncated))),
