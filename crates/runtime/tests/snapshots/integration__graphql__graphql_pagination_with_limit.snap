@@ -1,0 +1,8 @@
+---
+source: crates/runtime/tests/graphql/mod.rs
+description: GraphQL Pagination With Limit Results
+---
+  singlePaginatedUsers (first: 1) {
+  singlePaginatedUsers (first: 1) {
+  singlePaginatedUsers (first: 1, after: "1") {
+  singlePaginatedUsers (first: 1, after: "2") {

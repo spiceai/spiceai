@@ -111,7 +111,7 @@ impl TextSearchTableFunc {
             (None, None, None) => (None, None, Some(true)),
 
             // Single argument cases
-            (Some(Expr::Literal(ScalarValue::Utf8(Some(col)))), None, None) => {
+            (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
             (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
@@ -123,12 +123,12 @@ impl TextSearchTableFunc {
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
@@ -140,7 +140,7 @@ impl TextSearchTableFunc {
 
             // All three arguments provided
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
@@ -303,10 +303,14 @@ impl TextSearchUDTFProvider {
             .all_columns()
             .iter()
             .filter_map(|field_name| {
-                let f = tantivy_schema.get_field(field_name).ok()?;
-                let entry = tantivy_schema.get_field_entry(f);
-                let data_type = tantivy_to_arrow_type(entry.field_type())?;
-                Some(Field::new(field_name, data_type, false))
+                let (data_type, nullable) = if let Some(f) = field_index.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = tantivy_schema.get_field(field_name).ok()?;
+                    let entry = tantivy_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                };
+                Some(Field::new(field_name, data_type, nullable))
             })
             .chain([Field::new(
                 SEARCH_SCORE_COLUMN_NAME,

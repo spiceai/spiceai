@@ -41,8 +41,9 @@ use runtime_table_partition::{
     Partition,
     creator::{
         self, PartitionCreator,
-        filename::{self, decode_scalar_value, encode_scalar_value},
+        filename::{self, decode_pair, encode_pair},
     },
+    expression::PartitionBy,
     provider::PartitionTableProvider,
 };
 use snafu::{OptionExt, prelude::*};
@@ -111,6 +112,9 @@ pub enum Error {
 
     #[snafu(display("Partitioned DuckDB expected an AccelerationSource"))]
     ExpectedAccelerationSource,
+
+    #[snafu(display("Partition by expressions are required for Partitioned DuckDB acceleration"))]
+    PartitionByRequired,
 
     #[snafu(display("Unable to create partition: {source}"))]
     UnableToCreatePartition {
@@ -237,8 +241,10 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        let partition_by = partition_by.context(PartitionByRequiredSnafu)?;
+
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
         parameter_validation(source);
@@ -246,8 +252,17 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         let mut table_provider_guard = self.table_provider.lock().await;
         ensure!(table_provider_guard.is_none(), SingleTableSnafu);
 
+        let PartitionBy {
+            expressions_hash,
+            expressions: partition_by,
+        } = partition_by;
+
         let schema = Arc::new(cmd.schema.as_arrow().clone());
-        let creator = Arc::new(DuckDBPartitionCreator::new(partition_dir(source), cmd));
+        let creator = Arc::new(DuckDBPartitionCreator::new(
+            partition_dir(source),
+            cmd,
+            expressions_hash,
+        ));
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
@@ -274,21 +289,42 @@ pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
     partition_dir: PathBuf,
+    expressions_hash: u64,
 }
 
 impl DuckDBPartitionCreator {
-    pub(crate) fn new(partition_dir: PathBuf, cmd: CreateExternalTable) -> Self {
+    pub(crate) fn new(
+        partition_dir: PathBuf,
+        cmd: CreateExternalTable,
+        expressions_hash: u64,
+    ) -> Self {
         let duckdb_factory = create_factory();
 
         Self {
             cmd,
             duckdb_factory,
             partition_dir,
+            expressions_hash,
         }
     }
 
     fn valid_file_extensions() -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
+    }
+
+    fn add_open(
+        &self,
+        cmd: &mut CreateExternalTable,
+        partition_value: &ScalarValue,
+    ) -> Result<String, filename::Error> {
+        let partition_value_str = encode_pair(partition_value, self.expressions_hash)?;
+
+        let duckdb_file = format!("{partition_value_str}.db");
+        let duckdb_path = self.partition_dir.join(&duckdb_file);
+        let duckdb_path = duckdb_path.display().to_string();
+        cmd.options.insert("open".to_string(), duckdb_path.clone());
+
+        Ok(duckdb_path)
     }
 }
 
@@ -299,7 +335,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
         let mut cmd = self.cmd.clone();
-        let duckdb_path = add_open(&self.partition_dir, &mut cmd, &partition_value)
+        let duckdb_path = self
+            .add_open(&mut cmd, &partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         tracing::debug!("creating partition at {duckdb_path}");
@@ -346,8 +383,13 @@ impl PartitionCreator for DuckDBPartitionCreator {
                     continue;
                 };
 
-                let partition_value = match decode_scalar_value(file_name) {
-                    Ok(value) => value,
+                let partition_value = match decode_pair(file_name) {
+                    Ok((value, partition_by_hash)) => {
+                        if self.expressions_hash != partition_by_hash {
+                            return Err(creator::Error::PartitionByExpressionsChanged);
+                        }
+                        value
+                    }
                     Err(e) => {
                         tracing::trace!("Unable to decode ScalarValue: {e}");
                         continue;
@@ -355,7 +397,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 };
 
                 let mut cmd = self.cmd.clone();
-                add_open(&self.partition_dir, &mut cmd, &partition_value)
+                self.add_open(&mut cmd, &partition_value)
                     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
                 let duckdb_path = path.display().to_string();
@@ -397,21 +439,6 @@ impl PartitionCreator for DuckDBPartitionCreator {
             })
             .collect())
     }
-}
-
-fn add_open(
-    partition_dir: &Path,
-    cmd: &mut CreateExternalTable,
-    partition_value: &ScalarValue,
-) -> Result<String, filename::Error> {
-    let partition_value_str = encode_scalar_value(partition_value)?;
-
-    let duckdb_file = format!("{partition_value_str}.db");
-    let duckdb_path = partition_dir.join(&duckdb_file);
-    let duckdb_path = duckdb_path.display().to_string();
-    cmd.options.insert("open".to_string(), duckdb_path.clone());
-
-    Ok(duckdb_path)
 }
 
 fn create_factory() -> DuckDBTableProviderFactory {

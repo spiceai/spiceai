@@ -50,6 +50,7 @@ RUN mkdir -p /spice_sandbox/bin && \
     mkdir -p /spice_sandbox/dev && \
     mkdir -p /spice_sandbox/app
 
+
 # Copy the binary
 COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
@@ -74,6 +75,13 @@ RUN chmod 755 /spice_sandbox/.duckdb
 
 # Give the nobody user ownership of app dir
 RUN chown -R 65534:65534 /spice_sandbox/app
+
+# Create HuggingFace cache directory in sandbox
+RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
+RUN chown -R 65534:65534 /spice_sandbox/.cache
+RUN chmod -R 755 /spice_sandbox/.cache
+ENV HF_HOME=/spice_sandbox/.cache/huggingface
+ENV HF_HUB_CACHE=/spice_sandbox/.cache/huggingface/hub
 
 FROM scratch
 

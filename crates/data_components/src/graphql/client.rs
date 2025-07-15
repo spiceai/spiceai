@@ -703,7 +703,6 @@ impl GraphQLQuery {
 
 pub(crate) struct GraphQLQueryResult {
     pub(crate) records: Vec<RecordBatch>,
-    record_count: usize,
     limit_reached: bool,
     pub(crate) schema: SchemaRef,
     cursor: Option<String>,
@@ -833,13 +832,10 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        let record_count = res.len();
-
-        let limit_reached = query.limit_reached(limit, record_count);
+        let limit_reached = query.limit_reached(limit, res.len());
 
         Ok(GraphQLQueryResult {
             records: res,
-            record_count,
             limit_reached,
             schema: Arc::clone(&schema),
             cursor: next_cursor,
@@ -884,8 +880,8 @@ impl GraphQLClient {
 
             while let Some(next_cursor_val) = result.cursor {
                 if let Some(p) = query.pagination_parameters.as_ref() {
-                    if limit.is_some() {
-                        limit = Some(p.reduce_limit(result.record_count));
+                    if let Some(value) = limit {
+                        limit = Some(p.reduce_limit(value));
                     }
                 }
 

@@ -196,6 +196,10 @@ jobs:
           AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
           AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst

@@ -137,7 +137,7 @@ impl VectorSearchTableFunc {
         ];
 
         if let Some(col) = args.column.as_ref() {
-            expr.push(Expr::Literal(ScalarValue::Utf8(Some(col.clone()))));
+            expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
             expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit as u64))));
@@ -175,7 +175,7 @@ impl VectorSearchTableFunc {
             (None, None, None) => (None, None, Some(true)),
 
             // Single argument cases
-            (Some(Expr::Literal(ScalarValue::Utf8(Some(col)))), None, None) => {
+            (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
             (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
@@ -187,12 +187,12 @@ impl VectorSearchTableFunc {
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
@@ -204,7 +204,7 @@ impl VectorSearchTableFunc {
 
             // All three arguments provided
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),

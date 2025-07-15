@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "i_item_sk": 19,
+    "i_color": "smoke",
+    "i_item_id": "AAAAAAAADBAAAAAA",
+    "i_item_desc": "Patient",
+    "score": 4.284671306610107
+  }
+]

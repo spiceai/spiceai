@@ -116,6 +116,10 @@ jobs:
 
       - name: Build spiced (macOS)
         if: matrix.target.target_os == 'darwin'
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
 

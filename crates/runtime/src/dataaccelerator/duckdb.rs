@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable, prelude::Expr,
+    logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
     duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
@@ -40,6 +40,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_table_partition::expression::PartitionBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
 use std::{
@@ -322,7 +323,7 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        _partition_by: Vec<Expr>,
+        _partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
@@ -493,7 +494,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let (table, _) = duckdb_accelerator
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, None)
             .await
             .expect("table should be created");
 
