@@ -1,6 +1,7 @@
 name: Generate Changelog
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       previous_release_tag:
@@ -24,5 +25,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          #PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
+          #RELEASE_BRANCH: ${{ inputs.release_branch }}
+          PREVIOUS_RELEASE_TAG: v1.5.0-rc.2
+          RELEASE_BRANCH: pease/release-1.5-prep
         run: |
-          ./scripts/generate_changelog.sh ${{ inputs.previous_release_tag }} ${{ inputs.release_branch }}
+          ./scripts/generate_changelog.sh $PREVIOUS_RELEASE_TAG $RELEASE_BRANCH
