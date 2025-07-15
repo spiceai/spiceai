@@ -1,39 +1,59 @@
+# Oracle TPC-H Benchmark Setup
 
-1. create schema usign sqlplus:
-@setup_tpch.sql
+Steps to load the TPC-H SF1 dataset into Oracle database.
 
-2. Prepare export data. 
- - Generate or obtain DuckDB tpch database: `tpch.db`
- - Export data as csv:
+## Prerequisites
 
+- An Oracle Database instance with administrative access
+- Oracle SQLPlus and SQL*Loader utilities installed
+- DuckDB installed and populated with TPC-H data (`tpch.db`)
+
+## Setup Instructions
+
+### 1. Create Database Schema
+
+Connect to the Oracle instance using SQLPlus and execute the setup script:
+
+```sql
+SQL> @setup_tpch.sql
 ```
+
+### 2. Export Data from DuckDB
+
+Generate CSV files from the TPC-H DuckDB database:
+
+```bash
 for table in customer lineitem nation orders part partsupp region supplier; do
-  duckdb tpch.db "COPY $table TO '${table}.csv' (HEADER, DELIMITER ',');"
+  duckdb tpch.db "COPY $table TO '${table}.csv' (DELIMITER ',');"
 done
 ```
 
-3. Load data using `sqlldr`
+### 3. Load Data into Oracle
 
-```
-sqlldr admin/password_replace_me@connection_string_replace_me control=customer.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=orders.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=lineitem.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=part.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=partsupp.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=nation.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=region.ctl direct=true
-sqlldr admin/password_replace_me@connection_string_replace_me control=supplier.ctl direct=true
+- Replace `password` and `connection_string` with your actual Oracle credentials
+
+#### Option A: Individual Commands
+
+```bash
+sqlldr admin/password@connection_string control=customer.ctl direct=true
+sqlldr admin/password@connection_string control=orders.ctl direct=true
+sqlldr admin/password@connection_string control=lineitem.ctl direct=true
+sqlldr admin/password@connection_string control=part.ctl direct=true
+sqlldr admin/password@connection_string control=partsupp.ctl direct=true
+sqlldr admin/password@connection_string control=nation.ctl direct=true
+sqlldr admin/password@connection_string control=region.ctl direct=true
+sqlldr admin/password@connection_string control=supplier.ctl direct=true
 ```
 
-or 
+#### Option B: Batch Script
 
-```
+```bash
 USER="admin"
-PASS="password_replace_me"
-CONNECT_STRING="connection_string_replace_me"
+PASS="your_password"
+CONNECT_STRING="your_connection_string"
 
 for table in customer orders lineitem part partsupp nation region supplier; do
-  echo "Loading $table as ADMIN into TPCH_SF1.$table..."
+  echo "Loading $table..."
   sqlldr "${USER}/${PASS}@${CONNECT_STRING}" control="${table}.ctl" direct=true
 done
 ```
