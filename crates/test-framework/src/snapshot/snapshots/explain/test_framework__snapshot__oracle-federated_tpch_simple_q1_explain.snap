@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q1"
+---
++---------------+-----------------------------------------------------------------------------+
+| plan_type     | plan                                                                        |
++---------------+-----------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.L_ORDERKEY)]]                  |
+|               |   BytesProcessedNode                                                        |
+|               |     TableScan: lineitem projection=[L_ORDERKEY]                             |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.L_ORDERKEY)]          |
+|               |   CoalescePartitionsExec                                                    |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.L_ORDERKEY)]    |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1 |
+|               |         BytesProcessedExec                                                  |
+|               |           OracleExec sql=SELECT "L_ORDERKEY" FROM "TPCH_SF1"."LINEITEM"     |
+|               |                                                                             |
++---------------+-----------------------------------------------------------------------------+

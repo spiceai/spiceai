@@ -1,0 +1,24 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q4"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                     |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: lineitem.L_QUANTITY DESC NULLS FIRST, fetch=10                                                                                     |
+|               |   Projection: avg(lineitem.L_TAX), lineitem.L_LINENUMBER, lineitem.L_QUANTITY                                                            |
+|               |     Aggregate: groupBy=[[lineitem.L_LINENUMBER, lineitem.L_QUANTITY]], aggr=[[avg(lineitem.L_TAX)]]                                      |
+|               |       BytesProcessedNode                                                                                                                 |
+|               |         TableScan: lineitem projection=[L_LINENUMBER, L_QUANTITY, L_TAX]                                                                 |
+| physical_plan | SortPreservingMergeExec: [L_QUANTITY@2 DESC], fetch=10                                                                                   |
+|               |   SortExec: TopK(fetch=10), expr=[L_QUANTITY@2 DESC], preserve_partitioning=[true]                                                       |
+|               |     ProjectionExec: expr=[avg(lineitem.L_TAX)@2 as avg(lineitem.L_TAX), L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY]      |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY], aggr=[avg(lineitem.L_TAX)] |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                      |
+|               |           RepartitionExec: partitioning=Hash([L_LINENUMBER@0, L_QUANTITY@1], 14), input_partitions=14                                    |
+|               |             AggregateExec: mode=Partial, gby=[L_LINENUMBER@0 as L_LINENUMBER, L_QUANTITY@1 as L_QUANTITY], aggr=[avg(lineitem.L_TAX)]    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                      |
+|               |                 BytesProcessedExec                                                                                                       |
+|               |                   OracleExec sql=SELECT "L_LINENUMBER", "L_QUANTITY", "L_TAX" FROM "TPCH_SF1"."LINEITEM"                                 |
+|               |                                                                                                                                          |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------+
