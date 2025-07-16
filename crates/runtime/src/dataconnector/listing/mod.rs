@@ -49,7 +49,11 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("hive_partitioning_enabled")
         .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
     ParameterSpec::runtime("schema_source_path")
-        .description("Specify a path to use for schema inference.")
+        .description("Specify a path to use for schema inference."),
+    ParameterSpec::runtime("json_format")
+        .description("jsonl | array. Defaults to jsonl."),
+    ParameterSpec::runtime("flatten_json")
+        .description("Set true to flatten nested structs in JSON as separate columns."),
 ];
 
 pub enum DelimitedFormat {

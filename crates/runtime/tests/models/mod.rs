@@ -36,6 +36,8 @@ mod embedding;
 mod hf;
 mod local;
 pub(crate) mod openai;
+#[cfg(feature = "s3_vectors")]
+mod s3_vectors;
 mod search;
 mod tools;
 

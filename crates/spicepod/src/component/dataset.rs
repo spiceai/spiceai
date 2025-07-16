@@ -26,6 +26,7 @@ use crate::acceleration::Acceleration;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
+use crate::vector::VectorStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -139,6 +140,9 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<VectorStore>,
 }
 
 impl Nameable for Dataset {
@@ -170,6 +174,7 @@ impl Dataset {
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
             metrics: None,
+            vectors: None,
         }
     }
 
@@ -236,6 +241,7 @@ impl WithDependsOn<Dataset> for Dataset {
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
+            vectors: self.vectors.clone(),
         }
     }
 }
@@ -307,6 +313,9 @@ struct DatasetDeserializer {
     ready_state: ReadyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vectors: Option<VectorStore>,
 }
 
 #[allow(deprecated)]
@@ -356,6 +365,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             unsupported_type_action,
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
+            vectors: deserializer.vectors,
         })
     }
 }

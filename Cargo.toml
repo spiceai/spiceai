@@ -6,6 +6,7 @@ members = [
     "crates/arrow_sql_gen",
     "crates/arrow_tools",
     "crates/data_components",
+    "crates/dataformat-json",
     "crates/document_parse",
     "crates/event_stream",
     "crates/flight_client",
@@ -21,6 +22,8 @@ members = [
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",
+    "crates/s3_vectors",
+    "crates/s3_vectors_metadata_filter",
     "crates/search",
     "crates/spice_cloud",
     "crates/spicepod",
@@ -101,6 +104,7 @@ duckdb = "1.3.2"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
+governor = "0.10.0"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
@@ -241,3 +245,5 @@ arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5
 arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "aecc3402c5b1120200c8ce1b6d62c7ef700a698f" } # spiceai-55.1
+
+rusoto_core = { git = "https://github.com/spiceai/rusoto.git", rev = "6c36511956edd67b794ff2dcd3caf5769ef8c859" } # spiceai

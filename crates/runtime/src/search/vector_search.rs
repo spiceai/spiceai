@@ -38,6 +38,7 @@ use cache::result::CacheStatus;
 use cache::result::query::CachedStream;
 use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{CacheProvider, Sizeable};
+use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::{
     TableReference,
@@ -45,6 +46,8 @@ use datafusion::sql::{
 };
 use futures::StreamExt;
 use itertools::Itertools;
+use llms::embeddings::Embed;
+use runtime_datafusion_index::IndexedTableProvider;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -80,6 +83,24 @@ impl VectorSearch {
         }
     }
 
+    /// Checks if a  [`TableProvider`] has an associated vector index, and if so, returns the associated [`Embed`].
+    async fn model_from_vector_index(
+        &self,
+        tbl: &Arc<dyn TableProvider>,
+    ) -> Option<Arc<dyn Embed>> {
+        let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
+        #[cfg(feature = "s3_vectors")]
+        {
+            use crate::embeddings::index::S3Vector;
+            if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
+                return s3_vector.embedding_model().await;
+            }
+            None
+        }
+        #[cfg(not(feature = "s3_vectors"))]
+        None
+    }
+
     // Prepare an individual [`impl search::CandidateGeneration`] (specifically a [`VectorGeneration`]) based on the [`TableReference`].
     pub async fn vector_search_generator(
         &self,
@@ -95,43 +116,52 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let Some(embedding_table) = find_concrete_table_provider::<EmbeddingTable>(&table_provider)
-        else {
-            return Err(Error::CannotVectorSearchDataset {
-                data_source: tbl.clone(),
-            });
-        };
+        let (model, is_chunked) = if let Some(model) =
+            self.model_from_vector_index(&table_provider).await
+        {
+            (model, false)
+        } else {
+            let Some(embedding_table) =
+                find_concrete_table_provider::<EmbeddingTable>(&table_provider)
+            else {
+                return Err(Error::CannotVectorSearchDataset {
+                    data_source: tbl.clone(),
+                });
+            };
 
-        let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column) else {
-            return Err(Error::CannotVectorSearchDataset {
-                data_source: tbl.clone(),
-            });
-        };
+            let Some(model_name) = embedding_table.get_embedding_model_used_by(embedding_column)
+            else {
+                return Err(Error::CannotVectorSearchDataset {
+                    data_source: tbl.clone(),
+                });
+            };
 
-        let Some(embed) = self
-            .embeddings
-            .read()
-            .await
-            .iter()
-            .find_map(|(name, model)| {
-                if *name == model_name {
-                    return Some(Arc::clone(model));
-                }
-                None
-            })
-        else {
-            return Err(Error::CannotVectorSearchDataset {
-                data_source: tbl.clone(),
-            });
+            let Some(embed) = self
+                .embeddings
+                .read()
+                .await
+                .iter()
+                .find_map(|(name, model)| {
+                    if *name == model_name {
+                        return Some(Arc::clone(model));
+                    }
+                    None
+                })
+            else {
+                return Err(Error::CannotVectorSearchDataset {
+                    data_source: tbl.clone(),
+                });
+            };
+            (embed, embedding_table.is_chunked(embedding_column))
         };
 
         Ok(VectorGeneration::new(
             &self.df,
             tbl,
-            &embed,
+            &model,
             primary_keys,
             embedding_column,
-            embedding_table.is_chunked(embedding_column),
+            is_chunked,
         ))
     }
 
@@ -232,9 +262,9 @@ impl VectorSearch {
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
+
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
-
                     for (i, col) in embedding_columns.iter().enumerate() {
                         generators.insert(i, Arc::new(self.vector_search_generator(
                                 &tbl,
@@ -252,7 +282,7 @@ impl VectorSearch {
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
                         query.clone(),
                         where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                        additional_columns.iter().map(|s| Expr::Identifier(Ident::new(s))).collect(),
+                        additional_columns.iter().map(|s| Expr::Identifier(Ident::with_quote('"', s))).collect(),
                         primary_keys.to_vec(),
                         keywords,
                         *limit

@@ -65,6 +65,14 @@ impl IndexedTableProvider {
     }
 
     #[must_use]
+    pub fn get_indexes<T: Index + 'static>(&self) -> Vec<&T> {
+        self.indexes
+            .iter()
+            .filter_map(|i| i.as_any().downcast_ref::<T>())
+            .collect()
+    }
+
+    #[must_use]
     pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.underlying)
     }

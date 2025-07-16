@@ -375,13 +375,16 @@ impl TableProvider for TextSearchUDTFProvider {
         let underlying_projection =
             self.convert_projection(projection, &search_field_index_schema)?;
 
-        Ok(Arc::new(FullTextSearchExec::try_new(
-            field_index,
-            query.clone(),
-            search_field_index_schema,
-            Some(&underlying_projection),
-            filters.to_vec(),
-            limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
-        )?))
+        Ok(Arc::new(
+            FullTextSearchExec::try_new(
+                field_index,
+                query.clone(),
+                search_field_index_schema,
+                Some(&underlying_projection),
+                filters.to_vec(),
+                limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
+            )
+            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+        ))
     }
 }

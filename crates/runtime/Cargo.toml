@@ -41,6 +41,7 @@ clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"
 dashmap = "6.1.0"
 data_components = { path = "../data_components" }
+dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
@@ -60,7 +61,7 @@ flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
-governor = "0.10.0"
+governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 headers-accept = "0.1.3"
@@ -129,6 +130,10 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+s3_vectors = { path = "../s3_vectors", features = [
+    "deserialize_structs",
+    "serialize_structs",
+], optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
 search = { path = "../search" }
@@ -238,6 +243,7 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
+s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [
     "dep:snowflake-api",

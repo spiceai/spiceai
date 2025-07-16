@@ -1,0 +1,39 @@
+---
+source: crates/runtime/tests/models/s3_vectors.rs
+expression: formatted
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                              |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score,Int64(2))                                                         |
+|               |   Sort: vector_search().score DESC NULLS FIRST, fetch=4                                                                                                           |
+|               |     Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score, Int64(2)), vector_search().score                             |
+|               |       BytesProcessedNode                                                                                                                                          |
+|               |         Filter: vector_search().i_item_sk > Int32(5)                                                                                                              |
+|               |           TableScan: vector_search() projection=[i_item_sk, i_item_desc, score]                                                                                   |
+| physical_plan | ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(vector_search().score,Int64(2))@2 as round(vector_search().score,Int64(2))]   |
+|               |   SortPreservingMergeExec: [score@3 DESC], fetch=4                                                                                                                |
+|               |     SortExec: TopK(fetch=4), expr=[score@3 DESC], preserve_partitioning=[true]                                                                                    |
+|               |       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(score@2, 2) as round(vector_search().score,Int64(2)), score@2 as score] |
+|               |         BytesProcessedExec                                                                                                                                        |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |             FilterExec: i_item_sk@0 > 5                                                                                                                           |
+|               |               ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@2 as i_item_desc, score@1 as score]                                                     |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                       |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
+|               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(i_item_sk@0, i_item_sk@0)], projection=[i_item_sk@0, score@1, i_item_desc@3]             |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
+|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 14), input_partitions=14                                                                |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                             |
+|               |                             ProjectionExec: expr=[CAST(key@0 AS Int32) as i_item_sk, 1 - distance@1 as score]                                                     |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                               |
+|               |                                 BytesProcessedExec                                                                                                                |
+|               |                                   S3VectorsQueryExec: limit=100                                                                                                   |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
+|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 14), input_partitions=14                                                                |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                                   |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                           |
+|               |                               BytesProcessedExec                                                                                                                  |
+|               |                                 DataSourceExec: file_groups={1 group: [[tpcds/item/item.parquet]]}, projection=[i_item_sk, i_item_desc], file_type=parquet        |
+|               |                                                                                                                                                                   |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+

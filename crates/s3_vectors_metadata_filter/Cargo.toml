@@ -1,0 +1,16 @@
+[package]
+description = "S3 Vector metadata filtering for DataFusion"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "s3_vectors_metadata_filter"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+snafu.workspace = true
+tracing.workspace = true

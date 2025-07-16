@@ -19,6 +19,7 @@ aws-config.workspace = true
 aws-sdk-bedrockruntime = "1.55.0"
 bytes.workspace = true
 futures = { workspace = true }
+governor.workspace = true
 hf-hub.workspace = true
 insta = { workspace = true, features = ["filters"] }
 regex = "1.10.4"
@@ -32,6 +33,7 @@ tokenizers = "0.21.2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
+util = { path = "../util" }
 
 ## For Chunking
 text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "58f9c21006e01e5e968c5de80a0398b3f5ec439a", features = [

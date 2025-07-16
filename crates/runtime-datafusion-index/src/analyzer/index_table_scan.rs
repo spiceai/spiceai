@@ -42,6 +42,7 @@ use datafusion::{
     prelude::Expr,
 };
 use futures::StreamExt;
+use itertools::Itertools;
 
 use crate::{Index, IndexedTableProvider};
 
@@ -115,6 +116,12 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
 
                 if available_indexes.is_empty() {
                     // No indexes can be served by the projected schema
+                    let required_columns = indexed_table_provider.indexes.iter().flat_map(|i| i.required_columns()).collect::<HashSet<_>>().into_iter().join(",");
+                    let projected_schema_columns = projected_schema.fields().iter().map(|c| c.name()).join(",");
+                    tracing::warn!(
+                        "Could not index table {}, did not find expected columns [{required_columns}] in the projected schema [{projected_schema_columns}]",
+                        table_scan.table_name.table(),
+                    );
                     return Ok(Transformed::no(LogicalPlan::TableScan(table_scan)));
                 }
 
