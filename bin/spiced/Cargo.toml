@@ -14,7 +14,6 @@ clap = { workspace = true, features = ["derive"] }
 event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
-mimalloc = { version = "0.1.47", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -44,6 +43,7 @@ tracing-subscriber.workspace = true
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
+alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-system = []
 alloc-snmalloc = []
