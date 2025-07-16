@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.5.0-enterprise-beta"
+version = "1.5.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -11960,7 +11960,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.5.0-enterprise-beta"
+version = "1.5.0-unstable"
 dependencies = [
  "datafusion",
  "serde",
