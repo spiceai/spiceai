@@ -56,7 +56,7 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use tokio::sync::RwLock;
 
@@ -132,7 +132,7 @@ impl VectorSearchTableFunc {
     #[must_use]
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
         let mut expr = vec![
-            Expr::Column(Column::new_unqualified(args.tbl.to_string())),
+            Expr::Column(to_column_expr(&args.tbl)),
             Expr::Literal(ScalarValue::Utf8(Some(args.query.clone()))),
         ];
 
@@ -157,7 +157,7 @@ impl VectorSearchTableFunc {
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
-        let tbl_ref = table_ref_from_column_expr(&c);
+        let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {

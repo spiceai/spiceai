@@ -96,7 +96,7 @@ impl TextSearchTableFunc {
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
-        let tbl_ref = table_ref_from_column_expr(&c);
+        let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
