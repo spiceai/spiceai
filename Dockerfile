@@ -32,6 +32,8 @@ FROM debian:bookworm-slim as sandbox-setup
 
 ARG CARGO_FEATURES
 
+ARG INSTALL_ORACLE_ODPIC=false
+
 # Install required packages
 RUN apt update \
     && apt install --yes ca-certificates libssl3 findutils --no-install-recommends \
@@ -64,6 +66,31 @@ RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' s
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
 RUN find /lib /usr/lib -name 'librt.so.1' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
 RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
+
+
+# Preinstall Oracle ODPI-C (if enabled)
+RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
+    ARCH=$(dpkg --print-architecture); \
+    if [ "$ARCH" = "amd64" ]; then \
+    curl -sSL https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.x64-23.8.0.25.04.zip -o basic.zip; \
+    elif [ "$ARCH" = "arm64" ]; then \
+    curl -sSL https://download.oracle.com/otn_software/linux/instantclient/2380000/instantclient-basiclite-linux.arm64-23.8.0.25.04.zip -o basic.zip; \
+    fi; \
+    unzip basic.zip && \
+    cp -v \
+    instantclient_*/libclntsh.so.23.1 \
+    instantclient_*/libclntshcore.so.23.1 \
+    instantclient_*/libnnz.so \
+    instantclient_*/libociicus.so \
+    instantclient_*/fips.so \
+    instantclient_*/legacy.so \
+    /spice_sandbox/usr/lib && \
+    ln -s libclntsh.so.23.1 /spice_sandbox/usr/lib/libclntsh.so && \
+    ln -s libclntshcore.so.23.1 /spice_sandbox/usr/lib/libclntshcore.so && \
+    cp "$(find /usr/lib /lib -name 'libaio.so.1' | head -n 1)" /spice_sandbox/usr/lib && \
+    cp "$(find /usr/lib /lib -name 'libresolv.so.2' | head -n 1)" /spice_sandbox/usr/lib; \
+    fi
 
 # Minimal passwd & group for the nobody user
 RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
