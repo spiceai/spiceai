@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use spicepod::{
+    acceleration::Acceleration,
+    component::dataset::Dataset,
+    param::Params,
+    semantic::{Column, ColumnLevelEmbeddingConfig},
+};
+
 mod search {
     use crate::{
         models::{
@@ -29,14 +36,14 @@ mod search {
     use futures::StreamExt;
     use runtime::Runtime;
 
+    use crate::DEFAULT_TRACING_MODELS;
+    use crate::models::s3_vectors::get_package_delivery_dataset;
     use crate::utils::runtime_ready_check;
 
     // S3 Vectors search test is based on the Bedrock embeddings
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn s3_vectors_basic() -> Result<(), anyhow::Error> {
-        use crate::DEFAULT_TRACING_MODELS;
-
         for env_var in [
             "AWS_BEDROCK_KEY",
             "AWS_BEDROCK_SECRET",
@@ -62,7 +69,10 @@ mod search {
         // Generate a unique index name for each test run
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
-        test_dataset.vectors = Some(new_s3_vector_store(&index_name));
+        test_dataset.vectors = Some(new_s3_vector_store(
+            "spice-ci-s3-vectors-basic",
+            &index_name,
+        ));
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
@@ -70,6 +80,8 @@ mod search {
             .build();
 
         let rt = start_app(app).await?;
+
+        runtime_ready_check(&rt).await;
 
         run_and_snapshot_query(
             &rt,
@@ -88,15 +100,88 @@ mod search {
         Ok(())
     }
 
+    #[cfg(feature = "bedrock")]
+    #[tokio::test]
+    async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
+        for env_var in [
+            "AWS_BEDROCK_KEY",
+            "AWS_BEDROCK_SECRET",
+            "AWS_S3_VECTORS_KEY",
+            "AWS_S3_VECTORS_SECRET",
+        ] {
+            verify_env_secret_exists(env_var)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
+
+        // created model name is `titan-v2`
+        let titan_embeddings = create_titan_v2_embedding();
+
+        let mut test_dataset = get_package_delivery_dataset("delivery", None, "titan-v2");
+
+        // Generate a unique index name for each test run
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+
+        test_dataset.vectors = Some(new_s3_vector_store(
+            "spice-ci-s3-vectors-filters-pushdown",
+            &index_name,
+        ));
+
+        let app = AppBuilder::new("search_app")
+            .with_dataset(test_dataset)
+            .with_embedding(titan_embeddings)
+            .build();
+
+        let rt = start_app(app).await?;
+
+        runtime_ready_check(&rt).await;
+
+        // Failed sms notifications on heavy deliveries sent to the wrong location"
+        run_and_snapshot_query(
+            &rt,
+            r#"
+            SELECT 
+              "message.body",
+              attempt_count, "message.status",
+              package_weight_kg,
+              round(score, 2)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
+            ORDER BY package_weight_kg desc, score DESC
+            LIMIT 10;
+            "#,
+            "filters_pushdown",
+        )
+        .await?;
+
+        run_and_snapshot_query(
+            &rt,
+            r#"
+            explain SELECT 
+              "message.body",
+              attempt_count, "message.status",
+              package_weight_kg,
+              round(score, 2)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
+            ORDER BY package_weight_kg desc, score DESC
+            LIMIT 10;
+            "#,
+            "filters_pushdown_explain",
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Creates a new S3 `VectorStore`.
-    fn new_s3_vector_store(index_name: &str) -> VectorStore {
+    fn new_s3_vector_store(bucket_name: &str, index_name: &str) -> VectorStore {
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
-                (
-                    "s3_vectors_bucket".to_string(),
-                    "spice-ci-s3-vectors".to_string(),
-                ),
+                ("s3_vectors_bucket".to_string(), bucket_name.to_string()),
                 ("s3_vectors_index".to_string(), index_name.to_string()),
                 (
                     "s3_vectors_aws_access_key_id".to_string(),
@@ -105,12 +190,6 @@ mod search {
                 (
                     "s3_vectors_aws_secret_access_key".to_string(),
                     "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
-                // Providing an endpoint for the S3 Vectors service is unnecessary for tests,
-                // this is used to verify that the endpoint parameter is supported / can be defined
-                (
-                    "s3_vectors_endpoint".to_string(),
-                    "s3vectors.us-east-2.api.aws".to_string(),
                 ),
             ]
             .into_iter()
@@ -162,4 +241,64 @@ mod search {
         insta::assert_snapshot!(test_name, formatted);
         Ok(())
     }
+}
+
+pub fn get_package_delivery_dataset(
+    ds_name: &str,
+    refresh_sql: Option<&str>,
+    embedding_model: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/test_array_json/package-delivery/data/".to_string(),
+        ds_name.to_string(),
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "json".to_string()),
+            ("json_format".to_string(), "array".to_string()),
+            ("flatten_json".to_string(), "true".to_string()),
+            (
+                "schema_source_path".to_string(),
+                "s3://spiceai-public-datasets/test_array_json/package-delivery/data/01.json"
+                    .to_string(),
+            ),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some(
+            refresh_sql
+                .unwrap_or(&format!("SELECT * FROM {ds_name}"))
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+
+    dataset.columns = vec![
+        Column::new("message.body").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+            model: embedding_model.to_string(),
+            chunking: None,
+            row_ids: Some(vec!["event.id".to_string()]),
+        }]),
+        vectors_filterable_col("message.status"),
+        vectors_filterable_col("event.created"),
+        vectors_filterable_col("account.tier"),
+        vectors_filterable_col("package_weight_kg"),
+        vectors_filterable_col("attempt_count"),
+    ];
+
+    dataset
+}
+
+fn vectors_filterable_col(name: &str) -> Column {
+    Column::new(name).with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("filterable".to_string()),
+        )]
+        .into(),
+    )
 }

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/models/s3_vectors.rs
+expression: formatted
+---
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+
+| message.body                                                                  | attempt_count | message.status | package_weight_kg | round(vector_search().score,Int64(2)) |
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-6f4e6d94   | 2             | FAILED         | 9.89              | 0.26                                  |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-78ec2148   | 2             | FAILED         | 9.87              | 0.26                                  |
+| Delivery delayed due to traffic. ID: PKG-02cf421c                             | 2             | FAILED         | 9.85              | 0.22                                  |
+| Attempted delivery but no one was home. ID: PKG-6b4af8d2                      | 3             | FAILED         | 9.8               | 0.23                                  |
+| Delivered to a different unit. Contact support. Ref: PKG-02bf6245             | 2             | FAILED         | 9.79              | 0.29                                  |
+| Couldn't complete delivery. Try again later. (PKG-ad4d7ebe)                   | 3             | FAILED         | 9.78              | 0.25                                  |
+| Delivery failed. Please reschedule using ID: PKG-0dc96307                     | 3             | FAILED         | 9.72              | 0.24                                  |
+| Delivered to a different unit. Contact support. Ref: PKG-07612e3f             | 3             | FAILED         | 9.69              | 0.3                                   |
+| Package may have been delivered to the wrong address. Track with PKG-0fa25c7e | 2             | FAILED         | 9.68              | 0.29                                  |
+| Delivered to a different unit. Contact support. Ref: PKG-8da22436             | 2             | FAILED         | 9.64              | 0.3                                   |
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+

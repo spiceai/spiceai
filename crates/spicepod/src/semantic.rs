@@ -44,6 +44,26 @@ pub struct Column {
 }
 
 impl Column {
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+            embeddings: Vec::new(),
+            full_text_search: None,
+            metadata: HashMap::new(),
+        }
+    }
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    #[must_use]
+    pub fn with_embeddings(mut self, embeddings: Vec<ColumnLevelEmbeddingConfig>) -> Self {
+        self.embeddings = embeddings;
+        self
+    }
     /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
