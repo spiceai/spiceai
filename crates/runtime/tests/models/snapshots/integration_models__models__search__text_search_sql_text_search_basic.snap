@@ -7,6 +7,6 @@ snapshot_kind: text
   {
     "i_item_sk": 19,
     "i_item_desc": "Patient",
-    "score": 4.284671306610107
+    "trunc(text_search().score,Int64(3))": 4.285
   }
 ]
