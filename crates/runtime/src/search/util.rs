@@ -247,6 +247,7 @@ pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
 }
 
 // Constructs the associated [`Column`] derived from [`table_ref_from_column_expr`].
+#[must_use]
 pub fn to_column_expr(tbl: &TableReference) -> Column {
     match tbl {
         TableReference::Bare { table } => Column::new_unqualified(table.to_string()),
