@@ -399,7 +399,7 @@ impl BedrockRateLimitConfig {
 impl Default for BedrockRateLimitConfig {
     fn default() -> Self {
         Self {
-            requests_per_minute_limit: 5_000,
+            requests_per_minute_limit: 1_500,
             max_concurrent_invocations: EMBED_TEXT_MAX_CONCURRENT_INVOCATIONS,
         }
     }
