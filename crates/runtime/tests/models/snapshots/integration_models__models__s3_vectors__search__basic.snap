@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/models/s3_vectors.rs
+expression: formatted
+---
++-----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------+
+| i_item_sk | i_item_desc                                                                                                                                                                                             | round(vector_search().score,Int64(2)) |
++-----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------+
+| 19        | Patient                                                                                                                                                                                                 | 1.0                                   |
+| 7         | New                                                                                                                                                                                                     | 0.26                                  |
+| 12        | Theories take various bottles. Lucky, modern matters keep sessions; special sides see machines; still spatial activities disguise at a characteristics. Long, structural patients used to ask           | 0.22                                  |
+| 10        | Alone european attempts might take recently to the contributions. Just great clients put at least just social times. Institutions know marks. Bad, alone months guarantee more. Clearly economic propos | 0.21                                  |
++-----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------+

@@ -636,7 +636,7 @@ impl DataFusion {
         let federated_table = FederatedTable::new_unchecked(read_provider);
 
         tracing::info!(
-            "Loading data for dataset {}",
+            "Dataset {} loading data...",
             pending_registration.dataset.name
         );
         self.register_accelerated_table(

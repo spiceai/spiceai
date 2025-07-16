@@ -32,6 +32,7 @@ use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
     semantic::Column,
+    vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
@@ -236,6 +237,7 @@ pub struct Dataset {
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
+    pub vectors: Option<VectorStore>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -260,6 +262,7 @@ impl std::fmt::Debug for Dataset {
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
+            .field("vectors", &self.vectors)
             .finish_non_exhaustive()
     }
 }
@@ -284,6 +287,7 @@ impl PartialEq for Dataset {
             && self.schema == other.schema
             && self.columns == other.columns
             && self.metrics == other.metrics
+            && self.vectors == other.vectors
     }
 }
 

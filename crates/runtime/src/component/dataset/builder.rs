@@ -20,7 +20,7 @@ use super::{
     Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
     replication, validate_identifier,
 };
-use crate::Runtime;
+use crate::{Runtime, component::dataset::acceleration::Engine};
 use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
@@ -30,6 +30,7 @@ use spicepod::{
     metric::Metrics,
     param::Params,
     semantic::Column,
+    vector::VectorStore,
 };
 
 pub struct DatasetBuilder {
@@ -52,6 +53,7 @@ pub struct DatasetBuilder {
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
+    pub vectors: Option<VectorStore>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -70,7 +72,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let acceleration = dataset
+        let mut acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
@@ -78,6 +80,22 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
+
+        // If the dataset is enabled for a vector engine, use this instead of JIT.
+        if let Some(vector_engine) = &dataset.vectors {
+            // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
+            tracing::debug!(
+                "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
+                dataset.name
+            );
+            if vector_engine.enabled && acceleration.is_none() {
+                acceleration = Some(acceleration::Acceleration {
+                    enabled: true,
+                    engine: Engine::Void,
+                    ..Default::default()
+                });
+            }
+        }
 
         Ok(DatasetBuilder {
             from: dataset.from,
@@ -111,6 +129,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             ready_state,
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
+            vectors: dataset.vectors,
         })
     }
 }
@@ -137,6 +156,7 @@ impl DatasetBuilder {
             ready_state: ReadyState::default(),
             metrics: Metrics::default(),
             runtime: None,
+            vectors: None,
         })
     }
 
@@ -222,6 +242,7 @@ impl DatasetBuilder {
             ready_state: self.ready_state,
             metrics: self.metrics,
             runtime,
+            vectors: self.vectors,
         };
 
         Ok(dataset)

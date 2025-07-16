@@ -42,6 +42,7 @@ pub mod param;
 pub mod reader;
 pub mod semantic;
 pub mod spec;
+pub mod vector;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

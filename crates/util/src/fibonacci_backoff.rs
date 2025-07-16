@@ -24,7 +24,7 @@ const BACKOFF_INTERVALS_MS: [u64; 14] = [
     300_000,
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FibonacciBackoff {
     num_retries: usize,
     pub randomization_factor: f64,

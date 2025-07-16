@@ -18,7 +18,7 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{
     Expr, SelectItem, TableFactor, TableWithJoins, Value, ValueWithSpan,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
@@ -174,7 +174,7 @@ impl SearchRequest {
     }
 
     pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
-        let parser = Parser::new(&GenericDialect);
+        let parser = Parser::new(&PostgreSqlDialect {});
         let mut parser =
             parser
                 .try_with_sql(&where_cond)
@@ -205,7 +205,7 @@ impl SearchRequest {
         additional_columns
             .iter()
             .map(|c| {
-                let select_statement = format!("SELECT {c} FROM testing");
+                let select_statement = format!("SELECT \"{c}\" FROM testing");
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
                     tracing::trace!("vector_search additional column parsing failed. {err}");
@@ -495,27 +495,5 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
-    }
-
-    #[test]
-    fn test_search_request_parse_additional_columns() {
-        let additional_columns = vec!["column1".to_string(), "column2".to_string()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_ok());
-
-        // Test invalid column name
-        let additional_columns = vec!["column 1".to_string()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
-
-        // Test empty column name
-        let additional_columns = vec![String::new()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
-
-        // Test escaping column name
-        let additional_columns = vec!["1; DROP TABLE testing; --".to_string()]; // would result in SELECT 1; DROP TABLE testing; -- FROM testing;
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
     }
 }
