@@ -95,7 +95,7 @@ enum AvailabilityVerificationResult {
 
 pub struct DatasetsHealthMonitor {
     df: Arc<DataFusion>,
-    monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
+    pub monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
     is_task_history_enabled: bool,
 }
 
