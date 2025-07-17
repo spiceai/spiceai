@@ -45,7 +45,6 @@ fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyh
     Ok(dataset)
 }
 
-
 #[tokio::test]
 async fn dataset_availability_monitor_register_skipped_when_disabled() -> Result<(), anyhow::Error>
 {
