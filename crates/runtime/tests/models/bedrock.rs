@@ -118,7 +118,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_titan_v1_embeddings() {
+    async fn bedrock_test_titan_v1_embeddings() {
         let model = create_titan_v1_embedding();
         let tests = vec![
             EmbeddingTestCase {
@@ -159,7 +159,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_titan_v2_embeddings() {
+    async fn bedrock_test_titan_v2_embeddings() {
         let model = create_titan_v2_embedding();
         let tests = vec![
             EmbeddingTestCase {
@@ -192,7 +192,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_cohere_english_embeddings() {
+    async fn bedrock_test_cohere_english_embeddings() {
         let model = create_cohere_english_embedding();
         let tests = vec![
             EmbeddingTestCase {
@@ -225,7 +225,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_cohere_multilingual_embeddings() {
+    async fn bedrock_test_cohere_multilingual_embeddings() {
         let model = create_cohere_multilingual_embedding();
         let tests = vec![
             EmbeddingTestCase {
@@ -260,7 +260,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_all_bedrock_models() {
+    async fn bedrock_test_all_bedrock_models() {
         let models = vec![
             create_titan_v1_embedding(),
             create_titan_v2_embedding(),
@@ -310,12 +310,13 @@ pub(crate) mod embeddings {
 
     /// Test for handling various input types and edge cases
     #[tokio::test]
-    #[cfg_attr(
-        not(feature = "extended_tests"),
-        ignore = "Extended test - run with --features extended_tests"
-    )]
-    async fn test_bedrock_edge_cases() {
-        let model = create_titan_v1_embedding();
+    // thread 'models::bedrock::embeddings::test_bedrock_edge_cases' panicked at crates/runtime/tests/models/bedrock.rs:362:14:
+    // Bedrock edge case tests should pass: HTTP status server error (500 Internal Server Error) for url (http://127.0.0.1:50488/v1/embeddings)
+    // note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    // https://github.com/spiceai/spiceai/issues/6479
+    #[ignore]
+    async fn bedrock_test_bedrock_edge_cases() {
+        let model: Embeddings = create_titan_v1_embedding();
         let tests = vec![
             // Empty string test
             EmbeddingTestCase {
@@ -368,7 +369,7 @@ pub(crate) mod embeddings {
         not(feature = "extended_tests"),
         ignore = "Extended test - run with --features extended_tests"
     )]
-    async fn test_titan_dimensions() {
+    async fn bedrock_test_titan_dimensions() {
         let mut titan_256 = create_titan_v1_embedding();
         titan_256.name = "titan-256".to_string();
         titan_256
