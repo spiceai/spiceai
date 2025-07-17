@@ -6,7 +6,7 @@ snapshot_kind: text
 [
   {
     "cp_catalog_page_sk": 1,
-    "score": 2.708303689956665,
+    "trunc(text_search().score,Int64(3))": 2.708,
     "cp_description": "In general basic characters welcome. Clearly lively friends conv"
   }
 ]

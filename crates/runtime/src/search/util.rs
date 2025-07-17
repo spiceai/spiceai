@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
+use datafusion::common::Column;
 use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -165,16 +166,13 @@ pub async fn get_primary_keys_with_overrides(
 }
 
 pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
-    let tables = df.get_user_table_names();
     let mut tables_with_embeddings = Vec::new();
 
-    for t in tables {
-        let table_provider = df
-            .get_table(&t)
+    for t in df.get_user_table_names() {
+        if embedding_columns_from_table(df, &t)
             .await
-            // we should not fail here, as we are iterating over the tables that we know exist
-            .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
-        if find_concrete_table_provider::<EmbeddingTable>(&table_provider).is_some() {
+            .is_some_and(|cols| !cols.is_empty())
+        {
             tables_with_embeddings.push(t);
         }
     }
@@ -241,6 +239,54 @@ pub async fn full_text_search_candidates(
             .as_candidate_generations()
             .context(SearchGenerationSnafu),
     )
+}
+
+/// There is no [`Expr`] that can parse a fully qualified table name. For UDTFs that require
+/// tables as an input [`Expr`], it will be parsed as a [`Column`]. This function converts a
+///  [`Column`] to the [`TableReference`] intended.
+#[must_use]
+pub fn table_ref_from_column_expr(c: &Column) -> TableReference {
+    let table: Arc<str> = c.name.clone().into();
+    let schema: Option<&str> = c.relation.as_ref().map(TableReference::table);
+    let catalog: Option<&str> = c.relation.as_ref().and_then(TableReference::schema);
+    match (catalog, schema) {
+        // Catalog without schema is impossible.
+        (None | Some(_), None) => TableReference::Bare { table },
+        (None, Some(s)) => TableReference::Partial {
+            schema: s.into(),
+            table,
+        },
+        (Some(c), Some(s)) => TableReference::Full {
+            catalog: c.into(),
+            schema: s.into(),
+            table,
+        },
+    }
+}
+
+// Constructs the associated [`Column`] derived from [`table_ref_from_column_expr`].
+#[must_use]
+pub fn to_column_expr(tbl: &TableReference) -> Column {
+    match tbl {
+        TableReference::Bare { table } => Column::new_unqualified(table.to_string()),
+        TableReference::Partial { schema, table } => Column::new(
+            Some(TableReference::Bare {
+                table: Arc::clone(schema),
+            }),
+            table.to_string(),
+        ),
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => Column::new(
+            Some(TableReference::Partial {
+                schema: Arc::clone(catalog),
+                table: Arc::clone(schema),
+            }),
+            table.to_string(),
+        ),
+    }
 }
 
 #[cfg(test)]
