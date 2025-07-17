@@ -121,7 +121,10 @@ impl DatasetsHealthMonitor {
         }
 
         if !dataset.availability_monitor_enabled {
-            tracing::debug!("Skipping dataset {} for availability monitoring (disabled in config)", dataset.name);
+            tracing::debug!(
+                "Skipping dataset {} for availability monitoring (disabled in config)",
+                dataset.name
+            );
             return Ok(());
         }
 

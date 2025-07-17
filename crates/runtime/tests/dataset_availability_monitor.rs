@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use app::AppBuilder;
 use runtime::{Runtime, datasets_health_monitor::DatasetsHealthMonitor};
 use spicepod::component::dataset::Dataset;
+use std::sync::Arc;
 
 fn get_test_dataset() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
@@ -45,120 +45,99 @@ fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyh
     Ok(dataset)
 }
 
-#[tokio::test]
-async fn dataset_availability_monitor_enabled_by_default() -> Result<(), anyhow::Error> {
-    let dataset = get_test_dataset()?;
-    assert!(dataset.availability_monitor_enabled);
-    Ok(())
-}
 
 #[tokio::test]
-async fn dataset_availability_monitor_disabled_via_config() -> Result<(), anyhow::Error> {
-    let dataset = get_test_dataset_with_availability_monitor_disabled()?;
-    assert!(!dataset.availability_monitor_enabled);
-    Ok(())
-}
-
-#[tokio::test]
-async fn dataset_availability_monitor_register_skipped_when_disabled() -> Result<(), anyhow::Error> {
+async fn dataset_availability_monitor_register_skipped_when_disabled() -> Result<(), anyhow::Error>
+{
     // Create a test runtime to get DataFusion instance
     let app = AppBuilder::new("dataset_availability_monitor_test")
         .with_dataset(get_test_dataset()?)
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .build()
-        .await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
     let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
-    
+
     // Create dataset with availability monitor disabled
     let dataset = get_test_dataset_with_availability_monitor_disabled()?;
-    
+
     // Try to register the dataset - should be skipped
     let result = monitor.register_dataset(&dataset).await;
     assert!(result.is_ok());
-    
+
     // Check that monitored_datasets is empty
     let monitored_datasets = monitor.monitored_datasets.lock().await;
     assert!(monitored_datasets.is_empty());
-    
+
     Ok(())
 }
 
 #[tokio::test]
-async fn dataset_availability_monitor_register_succeeds_when_enabled() -> Result<(), anyhow::Error> {
+async fn dataset_availability_monitor_register_succeeds_when_enabled() -> Result<(), anyhow::Error>
+{
     // Create a test runtime to get DataFusion instance
     let app = AppBuilder::new("dataset_availability_monitor_test")
         .with_dataset(get_test_dataset()?)
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .build()
-        .await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
     let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
-    
+
     // Create dataset with availability monitor enabled (default)
     let dataset = get_test_dataset()?;
-    
+
     // Try to register the dataset - should succeed
     let result = monitor.register_dataset(&dataset).await;
     assert!(result.is_ok());
-    
+
     // Check that monitored_datasets contains the dataset
     let monitored_datasets = monitor.monitored_datasets.lock().await;
     assert_eq!(monitored_datasets.len(), 1);
     assert!(monitored_datasets.contains_key("datatypes"));
-    
+
     Ok(())
 }
 
 #[tokio::test]
-async fn dataset_availability_monitor_register_skipped_when_accelerated() -> Result<(), anyhow::Error> {
+async fn dataset_availability_monitor_register_skipped_when_accelerated()
+-> Result<(), anyhow::Error> {
     // Create a test runtime to get DataFusion instance
     let app = AppBuilder::new("dataset_availability_monitor_test")
         .with_dataset(get_test_dataset()?)
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .build()
-        .await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
     let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
-    
+
     // Create dataset with acceleration enabled (which should skip monitoring)
     let mut dataset = get_test_dataset()?;
     dataset.acceleration = Some(spicepod::acceleration::Acceleration::default());
-    
+
     // Try to register the dataset - should be skipped due to acceleration
     let result = monitor.register_dataset(&dataset).await;
     assert!(result.is_ok());
-    
+
     // Check that monitored_datasets is empty
     let monitored_datasets = monitor.monitored_datasets.lock().await;
     assert!(monitored_datasets.is_empty());
-    
+
     Ok(())
 }
 
 #[tokio::test]
-async fn dataset_availability_monitor_disabled_when_builder_not_called() -> Result<(), anyhow::Error> {
+async fn dataset_availability_monitor_disabled_when_builder_not_called() -> Result<(), anyhow::Error>
+{
     let app = AppBuilder::new("dataset_availability_monitor_test")
         .with_dataset(get_test_dataset()?)
         .build();
 
     // Build runtime WITHOUT calling with_datasets_health_monitor
-    let rt = Runtime::builder()
-        .with_app(app)
-        .build()
-        .await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Monitor should be disabled since with_datasets_health_monitor wasn't called
     assert!(rt.datasets_health_monitor.is_none());
