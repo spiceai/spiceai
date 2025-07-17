@@ -224,7 +224,6 @@ pub(crate) async fn run_search(
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_search",
@@ -290,7 +289,6 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
         .await
@@ -774,7 +772,6 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpch_dataset_w_embeddings(
         "cached_search",
@@ -811,7 +808,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -820,7 +817,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let duration = start.elapsed();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -834,7 +831,6 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpch_dataset_w_embeddings(
         "cached_search_bypass",
@@ -874,7 +870,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let mut bypass_headers = HeaderMap::new();
             bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_bypass_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -883,7 +879,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let duration = start.elapsed().as_secs_f64();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_bypass_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
