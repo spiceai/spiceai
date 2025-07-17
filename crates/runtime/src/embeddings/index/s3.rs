@@ -29,7 +29,7 @@ use data_components::s3_vectors::{
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use runtime_datafusion_index::Index;
-use s3_vectors::{S3Vectors, S3VectorsClient, S3VectorsCredentialProvider};
+use s3_vectors::{Client, S3Vectors};
 use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::{
@@ -59,9 +59,6 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("index")
         .description("The S3 Vectors index name to use within the bucket.")
-        .secret(),
-    ParameterSpec::component("endpoint")
-        .description("The S3 Vectors API endpoint to use. If set, this will override the default S3 Vectors API endpoint.")
         .secret(),
     ParameterSpec::component("aws_region")
         .description("The AWS region to use.")
@@ -375,15 +372,9 @@ async fn try_vector_table(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(s3_aws_region) = string_from_params(&params, "aws_region") else {
-        return Err(Box::from(
-            "S3 Vectors engine requires parameter 's3_aws_region'.".to_string(),
-        ));
-    };
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
-    let s3_vectors_endpoint = string_from_params(&params, "endpoint");
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -416,20 +407,7 @@ async fn try_vector_table(
     )
     .await?;
 
-    let credential_provider = S3VectorsCredentialProvider::from_config(&config)?;
-
-    let s3_vector_client = if let Some(endpoint) = s3_vectors_endpoint {
-        S3VectorsClient::try_new_with_endpoint(s3_aws_region, credential_provider, endpoint)
-            .ok_or::<Box<dyn std::error::Error + Send + Sync>>(Box::from(format!(
-                "Invalid S3 region specified: {s3_aws_region}."
-            )))?
-    } else {
-        S3VectorsClient::try_new(s3_aws_region, credential_provider).ok_or::<Box<
-            dyn std::error::Error + Send + Sync,
-        >>(Box::from(
-            format!("Invalid S3 region specified: {s3_aws_region}."),
-        ))?
-    };
+    let s3_vector_client = Client::new(&config);
 
     let s3_vector_client = Arc::new(S3VectorRetryClientBuilder::new(s3_vector_client).build())
         as Arc<dyn S3Vectors + Send + Sync>;
