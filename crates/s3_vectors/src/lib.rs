@@ -96,9 +96,9 @@ impl ProvideAwsCredentials for S3VectorsCredentialProvider {
 #[cfg(test)]
 pub mod tests {
     use crate::{
-        CreateIndexInput, CreateVectorBucketInput, DeleteIndexInput, DeleteVectorBucketInput,
-        ListVectorsInput, PutInputVector, PutVectorsInput, QueryVectorsInput, S3Vectors,
-        VectorData, generated,
+        generated, CreateIndexInput, CreateVectorBucketInput, DeleteIndexInput,
+        DeleteVectorBucketInput, ListVectorsInput, PutInputVector, PutVectorsInput,
+        QueryVectorsInput, S3Vectors, VectorData,
     };
 
     #[tokio::test]

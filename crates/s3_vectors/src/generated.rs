@@ -17,8 +17,8 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rusoto_core::credential::ProvideAwsCredentials;
 use rusoto_core::request::{BufferedHttpResponse, DispatchSignedRequest};
+use rusoto_core::{region, HttpClient};
 use rusoto_core::{Client, RusotoError};
-use rusoto_core::{HttpClient, region};
 
 use rusoto_core::proto;
 use rusoto_core::signature::SignedRequest;
