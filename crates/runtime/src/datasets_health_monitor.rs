@@ -120,6 +120,11 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
+        if !dataset.availability_monitor_enabled {
+            tracing::debug!("Skipping dataset {} for availability monitoring (disabled in config)", dataset.name);
+            return Ok(());
+        }
+
         let dataset_name = &dataset.name.to_string();
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");

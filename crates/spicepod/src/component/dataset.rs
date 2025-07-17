@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
+use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default, default_true};
 use crate::acceleration::Acceleration;
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -143,6 +143,13 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
+
+    /// Configures whether the dataset availability monitor is enabled for this dataset.
+    /// When enabled, the runtime will periodically check dataset availability
+    /// and report metrics. Disabling this can prevent unnecessary remote calls
+    /// that might wake up warehouses like Databricks or Snowflake.
+    #[serde(default = "default_true", skip_serializing_if = "is_default")]
+    pub availability_monitor_enabled: bool,
 }
 
 impl Nameable for Dataset {
@@ -175,6 +182,7 @@ impl Dataset {
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
+            availability_monitor_enabled: true,
         }
     }
 
@@ -242,6 +250,7 @@ impl WithDependsOn<Dataset> for Dataset {
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
+            availability_monitor_enabled: self.availability_monitor_enabled,
         }
     }
 }
@@ -316,6 +325,8 @@ struct DatasetDeserializer {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
+    #[serde(default = "default_true", skip_serializing_if = "is_default")]
+    availability_monitor_enabled: bool,
 }
 
 #[allow(deprecated)]
@@ -366,7 +377,46 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
+            availability_monitor_enabled: deserializer.availability_monitor_enabled,
         })
+    }
+}
+
+#[cfg(test)]
+mod availability_monitor_tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_availability_monitor_enabled_by_default() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(dataset.availability_monitor_enabled);
+    }
+
+    #[test]
+    fn test_availability_monitor_disabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            availability_monitor_enabled: false
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(!dataset.availability_monitor_enabled);
+    }
+
+    #[test]
+    fn test_availability_monitor_enabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            availability_monitor_enabled: true
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert!(dataset.availability_monitor_enabled);
     }
 }
 

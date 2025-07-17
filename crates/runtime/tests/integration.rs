@@ -31,6 +31,7 @@ mod catalog;
 #[cfg(feature = "duckdb")]
 mod clickbench;
 mod cors;
+mod dataset_availability_monitor;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
