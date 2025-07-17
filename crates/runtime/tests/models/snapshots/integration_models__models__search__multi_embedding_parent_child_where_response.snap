@@ -10,10 +10,10 @@ snapshot_kind: text
       "dataset": "multiple_columns",
       "matches": {
         "cp_department": "DEPARTMENT",
-        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+        "cp_description": "Practical schools might put twice interested, strong organizations. Regulatory,"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "cp_catalog_page_sk": 17
       },
       "score": 0.032
     },
@@ -21,23 +21,22 @@ snapshot_kind: text
       "dataset": "multiple_columns",
       "matches": {
         "cp_department": "DEPARTMENT",
-        "cp_description": "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+        "cp_description": "Absolute, early papers spare. Independent services need. About extreme women u"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 6
+        "cp_catalog_page_sk": 18
       },
       "score": 0.032
     },
     {
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make a"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 8
+        "cp_catalog_page_sk": 16
       },
-      "score": 0.031
+      "score": 0.016
     }
   ]
 }

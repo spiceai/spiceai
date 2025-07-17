@@ -674,7 +674,6 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
-#[ignore]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     let api_config = start_app(
         AppBuilder::new("search_app")
@@ -743,16 +742,16 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "multi_embedding_parent_child_basic",
                 body: json!({
-                    "text": "new patient",
-                    "limit": 2,
+                    "text": "close customers in the department",
+                    "limit": 10,
                     "datasets": ["multiple_columns"]
                 }),
             },
             SearchTestCase {
                 name: "multi_embedding_parent_child_additional",
                 body: json!({
-                    "text": "new patient",
-                    "limit": 2,
+                    "text": "close customers in the department",
+                    "limit": 10,
                     "datasets": ["multiple_columns"],
                     "additional_columns": ["cp_catalog_number"],
                 }),
@@ -760,9 +759,9 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "multi_embedding_parent_child_where",
                 body: json!({
-                    "text": "new patient",
+                    "text": "close customers in the department",
                     "datasets": ["multiple_columns"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "where": "cp_catalog_page_sk > 15"
                 }),
             },
         ],
