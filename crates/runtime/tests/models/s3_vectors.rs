@@ -24,7 +24,7 @@ use spicepod::{
 mod search {
     use crate::{
         configure_test_datafusion,
-        models::{openai::get_openai_embeddings, search::item_tpch_dataset_w_embeddings},
+        models::{hf::get_huggingface_embeddings, search::item_tpch_dataset_w_embeddings},
         utils::verify_env_secret_exists,
     };
     use app::AppBuilder;
@@ -41,11 +41,7 @@ mod search {
 
     #[tokio::test]
     async fn s3_vectors_basic() -> Result<(), anyhow::Error> {
-        for env_var in [
-            "AWS_S3_VECTORS_KEY",
-            "AWS_S3_VECTORS_SECRET",
-            "SPICE_OPENAI_API_KEY",
-        ] {
+        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -55,7 +51,7 @@ mod search {
 
         let mut test_dataset = item_tpch_dataset_w_embeddings(
             "item",
-            "openai_embeddings",
+            "hf_minilm",
             Some(vec!["i_item_sk".to_string()]),
             None,
         );
@@ -64,15 +60,15 @@ mod search {
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-s3-vectors-basic",
+            "spice-ci-tests-s3-vectors-basic",
             &index_name,
         ));
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
             ))
             .build();
 
@@ -80,14 +76,14 @@ mod search {
 
         run_and_snapshot_query(
             &rt,
-            "SELECT i_item_sk, i_item_desc, round(score, 2) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
+            "SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
             "basic",
         )
         .await?;
 
         run_and_snapshot_query(
             &rt,
-            "explain SELECT i_item_sk, i_item_desc, round(score, 2) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
+            "explain SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
             "basic_explain",
         )
         .await?;
@@ -97,11 +93,7 @@ mod search {
 
     #[tokio::test]
     async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
-        for env_var in [
-            "AWS_S3_VECTORS_KEY",
-            "AWS_S3_VECTORS_SECRET",
-            "SPICE_OPENAI_API_KEY",
-        ] {
+        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -109,21 +101,21 @@ mod search {
 
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        let mut test_dataset = get_package_delivery_dataset("delivery", None, "openai_embeddings");
+        let mut test_dataset = get_package_delivery_dataset("delivery", None, "hf_minilm");
 
         // Generate a unique index name for each test run
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-s3-vectors-filters-pushdown",
+            "spice-ci-tests-s3-vectors-filters-pushdown",
             &index_name,
         ));
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
             ))
             .build();
 
@@ -137,7 +129,7 @@ mod search {
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
-              round(score, 2)
+              round(score, 1)
             FROM vector_search(delivery, 'wrong location')
             WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
             ORDER BY package_weight_kg desc, score DESC
@@ -154,7 +146,7 @@ mod search {
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
-              round(score, 2)
+              round(score, 1)
             FROM vector_search(delivery, 'wrong location')
             WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
             ORDER BY package_weight_kg desc, score DESC

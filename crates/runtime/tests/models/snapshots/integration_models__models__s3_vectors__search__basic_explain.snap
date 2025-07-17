@@ -5,16 +5,16 @@ expression: formatted
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                              |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score,Int64(2))                                                         |
+| logical_plan  | Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score,Int64(1))                                                         |
 |               |   Sort: vector_search().score DESC NULLS FIRST, fetch=4                                                                                                           |
-|               |     Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score, Int64(2)), vector_search().score                             |
+|               |     Projection: vector_search().i_item_sk, vector_search().i_item_desc, round(vector_search().score, Int64(1)), vector_search().score                             |
 |               |       BytesProcessedNode                                                                                                                                          |
 |               |         Filter: vector_search().i_item_sk > Int32(5)                                                                                                              |
 |               |           TableScan: vector_search() projection=[i_item_sk, i_item_desc, score]                                                                                   |
-| physical_plan | ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(vector_search().score,Int64(2))@2 as round(vector_search().score,Int64(2))]   |
+| physical_plan | ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(vector_search().score,Int64(1))@2 as round(vector_search().score,Int64(1))]   |
 |               |   SortPreservingMergeExec: [score@3 DESC], fetch=4                                                                                                                |
 |               |     SortExec: TopK(fetch=4), expr=[score@3 DESC], preserve_partitioning=[true]                                                                                    |
-|               |       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(score@2, 2) as round(vector_search().score,Int64(2)), score@2 as score] |
+|               |       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_item_desc@1 as i_item_desc, round(score@2, 1) as round(vector_search().score,Int64(1)), score@2 as score] |
 |               |         BytesProcessedExec                                                                                                                                        |
 |               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |             FilterExec: i_item_sk@0 > 5                                                                                                                           |
