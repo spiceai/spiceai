@@ -165,16 +165,13 @@ pub async fn get_primary_keys_with_overrides(
 }
 
 pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
-    let tables = df.get_user_table_names();
     let mut tables_with_embeddings = Vec::new();
 
-    for t in tables {
-        let table_provider = df
-            .get_table(&t)
+    for t in df.get_user_table_names() {
+        if embedding_columns_from_table(df, &t)
             .await
-            // we should not fail here, as we are iterating over the tables that we know exist
-            .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
-        if find_concrete_table_provider::<EmbeddingTable>(&table_provider).is_some() {
+            .is_some_and(|cols| !cols.is_empty())
+        {
             tables_with_embeddings.push(t);
         }
     }
