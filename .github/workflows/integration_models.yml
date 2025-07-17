@@ -58,7 +58,7 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features flightsql,models,metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features flightsql,models,metal,s3_vectors --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./ai_integration_test
 
       # Upload the test binary as an artifact
@@ -233,6 +233,10 @@ jobs:
       - name: Run integration test
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
             echo "Error: OpenAI API key is not defined."
