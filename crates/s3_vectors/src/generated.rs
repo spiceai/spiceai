@@ -537,8 +537,7 @@ pub struct VectorBucketSummary {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct VectorData {
     #[serde(rename = "float32")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub float_32: Option<Vec<f32>>,
+    pub float_32: Vec<f32>,
 }
 
 // #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

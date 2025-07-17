@@ -145,7 +145,7 @@ pub mod tests {
                 vectors: vec![
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![1.0, 2.0, 3.0]),
+                            float_32: vec![1.0, 2.0, 3.0],
                         },
                         key: "v1".into(),
                         metadata: Some(serde_json::Map::from_iter([
@@ -157,7 +157,7 @@ pub mod tests {
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![4.0, 5.0, 6.0]),
+                            float_32: vec![4.0, 5.0, 6.0],
                         },
                         key: "v2".into(),
                         metadata: Some(serde_json::Map::from_iter([
@@ -169,7 +169,7 @@ pub mod tests {
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![7.0, 8.0, 9.0]),
+                            float_32: vec![7.0, 8.0, 9.0],
                         },
                         key: "v3".into(),
                         metadata: Some(serde_json::Map::from_iter([
@@ -181,7 +181,7 @@ pub mod tests {
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![2.0, 2.0, 2.0]),
+                            float_32: vec![2.0, 2.0, 2.0],
                         },
                         key: "v4".into(),
                         metadata: Some(serde_json::Map::from_iter([

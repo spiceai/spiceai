@@ -290,9 +290,7 @@ async fn query_vector_stream(
 
     let QueryVectorsOutput { vectors } = client
         .query_vectors(QueryVectorsInput {
-            query_vector: VectorData {
-                float_32: Some(query),
-            },
+            query_vector: VectorData { float_32: query },
             return_distance: Some(true),
             top_k: limit,
             filter: s3_filter.map(Into::into),
@@ -349,17 +347,16 @@ fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
     } = output;
     let mut result = metadata.unwrap_or_default();
     if let Some(data) = data {
-        if let Some(vec) = data.float_32 {
-            result.insert(
-                S3_VECTOR_EMBEDDING_NAME.into(),
-                serde_json::Value::Array(
-                    vec.into_iter()
-                        .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
-                        .map(serde_json::Value::Number)
-                        .collect::<Vec<_>>(),
-                ),
-            );
-        }
+        result.insert(
+            S3_VECTOR_EMBEDDING_NAME.into(),
+            serde_json::Value::Array(
+                data.float_32
+                    .into_iter()
+                    .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
+                    .map(serde_json::Value::Number)
+                    .collect::<Vec<_>>(),
+            ),
+        );
     }
     result.insert(
         S3_VECTOR_PRIMARY_KEY_NAME.to_string(),

@@ -155,28 +155,28 @@ pub mod tests {
                 vectors: vec![
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![1.0, 2.0, 3.0]),
+                            float_32: vec![1.0, 2.0, 3.0],
                         },
                         key: "v1".into(),
                         metadata: None,
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![4.0, 5.0, 6.0]),
+                            float_32: vec![4.0, 5.0, 6.0],
                         },
                         key: "v2".into(),
                         metadata: None,
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![7.0, 8.0, 9.0]),
+                            float_32: vec![7.0, 8.0, 9.0],
                         },
                         key: "v3".into(),
                         metadata: None,
                     },
                     PutInputVector {
                         data: VectorData {
-                            float_32: Some(vec![2.0, 2.0, 2.0]),
+                            float_32: vec![2.0, 2.0, 2.0],
                         },
                         key: "v4".into(),
                         metadata: None,
@@ -193,7 +193,7 @@ pub mod tests {
                 index_arn: None,
                 vector_bucket_name: Some("spice-s3-jeadie-vectors-2".into()),
                 query_vector: VectorData {
-                    float_32: Some(vec![4.0, 5.0, 3.0]),
+                    float_32: vec![4.0, 5.0, 3.0],
                 },
                 return_data: Some(true),
                 return_distance: Some(true),

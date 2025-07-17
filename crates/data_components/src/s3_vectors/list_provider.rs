@@ -396,17 +396,16 @@ fn to_flat_value(output: ListOutputVector) -> serde_json::Value {
     } = output;
     let mut result = metadata.unwrap_or_default();
     if let Some(data) = data {
-        if let Some(vec) = data.float_32 {
-            result.insert(
-                S3_VECTOR_EMBEDDING_NAME.into(),
-                serde_json::Value::Array(
-                    vec.into_iter()
-                        .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
-                        .map(serde_json::Value::Number)
-                        .collect::<Vec<_>>(),
-                ),
-            );
-        }
+        result.insert(
+            S3_VECTOR_EMBEDDING_NAME.into(),
+            serde_json::Value::Array(
+                data.float_32
+                    .into_iter()
+                    .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
+                    .map(serde_json::Value::Number)
+                    .collect::<Vec<_>>(),
+            ),
+        );
     }
     result.insert(
         S3_VECTOR_PRIMARY_KEY_NAME.to_string(),
