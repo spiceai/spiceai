@@ -40,7 +40,7 @@ impl GitHubTableArgs for MembersTableArgs {
             org = self.org
         );
 
-        GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
+        GitHubTableGraphQLParams::new(query.into(), None, 0, Some(gql_schema()))
     }
 }
 

@@ -316,7 +316,7 @@ async fn test_github_org_members() -> Result<(), String> {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
                     GithubDatasetType::OrgSpecific {
-                        org: "spiceai".to_string(),
+                        org: "apache".to_string(),
                         query_type: "members".to_string(),
                     },
                     "auto",
@@ -343,7 +343,7 @@ async fn test_github_org_members() -> Result<(), String> {
             run_query_and_check_results(
                 &mut rt,
                 "test_github_org_members_auto",
-                "SELECT * FROM spiceai_members_auto LIMIT 10",
+                "SELECT * FROM apache_members_auto LIMIT 10",
                 false,
                 Some(Box::new(|result_batches| {
                     let mut row_count = 0;
