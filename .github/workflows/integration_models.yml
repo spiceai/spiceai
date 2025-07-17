@@ -33,6 +33,12 @@ on:
       - 'bin/spice/**'
 
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -58,8 +64,17 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features flightsql,models,metal,s3_vectors --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
-          cp $TEST_BINARY_PATH ./ai_integration_test
+
+          FEATURES="flightsql,models,metal,s3_vectors"
+           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+             FEATURES="${FEATURES},bedrock,extended_tests"
+             echo "Including extended_tests"
+           else
+             echo "Excluding extended_tests"
+           fi
+
+           TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+           cp $TEST_BINARY_PATH ./ai_integration_test
 
       # Upload the test binary as an artifact
       - name: Upload test binary
@@ -174,6 +189,33 @@ jobs:
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
 
+  test-bedrock:
+    name: Test Bedrock Models
+    needs: build
+    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    permissions: read-all
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        run: |
+          ls -l ./integration_test
+          chmod +x ./integration_test/ai_integration_test
+
+      - name: Run Beta functionality embedding tests
+        env:
+          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture bedrock_test
+
   test-workers:
     name: Test Workers
     needs: build
@@ -233,8 +275,6 @@ jobs:
       - name: Run integration test
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
-          AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
@@ -243,4 +283,3 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture search
-
