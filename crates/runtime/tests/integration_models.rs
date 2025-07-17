@@ -28,6 +28,19 @@ pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
     "runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
 );
 
+/// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
+///
+/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
+    let state = df.ctx.state_ref();
+    let mut state_lock = state.write();
+    state_lock
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = 3;
+}
+
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),

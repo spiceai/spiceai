@@ -23,7 +23,7 @@ use async_openai::{
 use async_trait::async_trait;
 use llms::{
     chunking::{Chunker, ChunkingConfig},
-    embeddings::{Embed, Error as EmbedError, Result as EmbedResult},
+    embeddings::{Embed, Result as EmbedResult, get_or_infer_size},
 };
 use tracing::{Instrument, Span};
 
@@ -38,43 +38,12 @@ pub struct TaskEmbed {
 
 impl TaskEmbed {
     pub async fn new(name: &str, inner: Arc<dyn Embed>) -> EmbedResult<Self> {
-        let size = match inner.size() {
-            size if size > -1 => size,
-            _ => {
-                tracing::trace!(
-                    "Size of embedding vectors not known in advance, attempting to infer"
-                );
-                Self::infer_size(inner.as_ref()).await?
-            }
-        };
+        let size = get_or_infer_size(&inner).await?;
         Ok(Self {
             name: name.to_string(),
             inner,
             vector_size: size,
         })
-    }
-
-    /// Infer the size of the embedding vectors produced by the inner embedding model by calling [`Embed::embed`].
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    async fn infer_size(inner: &dyn Embed) -> EmbedResult<i32> {
-        match inner
-            .embed(EmbeddingInput::String("infer_size".to_string()))
-            .await
-        {
-            Ok(vec) => match vec.first() {
-                Some(first) => {
-                    tracing::trace!("Inferred size of embedding model vectors={}", first.len());
-                    Ok(first.len() as i32)
-                }
-                None => Err(EmbedError::FailedToCreateEmbedding {
-                    source: "Failed to infer size of embedding model, empty response".into(),
-                }),
-            },
-            Err(e) => {
-                tracing::warn!("Failed to infer size of embedding model");
-                Err(e)
-            }
-        }
     }
 }
 

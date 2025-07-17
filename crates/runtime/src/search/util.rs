@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
 
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
@@ -165,16 +166,13 @@ pub async fn get_primary_keys_with_overrides(
 }
 
 pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
-    let tables = df.get_user_table_names();
     let mut tables_with_embeddings = Vec::new();
 
-    for t in tables {
-        let table_provider = df
-            .get_table(&t)
+    for t in df.get_user_table_names() {
+        if embedding_columns_from_table(df, &t)
             .await
-            // we should not fail here, as we are iterating over the tables that we know exist
-            .ok_or_else(|| Error::DataSourceNotFound { table: t.clone() })?;
-        if find_concrete_table_provider::<EmbeddingTable>(&table_provider).is_some() {
+            .is_some_and(|cols| !cols.is_empty())
+        {
             tables_with_embeddings.push(t);
         }
     }
@@ -190,8 +188,28 @@ pub async fn embedding_columns_from_table(
 ) -> Option<Vec<String>> {
     let table_provider = df.get_table(tbl).await?;
 
-    let embedding_table = find_concrete_table_provider::<EmbeddingTable>(&table_provider)?;
-    Some(embedding_table.get_embedding_columns())
+    let mut embedding_columns: HashSet<String> = HashSet::default();
+
+    // embedding columns from [`EmbeddingTable`].
+    if let Some(embedding_table) = find_concrete_table_provider::<EmbeddingTable>(&table_provider) {
+        for c in embedding_table.get_embedding_columns() {
+            embedding_columns.insert(c);
+        }
+    }
+
+    // embedding columns from [`IndexedTableProvider`].
+    #[cfg(feature = "s3_vectors")]
+    {
+        if let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
+        {
+            use crate::embeddings::index::{S3Vector, VectorIndex};
+            if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
+                embedding_columns.insert(s3_vector.embedded_column());
+            }
+        }
+    }
+
+    Some(embedding_columns.into_iter().collect())
 }
 
 /// Returns a full text search [`CandidateGeneration`] if the [`TableReference`] has the appropriate index(es) defined in [`DataFusion`].
@@ -301,6 +319,7 @@ mod tests {
             )
             .expect("failed to make table"),
         );
+
         let index = Arc::new(
             FullTextDatabaseIndex::try_new(
                 Arc::clone(&base_table),

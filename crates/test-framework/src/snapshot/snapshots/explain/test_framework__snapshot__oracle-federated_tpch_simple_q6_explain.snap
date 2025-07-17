@@ -11,7 +11,7 @@ description: "Query: tpch_simple_q6"
 |               |       BytesProcessedNode                                                                      |
 |               |         TableScan: orders projection=[O_ORDERKEY], fetch=10                                   |
 | physical_plan | ProjectionExec: expr=[O_ORDERKEY@0 + 1 as KEY]                                                |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                       |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
 |               |     GlobalLimitExec: skip=0, fetch=10                                                         |
 |               |       BytesProcessedExec                                                                      |
 |               |         OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS"  FETCH FIRST 10 ROWS ONLY |

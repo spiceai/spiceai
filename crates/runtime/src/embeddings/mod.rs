@@ -16,6 +16,9 @@ limitations under the License.
 pub mod common;
 pub mod connector;
 pub mod execution_plan;
+
+#[cfg(feature = "s3_vectors")]
+pub mod index;
 pub mod metrics;
 pub mod table;
 pub mod task;

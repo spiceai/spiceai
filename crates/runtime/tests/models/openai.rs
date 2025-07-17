@@ -39,6 +39,7 @@ use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -68,6 +69,7 @@ mod nsql {
                     }],
                     description: None,
                     full_text_search: None,
+                    metadata: HashMap::new(),
             }];
 
             let app = AppBuilder::new("text-to-sql")
@@ -233,6 +235,7 @@ mod search {
             }],
             description: None,
             full_text_search: None,
+            metadata: HashMap::new(),
         }];
 
         clickbench_dataset_chunking.columns = vec![Column {
@@ -249,6 +252,7 @@ mod search {
             }],
             description: None,
             full_text_search: None,
+            metadata: HashMap::new(),
         }];
 
         let app = AppBuilder::new("search_app")
@@ -447,6 +451,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                 }],
                 description: None,
                 full_text_search: None,
+                metadata: HashMap::new(),
             }];
 
             let app = AppBuilder::new("text-to-sql")

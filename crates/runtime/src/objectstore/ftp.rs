@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::AsyncReadExt;
 use futures::stream::BoxStream;
-use object_store::{Attributes, GetRange, MultipartUpload, PutMultipartOpts, PutPayload};
+use object_store::{Attributes, GetRange, MultipartUpload, PutMultipartOptions, PutPayload};
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore, PutOptions,
     PutResult, path::Path,
@@ -217,7 +217,7 @@ impl ObjectStore for FTPObjectStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _opts: PutMultipartOpts,
+        _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         unimplemented!()
     }

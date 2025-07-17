@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 #[cfg(feature = "bedrock")]
-mod bedrock_tests {
+pub(crate) mod embeddings {
     use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
     use async_openai::types::EmbeddingInput;
     use spicepod::component::embeddings::Embeddings;
@@ -29,7 +29,8 @@ mod bedrock_tests {
         "The service was outstanding and the atmosphere was perfect.",
     ];
 
-    fn create_titan_v1_embedding() -> Embeddings {
+    #[must_use]
+    pub fn create_titan_v1_embedding() -> Embeddings {
         let mut params = HashMap::new();
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("normalize".to_string(), "true".to_string());
@@ -39,14 +40,15 @@ mod bedrock_tests {
             from: "bedrock:amazon.titan-embed-text-v1".to_string(),
             name: "titan-v1".to_string(),
             files: vec![],
-            params,
+            params: with_auth(params),
             datasets: vec![],
             depends_on: vec![],
             metrics: None,
         }
     }
 
-    fn create_titan_v2_embedding() -> Embeddings {
+    #[must_use]
+    pub fn create_titan_v2_embedding() -> Embeddings {
         let mut params = HashMap::new();
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("normalize".to_string(), "true".to_string());
@@ -56,14 +58,15 @@ mod bedrock_tests {
             from: "bedrock:amazon.titan-embed-text-v2:0".to_string(),
             name: "titan-v2".to_string(),
             files: vec![],
-            params,
+            params: with_auth(params),
             datasets: vec![],
             depends_on: vec![],
             metrics: None,
         }
     }
 
-    fn create_cohere_english_embedding() -> Embeddings {
+    #[must_use]
+    pub fn create_cohere_english_embedding() -> Embeddings {
         let mut params = HashMap::new();
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("input_type".to_string(), "search_document".to_string());
@@ -73,14 +76,15 @@ mod bedrock_tests {
             from: "bedrock:cohere.embed-english-v3".to_string(),
             name: "cohere-english".to_string(),
             files: vec![],
-            params,
+            params: with_auth(params),
             datasets: vec![],
             depends_on: vec![],
             metrics: None,
         }
     }
 
-    fn create_cohere_multilingual_embedding() -> Embeddings {
+    #[must_use]
+    pub fn create_cohere_multilingual_embedding() -> Embeddings {
         let mut params = HashMap::new();
         params.insert("aws_region".to_string(), "us-east-1".to_string());
         params.insert("input_type".to_string(), "classification".to_string());
@@ -90,15 +94,30 @@ mod bedrock_tests {
             from: "bedrock:cohere.embed-multilingual-v3".to_string(),
             name: "cohere-multilingual".to_string(),
             files: vec![],
-            params,
+            params: with_auth(params),
             datasets: vec![],
             depends_on: vec![],
             metrics: None,
         }
     }
 
+    fn with_auth(mut params: HashMap<String, String>) -> HashMap<String, String> {
+        params.insert(
+            "aws_access_key_id".to_string(),
+            "${env:AWS_BEDROCK_KEY}".to_string(),
+        );
+        params.insert(
+            "aws_secret_access_key".to_string(),
+            "${env:AWS_BEDROCK_SECRET}".to_string(),
+        );
+        params
+    }
+
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_v1_embeddings() {
         let model = create_titan_v1_embedding();
         let tests = vec![
@@ -136,7 +155,10 @@ mod bedrock_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_v2_embeddings() {
         let model = create_titan_v2_embedding();
         let tests = vec![
@@ -166,7 +188,10 @@ mod bedrock_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_cohere_english_embeddings() {
         let model = create_cohere_english_embedding();
         let tests = vec![
@@ -196,7 +221,10 @@ mod bedrock_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_cohere_multilingual_embeddings() {
         let model = create_cohere_multilingual_embedding();
         let tests = vec![
@@ -228,7 +256,10 @@ mod bedrock_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_all_bedrock_models() {
         let models = vec![
             create_titan_v1_embedding(),
@@ -279,7 +310,10 @@ mod bedrock_tests {
 
     /// Test for handling various input types and edge cases
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_bedrock_edge_cases() {
         let model = create_titan_v1_embedding();
         let tests = vec![
@@ -330,7 +364,10 @@ mod bedrock_tests {
 
     /// Test different dimension configurations for Titan models
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_dimensions() {
         let mut titan_256 = create_titan_v1_embedding();
         titan_256.name = "titan-256".to_string();

@@ -336,7 +336,7 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///                 [`FixedSizeListArray`]
 /// ```
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-async fn get_vectors(
+pub(super) async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
