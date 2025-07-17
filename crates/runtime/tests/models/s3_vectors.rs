@@ -23,9 +23,8 @@ use spicepod::{
 
 mod search {
     use crate::{
-        models::{
-            bedrock::embeddings::create_titan_v2_embedding, search::item_tpch_dataset_w_embeddings,
-        },
+        configure_test_datafusion,
+        models::{openai::get_openai_embeddings, search::item_tpch_dataset_w_embeddings},
         utils::verify_env_secret_exists,
     };
     use app::AppBuilder;
@@ -40,15 +39,12 @@ mod search {
     use crate::models::s3_vectors::get_package_delivery_dataset;
     use crate::utils::runtime_ready_check;
 
-    // S3 Vectors search test is based on the Bedrock embeddings
-    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn s3_vectors_basic() -> Result<(), anyhow::Error> {
         for env_var in [
-            "AWS_BEDROCK_KEY",
-            "AWS_BEDROCK_SECRET",
             "AWS_S3_VECTORS_KEY",
             "AWS_S3_VECTORS_SECRET",
+            "SPICE_OPENAI_API_KEY",
         ] {
             verify_env_secret_exists(env_var)
                 .await
@@ -57,11 +53,9 @@ mod search {
 
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        // created model name is `titan-v2`
-        let titan_embeddings = create_titan_v2_embedding();
         let mut test_dataset = item_tpch_dataset_w_embeddings(
             "item",
-            "titan-v2",
+            "openai_embeddings",
             Some(vec!["i_item_sk".to_string()]),
             None,
         );
@@ -76,12 +70,13 @@ mod search {
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(titan_embeddings)
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
             .build();
 
         let rt = start_app(app).await?;
-
-        runtime_ready_check(&rt).await;
 
         run_and_snapshot_query(
             &rt,
@@ -100,14 +95,12 @@ mod search {
         Ok(())
     }
 
-    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
         for env_var in [
-            "AWS_BEDROCK_KEY",
-            "AWS_BEDROCK_SECRET",
             "AWS_S3_VECTORS_KEY",
             "AWS_S3_VECTORS_SECRET",
+            "SPICE_OPENAI_API_KEY",
         ] {
             verify_env_secret_exists(env_var)
                 .await
@@ -116,10 +109,7 @@ mod search {
 
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        // created model name is `titan-v2`
-        let titan_embeddings = create_titan_v2_embedding();
-
-        let mut test_dataset = get_package_delivery_dataset("delivery", None, "titan-v2");
+        let mut test_dataset = get_package_delivery_dataset("delivery", None, "openai_embeddings");
 
         // Generate a unique index name for each test run
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
@@ -131,12 +121,13 @@ mod search {
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(titan_embeddings)
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
             .build();
 
         let rt = start_app(app).await?;
-
-        runtime_ready_check(&rt).await;
 
         // Failed sms notifications on heavy deliveries sent to the wrong location"
         run_and_snapshot_query(
@@ -204,7 +195,13 @@ mod search {
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await,
+        );
 
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

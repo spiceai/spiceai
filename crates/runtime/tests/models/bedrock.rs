@@ -114,7 +114,10 @@ pub(crate) mod embeddings {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_v1_embeddings() {
         let model = create_titan_v1_embedding();
         let tests = vec![
@@ -152,7 +155,10 @@ pub(crate) mod embeddings {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_v2_embeddings() {
         let model = create_titan_v2_embedding();
         let tests = vec![
@@ -182,7 +188,10 @@ pub(crate) mod embeddings {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_cohere_english_embeddings() {
         let model = create_cohere_english_embedding();
         let tests = vec![
@@ -212,7 +221,10 @@ pub(crate) mod embeddings {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_cohere_multilingual_embeddings() {
         let model = create_cohere_multilingual_embedding();
         let tests = vec![
@@ -244,7 +256,10 @@ pub(crate) mod embeddings {
     }
 
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_all_bedrock_models() {
         let models = vec![
             create_titan_v1_embedding(),
@@ -295,7 +310,10 @@ pub(crate) mod embeddings {
 
     /// Test for handling various input types and edge cases
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_bedrock_edge_cases() {
         let model = create_titan_v1_embedding();
         let tests = vec![
@@ -346,7 +364,10 @@ pub(crate) mod embeddings {
 
     /// Test different dimension configurations for Titan models
     #[tokio::test]
-    #[ignore = "requires AWS credentials and access to Bedrock models"]
+    #[cfg_attr(
+        not(feature = "extended_tests"),
+        ignore = "Extended test - run with --features extended_tests"
+    )]
     async fn test_titan_dimensions() {
         let mut titan_256 = create_titan_v1_embedding();
         titan_256.name = "titan-256".to_string();

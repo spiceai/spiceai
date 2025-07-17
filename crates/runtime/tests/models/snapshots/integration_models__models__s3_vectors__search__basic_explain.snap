@@ -23,15 +23,15 @@ expression: formatted
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
 |               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(i_item_sk@0, i_item_sk@0)], projection=[i_item_sk@0, score@1, i_item_desc@3]             |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
-|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 14), input_partitions=14                                                                |
+|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 3), input_partitions=3                                                                  |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                             |
 |               |                             ProjectionExec: expr=[CAST(key@0 AS Int32) as i_item_sk, 1 - distance@1 as score]                                                     |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                               |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                |
 |               |                                 BytesProcessedExec                                                                                                                |
 |               |                                   S3VectorsQueryExec: limit=100                                                                                                   |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
-|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 14), input_partitions=14                                                                |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(14), input_partitions=1                                                                   |
+|               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 3), input_partitions=3                                                                  |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                    |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                           |
 |               |                               BytesProcessedExec                                                                                                                  |
 |               |                                 DataSourceExec: file_groups={1 group: [[tpcds/item/item.parquet]]}, projection=[i_item_sk, i_item_desc], file_type=parquet        |
