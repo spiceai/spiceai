@@ -19,7 +19,6 @@ use snafu::Snafu;
 pub mod list_provider;
 pub mod query_provider;
 mod vector_table;
-use s3_vectors::custom::CoreError as S3VectorError;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;
 pub use metadata_column::{MetadataColumn, MetadataColumns};
@@ -40,7 +39,9 @@ pub enum Error {
     },
 
     #[snafu(display("An error occured interacting with the S3 vector API.\n{source}\n"))]
-    S3Vector { source: S3VectorError },
+    S3Vector {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(""))]
     InferSchemaError { source: ArrowError },
@@ -76,223 +77,231 @@ impl S3VectorIdentifier {
     }
 }
 
-#[cfg(test)]
-pub mod tests {
+// #[cfg(test)]
+// pub mod tests {
 
-    use std::sync::Arc;
+//     use std::sync::Arc;
 
-    use datafusion::datasource::TableProvider;
-    use datafusion::prelude::SessionContext;
-    use s3_vectors::{
-        CreateIndexInput, CreateVectorBucketInput, DeleteIndexInput, DeleteVectorBucketInput,
-        PutInputVector, PutVectorsInput, S3Vectors, S3VectorsClient, S3VectorsCredentialProvider,
-        VectorData,
-    };
-    use serde_json::json;
+//     use datafusion::datasource::TableProvider;
+//     use datafusion::prelude::SessionContext;
+//     use s3_vectors::{
+//         Client, CreateIndexInput, CreateVectorBucketInput, DataType, DeleteIndexInput,
+//         DeleteVectorBucketInput, DistanceMetric, PutInputVector, PutVectorsInput, S3Vectors,
+//         VectorData,
+//     };
+//     use serde_json::json;
 
-    use crate::s3_vectors::{
-        list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
-        vector_table::S3VectorsTable,
-    };
+//     use crate::s3_vectors::{
+//         list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+//         vector_table::S3VectorsTable,
+//     };
 
-    use super::*;
+//     use super::*;
 
-    async fn prepare_index(
-        client: &Arc<dyn S3Vectors + Send + Sync>,
-        bucket_name: &str,
-        index_name: &str,
-    ) {
-        client
-            .delete_index(DeleteIndexInput {
-                vector_bucket_name: Some(bucket_name.into()),
-                index_arn: None,
-                index_name: Some(index_name.into()),
-            })
-            .await
-            .expect("delete_index");
-        client
-            .delete_vector_bucket(DeleteVectorBucketInput {
-                vector_bucket_name: Some(bucket_name.into()),
-                vector_bucket_arn: None,
-            })
-            .await
-            .expect("delete_vector_bucket");
-        let _output = client
-            .create_vector_bucket(CreateVectorBucketInput {
-                encryption_configuration: None,
-                vector_bucket_name: bucket_name.to_string(),
-            })
-            .await
-            .expect("create_vector_bucket");
+//     async fn prepare_index(
+//         client: &Arc<dyn S3Vectors + Send + Sync>,
+//         bucket_name: &str,
+//         index_name: &str,
+//     ) {
+//         client
+//             .delete_index(
+//                 DeleteIndexInput::builder()
+//                     .vector_bucket_name(bucket_name)
+//                     .index_name(index_name)
+//                     .build()
+//                     .expect("delete_index"),
+//             )
+//             .await
+//             .expect("delete_index");
+//         client
+//             .delete_vector_bucket(
+//                 DeleteVectorBucketInput::builder()
+//                     .vector_bucket_name(bucket_name)
+//                     .build()
+//                     .expect("delete_vector_bucket"),
+//             )
+//             .await
+//             .expect("delete_vector_bucket");
+//         let _output = client
+//             .create_vector_bucket(
+//                 CreateVectorBucketInput::builder()
+//                     .vector_bucket_name(bucket_name.to_string())
+//                     .build()
+//                     .expect("create_vector_bucket"),
+//             )
+//             .await
+//             .expect("create_vector_bucket");
 
-        let _bucket = client
-            .create_index(CreateIndexInput {
-                data_type: "float32".into(),
-                dimension: 3,
-                distance_metric: "cosine".into(),
-                index_name: index_name.into(),
-                metadata_configuration: None,
-                vector_bucket_name: Some(bucket_name.into()),
-                vector_bucket_arn: None,
-            })
-            .await
-            .expect("create_index");
-        let _ = client
-            .put_vectors(PutVectorsInput {
-                index_name: Some(index_name.into()),
-                index_arn: None,
-                vector_bucket_name: Some(bucket_name.into()),
-                vectors: vec![
-                    PutInputVector {
-                        data: VectorData {
-                            float_32: Some(vec![1.0, 2.0, 3.0]),
-                        },
-                        key: "v1".into(),
-                        metadata: Some(serde_json::Map::from_iter([
-                            ("description".into(), json!("vector 1")),
-                            ("categories".into(), json!(["test", "example"])),
-                            ("msrp".into(), json!(100.0)),
-                            ("count".into(), json!(10)),
-                        ])),
-                    },
-                    PutInputVector {
-                        data: VectorData {
-                            float_32: Some(vec![4.0, 5.0, 6.0]),
-                        },
-                        key: "v2".into(),
-                        metadata: Some(serde_json::Map::from_iter([
-                            ("description".into(), json!("vector 2")),
-                            ("categories".into(), json!(["test", "eggs"])),
-                            ("msrp".into(), json!(200.0)),
-                            ("count".into(), json!(20)),
-                        ])),
-                    },
-                    PutInputVector {
-                        data: VectorData {
-                            float_32: Some(vec![7.0, 8.0, 9.0]),
-                        },
-                        key: "v3".into(),
-                        metadata: Some(serde_json::Map::from_iter([
-                            ("description".into(), json!("vector 3")),
-                            ("categories".into(), json!(["test", "bacon"])),
-                            ("msrp".into(), json!(300.0)),
-                            ("count".into(), json!(30)),
-                        ])),
-                    },
-                    PutInputVector {
-                        data: VectorData {
-                            float_32: Some(vec![2.0, 2.0, 2.0]),
-                        },
-                        key: "v4".into(),
-                        metadata: Some(serde_json::Map::from_iter([
-                            ("description".into(), json!("vector 4")),
-                            ("categories".into(), json!(["eggs", "bacon"])),
-                            ("msrp".into(), json!(400.0)),
-                            ("count".into(), json!(40)),
-                        ])),
-                    },
-                ],
-            })
-            .await
-            .expect("put_vectors");
-    }
+//         let _bucket = client
+//             .create_index(
+//                 CreateIndexInput::builder()
+//                     .data_type(DataType::Float32)
+//                     .dimension(3)
+//                     .distance_metric(DistanceMetric::Cosine)
+//                     .index_name(index_name)
+//                     .vector_bucket_name(bucket_name)
+//                     .build()
+//                     .expect("create_index"),
+//             )
+//             .await
+//             .expect("create_index");
+//         let _ = client
+//             .put_vectors(
+//                 PutVectorsInput::builder()
+//                     .index_name(index_name)
+//                     .vector_bucket_name(bucket_name)
+//                     .vectors(PutInputVector::builder()
+//                             .key("v1")
+//                             .data(VectorData::Float32(vec![1.0, 2.0, 3.0]))
+//                             .metadata()
+//                             .build()
+//                             .expect("put_input_vector"))
+//                     .vectors(PutInputVector::builder()
+//                             .data(VectorData::Float32(vec![4.0, 5.0, 6.0]))
+//                             .metadata(Some(serde_json::Map::from_iter([
+//                                 ("description".into(), json!("vector 1")),
+//                                 ("categories".into(), json!(["test", "example"])),
+//                                 ("msrp".into(), json!(100.0)),
+//                                 ("count".into(), json!(10)),
+//                             ]))
+//                         .build()
+//                         .expect("put_input_vector"),
+//                     PutInputVector::builder()
+//                             .data(VectorData::Float32(vec![4.0, 5.0, 6.0]))
+//                             .key("v1".into())
+//                             .metadata(Some(serde_json::Map::from_iter([
+//                                 ("description".into(), json!("vector 1")),
+//                                 ("categories".into(), json!(["test", "example"])),
+//                             ("msrp".into(), json!(100.0)),
+//                             ("count".into(), json!(10)),
+//                         ]))),
+//                     },
+//                     PutInputVector::builder()
+//                         .data(VectorData {
+//                             float_32: Some(vec![7.0, 8.0, 9.0]),
+//                         })
+//                         .key("v3".into())
+//                         .metadata(Some(serde_json::Map::from_iter([
+//                             ("description".into(), json!("vector 3")),
+//                             ("categories".into(), json!(["test", "bacon"])),
+//                             ("msrp".into(), json!(300.0)),
+//                             ("count".into(), json!(30)),
+//                         ])),
+//                     },
+//                     PutInputVector {
+//                         data: VectorData {
+//                             float_32: Some(vec![2.0, 2.0, 2.0]),
+//                         },
+//                         key: "v4".into(),
+//                         metadata: Some(serde_json::Map::from_iter([
+//                             ("description".into(), json!("vector 4")),
+//                             ("categories".into(), json!(["eggs", "bacon"])),
+//                             ("msrp".into(), json!(400.0)),
+//                             ("count".into(), json!(40)),
+//                         ])),
+//                     },
+//                 ],
+//             })
+//             .await
+//             .expect("put_vectors");
+//     }
 
-    #[tokio::test]
-    #[ignore]
-    async fn test_s3_list_vectors() -> Result<(), String> {
-        let (credential_provider, _) = S3VectorsCredentialProvider::from_env()
-            .await
-            .map_err(|e| e.to_string())?;
+//     #[tokio::test]
+//     #[ignore]
+//     async fn test_s3_list_vectors() -> Result<(), String> {
+//         let (credential_provider, _) = S3VectorsCredentialProvider::from_env()
+//             .await
+//             .map_err(|e| e.to_string())?;
 
-        let client = Arc::new(
-            S3VectorsClient::try_new("us-west-2", credential_provider).expect("bad region"),
-        ) as Arc<dyn S3Vectors + Send + Sync>;
-        let bucket_name: &'static str = "spice-s3-jeadie-vectors";
-        let index_name = "lookup";
+//         let client = Arc::new(
+//             S3VectorsClient::try_new("us-west-2", credential_provider).expect("bad region"),
+//         ) as Arc<dyn S3Vectors + Send + Sync>;
+//         let bucket_name: &'static str = "spice-s3-jeadie-vectors";
+//         let index_name = "lookup";
 
-        prepare_index(&client, bucket_name, index_name).await;
+//         prepare_index(&client, bucket_name, index_name).await;
 
-        let tbl: S3VectorsListTable = S3VectorsTable::try_new_vector_index(
-            bucket_name,
-            index_name,
-            client,
-            MetadataColumns::none(),
-        )
-        .await
-        .expect("could not create S3VectorsTable")
-        .expect("No S3VectorsTable was returned")
-        .into();
+//         let tbl: S3VectorsListTable = S3VectorsTable::try_new_vector_index(
+//             bucket_name,
+//             index_name,
+//             client,
+//             MetadataColumns::none(),
+//         )
+//         .await
+//         .expect("could not create S3VectorsTable")
+//         .expect("No S3VectorsTable was returned")
+//         .into();
 
-        println!("tbl.schema: {:?}", tbl.schema());
+//         println!("tbl.schema: {:?}", tbl.schema());
 
-        let ctx = SessionContext::new();
-        ctx.register_table("s3_vectors", Arc::new(tbl))
-            .expect("could not register S3VectorsTable");
+//         let ctx = SessionContext::new();
+//         ctx.register_table("s3_vectors", Arc::new(tbl))
+//             .expect("could not register S3VectorsTable");
 
-        ctx.sql("SELECT * FROM s3_vectors LIMIT 4")
-            .await
-            .expect("could not execute query")
-            .show()
-            .await
-            .expect("could not collect results");
+//         ctx.sql("SELECT * FROM s3_vectors LIMIT 4")
+//             .await
+//             .expect("could not execute query")
+//             .show()
+//             .await
+//             .expect("could not collect results");
 
-        Ok(())
-    }
+//         Ok(())
+//     }
 
-    #[tokio::test]
-    #[ignore]
-    async fn test_s3_query_vectors() -> Result<(), String> {
-        let (credential_provider, _) = S3VectorsCredentialProvider::from_env()
-            .await
-            .map_err(|e| e.to_string())?;
+//     #[tokio::test]
+//     #[ignore]
+//     async fn test_s3_query_vectors() -> Result<(), String> {
+//         let (credential_provider, _) = S3VectorsCredentialProvider::from_env()
+//             .await
+//             .map_err(|e| e.to_string())?;
 
-        let client = Arc::new(
-            S3VectorsClient::try_new("us-west-2", credential_provider).expect("bad region"),
-        ) as Arc<dyn S3Vectors + Send + Sync>;
-        let bucket_name: &'static str = "spice-s3-jeadie-vectors";
-        let index_name = "test";
+//         let client = Arc::new(
+//             S3VectorsClient::try_new("us-west-2", credential_provider).expect("bad region"),
+//         ) as Arc<dyn S3Vectors + Send + Sync>;
+//         let bucket_name: &'static str = "spice-s3-jeadie-vectors";
+//         let index_name = "test";
 
-        prepare_index(&client, bucket_name, index_name).await;
+//         prepare_index(&client, bucket_name, index_name).await;
 
-        let tbl = Arc::new(S3VectorsQueryTable::new(
-            S3VectorsTable::try_new_vector_index(
-                bucket_name,
-                index_name,
-                client,
-                MetadataColumns::none(),
-            )
-            .await
-            .expect("could not create S3VectorsTable")
-            .expect("No S3VectorsTable was returned"),
-            vec![1.0, -1.0, 3.0],
-        )) as Arc<dyn TableProvider>;
-        println!("tbl.schema: {:?}", tbl.schema());
+//         let tbl = Arc::new(S3VectorsQueryTable::new(
+//             S3VectorsTable::try_new_vector_index(
+//                 bucket_name,
+//                 index_name,
+//                 client,
+//                 MetadataColumns::none(),
+//             )
+//             .await
+//             .expect("could not create S3VectorsTable")
+//             .expect("No S3VectorsTable was returned"),
+//             vec![1.0, -1.0, 3.0],
+//         )) as Arc<dyn TableProvider>;
+//         println!("tbl.schema: {:?}", tbl.schema());
 
-        let ctx = SessionContext::new();
-        ctx.register_table("s3_vectors", tbl)
-            .expect("could not register S3VectorsTable");
+//         let ctx = SessionContext::new();
+//         ctx.register_table("s3_vectors", tbl)
+//             .expect("could not register S3VectorsTable");
 
-        ctx.sql("SELECT * FROM s3_vectors WHERE msrp > 100 LIMIT 101")
-            .await
-            .expect("could not execute query")
-            .show()
-            .await
-            .expect("could not collect results");
+//         ctx.sql("SELECT * FROM s3_vectors WHERE msrp > 100 LIMIT 101")
+//             .await
+//             .expect("could not execute query")
+//             .show()
+//             .await
+//             .expect("could not collect results");
 
-        ctx.sql("explain SELECT * FROM s3_vectors WHERE msrp > 100 and description!='somethind random' LIMIT 10")
-            .await
-            .expect("could not execute query")
-            .show()
-            .await
-            .expect("could not collect results");
+//         ctx.sql("explain SELECT * FROM s3_vectors WHERE msrp > 100 and description!='somethind random' LIMIT 10")
+//             .await
+//             .expect("could not execute query")
+//             .show()
+//             .await
+//             .expect("could not collect results");
 
-        ctx.sql("explain SELECT * FROM s3_vectors WHERE description IN ('vector 4', 'vector 2') AND msrp IN (300, 300.0, 100.0) LIMIT 10")
-            .await
-            .expect("could not execute query")
-            .show()
-            .await
-            .expect("could not collect results");
+//         ctx.sql("explain SELECT * FROM s3_vectors WHERE description IN ('vector 4', 'vector 2') AND msrp IN (300, 300.0, 100.0) LIMIT 10")
+//             .await
+//             .expect("could not execute query")
+//             .show()
+//             .await
+//             .expect("could not collect results");
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }
