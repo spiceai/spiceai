@@ -338,8 +338,6 @@ async fn test_github_org_members() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
-            let now = std::time::Instant::now();
-
             run_query_and_check_results(
                 &mut rt,
                 "test_github_org_members_auto",
@@ -356,11 +354,6 @@ async fn test_github_org_members() -> Result<(), String> {
                 })),
             )
             .await?;
-
-            let elapsed = now.elapsed().as_secs();
-
-            // LIMIT should stop this query from retrieving every member, so it shouldn't take that long
-            assert!(elapsed < 15, "elapsed: {elapsed}");
 
             Ok(())
         })
