@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "cp_catalog_page_sk": 1,
+    "trunc(vector_search().score,Int64(3))": 0.947,
+    "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+  },
+  {
+    "cp_catalog_page_sk": 3,
+    "trunc(vector_search().score,Int64(3))": 0.937,
+    "cp_description": "Earlier different differences get just to a methods; masses includ"
+  },
+  {
+    "cp_catalog_page_sk": 5,
+    "trunc(vector_search().score,Int64(3))": 0.874,
+    "cp_description": "Narrowly great dogs carry only by the events. Successful, able legs would not"
+  },
+  {
+    "cp_catalog_page_sk": 7,
+    "trunc(vector_search().score,Int64(3))": 0.926,
+    "cp_description": "Years must understand. Well fat thousands take. Good police l"
+  }
+]

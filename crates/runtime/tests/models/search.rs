@@ -455,13 +455,23 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         vec![
             (
                 "hybrid_column_sql_text_search_basic",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_projection",
-                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM text_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_filters",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+            ),
+            (
+                "hybrid_column_sql_vector_search_basic",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_projection",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM vector_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_filters",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
             )
         ],
     )
@@ -575,13 +585,13 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
         vec![
             (
                 "text_search_sql_text_search_basic",
-                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
             ), (
                 "text_search_sql_text_search_projection",
-                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
             ), (
                 "text_search_sql_text_search_filters",
-                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
             )
         ]
     )
@@ -660,19 +670,19 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         vec![
             (
                 "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ),
             // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
             (
                 "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
             ),
             (
                 "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
-                "SELECT cp_catalog_page_sk, score, cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
             )
         ]
     )
