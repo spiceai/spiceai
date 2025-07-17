@@ -17,8 +17,8 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rusoto_core::credential::ProvideAwsCredentials;
 use rusoto_core::request::{BufferedHttpResponse, DispatchSignedRequest};
-use rusoto_core::{region, HttpClient};
 use rusoto_core::{Client, RusotoError};
+use rusoto_core::{HttpClient, region};
 
 use rusoto_core::proto;
 use rusoto_core::signature::SignedRequest;
@@ -537,8 +537,7 @@ pub struct VectorBucketSummary {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct VectorData {
     #[serde(rename = "float32")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub float_32: Option<Vec<f32>>,
+    pub float_32: Vec<f32>,
 }
 
 // #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
