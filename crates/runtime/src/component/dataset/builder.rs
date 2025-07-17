@@ -54,6 +54,7 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
+    pub availability_monitor_enabled: bool,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -130,6 +131,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
+            availability_monitor_enabled: dataset.availability_monitor_enabled,
         })
     }
 }
@@ -157,6 +159,7 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
+            availability_monitor_enabled: true,
         })
     }
 
@@ -243,6 +246,7 @@ impl DatasetBuilder {
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
+            availability_monitor_enabled: self.availability_monitor_enabled,
         };
 
         Ok(dataset)

@@ -238,6 +238,7 @@ pub struct Dataset {
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub availability_monitor_enabled: bool,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -263,6 +264,10 @@ impl std::fmt::Debug for Dataset {
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
+            .field(
+                "availability_monitor_enabled",
+                &self.availability_monitor_enabled,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -288,6 +293,7 @@ impl PartialEq for Dataset {
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
+            && self.availability_monitor_enabled == other.availability_monitor_enabled
     }
 }
 

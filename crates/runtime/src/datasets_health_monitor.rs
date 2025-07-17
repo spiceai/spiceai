@@ -63,7 +63,7 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-struct DatasetAvailabilityInfo {
+pub struct DatasetAvailabilityInfo {
     name: String,
     table_provider: Arc<dyn TableProvider>,
     last_available_time: SystemTime,

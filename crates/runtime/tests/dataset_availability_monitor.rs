@@ -15,11 +15,14 @@ limitations under the License.
 */
 
 use app::AppBuilder;
-use runtime::{Runtime, datasets_health_monitor::DatasetsHealthMonitor};
-use spicepod::component::dataset::Dataset;
+use runtime::{
+    Runtime,
+    component::dataset::{Dataset, builder::DatasetBuilder},
+    datasets_health_monitor::DatasetsHealthMonitor,
+};
 use std::sync::Arc;
 
-fn get_test_dataset() -> Result<Dataset, anyhow::Error> {
+async fn get_test_dataset() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
         "./tests/file/datatypes.parquet"
     } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")? {
@@ -28,10 +31,23 @@ fn get_test_dataset() -> Result<Dataset, anyhow::Error> {
         return Err(anyhow::anyhow!("Could not find datatypes.parquet file"));
     };
 
-    Ok(Dataset::new(format!("file:{file_path}"), "datatypes"))
+    let spicepod_dataset =
+        spicepod::component::dataset::Dataset::new(format!("file:{file_path}"), "datatypes");
+    let app = AppBuilder::new("test")
+        .with_dataset(spicepod_dataset.clone())
+        .build();
+    let rt = Runtime::builder().with_app(app).build().await;
+
+    let dataset = DatasetBuilder::try_from(spicepod_dataset)?
+        .with_app(Arc::new(AppBuilder::new("test").build()))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
+
+    Ok(dataset)
 }
 
-fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyhow::Error> {
+async fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
         "./tests/file/datatypes.parquet"
     } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")? {
@@ -40,8 +56,48 @@ fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyh
         return Err(anyhow::anyhow!("Could not find datatypes.parquet file"));
     };
 
-    let mut dataset = Dataset::new(format!("file:{file_path}"), "datatypes");
-    dataset.availability_monitor_enabled = false;
+    let mut spicepod_dataset =
+        spicepod::component::dataset::Dataset::new(format!("file:{file_path}"), "datatypes");
+    spicepod_dataset.availability_monitor_enabled = false;
+
+    let app = AppBuilder::new("test")
+        .with_dataset(spicepod_dataset.clone())
+        .build();
+    let rt = Runtime::builder().with_app(app).build().await;
+
+    let dataset = DatasetBuilder::try_from(spicepod_dataset)?
+        .with_app(Arc::new(AppBuilder::new("test").build()))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
+
+    Ok(dataset)
+}
+
+async fn get_test_dataset_with_acceleration() -> Result<Dataset, anyhow::Error> {
+    let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
+        "./tests/file/datatypes.parquet"
+    } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")? {
+        "./crates/runtime/tests/file/datatypes.parquet"
+    } else {
+        return Err(anyhow::anyhow!("Could not find datatypes.parquet file"));
+    };
+
+    let mut spicepod_dataset =
+        spicepod::component::dataset::Dataset::new(format!("file:{file_path}"), "datatypes");
+    spicepod_dataset.acceleration = Some(spicepod::acceleration::Acceleration::default());
+
+    let app = AppBuilder::new("test")
+        .with_dataset(spicepod_dataset.clone())
+        .build();
+    let rt = Runtime::builder().with_app(app).build().await;
+
+    let dataset = DatasetBuilder::try_from(spicepod_dataset)?
+        .with_app(Arc::new(AppBuilder::new("test").build()))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
+
     Ok(dataset)
 }
 
@@ -49,17 +105,14 @@ fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyh
 async fn dataset_availability_monitor_register_skipped_when_disabled() -> Result<(), anyhow::Error>
 {
     // Create a test runtime to get DataFusion instance
-    let app = AppBuilder::new("dataset_availability_monitor_test")
-        .with_dataset(get_test_dataset()?)
-        .build();
-
+    let app = AppBuilder::new("dataset_availability_monitor_test").build();
     let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
-    let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
+    let monitor = DatasetsHealthMonitor::new(rt.datafusion());
 
     // Create dataset with availability monitor disabled
-    let dataset = get_test_dataset_with_availability_monitor_disabled()?;
+    let dataset = get_test_dataset_with_availability_monitor_disabled().await?;
 
     // Try to register the dataset - should be skipped
     let result = monitor.register_dataset(&dataset).await;
@@ -76,17 +129,14 @@ async fn dataset_availability_monitor_register_skipped_when_disabled() -> Result
 async fn dataset_availability_monitor_register_succeeds_when_enabled() -> Result<(), anyhow::Error>
 {
     // Create a test runtime to get DataFusion instance
-    let app = AppBuilder::new("dataset_availability_monitor_test")
-        .with_dataset(get_test_dataset()?)
-        .build();
-
+    let app = AppBuilder::new("dataset_availability_monitor_test").build();
     let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
-    let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
+    let monitor = DatasetsHealthMonitor::new(rt.datafusion());
 
     // Create dataset with availability monitor enabled (default)
-    let dataset = get_test_dataset()?;
+    let dataset = get_test_dataset().await?;
 
     // Try to register the dataset - should succeed
     let result = monitor.register_dataset(&dataset).await;
@@ -104,18 +154,14 @@ async fn dataset_availability_monitor_register_succeeds_when_enabled() -> Result
 async fn dataset_availability_monitor_register_skipped_when_accelerated()
 -> Result<(), anyhow::Error> {
     // Create a test runtime to get DataFusion instance
-    let app = AppBuilder::new("dataset_availability_monitor_test")
-        .with_dataset(get_test_dataset()?)
-        .build();
-
+    let app = AppBuilder::new("dataset_availability_monitor_test").build();
     let rt = Runtime::builder().with_app(app).build().await;
 
     // Create DatasetsHealthMonitor directly
-    let monitor = DatasetsHealthMonitor::new(Arc::clone(&rt.df));
+    let monitor = DatasetsHealthMonitor::new(rt.datafusion());
 
     // Create dataset with acceleration enabled (which should skip monitoring)
-    let mut dataset = get_test_dataset()?;
-    dataset.acceleration = Some(spicepod::acceleration::Acceleration::default());
+    let dataset = get_test_dataset_with_acceleration().await?;
 
     // Try to register the dataset - should be skipped due to acceleration
     let result = monitor.register_dataset(&dataset).await;
@@ -131,14 +177,12 @@ async fn dataset_availability_monitor_register_skipped_when_accelerated()
 #[tokio::test]
 async fn dataset_availability_monitor_disabled_when_builder_not_called() -> Result<(), anyhow::Error>
 {
-    let app = AppBuilder::new("dataset_availability_monitor_test")
-        .with_dataset(get_test_dataset()?)
-        .build();
+    let app = AppBuilder::new("dataset_availability_monitor_test").build();
 
     // Build runtime WITHOUT calling with_datasets_health_monitor
     let rt = Runtime::builder().with_app(app).build().await;
 
     // Monitor should be disabled since with_datasets_health_monitor wasn't called
-    assert!(rt.datasets_health_monitor.is_none());
+    assert!(rt.datasets_health_monitor().is_none());
     Ok(())
 }
