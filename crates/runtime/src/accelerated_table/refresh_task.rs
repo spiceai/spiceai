@@ -336,7 +336,7 @@ impl RefreshTask {
                     if let Some(batch) = stream.next().await {
                         match batch {
                             Ok(batch) => {
-                                tracing::info!(
+                                tracing::trace!(
                                     "Dataset {ds_name} received {} records",
                                     batch.num_rows()
                                 );
