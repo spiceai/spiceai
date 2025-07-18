@@ -65,22 +65,6 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
-      - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          os: 'linux'
-
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
