@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Nameable, WithDependsOn, default_true, embeddings::ColumnEmbeddingConfig, is_default};
+use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -78,6 +78,18 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+}
+
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AvailabilityMonitor {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Default,
+    /// The dataset is not checked for availability.
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,10 +158,9 @@ pub struct Dataset {
 
     /// Configures whether the dataset availability monitor is enabled for this dataset.
     /// When enabled, the runtime will periodically check dataset availability
-    /// and report metrics. Disabling this can prevent unnecessary remote calls
-    /// that might wake up warehouses like Databricks or Snowflake.
-    #[serde(default = "default_true", skip_serializing_if = "is_default")]
-    pub availability_monitor_enabled: bool,
+    /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub availability_monitor: AvailabilityMonitor,
 }
 
 impl Nameable for Dataset {
@@ -182,7 +193,7 @@ impl Dataset {
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
-            availability_monitor_enabled: true,
+            availability_monitor: AvailabilityMonitor::default(),
         }
     }
 
@@ -250,7 +261,7 @@ impl WithDependsOn<Dataset> for Dataset {
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
-            availability_monitor_enabled: self.availability_monitor_enabled,
+            availability_monitor: self.availability_monitor,
         }
     }
 }
@@ -325,8 +336,8 @@ struct DatasetDeserializer {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
-    #[serde(default = "default_true", skip_serializing_if = "is_default")]
-    availability_monitor_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    availability_monitor: AvailabilityMonitor,
 }
 
 #[allow(deprecated)]
@@ -377,7 +388,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
-            availability_monitor_enabled: deserializer.availability_monitor_enabled,
+            availability_monitor: deserializer.availability_monitor,
         })
     }
 }
@@ -394,7 +405,7 @@ mod availability_monitor_tests {
             from: file://test.csv
         ";
         let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert!(dataset.availability_monitor_enabled);
+        assert_eq!(dataset.availability_monitor, AvailabilityMonitor::Default);
     }
 
     #[test]
@@ -402,10 +413,10 @@ mod availability_monitor_tests {
         let yaml = r"
             name: test
             from: file://test.csv
-            availability_monitor_enabled: false
+            availability_monitor: disabled
         ";
         let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert!(!dataset.availability_monitor_enabled);
+        assert_eq!(dataset.availability_monitor, AvailabilityMonitor::Disabled);
     }
 
     #[test]
@@ -413,10 +424,10 @@ mod availability_monitor_tests {
         let yaml = r"
             name: test
             from: file://test.csv
-            availability_monitor_enabled: true
+            availability_monitor: default
         ";
         let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert!(dataset.availability_monitor_enabled);
+        assert_eq!(dataset.availability_monitor, AvailabilityMonitor::Default);
     }
 }
 

@@ -20,32 +20,8 @@ use runtime::{
     component::dataset::{Dataset, builder::DatasetBuilder},
     datasets_health_monitor::DatasetsHealthMonitor,
 };
+use spicepod::component::dataset::AvailabilityMonitor;
 use std::sync::Arc;
-
-async fn get_test_dataset() -> Result<Dataset, anyhow::Error> {
-    let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
-        "./tests/file/datatypes.parquet"
-    } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")? {
-        "./crates/runtime/tests/file/datatypes.parquet"
-    } else {
-        return Err(anyhow::anyhow!("Could not find datatypes.parquet file"));
-    };
-
-    let spicepod_dataset =
-        spicepod::component::dataset::Dataset::new(format!("file:{file_path}"), "datatypes");
-    let app = AppBuilder::new("test")
-        .with_dataset(spicepod_dataset.clone())
-        .build();
-    let rt = Runtime::builder().with_app(app).build().await;
-
-    let dataset = DatasetBuilder::try_from(spicepod_dataset)?
-        .with_app(Arc::new(AppBuilder::new("test").build()))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {}", e))?;
-
-    Ok(dataset)
-}
 
 async fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
@@ -58,7 +34,7 @@ async fn get_test_dataset_with_availability_monitor_disabled() -> Result<Dataset
 
     let mut spicepod_dataset =
         spicepod::component::dataset::Dataset::new(format!("file:{file_path}"), "datatypes");
-    spicepod_dataset.availability_monitor_enabled = false;
+    spicepod_dataset.availability_monitor = AvailabilityMonitor::Disabled;
 
     let app = AppBuilder::new("test")
         .with_dataset(spicepod_dataset.clone())

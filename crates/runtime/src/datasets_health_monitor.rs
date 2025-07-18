@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::{AvailabilityMonitor, Dataset},
     datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
 };
@@ -120,7 +120,7 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
-        if !dataset.availability_monitor_enabled {
+        if matches!(dataset.availability_monitor, AvailabilityMonitor::Disabled) {
             tracing::debug!(
                 "Skipping dataset {} for availability monitoring (disabled in config)",
                 dataset.name
@@ -239,7 +239,7 @@ AND labels.error_code IS NULL"
                 // Only datasets without recent activity/availability
                 let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
 
-                // check `task_history` first to exlude anything that had a successful query in the last 10 minutes
+                // check `task_history` first to exclude anything that had a successful query in the last 10 minutes
                 let recently_accessed_datasets = if is_task_history_enabled {
                     match Self::get_recently_accessed_datasets(Arc::clone(&df)).await {
                         Ok(datasets) => datasets,

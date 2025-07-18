@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
-    replication, validate_identifier,
+    AvailabilityMonitor, Dataset, Error, Mode, ReadyState, Result, TimeFormat,
+    UnsupportedTypeAction, acceleration, replication, validate_identifier,
 };
 use crate::{Runtime, component::dataset::acceleration::Engine};
 use app::App;
@@ -26,7 +26,10 @@ use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
+    component::{
+        dataset::{self as spicepod_dataset},
+        embeddings::ColumnEmbeddingConfig,
+    },
     metric::Metrics,
     param::Params,
     semantic::Column,
@@ -54,7 +57,7 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
-    pub availability_monitor_enabled: bool,
+    pub availability_monitor: AvailabilityMonitor,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -131,7 +134,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
-            availability_monitor_enabled: dataset.availability_monitor_enabled,
+            availability_monitor: AvailabilityMonitor::from(dataset.availability_monitor),
         })
     }
 }
@@ -159,7 +162,7 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
-            availability_monitor_enabled: true,
+            availability_monitor: AvailabilityMonitor::default(),
         })
     }
 
@@ -246,7 +249,7 @@ impl DatasetBuilder {
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
-            availability_monitor_enabled: self.availability_monitor_enabled,
+            availability_monitor: self.availability_monitor,
         };
 
         Ok(dataset)
