@@ -471,6 +471,15 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn retention_sql(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.retention_sql.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn refresh_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_sql.clone();

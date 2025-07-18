@@ -89,6 +89,7 @@ pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
+pub mod retention_sql;
 pub mod schema;
 pub mod udf;
 
@@ -127,6 +128,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     RefreshSql { source: refresh_sql::Error },
+
+    #[snafu(display("{source}"))]
+    RetentionSql { source: retention_sql::Error },
 
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
@@ -974,6 +978,18 @@ impl DataFusion {
             refresh,
         );
 
+        let retention_delete_expr = match dataset.retention_sql() {
+            Some(retention_sql) => Some(
+                retention_sql::parse_retention_sql(
+                    &dataset.name,
+                    retention_sql.as_str(),
+                    source_table_provider.schema(),
+                )
+                .context(RetentionSqlSnafu)?,
+            ),
+            None => None,
+        };
+
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format,
@@ -982,6 +998,7 @@ impl DataFusion {
             dataset.retention_period(),
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
+            retention_delete_expr,
         ));
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);

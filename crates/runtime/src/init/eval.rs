@@ -122,6 +122,7 @@ impl Runtime {
             Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
             Some(Duration::from_secs(1800)),      // Check every 30 minutes
             true,
+            None,
         );
 
         let table = create_internal_accelerated_table(
@@ -154,6 +155,7 @@ impl Runtime {
             Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
             Some(Duration::from_secs(1800)),      // Check every 30 minutes
             true,
+            None,
         );
 
         let table = create_internal_accelerated_table(
