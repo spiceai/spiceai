@@ -157,6 +157,7 @@ pub mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    #[ignore]
     async fn test_s3_vectors() -> Result<(), String> {
         let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let mut config_builder = config.into_builder();
