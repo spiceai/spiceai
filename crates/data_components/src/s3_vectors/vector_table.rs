@@ -346,7 +346,13 @@ impl S3VectorsTable {
                     .iter()
                     .filter_map(|(k, v)| {
                         let value = v.get(i)?.as_ref()?;
-                        Some((k.clone(), json_value_to_document(value.clone())))
+                        let meta = json_value_to_document(value.clone());
+
+                        if matches!(Document::Null, meta) {
+                            return None;
+                        }
+
+                        Some((k.clone(), meta))
                     })
                     .collect();
 
