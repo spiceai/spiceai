@@ -16,7 +16,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorSnafu,
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorBuildSnafu,
 };
 
 use super::{Error, Result, S3VectorIdentifier};
@@ -191,8 +191,7 @@ impl S3VectorsTable {
                 MetadataConfiguration::builder()
                     .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
                     .build()
-                    .boxed()
-                    .context(S3VectorSnafu)?,
+                    .context(S3VectorBuildSnafu)?,
             )
         };
 
@@ -206,11 +205,12 @@ impl S3VectorsTable {
                     .set_metadata_configuration(metadata_configuration)
                     .vector_bucket_name(bucket_name)
                     .build()
-                    .boxed()
-                    .context(S3VectorSnafu)?,
+                    .context(S3VectorBuildSnafu)?,
             )
             .await
-            .map_err(|e| Error::S3Vector { source: e.into() })?;
+            .map_err(|e| Error::S3VectorCreateIndexError {
+                source: e.into_service_error(),
+            })?;
         Ok(())
     }
 
@@ -226,11 +226,12 @@ impl S3VectorsTable {
                 CreateVectorBucketInput::builder()
                     .vector_bucket_name(bucket_name.clone())
                     .build()
-                    .boxed()
-                    .context(S3VectorSnafu)?,
+                    .context(S3VectorBuildSnafu)?,
             )
             .await
-            .map_err(|e| Error::S3Vector { source: e.into() })?;
+            .map_err(|e| Error::S3VectorCreateBucketError {
+                source: e.into_service_error(),
+            })?;
         Ok(())
     }
 
@@ -247,8 +248,7 @@ impl S3VectorsTable {
                 GetVectorBucketInput::builder()
                     .set_vector_bucket_name(bucket_name_opt)
                     .build()
-                    .boxed()
-                    .context(S3VectorSnafu)?,
+                    .context(S3VectorBuildSnafu)?,
             )
             .await
         {
@@ -258,7 +258,9 @@ impl S3VectorsTable {
             {
                 Ok(false)
             }
-            Err(e) => Err(Error::S3Vector { source: e.into() }),
+            Err(e) => Err(Error::S3VectorGetBucketError {
+                source: e.into_service_error(),
+            }),
         }
     }
 
@@ -275,8 +277,7 @@ impl S3VectorsTable {
                     .set_vector_bucket_name(vector_bucket_name)
                     .set_index_name(index_name)
                     .build()
-                    .boxed()
-                    .context(S3VectorSnafu)?,
+                    .context(S3VectorBuildSnafu)?,
             )
             .await
         {
@@ -286,7 +287,9 @@ impl S3VectorsTable {
                 Ok(false)
             }
             Ok(_) => Ok(true),
-            Err(e) => Err(Error::S3Vector { source: e.into() }),
+            Err(e) => Err(Error::S3VectorGetIndexError {
+                source: e.into_service_error(),
+            }),
         }
     }
 
@@ -373,11 +376,12 @@ impl S3VectorsTable {
                         .set_vector_bucket_name(vector_bucket_name.clone())
                         .set_vectors(Some(chunk.to_vec()))
                         .build()
-                        .boxed()
-                        .context(S3VectorSnafu)?,
+                        .context(S3VectorBuildSnafu)?,
                 )
                 .await
-                .map_err(|e| Error::S3Vector { source: e.into() })?;
+                .map_err(|e| Error::S3VectorPutVectorError {
+                    source: e.into_service_error(),
+                })?;
         }
 
         tracing::info!(

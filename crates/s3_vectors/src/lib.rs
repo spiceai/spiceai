@@ -56,7 +56,7 @@ pub use aws_sdk_s3vectors::{
         QueryOutputVector, VectorData,
     },
 };
-pub use aws_smithy_types::{Document, Number};
+pub use aws_smithy_types::{Document, Number, error::operation::BuildError};
 
 pub static LIST_VECTORS_MAX_RESULTS: usize = 500;
 pub static PUT_VECTORS_MAX_ITEMS: usize = 500;

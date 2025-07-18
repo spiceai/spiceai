@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::error::ArrowError;
+use s3_vectors::{
+    BuildError, CreateIndexError, CreateVectorBucketError, GetIndexError, GetVectorBucketError,
+    PutVectorsError, QueryVectorsError,
+};
 use snafu::Snafu;
 
 pub mod list_provider;
@@ -38,12 +42,28 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("An error occured interacting with the S3 vector API.\n{source}\n"))]
-    S3Vector {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
+    S3VectorPutVectorError { source: PutVectorsError },
 
-    #[snafu(display(""))]
+    #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
+    S3VectorQueryVectorsError { source: QueryVectorsError },
+
+    #[snafu(display("Failed to create index in S3 Vectors. {source}"))]
+    S3VectorCreateIndexError { source: CreateIndexError },
+
+    #[snafu(display("Failed to create bucket in S3 Vectors. {source}"))]
+    S3VectorCreateBucketError { source: CreateVectorBucketError },
+
+    #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
+    S3VectorGetBucketError { source: GetVectorBucketError },
+
+    #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
+    S3VectorGetIndexError { source: GetIndexError },
+
+    #[snafu(display("Failed to construct a request to send to S3 Vectors. {source}"))]
+    S3VectorBuildError { source: BuildError },
+
+    #[snafu(display("Failed to infer schema from S3 vector. {source}"))]
     InferSchemaError { source: ArrowError },
 
     #[snafu(display(

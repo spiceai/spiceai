@@ -304,7 +304,9 @@ async fn query_vector_stream(
                 .map_err(DataFusionError::External)?,
         )
         .await
-        .map_err(|e| Error::S3Vector { source: e.into() })
+        .map_err(|e| Error::S3VectorQueryVectorsError {
+            source: e.into_service_error(),
+        })
         .boxed()
         .map_err(DataFusionError::External)?;
 
