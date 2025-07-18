@@ -290,7 +290,7 @@ pub(crate) async fn compute_additional_embedding_columns(
 
             Arc::new(vectors) as ArrayRef
         } else {
-            let fixed_size_array = get_vectors(arr_iter, &**model).await?;
+            let fixed_size_array = get_vectors(arr_iter, &**model, cfg.vector_size).await?;
             tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
@@ -335,10 +335,15 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///
 ///                 [`FixedSizeListArray`]
 /// ```
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 pub(super) async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
+    vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     // Filter out nulls or empty strings before calling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
@@ -351,13 +356,12 @@ pub(super) async fn get_vectors(
         .collect();
 
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
-    let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
 
     let mut builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(
-            (embedded_data.len() + nulls.len()) * vector_length,
+            (embedded_data.len() + nulls.len()) * (vector_length as usize),
         ),
-        vector_length as i32,
+        vector_length,
         embedded_data.len() + nulls.len(),
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
@@ -372,7 +376,7 @@ pub(super) async fn get_vectors(
     for vector in embedded_data {
         // Keep inserting nulls until we reach the next non-null value.
         while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-            builder.values().append_nulls(vector_length);
+            builder.values().append_nulls(vector_length as usize);
             null_ptr += 1;
             output_ptr += 1;
             builder.append(false);
@@ -385,7 +389,7 @@ pub(super) async fn get_vectors(
 
     // Handle any trailing nulls/empty strings.
     while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-        builder.values().append_nulls(vector_length);
+        builder.values().append_nulls(vector_length as usize);
         null_ptr += 1;
         output_ptr += 1;
         builder.append(false);
@@ -591,6 +595,7 @@ mod tests {
             &MockEmbedder::default()
                 .with_pair("hello", vec![0.1, 0.2])
                 .with_pair("world", vec![0.3, 0.4]),
+            2,
         )
         .await?;
 
@@ -613,6 +618,7 @@ mod tests {
             &MockEmbedder::default()
                 .with_pair("hello", vec![0.1, 0.2])
                 .with_pair("world", vec![0.3, 0.4]),
+            2,
         )
         .await?;
 
