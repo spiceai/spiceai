@@ -689,47 +689,157 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
+#[derive(Debug)]
+pub enum DataRetentionFilter {
+    Time {
+        period: Duration,
+        time_column: String,
+        time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
+    },
+    Expression {
+        delete_expr: Expr,
+    },
+}
+
+pub struct RetentionBuilder {
+    time_column: Option<String>,
+    time_format: Option<TimeFormat>,
+    time_period: Option<Duration>,
+    time_partition_column: Option<String>,
+    time_partition_format: Option<TimeFormat>,
+    delete_expr: Option<Expr>,
+    check_interval: Option<Duration>,
+    enabled: bool,
+}
+
+impl RetentionBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            time_column: None,
+            time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
+            delete_expr: None,
+            time_period: None,
+            check_interval: None,
+            enabled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn time_column<S: Into<String>>(mut self, time_column: Option<S>) -> Self {
+        self.time_column = time_column.map(Into::into);
+        self
+    }
+
+    #[must_use]
+    pub fn time_format(mut self, time_format: Option<TimeFormat>) -> Self {
+        self.time_format = time_format;
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_column<S: Into<String>>(
+        mut self,
+        time_partition_column: Option<S>,
+    ) -> Self {
+        self.time_partition_column = time_partition_column.map(Into::into);
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_format(mut self, time_partition_format: Option<TimeFormat>) -> Self {
+        self.time_partition_format = time_partition_format;
+        self
+    }
+
+    #[must_use]
+    pub fn delete_expr(mut self, delete_expr: Option<Expr>) -> Self {
+        self.delete_expr = delete_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn time_period(mut self, time_period: Option<Duration>) -> Self {
+        self.time_period = time_period;
+        self
+    }
+
+    #[must_use]
+    pub fn check_interval(mut self, check_interval: Option<Duration>) -> Self {
+        self.check_interval = check_interval;
+        self
+    }
+
+    #[must_use]
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> Option<Retention> {
+        if !self.enabled {
+            return None;
+        }
+
+        let check_interval = self.check_interval?;
+        let mut filters = Vec::new();
+
+        // Add time-based filter if period and time_column are provided
+        if let Some(period) = self.time_period {
+            let Some(time_column) = self.time_column else {
+                tracing::error!(
+                    "[retention] The `time_column` must be specified for time-based retention"
+                );
+                return None;
+            };
+
+            filters.push(DataRetentionFilter::Time {
+                period,
+                time_column,
+                time_format: self.time_format,
+                time_partition_column: self.time_partition_column.clone(),
+                time_partition_format: self.time_partition_format,
+            });
+        }
+
+        // Add expression-based filter
+        if let Some(delete_expr) = self.delete_expr {
+            filters.push(DataRetentionFilter::Expression { delete_expr });
+        }
+
+        if filters.is_empty() {
+            tracing::error!(
+                "[retention] The `retention_period` or `retention_sql` must be specified for retention"
+            );
+            return None;
+        }
+
+        Some(Retention {
+            filters,
+            check_interval,
+        })
+    }
+}
+
+impl Default for RetentionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Retention {
-    pub(crate) time_column: Option<String>,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) time_partition_column: Option<String>,
-    pub(crate) time_partition_format: Option<TimeFormat>,
-    pub(crate) delete_expr: Option<Expr>,
-    pub(crate) period: Option<Duration>,
+    pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
 }
 
 impl Retention {
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        time_partition_column: Option<String>,
-        time_partition_format: Option<TimeFormat>,
-        retention_period: Option<Duration>,
-        retention_check_interval: Option<Duration>,
-        retention_check_enabled: bool,
-        delete_expr: Option<Expr>,
-    ) -> Option<Self> {
-        if !retention_check_enabled {
-            return None;
-        }
-
-        let check_interval = retention_check_interval?;
-
-        if retention_period.is_none() && delete_expr.is_none() {
-            return None;
-        }
-
-        Some(Self {
-            time_column,
-            time_format,
-            time_partition_column,
-            time_partition_format,
-            delete_expr,
-            period: retention_period,
-            check_interval,
-        })
+    pub fn builder() -> RetentionBuilder {
+        RetentionBuilder::new()
     }
 }
