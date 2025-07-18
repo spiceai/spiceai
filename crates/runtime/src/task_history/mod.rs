@@ -100,6 +100,7 @@ impl TaskSpan {
             Some(Duration::from_secs(retention_period_secs)), // 1 day
             Some(Duration::from_secs(retention_check_interval_secs)),
             true,
+            None,
         );
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);

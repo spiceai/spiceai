@@ -25,7 +25,7 @@ use http::{
 };
 use object_store::{
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
     http::{HttpBuilder, HttpStore},
     path::Path,
 };
@@ -128,7 +128,7 @@ impl ObjectStore for GitHubRawObjectStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _opts: PutMultipartOpts,
+        _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
         Err(object_store::Error::NotImplemented)
     }

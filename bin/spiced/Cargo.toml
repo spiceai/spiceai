@@ -73,6 +73,7 @@ default = [
   "imap",
   "alloc-snmalloc",
   "oracle",
+  "runtime/s3_vectors",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]

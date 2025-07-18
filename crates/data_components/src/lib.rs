@@ -52,6 +52,9 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "s3_vectors")]
+pub mod s3_vectors;
+
 #[cfg(feature = "sharepoint")]
 pub mod sharepoint;
 #[cfg(feature = "snowflake")]

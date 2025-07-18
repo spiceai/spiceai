@@ -49,12 +49,22 @@ use crate::{
 pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
-    base_table: Arc<dyn TableProvider>,
-    index: Arc<tantivy::Index>,
+    pub base_table: Arc<dyn TableProvider>,
+    pub index: Arc<tantivy::Index>,
+}
+
+impl std::fmt::Debug for FullTextDatabaseIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextDatabaseIndex")
+            .field("base_table", &self.base_table)
+            .field("search_fields", &self.search_fields)
+            .field("primary_key", &self.primary_key)
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
@@ -74,6 +84,7 @@ impl Index for FullTextDatabaseIndex {
         required_columns.extend(self.search_fields.iter().cloned());
         required_columns.into_iter().collect()
     }
+
     async fn compute_index(&self, batches: Vec<RecordBatch>) {
         if let Err(e) = self.update_index(batches.as_slice()) {
             tracing::error!("Failed to update full text search index: {e}");
@@ -198,6 +209,11 @@ impl FullTextDatabaseIndex {
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
     }
 
     #[must_use]

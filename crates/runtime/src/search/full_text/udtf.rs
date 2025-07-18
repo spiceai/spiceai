@@ -55,7 +55,10 @@ use search::{
 
 use crate::{
     datafusion::DataFusion,
-    search::{full_text::index::FullTextDatabaseIndex, util::find_concrete_table_provider},
+    search::{
+        full_text::index::FullTextDatabaseIndex,
+        util::{find_concrete_table_provider, table_ref_from_column_expr},
+    },
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
@@ -88,16 +91,12 @@ impl TextSearchTableFunc {
         let mut args = args.iter();
 
         let tbl = args.next();
-        let Some(Expr::Column(Column {
-            relation: None,
-            name: table_name,
-            ..
-        })) = tbl
-        else {
+        let Some(Expr::Column(c)) = tbl else {
             return Err(DataFusionError::Plan(format!(
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
+        let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
@@ -148,12 +147,12 @@ impl TextSearchTableFunc {
             // Invalid argument combinations
             (a, b, c) => {
                 return Err(DataFusionError::Plan(format!(
-                    "Invalid arguments: ({table_name}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
+                    "Invalid arguments: ({tbl_ref:?}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
                 )));
             }
         };
         Ok(TextSearchTableFuncArgs {
-            tbl: table_name.into(),
+            tbl: tbl_ref,
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
@@ -375,13 +374,16 @@ impl TableProvider for TextSearchUDTFProvider {
         let underlying_projection =
             self.convert_projection(projection, &search_field_index_schema)?;
 
-        Ok(Arc::new(FullTextSearchExec::try_new(
-            field_index,
-            query.clone(),
-            search_field_index_schema,
-            Some(&underlying_projection),
-            filters.to_vec(),
-            limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
-        )?))
+        Ok(Arc::new(
+            FullTextSearchExec::try_new(
+                field_index,
+                query.clone(),
+                search_field_index_schema,
+                Some(&underlying_projection),
+                filters.to_vec(),
+                limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
+            )
+            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+        ))
     }
 }
