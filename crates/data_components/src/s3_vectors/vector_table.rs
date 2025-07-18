@@ -15,17 +15,21 @@ limitations under the License.
 */
 use std::{collections::HashMap, sync::Arc};
 
-use crate::s3_vectors::{MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
+use crate::s3_vectors::{
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorBuildSnafu,
+};
 
 use super::{Error, Result, S3VectorIdentifier};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
-    CreateIndexInput, CreateVectorBucketInput, GetIndexError, GetIndexInput, GetVectorBucketError,
-    GetVectorBucketInput, MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector,
-    PutVectorsInput, S3Vectors, VectorData, VectorMetadata, custom::inner_service_error,
+    CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
+    GetIndexInput, GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration,
+    PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsInput, S3Vectors, SdkError, VectorData,
 };
+use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
+use snafu::ResultExt;
 
 /// An S3 Vector index.
 #[derive(Clone)]
@@ -183,23 +187,30 @@ impl S3VectorsTable {
         let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
             None
         } else {
-            Some(MetadataConfiguration {
-                non_filterable_metadata_keys: non_filterable_metadata_columns,
-            })
+            Some(
+                MetadataConfiguration::builder()
+                    .set_non_filterable_metadata_keys(Some(non_filterable_metadata_columns))
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
         };
 
         client
-            .create_index(CreateIndexInput {
-                data_type: "float32".to_string(),
-                dimension,
-                distance_metric: "cosine".to_string(),
-                index_name: index_name.clone(),
-                metadata_configuration,
-                vector_bucket_arn: None,
-                vector_bucket_name: Some(bucket_name.clone()),
-            })
+            .create_index(
+                CreateIndexInput::builder()
+                    .data_type(s3_vectors::DataType::Float32)
+                    .dimension(dimension.try_into().unwrap_or(i32::MAX))
+                    .distance_metric(DistanceMetric::Cosine)
+                    .index_name(index_name)
+                    .set_metadata_configuration(metadata_configuration)
+                    .vector_bucket_name(bucket_name)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
             .await
-            .map_err(|e| Error::S3Vector { source: e.into() })?;
+            .map_err(|e| Error::S3VectorCreateIndexError {
+                source: e.into_service_error(),
+            })?;
         Ok(())
     }
 
@@ -211,12 +222,16 @@ impl S3VectorsTable {
             return Err(Error::CreateIndexUsingArn);
         };
         client
-            .create_vector_bucket(CreateVectorBucketInput {
-                vector_bucket_name: bucket_name.clone(),
-                encryption_configuration: None,
-            })
+            .create_vector_bucket(
+                CreateVectorBucketInput::builder()
+                    .vector_bucket_name(bucket_name.clone())
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
             .await
-            .map_err(|e| Error::S3Vector { source: e.into() })?;
+            .map_err(|e| Error::S3VectorCreateBucketError {
+                source: e.into_service_error(),
+            })?;
         Ok(())
     }
 
@@ -229,22 +244,23 @@ impl S3VectorsTable {
             S3VectorIdentifier::IndexArn(_) => None,
         };
         match client
-            .get_vector_bucket(GetVectorBucketInput {
-                vector_bucket_arn: None,
-                vector_bucket_name: bucket_name_opt,
-            })
+            .get_vector_bucket(
+                GetVectorBucketInput::builder()
+                    .set_vector_bucket_name(bucket_name_opt)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
             .await
         {
             Ok(_) => Ok(true),
-            Err(e)
-                if matches!(
-                    inner_service_error::<GetVectorBucketError>(&e),
-                    Some(GetVectorBucketError::NotFound(_))
-                ) =>
+            Err(SdkError::ServiceError(e))
+                if matches!(&e.err(), GetVectorBucketError::NotFoundException(_)) =>
             {
                 Ok(false)
             }
-            Err(e) => Err(Error::S3Vector { source: e.into() }),
+            Err(e) => Err(Error::S3VectorGetBucketError {
+                source: e.into_service_error(),
+            }),
         }
     }
 
@@ -255,23 +271,25 @@ impl S3VectorsTable {
     ) -> Result<bool> {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
         match client
-            .get_index(GetIndexInput {
-                index_arn,
-                vector_bucket_name,
-                index_name,
-            })
+            .get_index(
+                GetIndexInput::builder()
+                    .set_index_arn(index_arn)
+                    .set_vector_bucket_name(vector_bucket_name)
+                    .set_index_name(index_name)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
             .await
         {
-            Err(e)
-                if matches!(
-                    inner_service_error::<GetIndexError>(&e),
-                    Some(GetIndexError::NotFound(_msg))
-                ) =>
+            Err(SdkError::ServiceError(e))
+                if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
             {
                 Ok(false)
             }
             Ok(_) => Ok(true),
-            Err(e) => Err(Error::S3Vector { source: e.into() }),
+            Err(e) => Err(Error::S3VectorGetIndexError {
+                source: e.into_service_error(),
+            }),
         }
     }
 
@@ -324,19 +342,32 @@ impl S3VectorsTable {
             .filter_map(|(i, (data, key))| {
                 let key = key?.to_string();
                 let data = data?;
-                let meta: VectorMetadata = metadata
+                let meta: HashMap<String, Document> = metadata
                     .iter()
                     .filter_map(|(k, v)| {
                         let value = v.get(i)?.as_ref()?;
-                        Some((k.clone(), value.clone()))
+                        let meta = json_value_to_document(value.clone());
+
+                        if matches!(meta, Document::Null) {
+                            return None;
+                        }
+
+                        Some((k.clone(), meta))
                     })
                     .collect();
 
-                Some(PutInputVector {
-                    key,
-                    metadata: if meta.is_empty() { None } else { Some(meta) },
-                    data: VectorData { float_32: data },
-                })
+                let put_input_vector = PutInputVector::builder()
+                    .key(key)
+                    .set_metadata(if meta.is_empty() {
+                        None
+                    } else {
+                        Some(Document::Object(meta))
+                    })
+                    .data(VectorData::Float32(data))
+                    .build()
+                    .ok()?;
+
+                Some(put_input_vector)
             })
             .collect();
 
@@ -344,14 +375,19 @@ impl S3VectorsTable {
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
             self.client
-                .put_vectors(PutVectorsInput {
-                    index_arn: index_arn.clone(),
-                    index_name: index_name.clone(),
-                    vector_bucket_name: vector_bucket_name.clone(),
-                    vectors: chunk.to_vec(),
-                })
+                .put_vectors(
+                    PutVectorsInput::builder()
+                        .set_index_arn(index_arn.clone())
+                        .set_index_name(index_name.clone())
+                        .set_vector_bucket_name(vector_bucket_name.clone())
+                        .set_vectors(Some(chunk.to_vec()))
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
                 .await
-                .map_err(|e| Error::S3Vector { source: e.into() })?;
+                .map_err(|e| Error::S3VectorPutVectorError {
+                    source: e.into_service_error(),
+                })?;
         }
 
         tracing::info!(

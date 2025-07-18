@@ -1,19 +1,18 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 use crate::{
     Error,
@@ -22,6 +21,7 @@ use crate::{
         UnsupportedOperatorSnafu,
     },
 };
+use aws_smithy_types::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use snafu::ResultExt;
@@ -104,6 +104,19 @@ impl From<MetadataFilter> for Map<String, Value> {
     }
 }
 
+impl From<MetadataFilter> for Document {
+    fn from(val: MetadataFilter) -> Self {
+        match val {
+            MetadataFilter::Simple(map) => Document::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, json_value_to_document(v)))
+                    .collect(),
+            ),
+            MetadataFilter::Complex(expr) => expr.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FilterExpression {
@@ -119,6 +132,21 @@ impl From<FilterExpression> for Map<String, Value> {
             FilterExpression::Logical(logical) => logical.into(),
             FilterExpression::Field(field_map) => {
                 field_map.into_iter().map(|(k, v)| (k, v.into())).collect()
+            }
+        }
+    }
+}
+
+impl From<FilterExpression> for Document {
+    fn from(val: FilterExpression) -> Self {
+        match val {
+            FilterExpression::Logical(logical) => logical.into(),
+            FilterExpression::Field(field_map) => {
+                let mut map = HashMap::new();
+                for (k, v) in field_map {
+                    map.insert(k, v.into());
+                }
+                Document::Object(map)
             }
         }
     }
@@ -143,6 +171,21 @@ impl From<FieldOperation> for Value {
                     result.insert(key, value);
                 }
                 Value::Object(result)
+            }
+        }
+    }
+}
+
+impl From<FieldOperation> for Document {
+    fn from(value: FieldOperation) -> Self {
+        match value {
+            FieldOperation::Direct(value) => json_value_to_document(value),
+            FieldOperation::Operation(map) => {
+                let mut result = HashMap::new();
+                for (key, value) in map {
+                    result.insert(key, json_value_to_document(value));
+                }
+                Document::Object(result)
             }
         }
     }
@@ -177,6 +220,24 @@ impl From<LogicalOperation> for Map<String, Value> {
         }
 
         result
+    }
+}
+
+impl From<LogicalOperation> for Document {
+    fn from(val: LogicalOperation) -> Self {
+        let mut result = HashMap::new();
+
+        if let Some(and_filters) = val.and {
+            let and_array: Vec<Document> = and_filters.into_iter().map(Into::into).collect();
+            result.insert("$and".to_string(), Document::Array(and_array));
+        }
+
+        if let Some(or_filters) = val.or {
+            let or_array: Vec<Document> = or_filters.into_iter().map(Into::into).collect();
+            result.insert("$or".to_string(), Document::Array(or_array));
+        }
+
+        Document::Object(result)
     }
 }
 
@@ -652,6 +713,80 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[must_use]
+pub fn document_to_json_map(document: Document) -> Map<String, Value> {
+    match document {
+        Document::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| (k, document_to_json_value(v)))
+            .collect(),
+        _ => Map::new(),
+    }
+}
+
+#[must_use]
+pub fn document_to_json_value(document: Document) -> Value {
+    match document {
+        Document::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, document_to_json_value(v)))
+                .collect(),
+        ),
+        Document::Array(arr) => Value::Array(arr.into_iter().map(document_to_json_value).collect()),
+        Document::Number(num) => aws_number_to_json_number(num).map_or(Value::Null, Value::Number),
+        Document::String(s) => Value::String(s),
+        Document::Bool(b) => Value::Bool(b),
+        Document::Null => Value::Null,
+    }
+}
+
+#[must_use]
+pub fn aws_number_to_json_number(num: aws_smithy_types::Number) -> Option<serde_json::Number> {
+    match num {
+        aws_smithy_types::Number::PosInt(pos_int) => Some(serde_json::Number::from(pos_int)),
+        aws_smithy_types::Number::NegInt(neg_int) => Some(serde_json::Number::from(neg_int)),
+        aws_smithy_types::Number::Float(float) => serde_json::Number::from_f64(float),
+    }
+}
+
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_types::Number> {
+    if num.is_i64() {
+        let i = num.as_i64()?;
+        if i >= 0 {
+            #[allow(clippy::cast_sign_loss)]
+            Some(aws_smithy_types::Number::PosInt(i as u64))
+        } else {
+            Some(aws_smithy_types::Number::NegInt(i))
+        }
+    } else if num.is_u64() {
+        Some(aws_smithy_types::Number::PosInt(num.as_u64()?))
+    } else if num.is_f64() {
+        Some(aws_smithy_types::Number::Float(num.as_f64()?))
+    } else {
+        None
+    }
+}
+
+#[must_use]
+pub fn json_value_to_document(value: Value) -> Document {
+    match value {
+        Value::Object(map) => Document::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, json_value_to_document(v)))
+                .collect(),
+        ),
+        Value::Array(arr) => Document::Array(arr.into_iter().map(json_value_to_document).collect()),
+        Value::Number(num) => {
+            json_number_to_aws_number(num).map_or(Document::Null, Document::Number)
+        }
+        Value::String(s) => Document::String(s),
+        Value::Bool(b) => Document::Bool(b),
+        Value::Null => Document::Null,
     }
 }
 

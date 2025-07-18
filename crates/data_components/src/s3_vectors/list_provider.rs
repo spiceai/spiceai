@@ -22,7 +22,7 @@ use crate::s3_vectors::{
 /// Num of segments to use for parallel `ListVectors` API calls.
 const LIST_S3_VECTORS_NUM_READ_SEGMENTS: usize = 10;
 
-use super::{Error, S3VectorIdentifier};
+use super::S3VectorIdentifier;
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -46,9 +46,10 @@ use datafusion::{
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use s3_vectors::{
-    LIST_VECTORS_MAX_RESULTS, ListOutputVector, ListVectorsError, ListVectorsInput,
-    ListVectorsOutput, RusotoError, S3Vectors,
+    LIST_VECTORS_MAX_RESULTS, ListOutputVector, ListVectorsInput, ListVectorsOutput, S3Vectors,
+    VectorData,
 };
+use s3_vectors_metadata_filter::document_to_json_map;
 use snafu::ResultExt;
 use tokio::sync::mpsc::Sender;
 
@@ -297,50 +298,29 @@ async fn list_vector_segment(
         let ListVectorsOutput {
             next_token: next_token_opt,
             vectors,
-        } = match client
-            .list_vectors(ListVectorsInput {
-                vector_bucket_name: bucket_name.clone(),
-                index_arn: arn.clone(),
-                index_name: index_name.clone(),
-                max_results: Some(
-                    i64::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS))
-                        .unwrap_or(i64::MAX),
-                ),
-                next_token: next_token.clone(),
-                return_data: Some(true),
-                return_metadata: Some(true),
-                segment_count: Some(i64::try_from(segment_count).unwrap_or(i64::MAX)),
-                segment_index: Some(i64::try_from(segment_index).unwrap_or(i64::MAX)),
-            })
+            ..
+        } = client
+            .list_vectors(
+                ListVectorsInput::builder()
+                    .set_vector_bucket_name(bucket_name.clone())
+                    .set_index_arn(arn.clone())
+                    .set_index_name(index_name.clone())
+                    .max_results(
+                        i32::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS))
+                            .unwrap_or(i32::MAX),
+                    )
+                    .set_next_token(next_token.clone())
+                    .return_data(true)
+                    .return_metadata(true)
+                    .segment_count(i32::try_from(segment_count).unwrap_or(i32::MAX))
+                    .segment_index(i32::try_from(segment_index).unwrap_or(i32::MAX))
+                    .build()
+                    .boxed()
+                    .map_err(DataFusionError::External)?,
+            )
             .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                let Ok(output) = (match &e {
-                    RusotoError::Service(
-                        ListVectorsError::InternalServer(err_string)
-                        | ListVectorsError::ServiceUnavailable(err_string),
-                    ) => {
-                        tracing::debug!(
-                            "/ListVectors segment {segment_index} returned an internal server error: {err_string}. Skipping this segment."
-                        );
-                        // HACK: There is currently an issue with S3 vectors that causes the ListVectors API to return an internal server error.
-                        // Pretend we got no results.
-                        Ok(ListVectorsOutput {
-                            next_token: None,
-                            vectors: vec![],
-                        })
-                    }
-                    _ => Err(()),
-                }) else {
-                    Err(e)
-                        .map_err(|e| Error::S3Vector { source: e.into() })
-                        .boxed()
-                        .map_err(DataFusionError::External)?
-                };
-                output
-            }
-        };
+            .boxed()
+            .map_err(DataFusionError::External)?;
 
         remaining_limit = remaining_limit.saturating_sub(vectors.len());
         let num_vectors = vectors.len();
@@ -393,14 +373,14 @@ fn to_flat_value(output: ListOutputVector) -> serde_json::Value {
         metadata,
         data,
         key,
+        ..
     } = output;
-    let mut result = metadata.unwrap_or_default();
-    if let Some(data) = data {
+    let mut result = document_to_json_map(metadata.unwrap_or_default());
+    if let Some(VectorData::Float32(vec)) = data {
         result.insert(
             S3_VECTOR_EMBEDDING_NAME.into(),
             serde_json::Value::Array(
-                data.float_32
-                    .into_iter()
+                vec.into_iter()
                     .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
                     .map(serde_json::Value::Number)
                     .collect::<Vec<_>>(),

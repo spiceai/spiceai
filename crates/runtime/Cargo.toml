@@ -130,10 +130,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
-s3_vectors = { path = "../s3_vectors", features = [
-    "deserialize_structs",
-    "serialize_structs",
-], optional = true }
+s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
 search = { path = "../search" }
