@@ -94,7 +94,7 @@ impl S3Vectors for S3VectorRetryClient {
                 .set_vector_bucket_name(input.vector_bucket_name.clone())
                 .set_index_name(input.index_name.clone())
                 .set_data_type(input.data_type.clone())
-                .set_dimension(input.dimension.clone())
+                .set_dimension(input.dimension)
                 .set_distance_metric(input.distance_metric.clone())
                 .set_metadata_configuration(input.metadata_configuration.clone())
                 .send()
@@ -103,16 +103,16 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        CreateIndexError::ServiceUnavailableException(_)
+                        | CreateIndexError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         CreateIndexError::AccessDeniedException(_)
                         | CreateIndexError::ConflictException(_)
                         | CreateIndexError::InternalServerException(_)
                         | CreateIndexError::NotFoundException(_)
                         | CreateIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        CreateIndexError::ServiceUnavailableException(_)
-                        | CreateIndexError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -139,15 +139,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        CreateVectorBucketError::ServiceUnavailableException(_)
+                        | CreateVectorBucketError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         CreateVectorBucketError::AccessDeniedException(_)
                         | CreateVectorBucketError::ConflictException(_)
                         | CreateVectorBucketError::InternalServerException(_)
                         | CreateVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        CreateVectorBucketError::ServiceUnavailableException(_)
-                        | CreateVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -175,14 +175,14 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
-                        DeleteIndexError::AccessDeniedException(_)
-                        | DeleteIndexError::InternalServerException(_)
-                        | DeleteIndexError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
                         DeleteIndexError::ServiceUnavailableException(_)
                         | DeleteIndexError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        DeleteIndexError::AccessDeniedException(_)
+                        | DeleteIndexError::InternalServerException(_)
+                        | DeleteIndexError::ServiceQuotaExceededException(_)
+                        | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -209,15 +209,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        DeleteVectorBucketError::ServiceUnavailableException(_)
+                        | DeleteVectorBucketError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         DeleteVectorBucketError::AccessDeniedException(_)
                         | DeleteVectorBucketError::ConflictException(_)
                         | DeleteVectorBucketError::InternalServerException(_)
                         | DeleteVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        DeleteVectorBucketError::ServiceUnavailableException(_)
-                        | DeleteVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -244,15 +244,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        DeleteVectorBucketPolicyError::ServiceUnavailableException(_)
+                        | DeleteVectorBucketPolicyError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         DeleteVectorBucketPolicyError::AccessDeniedException(_)
                         | DeleteVectorBucketPolicyError::InternalServerException(_)
                         | DeleteVectorBucketPolicyError::NotFoundException(_)
                         | DeleteVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        DeleteVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | DeleteVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -281,6 +281,10 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        DeleteVectorsError::ServiceUnavailableException(_)
+                        | DeleteVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         DeleteVectorsError::AccessDeniedException(_)
                         | DeleteVectorsError::InternalServerException(_)
                         | DeleteVectorsError::NotFoundException(_)
@@ -289,10 +293,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorsError::KmsInvalidStateException(_)
                         | DeleteVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        DeleteVectorsError::ServiceUnavailableException(_)
-                        | DeleteVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -320,15 +320,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        GetIndexError::ServiceUnavailableException(_)
+                        | GetIndexError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         GetIndexError::AccessDeniedException(_)
                         | GetIndexError::InternalServerException(_)
                         | GetIndexError::NotFoundException(_)
                         | GetIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        GetIndexError::ServiceUnavailableException(_)
-                        | GetIndexError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -355,15 +355,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        GetVectorBucketError::ServiceUnavailableException(_)
+                        | GetVectorBucketError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         GetVectorBucketError::AccessDeniedException(_)
                         | GetVectorBucketError::InternalServerException(_)
                         | GetVectorBucketError::NotFoundException(_)
                         | GetVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        GetVectorBucketError::ServiceUnavailableException(_)
-                        | GetVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -390,15 +390,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        GetVectorBucketPolicyError::ServiceUnavailableException(_)
+                        | GetVectorBucketPolicyError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         GetVectorBucketPolicyError::AccessDeniedException(_)
                         | GetVectorBucketPolicyError::InternalServerException(_)
                         | GetVectorBucketPolicyError::NotFoundException(_)
                         | GetVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        GetVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | GetVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -429,6 +429,10 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        GetVectorsError::ServiceUnavailableException(_)
+                        | GetVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         GetVectorsError::AccessDeniedException(_)
                         | GetVectorsError::InternalServerException(_)
                         | GetVectorsError::NotFoundException(_)
@@ -438,10 +442,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorsError::KmsNotFoundException(_)
                         | GetVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        GetVectorsError::ServiceUnavailableException(_)
-                        | GetVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -462,9 +462,9 @@ impl S3Vectors for S3VectorRetryClient {
                 .list_indexes()
                 .set_vector_bucket_name(input.vector_bucket_name.clone())
                 .set_vector_bucket_arn(input.vector_bucket_arn.clone())
-                .set_max_results(input.max_results.clone())
+                .set_max_results(input.max_results)
                 .set_next_token(input.next_token.clone())
-                .set_max_results(input.max_results.clone())
+                .set_max_results(input.max_results)
                 .set_prefix(input.prefix.clone())
                 .send()
                 .await
@@ -472,15 +472,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        ListIndexesError::ServiceUnavailableException(_)
+                        | ListIndexesError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         ListIndexesError::AccessDeniedException(_)
                         | ListIndexesError::InternalServerException(_)
                         | ListIndexesError::NotFoundException(_)
                         | ListIndexesError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        ListIndexesError::ServiceUnavailableException(_)
-                        | ListIndexesError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -499,7 +499,7 @@ impl S3Vectors for S3VectorRetryClient {
             match self
                 .client
                 .list_vector_buckets()
-                .set_max_results(input.max_results.clone())
+                .set_max_results(input.max_results)
                 .set_next_token(input.next_token.clone())
                 .set_prefix(input.prefix.clone())
                 .send()
@@ -508,14 +508,14 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
-                        ListVectorBucketsError::AccessDeniedException(_)
-                        | ListVectorBucketsError::InternalServerException(_)
-                        | ListVectorBucketsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
                         ListVectorBucketsError::ServiceUnavailableException(_)
                         | ListVectorBucketsError::TooManyRequestsException(_) => {
                             Err(RetryError::transient(e))
                         }
+                        ListVectorBucketsError::AccessDeniedException(_)
+                        | ListVectorBucketsError::InternalServerException(_)
+                        | ListVectorBucketsError::ServiceQuotaExceededException(_)
+                        | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -537,27 +537,27 @@ impl S3Vectors for S3VectorRetryClient {
                 .set_vector_bucket_name(input.vector_bucket_name.clone())
                 .set_index_name(input.index_name.clone())
                 .set_index_arn(input.index_arn.clone())
-                .set_max_results(input.max_results.clone())
+                .set_max_results(input.max_results)
                 .set_next_token(input.next_token.clone())
-                .set_segment_count(input.segment_count.clone())
-                .set_segment_index(input.segment_index.clone())
-                .set_return_data(input.return_data.clone())
-                .set_return_metadata(input.return_metadata.clone())
+                .set_segment_count(input.segment_count)
+                .set_segment_index(input.segment_index)
+                .set_return_data(input.return_data)
+                .set_return_metadata(input.return_metadata)
                 .send()
                 .await
             {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        ListVectorsError::ServiceUnavailableException(_)
+                        | ListVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         ListVectorsError::AccessDeniedException(_)
                         | ListVectorsError::InternalServerException(_)
                         | ListVectorsError::NotFoundException(_)
                         | ListVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        ListVectorsError::ServiceUnavailableException(_)
-                        | ListVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -585,15 +585,15 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        PutVectorBucketPolicyError::ServiceUnavailableException(_)
+                        | PutVectorBucketPolicyError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         PutVectorBucketPolicyError::AccessDeniedException(_)
                         | PutVectorBucketPolicyError::InternalServerException(_)
                         | PutVectorBucketPolicyError::NotFoundException(_)
                         | PutVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        PutVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | PutVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -622,6 +622,10 @@ impl S3Vectors for S3VectorRetryClient {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        PutVectorsError::ServiceUnavailableException(_)
+                        | PutVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         PutVectorsError::AccessDeniedException(_)
                         | PutVectorsError::InternalServerException(_)
                         | PutVectorsError::NotFoundException(_)
@@ -631,10 +635,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | PutVectorsError::KmsNotFoundException(_)
                         | PutVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        PutVectorsError::ServiceUnavailableException(_)
-                        | PutVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
@@ -657,16 +657,20 @@ impl S3Vectors for S3VectorRetryClient {
                 .set_index_name(input.index_name.clone())
                 .set_index_arn(input.index_arn.clone())
                 .set_query_vector(input.query_vector.clone())
-                .set_top_k(input.top_k.clone())
+                .set_top_k(input.top_k)
                 .set_filter(input.filter.clone())
-                .set_return_metadata(input.return_metadata.clone())
-                .set_return_distance(input.return_distance.clone())
+                .set_return_metadata(input.return_metadata)
+                .set_return_distance(input.return_distance)
                 .send()
                 .await
             {
                 Ok(result) => Ok(result),
                 Err(e) => match &e {
                     SdkError::ServiceError(service_error) => match service_error.err() {
+                        QueryVectorsError::ServiceUnavailableException(_)
+                        | QueryVectorsError::TooManyRequestsException(_) => {
+                            Err(RetryError::transient(e))
+                        }
                         QueryVectorsError::AccessDeniedException(_)
                         | QueryVectorsError::InternalServerException(_)
                         | QueryVectorsError::NotFoundException(_)
@@ -676,10 +680,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | QueryVectorsError::KmsNotFoundException(_)
                         | QueryVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
-                        QueryVectorsError::ServiceUnavailableException(_)
-                        | QueryVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
                     },
                     SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
                     _ => Err(RetryError::permanent(e)),
