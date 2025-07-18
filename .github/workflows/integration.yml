@@ -169,11 +169,21 @@ jobs:
       - name: Set up Spice.ai API Key
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+      
+      - name: Set up Github Token
+        uses: actions/create-github-app-token@v2
+        id: github-app-token
+        with:
+          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            spiceai
 
       - name: Run integration test
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
