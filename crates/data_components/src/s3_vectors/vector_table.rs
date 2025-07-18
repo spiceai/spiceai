@@ -323,7 +323,7 @@ impl S3VectorsTable {
     /// Inputs are expected to have equal length.
     ///   `data.len() == key.len() == metadata[key].len()`, for all `key` in `metadata.keys()`.
     ///
-    /// For `None` values of `key`, the row will not be inserted.
+    /// For `None` values of either `key` or `data`, the row will not be inserted.
     pub async fn write_data(
         &self,
         data: Vec<Option<Vec<f32>>>,
