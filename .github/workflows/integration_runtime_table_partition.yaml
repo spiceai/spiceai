@@ -1,5 +1,5 @@
 ---
-name: Partition Table Integration Tests
+name: integration tests (runtime-table-partition)
 
 on:
   push:
