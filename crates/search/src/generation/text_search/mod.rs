@@ -31,7 +31,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Index, ReloadPolicy, Searcher, TantivyError,
+    Index, ReloadPolicy, TantivyError,
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -494,8 +494,6 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
-
     use datafusion::{execution::SendableRecordBatchStream, physical_plan::common::collect};
     use serde_json::Value;
     use tantivy::{
