@@ -128,7 +128,7 @@ impl FullTextDatabaseIndex {
     /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
     fn existing_terms_to_delete(
         &self,
-        index_schema: tantivy::schema::Schema,
+        index_schema: &tantivy::schema::Schema,
         rb: &[RecordBatch],
     ) -> Result<Vec<tantivy::Term>, Error> {
         let Some(pk) = self.primary_key.first() else {
@@ -193,7 +193,7 @@ impl FullTextDatabaseIndex {
             .context(IndexCreationSnafu)?;
 
         // Deletion.
-        for t in self.existing_terms_to_delete(index_writable.schema(), &rb)? {
+        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
             index_writer.delete_term(t);
         }
 
