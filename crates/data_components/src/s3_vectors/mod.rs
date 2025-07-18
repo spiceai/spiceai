@@ -15,9 +15,10 @@ limitations under the License.
 */
 use arrow::error::ArrowError;
 use s3_vectors::{
-    BuildError, CreateIndexError, CreateVectorBucketError, GetIndexError, GetVectorBucketError,
-    PutVectorsError, QueryVectorsError,
+    BuildError, CreateIndexError, CreateVectorBucketError, Document, GetIndexError,
+    GetVectorBucketError, PutVectorsError, QueryVectorsError,
 };
+use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
 pub mod list_provider;
@@ -47,6 +48,14 @@ pub enum Error {
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
     S3VectorQueryVectorsError { source: QueryVectorsError },
+
+    #[snafu(display(
+        "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
+    ))]
+    S3VectorQueryVectorsInvalidFilterError {
+        filter_pre: MetadataFilter,
+        filter: Document,
+    },
 
     #[snafu(display("Failed to create index in S3 Vectors. {source}"))]
     S3VectorCreateIndexError { source: CreateIndexError },

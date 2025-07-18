@@ -41,7 +41,10 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use s3_vectors::{QueryOutputVector, QueryVectorsInput, QueryVectorsOutput, S3Vectors, VectorData};
+use s3_vectors::{
+    Document, QueryOutputVector, QueryVectorsInput, QueryVectorsOutput, S3Vectors, SdkError,
+    VectorData,
+};
 use s3_vectors_metadata_filter::{convert_datafusion_filters_to_s3_vectors, document_to_json_map};
 use snafu::ResultExt;
 use tokio::sync::mpsc::Sender;
@@ -286,7 +289,8 @@ async fn query_vector_stream(
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
     let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
 
-    let s3_filter = convert_datafusion_filters_to_s3_vectors(&filters)?;
+    let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
+    let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
 
     let QueryVectorsOutput { vectors, .. } = client
         .query_vectors(
@@ -294,7 +298,7 @@ async fn query_vector_stream(
                 .query_vector(VectorData::Float32(query))
                 .return_distance(true)
                 .top_k(limit)
-                .set_filter(s3_filter.map(Into::into))
+                .set_filter(s3_filter.clone())
                 .set_vector_bucket_name(bucket_name.clone())
                 .set_index_arn(arn.clone())
                 .set_index_name(index_name.clone())
@@ -304,11 +308,35 @@ async fn query_vector_stream(
                 .map_err(DataFusionError::External)?,
         )
         .await
-        .map_err(|e| Error::S3VectorQueryVectorsError {
-            source: e.into_service_error(),
-        })
-        .boxed()
-        .map_err(DataFusionError::External)?;
+        .map_err(|e| {
+            if let SdkError::ServiceError(service_error) = &e {
+                if let s3_vectors::QueryVectorsError::ValidationException(validation_exception) =
+                    service_error.err()
+                {
+                    if validation_exception
+                        .message()
+                        .contains("Invalid query filter")
+                    {
+                        if let (Some(s3_filter), Some(s3_filter_pre)) = (s3_filter, s3_filter_pre) {
+                            return DataFusionError::External(
+                                Error::S3VectorQueryVectorsInvalidFilterError {
+                                    filter_pre: s3_filter_pre,
+                                    filter: s3_filter,
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            DataFusionError::External(
+                Error::S3VectorQueryVectorsError {
+                    source: e.into_service_error(),
+                }
+                .into(),
+            )
+        })?;
 
     let num_vectors = vectors.len();
 

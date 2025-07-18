@@ -348,7 +348,7 @@ impl S3VectorsTable {
                         let value = v.get(i)?.as_ref()?;
                         let meta = json_value_to_document(value.clone());
 
-                        if matches!(Document::Null, meta) {
+                        if matches!(meta, Document::Null) {
                             return None;
                         }
 

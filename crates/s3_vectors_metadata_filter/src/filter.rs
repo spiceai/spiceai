@@ -765,6 +765,8 @@ pub fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_t
         }
     } else if num.is_u64() {
         Some(aws_smithy_types::Number::PosInt(num.as_u64()?))
+    } else if num.is_f64() {
+        Some(aws_smithy_types::Number::Float(num.as_f64()?))
     } else {
         None
     }
