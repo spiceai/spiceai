@@ -135,6 +135,5 @@ jobs:
         run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Run partition table integration test
-        env:
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
