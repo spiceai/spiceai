@@ -174,6 +174,7 @@ impl SpiceExtension {
             Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
             Some(Duration::from_secs(300)),  // run retention every 5 minutes
             true,
+            None,
         );
 
         let refresh = Refresh::new(RefreshMode::Full)

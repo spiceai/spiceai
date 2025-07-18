@@ -102,6 +102,7 @@ pub async fn register_metrics_table(
         Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
         Some(Duration::from_secs(300)),  // run retention every 5 minutes
         true,
+        None,
     );
 
     let table = create_internal_accelerated_table(
