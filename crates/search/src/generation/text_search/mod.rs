@@ -31,7 +31,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Index, ReloadPolicy, Searcher, TantivyError,
+    Index, ReloadPolicy, TantivyError,
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -94,10 +94,26 @@ impl Error {
     }
 }
 
-/// A [`FullTextSearchFieldIndex`] is a [`tantivy::Index`] that is used to search a single field of a table.
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for FullTextSearchFieldIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextSearchFieldIndex")
+            .field("schema", &self.search_schema)
+            .field("field", &self.field)
+            .field("primary_key", &self.primary_key)
+            .field("additional_columns", &self.additional_columns)
+            .field("type_hints", &self.type_hints)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`FullTextSearchFieldIndex`] performs a search on a [`tantivy::Index`]  for a single field of a table.
+#[derive(Clone)]
 pub struct FullTextSearchFieldIndex {
-    idx: Arc<Index>,
+    // These are components from a [`tantivy::Index`] required to perform a search on a  [`tantivy::Index`] at a given commit.
+    pub search_schema: tantivy::schema::Schema,
+    reader: tantivy::Searcher,
+    tokenizer_manager: tantivy::tokenizer::TokenizerManager,
+
     field: String,
     primary_key: Vec<String>,
 
@@ -113,13 +129,20 @@ pub struct FullTextSearchFieldIndex {
 
 impl FullTextSearchFieldIndex {
     pub fn try_new(
-        index: Arc<Index>,
+        index: &Index,
         field: String,
         primary_key: Vec<String>,
         additional_columns: Option<Vec<String>>,
     ) -> Result<Self> {
         let fts = Self {
-            idx: index,
+            search_schema: index.schema(),
+            reader: index
+                .reader_builder()
+                .reload_policy(ReloadPolicy::OnCommitWithDelay)
+                .try_into()
+                .context(TextSearchSnafu)?
+                .searcher(),
+            tokenizer_manager: index.tokenizers().clone(),
             field,
             primary_key,
             additional_columns,
@@ -187,8 +210,7 @@ impl FullTextSearchFieldIndex {
 
     #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
-        self.idx
-            .schema()
+        self.search_schema
             .fields()
             .filter_map(|(_, f)| {
                 let name = f.name().to_string();
@@ -208,29 +230,17 @@ impl FullTextSearchFieldIndex {
             .collect()
     }
 
-    #[must_use]
-    pub fn tantivy_schema(&self) -> tantivy::schema::Schema {
-        self.idx.schema()
-    }
-
-    fn index_searcher(&self) -> Result<Searcher> {
-        Ok(self
-            .idx
-            .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .context(TextSearchSnafu)?
-            .searcher())
-    }
-
     fn query_parser(&self) -> QueryParser {
         let default_field = self
-            .idx
-            .schema()
+            .search_schema
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
-        QueryParser::for_index(&self.idx, default_field)
+        QueryParser::new(
+            self.search_schema.clone(),
+            default_field,
+            self.tokenizer_manager.clone(),
+        )
     }
 
     /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
@@ -248,22 +258,20 @@ impl FullTextSearchFieldIndex {
                 query: literal.to_string(),
             })?;
 
-        let schema = self.idx.schema();
-        let searcher = self.index_searcher()?;
-
         let all_cols = self.all_columns();
 
-        let top_docs = searcher
+        let top_docs = self
+            .reader
             .search(&q, &TopDocs::with_limit(limit).and_offset(offset))
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
-                    searcher.doc(addr).context(TextSearchSnafu)?;
+                    self.reader.doc(addr).context(TextSearchSnafu)?;
 
                 let mut doc_w_col_names = doc
                     .into_iter()
-                    .map(|(f, v)| (schema.get_field_name(f), v))
+                    .map(|(f, v)| (self.search_schema.get_field_name(f), v))
                     .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
                     .collect::<HashMap<_, _>>();
 
@@ -486,8 +494,6 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
-
     use datafusion::{execution::SendableRecordBatchStream, physical_plan::common::collect};
     use serde_json::Value;
     use tantivy::{
@@ -582,7 +588,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_basic_index() {
         let fts = FullTextSearchFieldIndex::try_new(
-            Arc::new(create_basic_index()),
+            &create_basic_index(),
             "body".to_string(),
             vec![],
             None,
