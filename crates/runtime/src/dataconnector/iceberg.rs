@@ -22,6 +22,7 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use iceberg::TableIdent;
+use iceberg_aws_sdk::S3CredentialProvider;
 use iceberg_catalog_rest::RestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
@@ -35,6 +36,7 @@ use crate::{
     component::dataset::Dataset,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
+        parameters::aws::load_config,
     },
     parameters::{ParameterSpec, Parameters},
 };
@@ -139,9 +141,35 @@ impl DataConnector for IcebergDataConnector {
                 })?;
         }
 
+        let aws_sdk_config = load_config(
+            "IcebergDataConnector",
+            "s3_region",
+            "s3_access_key_id",
+            "s3_secret_access_key",
+            "s3_session_token",
+            &self.params,
+        )
+        .await
+        .map_err(|e| Error::InvalidConfiguration {
+            dataconnector: "iceberg".into(),
+            message: e.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
+
+        let custom_credential_loader = S3CredentialProvider::from_config(&aws_sdk_config)
+            .map_err(|e| Error::InvalidConfiguration {
+                dataconnector: "iceberg".into(),
+                message: e.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?
+            .into_custom_loader();
+
         let catalog_config = get_rest_catalog_config(base_uri, props);
 
-        let catalog_client = RestCatalog::new(catalog_config);
+        let catalog_client =
+            RestCatalog::new(catalog_config).with_file_io_extension(custom_credential_loader);
         let catalog_client = Arc::new(catalog_client);
 
         // Load the specific table
