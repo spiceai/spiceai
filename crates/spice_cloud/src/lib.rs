@@ -166,16 +166,13 @@ impl SpiceExtension {
         runtime: Arc<Runtime>,
         from: String,
     ) -> Result<()> {
-        let retention = Retention::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            None,
-            None,
-            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-            Some(Duration::from_secs(300)),  // run retention every 5 minutes
-            true,
-            None,
-        );
+        let retention = Retention::builder()
+            .time_column(Some("timestamp".to_string()))
+            .time_format(Some(TimeFormat::UnixSeconds))
+            .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
+            .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+            .enabled(true)
+            .build();
 
         let refresh = Refresh::new(RefreshMode::Full)
             .time_column("timestamp".to_string())

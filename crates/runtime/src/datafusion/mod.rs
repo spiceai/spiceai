@@ -990,16 +990,18 @@ impl DataFusion {
             None => None,
         };
 
-        accelerated_table_builder.retention(Retention::new(
-            dataset.time_column.clone(),
-            dataset.time_format,
-            dataset.time_partition_column.clone(),
-            dataset.time_partition_format,
-            dataset.retention_period(),
-            dataset.retention_check_interval(),
-            acceleration_settings.retention_check_enabled,
-            retention_delete_expr,
-        ));
+        let retention = Retention::builder()
+            .time_column(dataset.time_column.clone())
+            .time_format(dataset.time_format)
+            .time_partition_column(dataset.time_partition_column.clone())
+            .time_partition_format(dataset.time_partition_format)
+            .time_period(dataset.retention_period())
+            .check_interval(dataset.retention_check_interval())
+            .enabled(acceleration_settings.retention_check_enabled)
+            .delete_expr(retention_delete_expr)
+            .build();
+
+        accelerated_table_builder.retention(retention);
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
