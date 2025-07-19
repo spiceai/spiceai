@@ -1647,9 +1647,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82c33c072c9d87777262f35abfe2a64b609437076551d4dac8373e60f0e3fde9"
+checksum = "5bc409f6252d078df978e532dafdd364154f5e60862dce46a712e37aa61b6ace"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -11297,7 +11297,7 @@ dependencies = [
  "aws-sdk-sts",
  "axum 0.8.4",
  "axum-extra",
- "azure_core 0.25.0",
+ "azure_core 0.26.0",
  "azure_storage",
  "azure_storage_blobs",
  "base64 0.22.1",
@@ -14820,9 +14820,9 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "typespec"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04c7a952f1f34257f945fc727b20defe7a3c01c05ddd42925977626cfa6e62ab"
+checksum = "a0db0b9d3d46ff019aee01436243e77388ef101300b0a7be0d99884ee2aa8241"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -14832,18 +14832,18 @@ dependencies = [
 
 [[package]]
 name = "typespec_client_core"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5879ce67ba9e525fe088c882ede1337c32c3f80e83e72d9fd3cc6c8e05bcb3d7"
+checksum = "e86c48a434f77b12fc368549d3cc9741a60270e799b48be3790d52fbdaae2a5a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "dyn-clone",
  "futures",
- "getrandom 0.2.16",
+ "getrandom 0.3.3",
  "pin-project",
- "rand 0.8.5",
+ "rand 0.9.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -14858,9 +14858,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_macros"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cbccdbe531c8d553812a609bdb70c0d1002ad91333498e18df42c98744b15cc"
+checksum = "23800b88212e659cf2113cd5488510d0ead6ba26bf3b31158f77d47cec0d4031"
 dependencies = [
  "proc-macro2",
  "quote",
