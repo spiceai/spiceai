@@ -31,6 +31,7 @@ use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
 use snafu::{OptionExt, ResultExt};
+use tokio::time::Instant;
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -58,7 +59,7 @@ use super::synchronized_table::SynchronizedTable;
 use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 
 use crate::component::dataset::TimeFormat;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{RwLock, Semaphore, oneshot};
 
@@ -331,25 +332,41 @@ impl RefreshTask {
                     RefreshStat::default(),
                     dataset_name.to_string(),
                     notify_written_data_stat_available,
+                    DataLoadTracing::new(&self.dataset_name),
                 ),
-                move |(mut stream, mut stat, ds_name, notify_refresh_stat_available)| async move {
+                move |(
+                    mut stream,
+                    mut stat,
+                    ds_name,
+                    notify_refresh_stat_available,
+                    mut tracing,
+                )| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
                             Ok(batch) => {
-                                tracing::trace!(
-                                    "Dataset {ds_name} received {} records",
-                                    batch.num_rows()
-                                );
+                                tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
                                 Some((
                                     Ok(batch),
-                                    (stream, stat, ds_name, notify_refresh_stat_available),
+                                    (
+                                        stream,
+                                        stat,
+                                        ds_name,
+                                        notify_refresh_stat_available,
+                                        tracing,
+                                    ),
                                 ))
                             }
                             Err(err) => Some((
                                 Err(err),
-                                (stream, stat, ds_name, notify_refresh_stat_available),
+                                (
+                                    stream,
+                                    stat,
+                                    ds_name,
+                                    notify_refresh_stat_available,
+                                    tracing,
+                                ),
                             )),
                         }
                     } else {
@@ -918,6 +935,46 @@ impl RefreshTask {
         );
         self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
             .await;
+    }
+}
+
+#[derive(Debug)]
+/// Tracks and logs data load progress for a dataset, periodically reporting the number of records received
+struct DataLoadTracing {
+    dataset: TableReference,
+    num_records_received: usize,
+    last_updated_time: Instant,
+    log_interval: Duration,
+}
+
+impl DataLoadTracing {
+    fn new(dataset: &TableReference) -> Self {
+        Self {
+            dataset: dataset.clone(),
+            num_records_received: 0,
+            last_updated_time: Instant::now(),
+            log_interval: Duration::from_secs(10),
+        }
+    }
+
+    fn on_new_batch_received(&mut self, batch: &RecordBatch) {
+        let num_rows = batch.num_rows();
+        tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
+        self.num_records_received += num_rows;
+
+        // trace num loaded records and reset every 10 seconds
+        if self.last_updated_time.elapsed() > self.log_interval {
+            let pretty_records = util::pretty_print_number(self.num_records_received);
+
+            if is_spice_internal_dataset(&self.dataset) {
+                tracing::debug!("Dataset {} received {pretty_records} records", self.dataset);
+            } else {
+                tracing::info!("Dataset {} received {pretty_records} records", self.dataset);
+            }
+
+            self.num_records_received = 0;
+            self.last_updated_time = Instant::now();
+        }
     }
 }
 
