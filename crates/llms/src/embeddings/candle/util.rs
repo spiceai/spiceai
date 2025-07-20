@@ -30,9 +30,9 @@ use std::{
     fs,
     path::{self, Path, PathBuf},
 };
-use tei_backend::Pool;
+use tei_backend::{Pool, download_safetensors};
 use tei_core::{
-    download::{ST_CONFIG_NAMES, download_artifacts, download_pool_config, download_st_config},
+    download::{ST_CONFIG_NAMES, download_artifacts, download_st_config},
     tokenization::EncodingInput,
 };
 
@@ -153,12 +153,11 @@ pub(crate) async fn download_hf_artifacts(
     let repo_url = api_repo.url("");
 
     tracing::trace!("Downloading artifacts for {repo_url}");
-    let root_dir = download_artifacts(&api_repo)
+    let root_dir = download_artifacts(&api_repo, true)
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    tracing::trace!("Downloading pool config for {repo_url}");
-    let _ = download_pool_config(&api_repo)
+    let _ = download_safetensors(&api_repo)
         .await
         .context(FailedWithHFApiSnafu)?;
 

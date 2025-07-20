@@ -1,0 +1,19 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q3"
+---
++---------------+---------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                          |
++---------------+---------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: lineitem.L_COMMENT, lineitem.L_PARTKEY                                                            |
+|               |   Sort: lineitem.L_LINENUMBER DESC NULLS FIRST, fetch=10                                                      |
+|               |     Projection: lineitem.L_COMMENT, lineitem.L_PARTKEY, lineitem.L_LINENUMBER                                 |
+|               |       BytesProcessedNode                                                                                      |
+|               |         TableScan: lineitem projection=[L_PARTKEY, L_LINENUMBER, L_COMMENT]                                   |
+| physical_plan | ProjectionExec: expr=[L_COMMENT@0 as L_COMMENT, L_PARTKEY@1 as L_PARTKEY]                                     |
+|               |   SortExec: TopK(fetch=10), expr=[L_LINENUMBER@2 DESC], preserve_partitioning=[false]                         |
+|               |     ProjectionExec: expr=[L_COMMENT@2 as L_COMMENT, L_PARTKEY@0 as L_PARTKEY, L_LINENUMBER@1 as L_LINENUMBER] |
+|               |       BytesProcessedExec                                                                                      |
+|               |         OracleExec sql=SELECT "L_PARTKEY", "L_LINENUMBER", "L_COMMENT" FROM "TPCH_SF1"."LINEITEM"             |
+|               |                                                                                                               |
++---------------+---------------------------------------------------------------------------------------------------------------+

@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/oracle/mod.rs
+expression: formatted
+---
++-----------+------------------------------------------------------------------------------------------------------------+
+| N_NAME    | N_COMMENT                                                                                                  |
++-----------+------------------------------------------------------------------------------------------------------------+
+| ALGERIA   | haggle. carefully final deposits detect slyly agai                                                         |
+| ARGENTINA | al foxes promise slyly according to the regular accounts. bold requests alon                               |
+| BRAZIL    | y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special |
+| CANADA    | eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold      |
+| CHINA     | c dependencies. furiously express notornis sleep slyly regular accounts. ideas sleep. depos                |
++-----------+------------------------------------------------------------------------------------------------------------+

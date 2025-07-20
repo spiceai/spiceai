@@ -39,6 +39,19 @@ pub enum Error {
     FieldNotNullable { field: String },
 }
 
+impl From<Error> for DataFusionError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::UnableToConvertRecordBatch {
+                source: arrow_error,
+            } => DataFusionError::ArrowError(arrow_error, None),
+            Error::FieldNotNullable { .. } => {
+                DataFusionError::ArrowError(ArrowError::SchemaError(e.to_string()), None)
+            }
+        }
+    }
+}
+
 /// Cast a given record batch into a new record batch with the given schema.
 ///
 /// # Errors
@@ -263,7 +276,6 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
 
 #[cfg(test)]
 mod test {
-
     use std::collections::HashMap;
 
     use arrow::{

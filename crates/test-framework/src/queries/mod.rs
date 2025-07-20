@@ -390,6 +390,7 @@ pub enum QueryOverrides {
     DuckDB,
     DuckDBOnZeroResults,
     Snowflake,
+    Oracle,
     IcebergSF1,
     SpicecloudCatalog,
     GlueCatalog,
@@ -464,6 +465,11 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             simple_q4,
             simple_q5,
             simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::Oracle) => generate_tpch_queries_override!(
+            "oracle", q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18,
+            q19, q20, q21, q22, simple_q1, simple_q2, simple_q3, simple_q4, simple_q5, simple_q6,
             simple_q7
         ),
         Some(QueryOverrides::IcebergSF1) => generate_tpch_queries_override!(

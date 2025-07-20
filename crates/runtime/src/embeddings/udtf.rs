@@ -1,9 +1,12 @@
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
      https://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,7 +17,7 @@ limitations under the License.
 //!
 //! `vector_search(tbl`: `TableReference`, query: &str, col: Option<str>, limit: Option<usize>, `include_score`: Option<bool>)
 //!
-//! - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), an empty table is returned.
+//! - tbl: Table to perform full text search upon. If the table does not support it (i.e. no index), and empty table is returned.
 //! - query: Query to perform full text search against.
 //! - col: If provided, use this column to compare vector search results against.
 //! - limit:
@@ -23,6 +26,7 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
+
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
@@ -47,6 +51,11 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::Itertools;
+use runtime_datafusion_index::IndexedTableProvider;
+
+#[cfg(feature = "s3_vectors")]
+use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
+
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
@@ -56,7 +65,7 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::find_concrete_table_provider,
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use tokio::sync::RwLock;
 
@@ -132,15 +141,17 @@ impl VectorSearchTableFunc {
     #[must_use]
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
         let mut expr = vec![
-            Expr::Column(Column::new_unqualified(args.tbl.to_string())),
+            Expr::Column(to_column_expr(&args.tbl)),
             Expr::Literal(ScalarValue::Utf8(Some(args.query.clone()))),
         ];
 
         if let Some(col) = args.column.as_ref() {
-            expr.push(Expr::Literal(ScalarValue::Utf8(Some(col.clone()))));
+            expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit as u64))));
+            expr.push(Expr::Literal(ScalarValue::Int64(Some(
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ))));
         }
         if let Some(include_score) = args.include_score {
             expr.push(Expr::Literal(ScalarValue::Boolean(Some(include_score))));
@@ -152,16 +163,12 @@ impl VectorSearchTableFunc {
         let mut args = args.iter();
 
         let tbl = args.next();
-        let Some(Expr::Column(Column {
-            relation: None,
-            name: table_name,
-            ..
-        })) = tbl
-        else {
+        let Some(Expr::Column(c)) = tbl else {
             return Err(DataFusionError::Plan(format!(
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
+        let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
@@ -175,10 +182,10 @@ impl VectorSearchTableFunc {
             (None, None, None) => (None, None, Some(true)),
 
             // Single argument cases
-            (Some(Expr::Literal(ScalarValue::Utf8(Some(col)))), None, None) => {
+            (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
+            (Some(Expr::Literal(ScalarValue::Int64(Some(limit)))), None, None) => {
                 (None, Some(*limit), Some(true))
             }
             (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))), None, None) => {
@@ -187,42 +194,79 @@ impl VectorSearchTableFunc {
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
+                Some(Expr::Column(Column { name: col, .. })),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
             (
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
             ) => (None, Some(*limit), Some(*include_score)),
 
             // All three arguments provided
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
+                Some(Expr::Column(Column { name: col, .. })),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
 
             // Invalid argument combinations
             (a, b, c) => {
                 return Err(DataFusionError::Plan(format!(
-                    "Invalid arguments: ({table_name}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
+                    "Invalid arguments: ({tbl_ref:?}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
                 )));
             }
         };
         Ok(VectorSearchTableFuncArgs {
-            tbl: table_name.into(),
+            tbl: tbl_ref,
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
         })
+    }
+
+    #[cfg(feature = "s3_vectors")]
+    fn index_based_vector_table(
+        tbl: &Arc<dyn TableProvider>,
+        args: &VectorSearchTableFuncArgs,
+    ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        // TODO: we might actually not want to recurse over accelerated table here.
+
+        use crate::embeddings::index::S3Vector;
+        let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
+            return Ok(None);
+        };
+        let mut vector_indexes = indexed.get_indexes::<S3Vector>();
+        let vector_index_opt = if let Some(col) = &args.column {
+            vector_indexes
+                .into_iter()
+                .find(|idx| *idx.embedded_column() == *col)
+        } else {
+            if vector_indexes.len() > 1 {
+                return Err(DataFusionError::Internal(format!(
+                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                    args.tbl,
+                    vector_indexes.len()
+                )));
+            }
+            vector_indexes.pop()
+        };
+        let Some(vector_index) = vector_index_opt else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(VectorQueryTableProvider {
+            query: args.query.clone(),
+            table_provider: Arc::clone(&indexed),
+            vector_index: Arc::new(vector_index.clone()),
+            pre_limit: args.limit,
+        })))
     }
 }
 
@@ -241,6 +285,13 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             )));
         };
 
+        // For table with a vector engine, use it.
+        #[cfg(feature = "s3_vectors")]
+        if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
+            return Ok(table_provider);
+        }
+
+        // If an embedding column is defined, fallback to JIT or.
         let embedding_table_provider =
             find_concrete_table_provider::<EmbeddingTable>(&table_provider).ok_or_else(|| {
                 DataFusionError::Plan(format!(

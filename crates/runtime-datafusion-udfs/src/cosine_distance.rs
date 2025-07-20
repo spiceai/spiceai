@@ -113,14 +113,14 @@ impl ScalarUDFImpl for CosineDistance {
         match arg_types[0] {
             List(_) | LargeList(_) | FixedSizeList(_, _) => Ok(Float64),
             _ => exec_err!(
-                "The cosine_distance function can only accept List/LargeList/FixedSizeList."
+                "The {COSINE_DISTANCE_UDF_NAME} function can only accept List/LargeList/FixedSizeList."
             ),
         }
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
         if arg_types.len() != 2 {
-            return exec_err!("cosine_distance expects exactly two arguments");
+            return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
         }
         let mut result = Vec::new();
         for arg_type in arg_types {
@@ -130,7 +130,7 @@ impl ScalarUDFImpl for CosineDistance {
                 }
                 _ => {
                     return exec_err!(
-                        "The cosine_distance function can only accept List/LargeList/FixedSizeList."
+                        "The {COSINE_DISTANCE_UDF_NAME} function can only accept List/LargeList/FixedSizeList."
                     );
                 }
             }
@@ -146,7 +146,7 @@ impl ScalarUDFImpl for CosineDistance {
 
 fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     if args.len() != 2 {
-        return exec_err!("cosine_distance expects exactly two arguments");
+        return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
     }
 
     match (&args[0].data_type(), &args[1].data_type()) {
@@ -154,7 +154,7 @@ fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
             exec_err!(
-                "cosine_distance does not support types '{array_type1:?}' and '{array_type2:?}'"
+                "{COSINE_DISTANCE_UDF_NAME} does not support types '{array_type1:?}' and '{array_type2:?}'"
             )
         }
     }

@@ -81,16 +81,18 @@ impl PartitionTableProvider {
             num_partition_by == 1,
             PartitionByViolationSnafu { num_partition_by }
         );
-        let partition_by = partition_by
-            .pop()
-            .context(PartitionByViolationSnafu { num_partition_by })?;
-
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
             .infer_existing_partitions()
             .await
-            .context(CreatingPartitionSnafu)?
+            .context(CreatingPartitionSnafu)?;
+
+        let partition_by = partition_by
+            .pop()
+            .context(PartitionByViolationSnafu { num_partition_by })?;
+
+        let partitions = partitions
             .into_iter()
             .map(|p| {
                 validate_scalar_compatibility(&partition_by, &p.partition_value, &df_schema)?;
@@ -145,7 +147,7 @@ impl TableProvider for PartitionTableProvider {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            if prune_partition(filters, &self.partition_by, &partition.partition_value) {
+            if prune_partition(filters, &self.partition_by, &partition.partition_value)? {
                 continue;
             }
             let plan = partition

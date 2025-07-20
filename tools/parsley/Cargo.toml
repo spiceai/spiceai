@@ -23,4 +23,4 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
     "tiktoken-rs",
 ] }
 tiktoken-rs = "0.6.0"
-tokenizers = { version = "0.21.0", features = ["http"] }
+tokenizers = { version = "0.21.2", features = ["http"] }

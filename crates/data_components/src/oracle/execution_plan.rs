@@ -199,8 +199,16 @@ async fn query_arrow(
 
     let conn = pool.get().await.map_err(to_datafusion_err)?;
 
-    let query_res = conn
-        .query(&sql, &[])
+    let stmt = conn
+        .statement(&sql)
+        //TODO: make size configurable; https://github.com/spiceai/spiceai/issues/6447
+        .fetch_array_size(100_000)
+        .build()
+        .context(QuerySnafu)
+        .map_err(to_datafusion_err)?;
+
+    let query_res = stmt
+        .into_result_set(&[])
         .context(QuerySnafu)
         .map_err(to_datafusion_err)?;
 
