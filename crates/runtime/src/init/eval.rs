@@ -114,16 +114,13 @@ impl Runtime {
     }
 
     pub(crate) async fn load_eval_results_table(self: Arc<Self>) -> Result<()> {
-        let retention = Retention::new(
-            Some(EVAL_RESULTS_TABLE_TIME_COLUMN.to_string()),
-            Some(TimeFormat::Timestamptz),
-            None,
-            None,
-            Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
-            Some(Duration::from_secs(1800)),      // Check every 30 minutes
-            true,
-            None,
-        );
+        let retention = Retention::builder()
+            .time_column(Some(EVAL_RESULTS_TABLE_TIME_COLUMN.to_string()))
+            .time_format(Some(TimeFormat::Timestamptz))
+            .time_period(Some(Duration::from_secs(24 * 3600))) // Keep data for last 24 hours
+            .check_interval(Some(Duration::from_secs(1800))) // Check every 30 minutes
+            .enabled(true)
+            .build();
 
         let table = create_internal_accelerated_table(
             self.status(),
@@ -147,16 +144,13 @@ impl Runtime {
     }
 
     pub(crate) async fn load_eval_run_table(self: Arc<Self>) -> Result<()> {
-        let retention = Retention::new(
-            Some(EVAL_RUNS_TABLE_TIME_COLUMN.to_string()),
-            Some(TimeFormat::Timestamptz),
-            None,
-            None,
-            Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
-            Some(Duration::from_secs(1800)),      // Check every 30 minutes
-            true,
-            None,
-        );
+        let retention = Retention::builder()
+            .time_column(Some(EVAL_RUNS_TABLE_TIME_COLUMN.to_string()))
+            .time_format(Some(TimeFormat::Timestamptz))
+            .time_period(Some(Duration::from_secs(24 * 3600))) // Keep data for last 24 hours
+            .check_interval(Some(Duration::from_secs(1800))) // Check every 30 minutes
+            .enabled(true)
+            .build();
 
         let table = create_internal_accelerated_table(
             self.status(),

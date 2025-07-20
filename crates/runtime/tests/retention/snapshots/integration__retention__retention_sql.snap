@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/retention/mod.rs
+expression: results_str
+---
++-------------+-----------+-------------+-------------------------------------------------------------------------------------------------------+
+| n_nationkey | n_name    | n_regionkey | n_comment                                                                                             |
++-------------+-----------+-------------+-------------------------------------------------------------------------------------------------------+
+| 0           | ALGERIA   | 0           | furiously regular requests. platelets affix furious                                                   |
+| 1           | ARGENTINA | 1           | instructions wake quickly. final deposits haggle. final, silent theodolites                           |
+| 3           | CANADA    | 1           | ss deposits wake across the pending foxes. packages after the carefully bold requests integrate caref |
++-------------+-----------+-------------+-------------------------------------------------------------------------------------------------------+

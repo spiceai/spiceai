@@ -94,16 +94,13 @@ pub async fn register_metrics_table(
 ) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
-    let retention = Retention::new(
-        Some("time_unix_nano".to_string()),
-        Some(TimeFormat::Timestamptz),
-        None,
-        None,
-        Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-        Some(Duration::from_secs(300)),  // run retention every 5 minutes
-        true,
-        None,
-    );
+    let retention = Retention::builder()
+        .time_column(Some("time_unix_nano"))
+        .time_format(Some(TimeFormat::Timestamptz))
+        .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
+        .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+        .enabled(true)
+        .build();
 
     let table = create_internal_accelerated_table(
         datafusion.runtime_status(),
