@@ -196,7 +196,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         Ok(Arc::new(TextSearchUDTFProvider {
             args,
             index: fts_index.clone(),
-            underlying: index_table_provider.get_underlying(),
+            underlying: table_provider,
         }))
     }
 }
@@ -208,7 +208,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
 pub(super) struct TextSearchUDTFProvider {
     pub args: TextSearchTableFuncArgs,
     pub index: FullTextDatabaseIndex,
-    underlying: Arc<dyn TableProvider>,
+    pub underlying: Arc<dyn TableProvider>,
 }
 
 impl TextSearchUDTFProvider {
