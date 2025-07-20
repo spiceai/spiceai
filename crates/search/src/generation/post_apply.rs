@@ -397,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter() {
         let fts = FullTextSearchFieldIndex::try_new(
-            Arc::new(create_basic_index()),
+            &create_basic_index(),
             "body".to_string(),
             vec!["title".to_string()],
             None,
@@ -423,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn test_projection() {
         let fts = FullTextSearchFieldIndex::try_new(
-            Arc::new(create_basic_index()),
+            &create_basic_index(),
             "body".to_string(),
             vec![],
             None,

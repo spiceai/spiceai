@@ -1,0 +1,19 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "iceberg-aws-sdk"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+iceberg.workspace = true
+reqwest.workspace = true
+snafu.workspace = true
+url.workspace = true

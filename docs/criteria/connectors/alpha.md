@@ -27,6 +27,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | MS SQL                           | ✅            | @peasee         |
 | MySQL                            | ✅            | @peasee         |
 | ODBC                             | ➖            |                 |
+| Oracle                           | ✅            | @sgrebnov       |
 | PostgreSQL                       | ✅            | @Sevenannn      |
 | Sharepoint                       | ➖            |                 |
 | Snowflake                        | ✅            | @phillipleblanc |
