@@ -6376,7 +6376,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ff38b47ccb66349214708e573a61f8b48d8d1bcf#ff38b47ccb66349214708e573a61f8b48d8d1bcf"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6406,6 +6406,7 @@ dependencies = [
  "ordered-float 4.6.0",
  "parquet",
  "rand 0.8.5",
+ "reqsign",
  "reqwest",
  "reqwest-middleware 0.4.2",
  "roaring",
@@ -6425,10 +6426,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-aws-sdk"
+version = "1.5.0-unstable"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "iceberg",
+ "reqwest",
+ "snafu",
+ "url",
+]
+
+[[package]]
 name = "iceberg-catalog-glue"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf3d1a3346b53abb21abba3c85ebf42e91665e2dce5d9e7670d49ba559f5177"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6445,7 +6459,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ff38b47ccb66349214708e573a61f8b48d8d1bcf#ff38b47ccb66349214708e573a61f8b48d8d1bcf"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6471,7 +6485,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=ff38b47ccb66349214708e573a61f8b48d8d1bcf#ff38b47ccb66349214708e573a61f8b48d8d1bcf"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11338,6 +11352,7 @@ dependencies = [
  "hyper 1.6.0",
  "hyper-util",
  "iceberg",
+ "iceberg-aws-sdk",
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
