@@ -196,7 +196,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         Ok(Arc::new(TextSearchUDTFProvider {
             args,
             index: fts_index.clone(),
-            underlying: table_provider, // .get_underlying(),
+            underlying: table_provider,
         }))
     }
 }
