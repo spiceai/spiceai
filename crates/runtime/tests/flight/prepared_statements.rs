@@ -437,13 +437,9 @@ async fn test_binder_error_specificity() -> Result<(), anyhow::Error> {
             assert!(result.is_err(), "There are two parameter placeholders, but only one binding");
 
             // Check that the error specifically uses the InvalidArgument code vs generic "Internal"
-            assert!(
-                result
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("code: InvalidArgument"),
-            );
+            let result_err_message = result.err().unwrap().to_string();
+            assert!(result_err_message.contains("code: InvalidArgument"));
+            assert!(result_err_message.contains("No value found for placeholder with id $2"));
 
             Ok(())
         })
