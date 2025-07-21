@@ -161,8 +161,14 @@ impl DataConnectorFactory for S3Factory {
                 validator.validate(&mut params).await?;
             }
 
-            // Initialize the AWS SDK and make it available.
-            let _ = object_store_aws_sdk::initialize_sdk_config().await;
+            // `initialize_sdk_config` emits a warning if the credentials provider cannot be initialized
+            // so we skip it if the auth method is public.
+            match params.parameters.get("auth").expose().ok() {
+                None | Some("public") => (),
+                _ => {
+                    let _ = object_store_aws_sdk::initialize_sdk_config().await;
+                }
+            }
 
             let s3 = S3 {
                 params: params.parameters,
