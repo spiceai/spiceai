@@ -65,7 +65,7 @@ jobs:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           CARGO_INCREMENTAL: 0
         run: |
-          cargo nextest archive -p runtime --test integration_aws_sdk --archive-file integration_aws_sdk.tar.zst
+          cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
 
       - name: Upload test archive
         uses: actions/upload-artifact@v4
