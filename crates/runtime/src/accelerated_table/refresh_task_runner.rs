@@ -167,13 +167,13 @@ impl RefreshTaskRunner {
                         res = task => {
                             match res {
                                 Ok(()) => {
-                                    tracing::debug!("Refresh task successfully completed for dataset {dataset_name}");
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully");
                                     if let Err(err) = notify_refresh_complete.send(Ok(())).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
                                 Err(err) => {
-                                    tracing::debug!("Refresh task for dataset {dataset_name} failed with error: {err}");
+                                    tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
                                     if let Err(err) = notify_refresh_complete.send(Err(err)).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }

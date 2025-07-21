@@ -136,6 +136,7 @@ pub(crate) fn item_tpch_dataset_w_embeddings(
         }],
         description: None,
         full_text_search: None,
+        metadata: HashMap::new(),
     }];
 
     ds_tpcds_item
@@ -163,6 +164,7 @@ pub(crate) fn catalog_page_tpch_dataset_w_embeddings(
         }],
         description: None,
         full_text_search: None,
+        metadata: HashMap::new(),
     }];
     ds_tpcds_cp
 }
@@ -246,6 +248,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         }],
         description: None,
         full_text_search: None,
+        metadata: HashMap::new(),
     });
 
     let app = AppBuilder::new("search_app")
@@ -310,6 +313,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
         }],
         description: None,
         full_text_search: None,
+        metadata: HashMap::new(),
     });
 
     let app = AppBuilder::new("search_app")
@@ -357,8 +361,8 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     .await
 }
 
+// Ensure that if there is no primary key inferrable or available, that search results for multiple columns are not returned.
 #[tokio::test]
-#[ignore]
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
         catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
@@ -371,6 +375,7 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
         }],
         description: None,
         full_text_search: None,
+        metadata: HashMap::new(),
     });
     let app = AppBuilder::new("search_app")
         .with_dataset(chunked)
@@ -394,6 +399,7 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     .await
 }
 
+// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "cp_catalog_page_sk: Int32, cp_catalog_number: Int32, score: Float64, value: LargeUtf8". And "cp_catalog_page_sk: Int32, value: Utf8, score: Float64".
 #[tokio::test]
 #[ignore]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
@@ -449,21 +455,30 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         vec![
             (
                 "hybrid_column_sql_text_search_basic",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_projection",
-                format!("SELECT cp_catalog_page_sk, score, {column_name}, cp_catalog_number FROM text_search(hybrid_column_search, 'basic') LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM text_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
             ), (
                 "hybrid_column_sql_text_search_filters",
-                format!("SELECT cp_catalog_page_sk, score, {column_name} FROM text_search(hybrid_column_search, 'basic') WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
+            ),
+            (
+                "hybrid_column_sql_vector_search_basic",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_projection",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM vector_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
+            ), (
+                "hybrid_column_sql_vector_search_filters",
+                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
             )
-        ]
+        ],
     )
     .await
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpch_dataset_w_embeddings(
         "multi_column_hybrid_search",
@@ -484,6 +499,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
             enabled: true,
             row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
         }),
+        metadata: HashMap::new(),
     });
 
     let app = AppBuilder::new("search_app")
@@ -527,6 +543,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     .await
 }
 
+// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
 #[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
@@ -539,6 +556,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             enabled: true,
             row_ids: Some(vec!["i_item_sk".to_string()]),
         }),
+        metadata: HashMap::new(),
     }];
 
     run_search(
@@ -567,19 +585,20 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
         vec![
             (
                 "text_search_sql_text_search_basic",
-                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
             ), (
                 "text_search_sql_text_search_projection",
-                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, score FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
             ), (
                 "text_search_sql_text_search_filters",
-                "SELECT i_item_sk, i_item_desc, score FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
             )
         ]
     )
     .await
 }
 
+// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
 #[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
@@ -597,6 +616,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 enabled: true,
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
             }),
+            metadata: HashMap::new(),
         },
         Column {
             name: "cp_department".to_string(),
@@ -606,6 +626,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 enabled: true,
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
             }),
+            metadata: HashMap::new(),
         },
     ];
     run_search(
@@ -649,19 +670,19 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         vec![
             (
                 "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ),
             // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
             (
                 "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, score, cp_department FROM text_search(catalog_page, 'In general basic') LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
             ),
             (
                 "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, score, cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'In general basic', cp_department) LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
-                "SELECT cp_catalog_page_sk, score, cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
+                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
             )
         ]
     )
@@ -713,6 +734,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
                 chunking: None,
             }],
+            metadata: HashMap::new(),
         },
         Column {
             name: "cp_department".to_string(),
@@ -723,6 +745,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
                 chunking: None,
             }],
+            metadata: HashMap::new(),
         },
     ];
     let app2 = AppBuilder::new("search_app2")

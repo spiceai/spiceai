@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
+use dataformat_json::{Format, SpiceJsonFormat};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -175,6 +176,10 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                 extension.unwrap_or(".tsv".to_string()),
             )),
+            (Some("json"), _) | (None, Some("json")) => Ok((
+                Some(self.get_json_format(dataset, params)?),
+                extension.unwrap_or(".json".to_string()),
+            )),
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
@@ -232,6 +237,62 @@ pub trait ListingTableConnector: DataConnector {
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
+        }
+
+        Ok(Arc::new(format))
+    }
+
+    /// Returns a [`SpiceJsonFormat`] based on the provided [`Datasets`] parameters.
+    ///
+    /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    fn get_json_format(
+        &self,
+        dataset: &Dataset,
+        params: &Parameters,
+    ) -> DataConnectorResult<Arc<SpiceJsonFormat>>
+    where
+        Self: Display,
+    {
+        let mut format = SpiceJsonFormat::default();
+
+        if let ExposedParamLookup::Present(comp_as_str) =
+            params.get("file_compression_type").expose()
+        {
+            let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!(
+                        "Invalid JSON compression_type: {comp_as_str}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                    connector_component: ConnectorComponent::from(dataset)
+                })?;
+            format = format.with_file_compression_type(compression);
+        }
+
+        if let ExposedParamLookup::Present(infer_max_rec_str) =
+            params.get("schema_infer_max_records").expose()
+        {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!(
+                        "JSON parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
+                    connector_component: ConnectorComponent::from(dataset)
+                })?;
+            format = format.with_schema_infer_max_rec(schema_infer_max_rec);
+        }
+
+        if let ExposedParamLookup::Present(json_format_str) = params.get("json_format").expose() {
+            let json_format = json_format_str.parse::<Format>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!(
+                        "Invalid JSON format: {json_format_str}, supported formats are: 'jsonl', 'ndjson', 'array'"),
+                    connector_component: ConnectorComponent::from(dataset)
+                })?;
+            format = format.with_format(json_format);
+        }
+
+        if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
+            if flatten_json.eq_ignore_ascii_case("true") {
+                format = format.with_flatten_json(".".to_string());
+            }
         }
 
         Ok(Arc::new(format))
@@ -1064,7 +1125,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             _location: &Path,
-            _opts: object_store::PutMultipartOpts,
+            _opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }

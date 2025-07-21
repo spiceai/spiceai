@@ -161,6 +161,9 @@ impl DataConnectorFactory for S3Factory {
                 validator.validate(&mut params).await?;
             }
 
+            // Initialize the AWS SDK and make it available.
+            let _ = object_store_aws_sdk::initialize_sdk_config().await;
+
             let s3 = S3 {
                 params: params.parameters,
             };

@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q12"
+---
++------------+-----------------+----------------+
+| L_SHIPMODE | HIGH_LINE_COUNT | LOW_LINE_COUNT |
++------------+-----------------+----------------+
+| MAIL       | 6202            | 9324           |
+| SHIP       | 6200            | 9262           |
++------------+-----------------+----------------+

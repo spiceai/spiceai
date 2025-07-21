@@ -1,0 +1,32 @@
+name: Generate Changelog
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_release_tag:
+        description: 'The previous release tag to compare against (e.g. v1.4.0)'
+        type: string
+        required: true
+      release_branch:
+        description: 'The release branch (or prep branch) to compare against (e.g. release/1.5 or pease/release-1.5-prep)'
+        type: string
+        required: true
+
+jobs:
+  generate:
+    name: Generate Changelog
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history (including tags) to get the correct cherry-pick commits
+
+      - name: Generate Changelog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+        run: |
+          ./scripts/generate_changelog.sh $PREVIOUS_RELEASE_TAG $RELEASE_BRANCH

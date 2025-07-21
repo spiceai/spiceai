@@ -140,7 +140,7 @@ impl Runtime {
                 let Ok(_guard) = semaphore.acquire().await else {
                     unreachable!("Semaphore is never closed.");
                 };
-                tracing::info!("Initializing dataset {ds}");
+                tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
             spawned_tasks.push(handle);
@@ -470,7 +470,7 @@ impl Runtime {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
-                    tracing::info!("Updating accelerated dataset {}...", &ds.name);
+                    tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     if let Ok(()) = Arc::clone(&self)
                         .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
@@ -617,6 +617,7 @@ impl Runtime {
             data_connector = Arc::new(EmbeddingConnector::new(
                 data_connector,
                 Arc::clone(&self.embeds),
+                self.secrets(),
             ));
         }
 

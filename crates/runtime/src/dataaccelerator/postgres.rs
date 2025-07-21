@@ -18,11 +18,12 @@ use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable, prelude::Expr,
+    logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
 };
+use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -88,15 +89,12 @@ impl DataAccelerator for PostgresAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
-        let num_partitions = partition_by.len();
         ensure!(
-            num_partitions == 0,
+            partition_by.is_none(),
             super::InvalidConfigurationSnafu {
-                msg: format!(
-                    "Postgres data accelerator does not support the `partition_by` setting but {num_partitions} expressions were provided"
-                )
+                msg: "Postgres data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
 

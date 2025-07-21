@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use aws_config::{BehaviorVersion, SdkConfig};
+use aws_credential_types::provider::ProvideCredentials;
 use object_store::{ObjectStore, aws::AmazonS3Builder};
+use tokio::sync::OnceCell;
 
 mod credential_provider;
 pub use credential_provider::S3CredentialProvider;
@@ -36,6 +39,32 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+static SDK_CONFIG: OnceCell<Option<SdkConfig>> = OnceCell::const_new();
+
+/// Initializes the global SDK configuration if it can provide credentials.
+pub async fn initialize_sdk_config() -> &'static Option<SdkConfig> {
+    SDK_CONFIG
+        .get_or_init(|| async {
+            let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+
+            if let Some(creds_provider) = sdk_config.credentials_provider() {
+                if creds_provider.provide_credentials().await.is_ok() {
+                    Some(sdk_config)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .await
+}
+
+/// Gets the initialized SDK configuration if available.
+pub fn get_sdk_config() -> Option<&'static SdkConfig> {
+    SDK_CONFIG.get().and_then(|opt| opt.as_ref())
+}
+
 /// Creates an `ObjectStore` from an S3 URL
 ///
 /// # Errors
@@ -44,7 +73,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - Unable to parse bucket name from URL
 /// - Unable to build S3 client with provided configuration
 /// - Unable to get credentials from environment
-pub async fn from_s3_url(url: &url::Url) -> Result<Box<dyn ObjectStore>> {
+pub async fn from_s3_url(url: &url::Url, region: Option<String>) -> Result<Box<dyn ObjectStore>> {
     if url.scheme() != "s3" {
         return Err(Error::NotAnS3Url {
             url: url.to_string(),
@@ -55,8 +84,40 @@ pub async fn from_s3_url(url: &url::Url) -> Result<Box<dyn ObjectStore>> {
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
     let (credential_provider, config) = S3CredentialProvider::from_env().await?;
 
-    if let Some(region) = config.region() {
-        builder = builder.with_region(region.to_string());
+    if let Some(region) = region.or(config.region().map(ToString::to_string)) {
+        builder = builder.with_region(region);
+    }
+
+    builder = builder.with_credentials(Arc::new(credential_provider));
+
+    Ok(Box::new(builder.build()?))
+}
+
+/// Creates an `ObjectStore` from an S3 URL
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Unable to parse bucket name from URL
+/// - Unable to build S3 client with provided configuration
+/// - Unable to get credentials from environment
+pub fn from_s3_url_and_config(
+    url: &url::Url,
+    region: Option<String>,
+    sdk_config: &SdkConfig,
+) -> Result<Box<dyn ObjectStore>> {
+    if url.scheme() != "s3" {
+        return Err(Error::NotAnS3Url {
+            url: url.to_string(),
+        });
+    }
+
+    let bucket_name = get_bucket_name(url)?;
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
+    let credential_provider = S3CredentialProvider::from_config(sdk_config)?;
+
+    if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
+        builder = builder.with_region(region);
     }
 
     builder = builder.with_credentials(Arc::new(credential_provider));

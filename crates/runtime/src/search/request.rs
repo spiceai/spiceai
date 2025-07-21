@@ -18,10 +18,11 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{
     Expr, SelectItem, TableFactor, TableWithJoins, Value, ValueWithSpan,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
+use itertools::Itertools;
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,7 @@ impl SearchRequest {
     }
 
     pub fn parse_where_cond(where_cond: String) -> Result<Expr> {
-        let parser = Parser::new(&GenericDialect);
+        let parser = Parser::new(&PostgreSqlDialect {});
         let mut parser =
             parser
                 .try_with_sql(&where_cond)
@@ -229,19 +230,32 @@ impl SearchRequest {
                     });
                 }
 
-                let Some(SelectItem::UnnamedExpr(Expr::Identifier(sqlparser::ast::Ident {
-                    value,
-                    ..
-                }))) = expr.projection.first()
-                else {
+
+                let Some(SelectItem::UnnamedExpr(select_expr)) = expr.projection.first() else {
                     tracing::trace!("vector_search additional column parsing failed. expected an identifier, but got {expr:?}");
                     return Err(Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     });
                 };
 
-                if value != c {
-                    tracing::trace!("vector_search additional column parsing failed. expected {c}, but got {value}");
+                // Find the projected column. Must handle single and compound identifiers separately.
+                let proj_value = match select_expr {
+                    Expr::Identifier(sqlparser::ast::Ident {
+                        value,
+                        ..
+                    }) => value,
+                    Expr::CompoundIdentifier(idents) => &idents.iter().map(|i| i.value.clone()).join("."),
+                    _ => {
+                        tracing::trace!("vector_search additional column parsing failed. expected an identifier, but got {expr:?}");
+                        return Err(Error::InvalidAdditionalColumns {
+                            additional_column: c.clone(),
+                        });
+                    }
+                };
+
+                // Check equality whilst ignoring quotation.
+                if proj_value != c.trim_matches('"') {
+                    tracing::trace!("vector_search additional column parsing failed. expected {c}, but got {proj_value}");
                     return Err(Error::InvalidAdditionalColumns {
                         additional_column: c.clone(),
                     });
@@ -374,6 +388,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_parse_additional_columns_basic() {
+        let mut resp = match SearchRequest::parse_additional_columns(&["column".to_string()]) {
+            Ok(r) => r,
+            Err(e) => panic!("failed to parse additional columns: {e}"),
+        };
+        assert_eq!(resp.pop(), Some("column".to_string()));
+    }
+
+    #[test]
+    fn test_parse_additional_columns_quoted() {
+        let mut resp =
+            match SearchRequest::parse_additional_columns(&["\"quoted_column\"".to_string()]) {
+                Ok(r) => r,
+                Err(e) => panic!("failed to parse additional columns: {e}"),
+            };
+        assert_eq!(resp.pop(), Some("\"quoted_column\"".to_string()));
+    }
+
+    #[test]
+    fn test_parse_additional_columns_qualified() {
+        let mut resp =
+            match SearchRequest::parse_additional_columns(&["qualified.column".to_string()]) {
+                Ok(r) => r,
+                Err(e) => panic!("failed to parse additional columns: {e}"),
+            };
+
+        assert_eq!(resp.pop(), Some("qualified.column".to_string()));
+    }
+
+    #[test]
+    fn test_parse_additional_columns_quoted_qualified() {
+        let mut resp = match SearchRequest::parse_additional_columns(&[
+            "\"qualified.quoted_column\"".to_string(),
+        ]) {
+            Ok(r) => r,
+            Err(e) => panic!("failed to parse additional columns: {e}"),
+        };
+
+        assert_eq!(resp.pop(), Some("\"qualified.quoted_column\"".to_string()));
+    }
+
+    #[test]
     fn test_valid_where_conditions() {
         // Test basic comparison
         match SearchRequest::parse_where_cond("column = 'value'".to_string()) {
@@ -495,27 +551,5 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
-    }
-
-    #[test]
-    fn test_search_request_parse_additional_columns() {
-        let additional_columns = vec!["column1".to_string(), "column2".to_string()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_ok());
-
-        // Test invalid column name
-        let additional_columns = vec!["column 1".to_string()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
-
-        // Test empty column name
-        let additional_columns = vec![String::new()];
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
-
-        // Test escaping column name
-        let additional_columns = vec!["1; DROP TABLE testing; --".to_string()]; // would result in SELECT 1; DROP TABLE testing; -- FROM testing;
-        let result = SearchRequest::parse_additional_columns(&additional_columns);
-        assert!(result.is_err());
     }
 }

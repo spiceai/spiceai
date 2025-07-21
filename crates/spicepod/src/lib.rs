@@ -42,6 +42,7 @@ pub mod param;
 pub mod reader;
 pub mod semantic;
 pub mod spec;
+pub mod vector;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -171,11 +172,11 @@ impl Spicepod {
     pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
         let (store, path) = match (url.scheme(), url.path()) {
             ("s3", path) => {
-                let store = object_store_aws_sdk::from_s3_url(&url).await.context(
-                    UnableToParseS3UrlSnafu {
+                let store = object_store_aws_sdk::from_s3_url(&url, None)
+                    .await
+                    .context(UnableToParseS3UrlSnafu {
                         path: url.to_string(),
-                    },
-                )?;
+                    })?;
                 let path = object_store::path::Path::from(path);
                 (store, path)
             }

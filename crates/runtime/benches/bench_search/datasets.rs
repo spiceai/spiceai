@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use app::AppBuilder;
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
 use spicepod::{component::dataset::Dataset, semantic::Column};
@@ -81,6 +83,7 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
             description: None,
             embeddings: vec![], // Defined on `.dataset[].embeddings`.
             full_text_search: Some(fts_config.clone()),
+            metadata: HashMap::new(),
         });
     }
 

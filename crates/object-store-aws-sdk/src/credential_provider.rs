@@ -40,15 +40,26 @@ impl S3CredentialProvider {
     pub async fn from_env() -> object_store::Result<(Self, SdkConfig)> {
         let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
+        Ok((Self::from_config(&config)?, config))
+    }
+
+    /// Creates a new `S3CredentialProvider` from the given SDK configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials provider cannot be obtained from the SDK configuration.
+    pub fn from_config(sdk_config: &SdkConfig) -> object_store::Result<Self> {
         let credentials =
-            config
+            sdk_config
                 .credentials_provider()
                 .ok_or_else(|| object_store::Error::Generic {
                     store: "S3",
-                    source: "Failed to get S3 credentials from the environment".into(),
+                    source: "Failed to get S3 credentials from the AWS SDK".into(),
                 })?;
 
-        Ok((Self { credentials }, config))
+        Ok(Self {
+            credentials: credentials.clone(),
+        })
     }
 }
 
