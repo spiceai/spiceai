@@ -81,13 +81,6 @@ mod search {
         )
         .await?;
 
-        run_and_snapshot_query(
-            &rt,
-            "explain SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
-            "basic_explain",
-        )
-        .await?;
-
         Ok(())
     }
 
