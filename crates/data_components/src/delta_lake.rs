@@ -146,7 +146,7 @@ impl DeltaTable {
             object_store_aws_sdk::get_sdk_config(),
         ) {
             (true, Some(sdk_config)) => {
-                let region = storage_options.get("aws_region").map(|s| s.to_string());
+                let region = storage_options.get("aws_region").map(ToString::to_string);
                 object_store_aws_sdk::from_s3_url_and_config(table.location(), region, sdk_config)
                     .ok()
             }
