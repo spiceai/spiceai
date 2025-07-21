@@ -80,6 +80,18 @@ pub enum ReadyState {
     OnRegistration,
 }
 
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheckAvailability {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Default,
+    /// The dataset is not checked for availability.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -143,6 +155,12 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
+
+    /// Configures whether the dataset availability monitor is enabled for this dataset.
+    /// When enabled, the runtime will periodically check dataset availability
+    /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub check_availability: CheckAvailability,
 }
 
 impl Nameable for Dataset {
@@ -175,6 +193,7 @@ impl Dataset {
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
+            check_availability: CheckAvailability::default(),
         }
     }
 
@@ -242,6 +261,7 @@ impl WithDependsOn<Dataset> for Dataset {
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
+            check_availability: self.check_availability,
         }
     }
 }
@@ -316,6 +336,8 @@ struct DatasetDeserializer {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    check_availability: CheckAvailability,
 }
 
 #[allow(deprecated)]
@@ -366,7 +388,46 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
+            check_availability: deserializer.check_availability,
         })
+    }
+}
+
+#[cfg(test)]
+mod check_availability_tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_check_availability_enabled_by_default() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Default);
+    }
+
+    #[test]
+    fn test_check_availability_disabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability: disabled
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Disabled);
+    }
+
+    #[test]
+    fn test_check_availability_enabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability: default
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Default);
     }
 }
 
