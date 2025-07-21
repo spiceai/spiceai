@@ -92,16 +92,14 @@ impl TaskSpan {
             "Task history retention check interval: {retention_check_interval_secs} seconds"
         );
 
-        let retention = Retention::new(
-            time_column.clone(),
-            time_format,
-            None,
-            None,
-            Some(Duration::from_secs(retention_period_secs)), // 1 day
-            Some(Duration::from_secs(retention_check_interval_secs)),
-            true,
-            None,
-        );
+        let retention = Retention::builder()
+            .time_column(time_column.clone())
+            .time_format(time_format)
+            .time_period(Some(Duration::from_secs(retention_period_secs)))
+            .check_interval(Some(Duration::from_secs(retention_check_interval_secs)))
+            .enabled(true)
+            .build();
+
         let tbl_reference =
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 

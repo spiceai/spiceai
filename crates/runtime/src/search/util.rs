@@ -237,6 +237,7 @@ pub async fn full_text_search_candidates(
     Some(
         fts.with_new_base(table_provider)
             .as_candidate_generations()
+            .await
             .context(SearchGenerationSnafu),
     )
 }
