@@ -38,6 +38,7 @@ Spice is primarily used for:
 
 - **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/query-federation).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
+- **Enterprise Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and vector similarity search for structured and unstructured data.
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
 If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
@@ -54,6 +55,7 @@ Spice is built-on industry leading technologies including [Apache DataFusion](ht
 
 🎥 [Watch the CMU Databases Accelerating Data and AI with Spice.ai Open-Source](https://www.youtube.com/watch?v=tyM-ec1lKfU)
 🎥 [Watch How to Query Data using Spice, OpenAI, and MCP](https://www.youtube.com/watch?v=TFAu4qxjTPk&list=PLesJrUXEx3U-dQul0PqLV3TGTdUmr3B6e&index=8)
+🎥 [Watch How to search with Amazon S3 Vectors](https://www.youtube.com/watch?v=QPbqPf5W36g)
 
 ## Why Spice?
 
