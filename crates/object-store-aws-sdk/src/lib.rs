@@ -84,7 +84,7 @@ pub async fn from_s3_url(url: &url::Url, region: Option<String>) -> Result<Box<d
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
     let (credential_provider, config) = S3CredentialProvider::from_env().await?;
 
-    if let Some(region) = region.or(config.region().map(|r| r.to_string())) {
+    if let Some(region) = region.or(config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
     }
 
@@ -116,7 +116,7 @@ pub fn from_s3_url_and_config(
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
     let credential_provider = S3CredentialProvider::from_config(sdk_config)?;
 
-    if let Some(region) = region.or(sdk_config.region().map(|r| r.to_string())) {
+    if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
     }
 
