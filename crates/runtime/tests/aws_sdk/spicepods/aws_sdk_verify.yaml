@@ -1,0 +1,46 @@
+version: v1
+kind: Spicepod
+name: aws_sdk_verify
+
+datasets:
+  # Public S3
+  - from: s3://spiceai-public-datasets/nyc_taxi_2023/
+    name: public_taxi
+    params:
+      file_format: parquet
+      s3_region: us-east-1
+
+  # Private S3
+  - from: s3://spiceai-seoul-glue/parquet_taxi_trips_2023/
+    name: private_taxi
+    params:
+      file_format: parquet
+      s3_region: ap-northeast-2
+
+  # Delta Lake
+  - from: delta_lake:s3://databricks-workspace-stack-bfa88-bucket/unity-catalog/334046012506932/__unitystorage/catalogs/73ac4d49-21b9-49d9-94c7-15461a4a87fa/tables/a7aad9df-10be-4984-b426-1f94e289948f
+    name: region_delta
+    params:
+      delta_lake_aws_region: us-west-2
+
+  # Databricks Delta Lake
+  - from: databricks:spiceai_sandbox.tpch.region
+    name: region_databricks_delta
+    params:
+      mode: delta_lake
+      databricks_endpoint: dbc-46470731-42e5.cloud.databricks.com
+      databricks_token: ${secrets:TEST_DATABRICKS_TOKEN}
+      databricks_aws_region: us-west-2
+
+  # Iceberg
+  - from: iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/testdb/tables/iceberg_table_001
+    name: iceberg_table
+    params:
+      iceberg_s3_region: ap-northeast-2
+
+  # Glue
+  - from: glue:testdb.iceberg_table_001
+    name: iceberg_table_glue
+    params:
+      glue_region: ap-northeast-2
+  

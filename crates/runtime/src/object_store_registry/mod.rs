@@ -27,6 +27,7 @@ use object_store::{
     ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
     http::HttpBuilder,
 };
+use object_store_aws_sdk::S3CredentialProvider;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
@@ -81,12 +82,16 @@ impl SpiceObjectStoreRegistry {
             })?;
             client_options = client_options.with_allow_http(as_bool);
         }
+
+        let mut load_credentials_from_environment = true;
+
         if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
             if let Some(token) = params.get("session_token") {
                 s3_builder = s3_builder.with_token(token);
             }
+            load_credentials_from_environment = false;
         } else {
             match params.get("auth") {
                 Some(auth) if auth == "iam_role" => {
@@ -94,11 +99,9 @@ impl SpiceObjectStoreRegistry {
                 }
                 Some(auth) if auth == "public" => {
                     s3_builder = s3_builder.with_skip_signature(true);
+                    load_credentials_from_environment = false;
                 }
-                None => {
-                    // Default to public if no auth is provided
-                    s3_builder = s3_builder.with_skip_signature(true);
-                }
+                None => {}
                 Some(auth) => {
                     return Err(DataFusionError::Configuration(format!(
                         "Unexpected S3 auth method: {auth}",
@@ -107,6 +110,25 @@ impl SpiceObjectStoreRegistry {
             }
         }
         s3_builder = s3_builder.with_client_options(client_options);
+
+        if load_credentials_from_environment {
+            tracing::trace!("Loading S3 credentials from environment");
+            if let Some(sdk_config) = object_store_aws_sdk::get_sdk_config() {
+                if let Some(creds_provider) = sdk_config.credentials_provider() {
+                    tracing::trace!("Using S3 credentials provider from SDK config");
+                    s3_builder = s3_builder
+                        .with_credentials(Arc::new(S3CredentialProvider::new(creds_provider)));
+                } else {
+                    tracing::trace!(
+                        "No S3 credentials provider found from AWS SDK, assuming public access"
+                    );
+                    s3_builder = s3_builder.with_skip_signature(true);
+                }
+            } else {
+                tracing::trace!("No AWS SDK loaded, assuming public access");
+                s3_builder = s3_builder.with_skip_signature(true);
+            }
+        }
 
         Ok(Arc::new(s3_builder.build()?))
     }

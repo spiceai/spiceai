@@ -54,6 +54,7 @@ itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
+object-store-aws-sdk = { path = "../object-store-aws-sdk" }
 oracle = { version = "0.6", optional = true }
 rdkafka = { version = "0.38.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
