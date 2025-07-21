@@ -43,6 +43,11 @@ impl S3CredentialProvider {
         Ok((Self::from_config(&config)?, config))
     }
 
+    /// Creates a new `S3CredentialProvider` from the given SDK configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials provider cannot be obtained from the SDK configuration.
     pub fn from_config(sdk_config: &SdkConfig) -> object_store::Result<Self> {
         let credentials =
             sdk_config
