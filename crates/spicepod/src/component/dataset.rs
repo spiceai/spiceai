@@ -87,7 +87,7 @@ pub enum ReadyState {
 pub enum CheckAvailability {
     /// The dataset is checked for availability if it isn't accelerated.
     #[default]
-    Default,
+    Auto,
     /// The dataset is not checked for availability.
     Disabled,
 }
@@ -405,7 +405,7 @@ mod check_availability_tests {
             from: file://test.csv
         ";
         let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.check_availability, CheckAvailability::Default);
+        assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 
     #[test]
@@ -424,10 +424,10 @@ mod check_availability_tests {
         let yaml = r"
             name: test
             from: file://test.csv
-            check_availability: default
+            check_availability: auto
         ";
         let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
-        assert_eq!(dataset.check_availability, CheckAvailability::Default);
+        assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 }
 
