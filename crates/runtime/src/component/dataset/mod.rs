@@ -215,6 +215,34 @@ impl Display for ReadyState {
     }
 }
 
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CheckAvailability {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Default,
+    /// The dataset is not checked for availability.
+    Disabled,
+}
+
+impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
+    fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
+        match monitor {
+            spicepod_dataset::CheckAvailability::Default => CheckAvailability::Default,
+            spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
+        }
+    }
+}
+
+impl Display for CheckAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckAvailability::Default => write!(f, "default"),
+            CheckAvailability::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -238,6 +266,7 @@ pub struct Dataset {
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub check_availability: CheckAvailability,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -263,6 +292,7 @@ impl std::fmt::Debug for Dataset {
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
+            .field("check_availability", &self.check_availability)
             .finish_non_exhaustive()
     }
 }
@@ -288,6 +318,7 @@ impl PartialEq for Dataset {
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
+            && self.check_availability == other.check_availability
     }
 }
 
