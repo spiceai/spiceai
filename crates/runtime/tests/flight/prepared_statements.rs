@@ -429,7 +429,7 @@ async fn test_binder_error_specificity() -> Result<(), anyhow::Error> {
             );
 
             // Check that the error specifically uses the InvalidArgument code vs generic "Internal"
-            let result_err_message = result.err().unwrap().to_string();
+            let result_err_message = result.expect_err("Must be error").to_string();
             assert!(result_err_message.contains("code: InvalidArgument"));
             assert!(result_err_message.contains("No value found for placeholder with id $2"));
 
