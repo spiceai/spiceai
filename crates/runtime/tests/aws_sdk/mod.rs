@@ -99,14 +99,14 @@ fn ensure_aws_profile() {
 
     // Create the default profile with the credentials from AWS_DATABRICKS_DELTA_ACCESS_KEY_ID and AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY
     let config_content = "[default]
-    region = us-east-1
-    output = json
-    ";
+region = us-east-1
+output = json
+";
     let credentials_content = format!(
         "[default]
-    aws_access_key_id = {access_key_id}
-    aws_secret_access_key = {secret_access_key}
-    "
+aws_access_key_id = {access_key_id}
+aws_secret_access_key = {secret_access_key}
+"
     );
 
     // Create the .aws directory if it doesn't exist
