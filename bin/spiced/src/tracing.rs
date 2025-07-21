@@ -69,7 +69,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "workers",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off";
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {

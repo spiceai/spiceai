@@ -493,6 +493,11 @@ impl Runtime {
         Arc::clone(&self.schedulers)
     }
 
+    #[must_use]
+    pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
+        self.datasets_health_monitor.clone()
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
