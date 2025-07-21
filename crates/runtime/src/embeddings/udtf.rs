@@ -263,7 +263,7 @@ impl VectorSearchTableFunc {
         };
         Ok(Some(Arc::new(VectorQueryTableProvider {
             query: args.query.clone(),
-            table_provider: Arc::clone(&tbl),
+            table_provider: Arc::clone(tbl),
             vector_index: Arc::new(vector_index.clone()),
             pre_limit: args.limit,
         })))

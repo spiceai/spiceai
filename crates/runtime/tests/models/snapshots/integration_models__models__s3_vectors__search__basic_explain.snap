@@ -34,6 +34,7 @@ expression: formatted
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                    |
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                           |
 |               |                               BytesProcessedExec                                                                                                                  |
-|               |                                 DataSourceExec: file_groups={1 group: [[tpcds/item/item.parquet]]}, projection=[i_item_sk, i_item_desc], file_type=parquet        |
+|               |                                 SchemaCastScanExec                                                                                                                |
+|               |                                   DataSourceExec: partitions=1, partition_sizes=[9]                                                                               |
 |               |                                                                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
