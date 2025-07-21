@@ -18,6 +18,17 @@ use std::{any::Any, sync::Arc};
 
 use arrow::{array::RecordBatch, datatypes::DataType};
 
+use crate::search::{
+    full_text::util::{array_to_terms, with_json_subset_column},
+    util::get_primary_keys,
+};
+use crate::{datafusion::query::write_to_json_string, search::full_text::Error};
+use crate::{
+    object_store_registry::SpiceObjectStoreRegistry,
+    search::full_text::{
+        FailedToInsertDataIntoIndexSnafu, IndexCreationSnafu, InvalidIndexingSnafu,
+    },
+};
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
@@ -32,18 +43,7 @@ use snafu::ResultExt;
 use std::collections::HashSet;
 use tantivy::schema::DocParsingError;
 use tantivy::{TantivyDocument, TantivyError};
-
-use crate::search::{
-    full_text::util::{array_to_terms, with_json_subset_column},
-    util::get_primary_keys,
-};
-use crate::{datafusion::query::write_to_json_string, search::full_text::Error};
-use crate::{
-    object_store_registry::SpiceObjectStoreRegistry,
-    search::full_text::{
-        FailedToInsertDataIntoIndexSnafu, IndexCreationSnafu, InvalidIndexingSnafu,
-    },
-};
+use tokio::sync::RwLock;
 
 /// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
 pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
@@ -54,7 +54,7 @@ pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<tantivy::Index>,
+    pub index: Arc<RwLock<tantivy::Index>>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -86,7 +86,7 @@ impl Index for FullTextDatabaseIndex {
     }
 
     async fn compute_index(&self, batches: Vec<RecordBatch>) {
-        if let Err(e) = self.update_index(batches.as_slice()) {
+        if let Err(e) = self.update_index(batches.as_slice()).await {
             tracing::error!("Failed to update full text search index: {e}");
         }
     }
@@ -126,14 +126,18 @@ impl FullTextDatabaseIndex {
 
     /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
     /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
-    fn existing_terms_to_delete(&self, rb: &[RecordBatch]) -> Result<Vec<tantivy::Term>, Error> {
+    fn existing_terms_to_delete(
+        &self,
+        index_schema: &tantivy::schema::Schema,
+        rb: &[RecordBatch],
+    ) -> Result<Vec<tantivy::Term>, Error> {
         let Some(pk) = self.primary_key.first() else {
             // Should not occur, but no primary key implies none must be deleted.
             return Ok(vec![]);
         };
 
         let (pk_field, pk) = if self.primary_key.len() == 1 {
-            let Some((pk_field, _)) = self.index.schema().find_field(pk.as_str()) else {
+            let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
                 return Err(Error::FailedToRetrieveDataFromIndex {
                     source: TantivyError::FieldNotFound(pk.clone()),
                 });
@@ -141,8 +145,7 @@ impl FullTextDatabaseIndex {
             (pk_field, pk.clone())
         } else {
             // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
-            let Some((pk_field, _)) = self.index.schema().find_field(INDEX_UNIQUE_FIELD_NAME)
-            else {
+            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
                 return Err(Error::InvalidIndexingError {
                     source: Box::from(TantivyError::FieldNotFound(pk.clone())),
                     context: format!(
@@ -170,7 +173,7 @@ impl FullTextDatabaseIndex {
     /// columns present will be ignored.
     ///
     /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
-    fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
+    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if self.primary_key.len() > 1 {
             rb.iter()
@@ -183,14 +186,14 @@ impl FullTextDatabaseIndex {
             rb.to_vec()
         };
 
+        let index_writable = self.index.write().await;
         // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = self
-            .index
+        let mut index_writer: tantivy::IndexWriter = index_writable
             .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
             .context(IndexCreationSnafu)?;
 
         // Deletion.
-        for t in self.existing_terms_to_delete(&rb)? {
+        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
             index_writer.delete_term(t);
         }
 
@@ -198,7 +201,7 @@ impl FullTextDatabaseIndex {
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&self.index.schema(), doc_json.as_str())
+        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
         for doc in docs {
@@ -207,7 +210,6 @@ impl FullTextDatabaseIndex {
         index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu)?;
-
         Ok(())
     }
 
@@ -238,7 +240,7 @@ impl FullTextDatabaseIndex {
         base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
-    ) -> Result<Arc<tantivy::Index>, Error> {
+    ) -> Result<Arc<RwLock<tantivy::Index>>, Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
         for p in primary_key {
@@ -306,7 +308,7 @@ impl FullTextDatabaseIndex {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
         let schema = schema_builder.build();
-        Ok(Arc::new(tantivy::Index::create_in_ram(schema)))
+        Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
     }
 
     fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
@@ -320,12 +322,13 @@ impl FullTextDatabaseIndex {
         )))
     }
 
-    pub fn full_text_search_field_index(
+    pub async fn full_text_search_field_index(
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, search::generation::text_search::Error> {
+        let index_read = self.index.read().await;
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            Arc::clone(&self.index),
+            &index_read,
             search_field.to_string(),
             self.primary_key.clone(),
             Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
@@ -335,13 +338,14 @@ impl FullTextDatabaseIndex {
     }
 
     /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
-    pub fn as_candidate_generations(
+    pub async fn as_candidate_generations(
         &self,
     ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
         let mut generators = vec![];
         for search_field in self.search_fields.as_slice() {
             let base = self
                 .full_text_search_field_index(search_field.as_str())
+                .await
                 .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
             let post_apply = PostApplyCandidateGeneration::new(

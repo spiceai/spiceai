@@ -21,7 +21,7 @@ use std::{
 };
 
 use arrow::datatypes::SchemaRef;
-use arrow_schema::{ArrowError, Field};
+use arrow_schema::{ArrowError, Field, Schema};
 use async_trait::async_trait;
 
 use data_components::s3_vectors::{MetadataColumns, S3_VECTOR_PRIMARY_KEY_NAME};
@@ -47,13 +47,18 @@ use search::SEARCH_SCORE_COLUMN_NAME;
 
 use tokio_stream::StreamExt;
 
-use crate::embeddings::udtf::append_fields;
 use crate::{embedding_col, embeddings::index::VectorIndex};
+use crate::{embeddings::udtf::append_fields, search::util::find_concrete_table_provider};
 
 /// An [`IndexedTableProvider`] embued with a [`VectorIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by vector similarity to a query (similarity with respect to associated embedded column in [`VectorIndex`]).
 #[derive(Debug, Clone)]
 pub struct VectorQueryTableProvider {
-    pub table_provider: Arc<IndexedTableProvider>,
+    /// Base [`TableProvider`] associated with the vector index query.
+    /// Note: [`TableProvider::schema`] will contain vector embedding columns that may need to be
+    /// recomputed at query time. As such full projections on this [`TableProvider`] are not advised.
+    ///
+    /// To get the underlying schema (i.e. without any calculated columns), downcast to, and use [`runtime_datafusion_index::IndexedTableProvider::get_underlying`].
+    pub table_provider: Arc<dyn TableProvider>,
     pub vector_index: Arc<dyn VectorIndex>,
 
     pub query: String,
@@ -126,7 +131,7 @@ impl VectorQueryTableProvider {
     }
 
     fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
-        let base = self.table_provider.get_underlying().schema();
+        let base = self.get_underlying_schema();
         let mut qualified_fields: Vec<_> = base
             .fields()
             .iter()
@@ -167,8 +172,7 @@ impl VectorQueryTableProvider {
         metadata_columns: &[String],
     ) -> DataFusionResult<LogicalPlan> {
         // Remove embedding column and metadata columns of vector index.
-        let base_proj =
-            (0..self.table_provider.underlying.schema().fields().len()).collect::<Vec<_>>();
+        let base_proj = (0..self.get_underlying_schema().fields().len()).collect::<Vec<_>>();
         let base_proj =
             self.underlying_projection_without_metadata(metadata_columns, Some(&base_proj));
         let base_proj = self.remove_embedding_column(base_proj, embedded_column);
@@ -176,7 +180,6 @@ impl VectorQueryTableProvider {
         let filter_refs: Vec<_> = filters.iter().collect();
         let supported_filters = self
             .table_provider
-            .get_underlying()
             .supports_filters_pushdown(filter_refs.as_slice())?;
         let underlying_filters: Vec<Expr> = filters
             .iter()
@@ -193,9 +196,7 @@ impl VectorQueryTableProvider {
 
         let scan = LogicalPlan::TableScan(TableScan::try_new(
             TableReference::parse_str("tbl"), // This name is just useful for picking columns during JOIN. kinda
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider.get_underlying()) as Arc<dyn TableProvider>,
-            )),
+            Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
             Some(base_proj),
             vec![],
             None, // Cannot restrict, as dependent on vector query scan.
@@ -214,6 +215,19 @@ impl VectorQueryTableProvider {
             Some((idx, _)) => projection.into_iter().filter(|p| *p != idx).collect(),
             None => projection,
         }
+    }
+
+    fn get_underlying_schema(&self) -> Arc<Schema> {
+        let Some(indexed) =
+            find_concrete_table_provider::<IndexedTableProvider>(&self.table_provider)
+        else {
+            tracing::debug!(
+                "'VectorQueryTableProvider' instantiated without using a 'IndexedTableProvider'. Cannot get underlying schema, defaulting to TableProvider. TableProvider is {:?}",
+                self.table_provider
+            );
+            return self.table_provider.schema();
+        };
+        indexed.get_underlying().schema()
     }
 
     // Remove any fields that can be returned from the vector indexes `metadata_columns`.
@@ -339,7 +353,7 @@ impl TableProvider for VectorQueryTableProvider {
 
     fn schema(&self) -> SchemaRef {
         append_fields(
-            &self.table_provider.get_underlying().schema(),
+            &self.get_underlying_schema(),
             vec![Arc::new(Field::new(
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 arrow_schema::DataType::Float64,
