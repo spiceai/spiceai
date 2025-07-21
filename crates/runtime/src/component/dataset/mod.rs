@@ -237,7 +237,7 @@ impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
 impl Display for CheckAvailability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CheckAvailability::Auto => write!(f, "default"),
+            CheckAvailability::Auto => write!(f, "auto"),
             CheckAvailability::Disabled => write!(f, "disabled"),
         }
     }
