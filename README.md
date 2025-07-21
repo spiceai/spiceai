@@ -234,10 +234,12 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Vector Stores
 
-| Name         | Description                                                      | Status |
-| ------------ | ---------------------------------------------------------------- | ------ |
-| `pgvector`   | PostgreSQL with pgvector extension                               | Alpha  |
-| `s3_vectors` | Amazon S3 Vectors for petabyte-scale vector storage and querying | Alpha  |
+| Name            | Description                                                          | Status |
+| --------------- | -------------------------------------------------------------------- | ------ |
+| `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
+| `pgvector`      | PostgreSQL with pgvector extension                                   | Alpha  |
+| `duckdb_vector` | DuckDB with vector extension for efficient vector storage and search | Alpha  |
+| `sqlite_vec`    | SQLite with sqlite-vec extension for lightweight vector operations   | Alpha  |
 
 ## Supported Catalogs
 
