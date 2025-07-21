@@ -464,6 +464,8 @@ impl DataConnectorFactory for DatabricksFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
             Box::pin(async move {
+                // Initialize the AWS SDK and make it available.
+                let _ = object_store_aws_sdk::initialize_sdk_config().await;
                 let databricks =
                     Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)

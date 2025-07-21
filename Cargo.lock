@@ -3445,6 +3445,7 @@ dependencies = [
  "itertools 0.14.0",
  "logos",
  "mailparse",
+ "object-store-aws-sdk",
  "object_store",
  "oracle",
  "rdkafka",
@@ -8922,6 +8923,7 @@ dependencies = [
  "aws-credential-types",
  "object_store",
  "snafu",
+ "tokio",
  "url",
 ]
 
@@ -11371,6 +11373,7 @@ dependencies = [
  "mysql_async",
  "notify",
  "ns_lookup",
+ "object-store-aws-sdk",
  "object_store",
  "once_cell",
  "opentelemetry 0.27.1",
