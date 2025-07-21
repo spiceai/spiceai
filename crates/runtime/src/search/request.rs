@@ -22,6 +22,7 @@ use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
+use itertools::Itertools;
 use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
