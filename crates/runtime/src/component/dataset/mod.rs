@@ -217,7 +217,7 @@ impl Display for ReadyState {
 
 /// Controls whether the federated table periodically has its availability checked.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum AvailabilityMonitor {
+pub enum CheckAvailability {
     /// The dataset is checked for availability if it isn't accelerated.
     #[default]
     Default,
@@ -225,20 +225,20 @@ pub enum AvailabilityMonitor {
     Disabled,
 }
 
-impl From<spicepod_dataset::AvailabilityMonitor> for AvailabilityMonitor {
-    fn from(monitor: spicepod_dataset::AvailabilityMonitor) -> Self {
+impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
+    fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
         match monitor {
-            spicepod_dataset::AvailabilityMonitor::Default => AvailabilityMonitor::Default,
-            spicepod_dataset::AvailabilityMonitor::Disabled => AvailabilityMonitor::Disabled,
+            spicepod_dataset::CheckAvailability::Default => CheckAvailability::Default,
+            spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
         }
     }
 }
 
-impl Display for AvailabilityMonitor {
+impl Display for CheckAvailability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AvailabilityMonitor::Default => write!(f, "default"),
-            AvailabilityMonitor::Disabled => write!(f, "disabled"),
+            CheckAvailability::Default => write!(f, "default"),
+            CheckAvailability::Disabled => write!(f, "disabled"),
         }
     }
 }
@@ -266,7 +266,7 @@ pub struct Dataset {
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
-    pub availability_monitor: AvailabilityMonitor,
+    pub check_availability: CheckAvailability,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -292,7 +292,7 @@ impl std::fmt::Debug for Dataset {
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
-            .field("availability_monitor", &self.availability_monitor)
+            .field("check_availability", &self.check_availability)
             .finish_non_exhaustive()
     }
 }
@@ -318,7 +318,7 @@ impl PartialEq for Dataset {
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
-            && self.availability_monitor == other.availability_monitor
+            && self.check_availability == other.check_availability
     }
 }
 

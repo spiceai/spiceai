@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    AvailabilityMonitor, Dataset, Error, Mode, ReadyState, Result, TimeFormat,
-    UnsupportedTypeAction, acceleration, replication, validate_identifier,
+    CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    acceleration, replication, validate_identifier,
 };
 use crate::{Runtime, component::dataset::acceleration::Engine};
 use app::App;
@@ -57,7 +57,7 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
-    pub availability_monitor: AvailabilityMonitor,
+    pub check_availability: CheckAvailability,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -134,7 +134,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
-            availability_monitor: AvailabilityMonitor::from(dataset.availability_monitor),
+            check_availability: CheckAvailability::from(dataset.check_availability),
         })
     }
 }
@@ -162,7 +162,7 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
-            availability_monitor: AvailabilityMonitor::default(),
+            check_availability: CheckAvailability::default(),
         })
     }
 
@@ -249,7 +249,7 @@ impl DatasetBuilder {
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
-            availability_monitor: self.availability_monitor,
+            check_availability: self.check_availability,
         };
 
         Ok(dataset)

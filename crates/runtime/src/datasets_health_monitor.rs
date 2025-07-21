@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
 use crate::{
-    component::dataset::{AvailabilityMonitor, Dataset},
+    component::dataset::{CheckAvailability, Dataset},
     datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
 };
@@ -120,7 +120,7 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
-        if matches!(dataset.availability_monitor, AvailabilityMonitor::Disabled) {
+        if matches!(dataset.check_availability, CheckAvailability::Disabled) {
             tracing::debug!(
                 "Skipping dataset {} for availability monitoring (disabled in config)",
                 dataset.name
