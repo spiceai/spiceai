@@ -208,7 +208,7 @@ jobs:
           $body = @{ text = "Spice runtime error" } | ConvertTo-Json
           $response = Invoke-RestMethod -Uri $url -Headers @{ "Content-Type" = "application/json" } -Method POST -Body $body -ErrorAction Stop
           echo ($response | ConvertTo-Json -Depth 10)
-          if (-not $response.matches) { exit 1 }
+          if (-not $response.results) { exit 1 }
           echo "Passed"
 
           echo "Verifying chat functionality"

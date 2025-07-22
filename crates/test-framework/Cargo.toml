@@ -32,7 +32,7 @@ octocrab = "0.44.1"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
-rand = "0.9.1"
+rand = "0.9.2"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -41,7 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
-sysinfo = "0.33.1"
+sysinfo = "0.35.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true
