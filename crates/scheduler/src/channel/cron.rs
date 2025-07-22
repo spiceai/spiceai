@@ -128,7 +128,7 @@ impl TaskRequestChannel for CronRequestChannel {
 
                 let time = Local::now();
                 let next = cron
-                    .find_next_occurrence(&time, true)
+                    .find_next_occurrence(&time, false)
                     .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
 
                 let duration_till = next.signed_duration_since(time);
