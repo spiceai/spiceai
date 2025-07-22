@@ -36,8 +36,8 @@ use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 
 use url::Url;
 
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchReceiverStream};
-use datafusion::{logical_expr::Unnest, physical_plan::SendableRecordBatchStream};
 
 pub enum Auth {
     Basic(String, Option<String>),
@@ -49,15 +49,17 @@ enum DuplicateBehavior {
     Error,
 }
 
+type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
+
 pub enum UnnestBehavior {
     Default(usize),
-    Custom(Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>),
+    Custom(UnnestHandler),
 }
 
 impl std::fmt::Debug for UnnestBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnnestBehavior::Default(depth) => write!(f, "Default({})", depth),
+            UnnestBehavior::Default(depth) => write!(f, "Default({depth})"),
             UnnestBehavior::Custom(_) => write!(f, "Custom"),
         }
     }
@@ -841,7 +843,7 @@ impl GraphQLClient {
         }?;
 
         unwrapped = match self.unnest_parameters.behavior {
-            UnnestBehavior::Default(depth) if depth <= 0 => unwrapped,
+            UnnestBehavior::Default(0) => unwrapped,
             UnnestBehavior::Default(_) | UnnestBehavior::Custom(_) => {
                 unnest_json_objects(&self.unnest_parameters, &unwrapped)?
             }
