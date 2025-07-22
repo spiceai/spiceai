@@ -541,10 +541,7 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
-                warn_if_provided(vec![
-                    ("github_include_comments", include_comments.is_some()),
-                    ("github_max_comments_fetched", max_comments_fetched.is_some()),
-                ], "commits");
+                warn_if_provided(pull_request_specific_params, "commits");
 
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
