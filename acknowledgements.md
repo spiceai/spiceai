@@ -34,9 +34,9 @@ github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.9.1/LICENSE.txt, 
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.6/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.25.0:LICENSE, BSD-3-Clause
-golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.33.0:LICENSE, BSD-3-Clause
-golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
+golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.26.0:LICENSE, BSD-3-Clause
+golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.34.0:LICENSE, BSD-3-Clause
+golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.26.0:LICENSE, BSD-3-Clause
 gopkg.in/ini.v1, https://github.com/go-ini/ini/blob/v1.67.0/LICENSE, Apache-2.0
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
@@ -99,7 +99,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-config 1.6.3, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-credential-types 1.2.3, Apache-2.0 
+- aws-credential-types 1.2.4, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-sdk-bedrockruntime 1.92.0, Apache-2.0 
@@ -111,11 +111,17 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-glue 1.90.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
+- aws-sdk-s3vectors 1.1.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
+
 - aws-sdk-secretsmanager 1.76.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-sdk-sts 1.71.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
+
+- aws-smithy-types 1.3.2, Apache-2.0 
+  <br/>https://github.com/smithy-lang/smithy-rs
 
 - axum 0.7.9, MIT 
   <br/>https://github.com/tokio-rs/axum
@@ -129,7 +135,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - azure_core 0.21.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_core 0.25.0, MIT 
+- azure_core 0.26.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
 - azure_storage 0.21.0, MIT 
@@ -327,7 +333,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.9.0, Apache-2.0 OR MIT 
+- indexmap 2.10.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
 - indicatif 0.17.11, MIT 
@@ -396,7 +402,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 8.0.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
-- object_store 0.12.1, Apache-2.0 OR MIT 
+- object_store 0.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs-object-store
 
 - octocrab 0.44.1, Apache-2.0 OR MIT 
@@ -495,7 +501,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rand 0.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rdkafka 0.37.0, MIT 
+- rdkafka 0.38.0, MIT 
   <br/>https://github.com/fede1024/rust-rdkafka
 
 - regex 1.11.1, Apache-2.0 OR MIT 
@@ -699,7 +705,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - url 2.5.4, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url
 
-- utoipa 5.3.1, Apache-2.0 OR MIT 
+- utoipa 5.4.0, Apache-2.0 OR MIT 
   <br/>https://github.com/juhaku/utoipa
 
 - utoipa-swagger-ui 9.0.2, Apache-2.0 OR MIT 
