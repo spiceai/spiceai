@@ -450,6 +450,16 @@ impl std::str::FromStr for GitHubQueryMode {
     }
 }
 
+fn warn_if_provided(parameters: Vec<(&str, bool)>, table_type: &str) {
+    for (param, present) in parameters {
+        if present {
+            tracing::warn!(
+                "The parameter '{param}' is not supported for the '{table_type}' table type and will be ignored."
+            );
+        }
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
@@ -505,6 +515,14 @@ impl DataConnector for Github {
             })
             .transpose()?;
 
+        let pull_request_specific_params = vec![
+            ("github_include_comments", include_comments.is_some()),
+            (
+                "github_max_comments_fetched",
+                max_comments_fetched.is_some(),
+            ),
+        ];
+
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
                 let table_args = Arc::new(PullRequestTableArgs {
@@ -523,6 +541,11 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
+                warn_if_provided(vec![
+                    ("github_include_comments", include_comments.is_some()),
+                    ("github_max_comments_fetched", max_comments_fetched.is_some()),
+                ], "commits");
+
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
@@ -536,6 +559,8 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
+                warn_if_provided(pull_request_specific_params, "issues");
+
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
@@ -550,6 +575,8 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
+                warn_if_provided(pull_request_specific_params, "stargazers");
+
                 let table_args = Arc::new(StargazersTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
@@ -558,10 +585,12 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(owner, repo)).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
+                warn_if_provided(pull_request_specific_params, "files");
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
             }
             (Some("github.com"), Some(org), Some("members"), None) => {
+                warn_if_provided(pull_request_specific_params, "members");
                 let table_args = Arc::new(MembersTableArgs {
                     org: org.to_string(),
                     component: ConnectorComponent::from(dataset),
