@@ -25,10 +25,11 @@ use data_components::{
     github::error_checker,
     graphql::{
         ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{GraphQLQuery, UnnestBehavior},
+        client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
     },
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use serde_json::Value;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
@@ -108,7 +109,28 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             deletions
                             changed_files: changedFiles
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{comments_count: totalCount}}
+                            comments_info: comments(first: 100) {{
+                                discussion: nodes {{
+                                    body
+                                    created_at: createdAt
+                                    author {{
+                                        author: login
+                                    }}
+                                }}
+                            }}
+                            reviewThreads(first: 20) {{
+                                thread_comments: nodes {{
+                                    comments(first: 100) {{
+                                        review_comments: nodes {{
+                                            body
+                                            created_at: createdAt
+                                            author {{
+                                                author: login
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }}
                             commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
@@ -147,7 +169,28 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             deletions
                             changed_files: changedFiles
                             labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{comments_count: totalCount}}
+                            comments_info: comments(first: 100) {{
+                                discussion: nodes {{
+                                    body
+                                    created_at: createdAt
+                                    author {{
+                                        author: login
+                                    }}
+                                }}
+                            }}
+                            reviewThreads(first: 20) {{
+                                thread_comments: nodes {{
+                                    comments(first: 100) {{
+                                        review_comments: nodes {{
+                                            body
+                                            created_at: createdAt
+                                            author {{
+                                                author: login
+                                            }}
+                                        }}
+                                    }}
+                                }}
+                            }}
                             commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                         }}
@@ -164,13 +207,83 @@ impl GitHubTableArgs for PullRequestTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(1),
+            UnnestBehavior::Custom(Box::new(custom_unnestter)),
             Some(gql_schema()),
         )
     }
 }
 
+fn flatten_author_field(comment: &mut Value) {
+    if let Value::Object(comment_obj) = comment {
+        if let Some(Value::Object(author_obj)) = comment_obj.get("author") {
+            if let Some(Value::String(author_name)) = author_obj.get("author") {
+                comment_obj.insert("author".to_string(), Value::String(author_name.clone()));
+            }
+        }
+    }
+}
+
+fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
+    // Unnest normally, then handle the `thread_comments` and `discussion` fields
+    unnest_json_object_to_depth(object, 1, &DuplicateBehavior::Error).map(|mut values| {
+        values.iter_mut().for_each(|value| {
+            if let Value::Object(obj) = value {
+                if let Some(thread_comments) = obj.remove("thread_comments") {
+                    let review_comments = extract_review_comments(thread_comments);
+                    obj.insert("review_comments".to_string(), Value::Array(review_comments));
+                }
+
+                if let Some(Value::Array(discussion_array)) = obj.get_mut("discussion") {
+                    discussion_array.iter_mut().for_each(flatten_author_field);
+                }
+            }
+        });
+
+        values
+    })
+}
+
+// Flattens the `thread_comments` field match the schema expected by the table
+fn extract_review_comments(thread_comments: Value) -> Vec<Value> {
+    match thread_comments {
+        Value::Array(thread_array) => thread_array
+            .into_iter()
+            .filter_map(|thread| {
+                if let Value::Object(thread_obj) = thread {
+                    thread_obj
+                        .get("comments")
+                        .and_then(|comments| comments.as_object())
+                        .and_then(|comments_obj| comments_obj.get("reviews"))
+                        .and_then(|reviews| reviews.as_array())
+                        .map(|reviews| reviews.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .map(|mut review| {
+                flatten_author_field(&mut review);
+                review
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn gql_schema() -> SchemaRef {
+    let comment_data_type = DataType::Struct(
+        vec![
+            Arc::new(Field::new("body", DataType::Utf8, true)),
+            Arc::new(Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            )),
+            Arc::new(Field::new("author", DataType::Utf8, true)),
+        ]
+        .into(),
+    );
+
     Arc::new(Schema::new(vec![
         Field::new("additions", DataType::Int64, true),
         Field::new(
@@ -190,7 +303,20 @@ fn gql_schema() -> SchemaRef {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
             true,
         ),
-        Field::new("comments_count", DataType::Int64, true),
+        Field::new(
+            "discussion",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                comment_data_type.clone(),
+                true,
+            ))),
+            true,
+        ),
+        Field::new(
+            "review_comments",
+            DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+            true,
+        ),
         Field::new("commits_count", DataType::Int64, true),
         Field::new(
             "created_at",
