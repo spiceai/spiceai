@@ -287,7 +287,7 @@ fn extract_review_comments(thread_comments: Value) -> Vec<Value> {
                     thread_obj
                         .get("comments")
                         .and_then(|comments| comments.as_object())
-                        .and_then(|comments_obj| comments_obj.get("reviews"))
+                        .and_then(|comments_obj| comments_obj.get("review_comments"))
                         .and_then(|reviews| reviews.as_array())
                         .cloned()
                 } else {
