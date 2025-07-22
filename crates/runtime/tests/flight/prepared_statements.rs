@@ -405,6 +405,39 @@ async fn test_parameters_in_case_expressions() -> Result<(), anyhow::Error> {
         .await
 }
 
+#[tokio::test]
+async fn test_binder_error_specificity() -> Result<(), anyhow::Error> {
+    test_request_context()
+        .scope(async {
+            let (channel, _df) = start_spice_test_app(None, None, None).await?;
+            let mut client = FlightSqlServiceClient::new(channel);
+
+            // Write a statement with two parameter bindings
+            let stmt = get_prepared_statement(&mut client, "select ?, ?").await?;
+
+            // ...but only provide one parameter
+            let param_batch = create_param_batch(
+                vec![("$1", arrow::datatypes::DataType::Int32, false)],
+                vec![Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow::array::Array>],
+            )?;
+
+            let result = execute_prepared_statement(&mut client, stmt, param_batch).await;
+
+            assert!(
+                result.is_err(),
+                "There are two parameter placeholders, but only one binding"
+            );
+
+            // Check that the error specifically uses the InvalidArgument code vs generic "Internal"
+            let result_err_message = result.expect_err("Must be error").to_string();
+            assert!(result_err_message.contains("code: InvalidArgument"));
+            assert!(result_err_message.contains("No value found for placeholder with id $2"));
+
+            Ok(())
+        })
+        .await
+}
+
 async fn get_prepared_statement(
     client: &mut FlightSqlServiceClient<Channel>,
     query: &str,

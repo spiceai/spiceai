@@ -21,16 +21,16 @@
   <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a>
 </p>
 
-**Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
+**Spice** is a SQL query, search, and LLM-inference engine, written in Rust, for data apps and agents.
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
 Spice provides four industry standard APIs in a lightweight, portable runtime (single binary/container):
 
-1. **SQL Query APIs**: Supports HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
-2. **OpenAI-Compatible APIs**: Provides HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
-3. **Iceberg Catalog REST APIs**: Offers a unified API for Iceberg Catalog.
-4. **MCP HTTP+SSE APIs**: Enables integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
+1. **SQL Query & Search**: HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC APIs; `vector_search` and `text_search` UDTFs.
+2. **OpenAI-Compatible APIs**: HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
+3. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API.
+4. **MCP HTTP+SSE APIs**: Integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
 
 🎯 Goal: Developers can focus on building data apps and AI agents confidently, knowing they are grounded in data.
 
@@ -38,6 +38,7 @@ Spice is primarily used for:
 
 - **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/query-federation).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
+- **Enterprise Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and vector similarity search for structured and unstructured data.
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
 If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
@@ -54,6 +55,7 @@ Spice is built-on industry leading technologies including [Apache DataFusion](ht
 
 🎥 [Watch the CMU Databases Accelerating Data and AI with Spice.ai Open-Source](https://www.youtube.com/watch?v=tyM-ec1lKfU)
 🎥 [Watch How to Query Data using Spice, OpenAI, and MCP](https://www.youtube.com/watch?v=TFAu4qxjTPk&list=PLesJrUXEx3U-dQul0PqLV3TGTdUmr3B6e&index=8)
+🎥 [Watch How to search with Amazon S3 Vectors](https://www.youtube.com/watch?v=QPbqPf5W36g)
 
 ## Why Spice?
 
@@ -95,19 +97,19 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 
 ### AI Apps and Agents
 
-| Feature                       | **Spice**                            | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
-| ----------------------------- | ------------------------------------ | ------------------ | ---------- | ---------------- | ----------------------------- |
-| **Primary Use-Case**          | Data & AI apps                       | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
-| **Programming Language**      | Any language (HTTP interface)        | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
-| **Unified Data + AI Runtime** | ✅                                   | ―                  | ―          | ―                | ―                             |
-| **Federated Data Query**      | ✅                                   | ―                  | ―          | ―                | ―                             |
-| **Accelerated Data Access**   | ✅                                   | ―                  | ―          | ―                | ―                             |
-| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                    | ✅                 | ✅         | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                   | ✅                 | ―          | ✅               | ―                             |
-| **Evaluations (Evals)**       | ✅                                   | Limited            | ―          | Limited          | ―                             |
-| **Search**                    | ✅ (VSS)                             | ✅                 | ✅         | Limited          | Limited                       |
-| **Caching**                   | ✅ (Query and results caching)       | Limited            | ―          | ―                | ―                             |
-| **Embeddings**                | ✅ (Built-in & pluggable models/DBs) | ✅                 | ✅         | Limited          | ―                             |
+| Feature                       | **Spice**                                | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
+| ----------------------------- | ---------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
+| **Primary Use-Case**          | Data & AI apps                           | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
+| **Programming Language**      | Any language (HTTP interface)            | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
+| **Unified Data + AI Runtime** | ✅                                       | ―                  | ―          | ―                | ―                             |
+| **Federated Data Query**      | ✅                                       | ―                  | ―          | ―                | ―                             |
+| **Accelerated Data Access**   | ✅                                       | ―                  | ―          | ―                | ―                             |
+| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                 | ✅         | Limited          | Limited                       |
+| **LLM Memory**                | ✅                                       | ✅                 | ―          | ✅               | ―                             |
+| **Evaluations (Evals)**       | ✅                                       | Limited            | ―          | Limited          | ―                             |
+| **Search**                    | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                 | ✅         | Limited          | Limited                       |
+| **Caching**                   | ✅ (Query and results caching)           | Limited            | ―          | ―                | ―                             |
+| **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                 | ✅         | Limited          | ―                             |
 
 ✅ = Fully supported
 ❌ = Not supported
@@ -119,7 +121,7 @@ Limited = Partial or restricted support
 
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
-- **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
+- **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows, including full-text search (FTS) via Tantivy-powered BM25 scoring and vector similarity search (VSS) integrated into SQL queries. Use SQL functions like `vector_search` for semantic search and `text_search` for keyword-based search. Supports multi-column vector search with reciprocal rank fusion for aggregated results. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability & Monitoring Features Documentation](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
@@ -131,7 +133,7 @@ Limited = Partial or restricted support
 
 ### Retrieval-Augmented Generation (RAG)
 
-- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
+- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources, now with native support for Amazon S3 Vectors for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data from disparate sources, embedding it using models like Amazon Titan Embeddings or Cohere Embeddings via AWS Bedrock, or MiniLM L6 from HuggingFace, and storing in S3 Vector buckets. Supports distance metrics like cosine similarity, Euclidean distance, or dot product. Example SQL: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
 - **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
@@ -230,18 +232,28 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `file`        | Local filesystem                    | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace        | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `azure`       | Azure OpenAI                        | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| `bedrock`     | AWS Bedrock (e.g., Titan, Cohere)   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+
+## Supported Vector Stores
+
+| Name            | Description                                                          | Status |
+| --------------- | -------------------------------------------------------------------- | ------ |
+| `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
+| `pgvector`      | PostgreSQL with pgvector extension                                   | Alpha  |
+| `duckdb_vector` | DuckDB with vector extension for efficient vector storage and search | Alpha  |
+| `sqlite_vec`    | SQLite with sqlite-vec extension for lightweight vector operations   | Alpha  |
 
 ## Supported Catalogs
 
 Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. Configuring accelerations for tables in external catalogs is not supported. The schema hierarchy of the external catalog is preserved in Spice.
 
-| Name            | Description             | Status      | Protocol/Format              |
-| --------------- | ----------------------- | ----------- | ---------------------------- |
-| `unity_catalog` | Unity Catalog           | Stable      | Delta Lake                   |
-| `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
-| `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
-| `spice.ai`      | Spice.ai Cloud Platform | Beta        | Arrow Flight                 |
-| `glue`          | AWS Glue                | Alpha       | CSV, Parquet, Iceberg        |
+| Name            | Description             | Status | Protocol/Format              |
+| --------------- | ----------------------- | ------ | ---------------------------- |
+| `spice.ai`      | Spice.ai Cloud Platform | Stable | Arrow Flight                 |
+| `unity_catalog` | Unity Catalog           | Stable | Delta Lake                   |
+| `databricks`    | Databricks              | Beta   | Spark Connect, S3/Delta Lake |
+| `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
+| `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
 
 ## ⚡️ Quickstart (Local Machine)
 
