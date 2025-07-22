@@ -1581,4 +1581,50 @@ mod tests {
             "Invalid object access. Column 'a' already exists in the object."
         );
     }
+
+    #[test]
+    fn test_custom_unnesting_behavior_success() {
+        // Takes any array values and creates a new object with keys as the array items and values as the original key.
+        // Leaves any keys with values that aren't arrays as is
+        fn custom_unnester(obj: &Value) -> super::super::Result<Vec<Value>> {
+            if let Value::Object(map) = obj {
+                let mut result = vec![];
+                let mut resulting_map = serde_json::Map::new();
+                for (key, value) in map {
+                    if let Value::Array(arr) = value {
+                        for item in arr {
+                            resulting_map.insert(item.clone().to_string(), key.clone().into());
+                        }
+                    } else {
+                        resulting_map.insert(key.clone(), value.clone());
+                    }
+                }
+                result.push(Value::Object(resulting_map));
+                Ok(result)
+            } else {
+                Err(super::Error::InvalidObjectAccess {
+                    message: "Expected an object".to_string(),
+                })
+            }
+        }
+
+        let unnest_parameters = super::UnnestParameters {
+            behavior: UnnestBehavior::Custom(Box::new(custom_unnester)),
+            duplicate_behavior: DuplicateBehavior::Error,
+        };
+
+        let object: Value =
+            serde_json::from_str(r#"{"a": [1, 2], "b": {"c": [3, 4]}}"#).expect("Valid json");
+
+        let result = super::unnest_json_object(&unnest_parameters, &object)
+            .expect("To unnest JSON object with custom behavior");
+
+        assert_eq!(result.len(), 1);
+        let obj = result.first().expect("To get first unnested object");
+        assert!(
+            matches!(obj, Value::Object(ob) if ob.contains_key("1") && ob.contains_key("b") && ob.contains_key("2"))
+        );
+        assert_eq!(obj.get("1"), Some(&Value::String("a".to_string())));
+        assert_eq!(obj.get("2"), Some(&Value::String("a".to_string())));
+    }
 }
