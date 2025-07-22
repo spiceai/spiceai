@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use croner::Cron;
-use croner::parser::{CronParser, Seconds};
+use croner::parser::{CronParser, Seconds, Year};
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -36,8 +36,12 @@ pub struct CronRequestChannel {
     cron: Arc<Cron>,
 }
 
-static CRON_PARSER: LazyLock<CronParser> =
-    LazyLock::new(|| CronParser::builder().seconds(Seconds::Optional).build());
+static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .year(Year::Disallowed) // TODO: allow optional years in 2.0.0 - https://github.com/spiceai/spiceai/issues/6548
+        .build()
+});
 
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
