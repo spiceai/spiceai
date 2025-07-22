@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::Local;
 use croner::Cron;
+use croner::parser::{CronParser, Seconds};
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +28,6 @@ use crate::Result;
 use crate::task::TaskRequest;
 
 use super::TaskRequestChannel;
-
 pub struct CronRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     task_completion: Option<Arc<tokio::sync::Notify>>,
@@ -35,6 +35,9 @@ pub struct CronRequestChannel {
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     cron: Arc<Cron>,
 }
+
+static CRON_PARSER: LazyLock<CronParser> =
+    LazyLock::new(|| CronParser::builder().seconds(Seconds::Optional).build());
 
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
@@ -49,9 +52,8 @@ impl CronRequestChannel {
             reset: None,
             tx: None,
             cron: Arc::new(
-                Cron::new(cron)
-                    .with_seconds_optional()
-                    .parse()
+                CRON_PARSER
+                    .parse(cron)
                     .context(crate::FailedToParseCronSnafu)?,
             ),
         })
