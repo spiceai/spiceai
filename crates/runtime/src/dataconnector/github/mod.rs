@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
 use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
 use arrow::array::{Array, RecordBatch};
@@ -351,6 +352,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
+    ParameterSpec::component("include_comments")
+        .description(
+            "Specifies the types of comments to fetch: 'all', 'review', 'discussion', or 'none'.",
+        )
+        .default("none"),
+    ParameterSpec::component("max_comments_fetched")
+        .description("Maximum number of comments to fetch per discussion or review thread.")
+        .default("100"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -467,6 +476,34 @@ impl DataConnector for Github {
             }
         })?;
 
+        let include_comments = dataset
+            .params
+            .get("github_include_comments")
+            .map(|value| {
+                PullRequestCommentType::try_from(value.as_str()).map_err(|e| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: e.into(),
+                    }
+                })
+            })
+            .transpose()?;
+
+        let max_comments_fetched = dataset
+            .params
+            .get("github_max_comments_fetched")
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!("Failed to parse integer from string '{value}': {e}"),
+                    })
+            })
+            .transpose()?;
+
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
                 let table_args = Arc::new(PullRequestTableArgs {
@@ -474,6 +511,8 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     query_mode,
                     component: ConnectorComponent::from(dataset),
+                    include_comments: include_comments.unwrap_or(PullRequestCommentType::None),
+                    max_comments_fetched: max_comments_fetched.unwrap_or(100),
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
