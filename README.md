@@ -27,10 +27,10 @@
 
 Spice provides four industry standard APIs in a lightweight, portable runtime (single binary/container):
 
-1. **SQL Query & Search APIs**: Supports HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
-2. **OpenAI-Compatible APIs**: Provides HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
-3. **Iceberg Catalog REST APIs**: Offers a unified API for Iceberg Catalog.
-4. **MCP HTTP+SSE APIs**: Enables integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
+1. **SQL Query & Search**: HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC APIs; `vector_search` and `text_search` UDTFs.
+2. **OpenAI-Compatible APIs**: HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
+3. **Iceberg Catalog REST APIs**: A unified Iceberg REST Catalog API.
+4. **MCP HTTP+SSE APIs**: Integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
 
 🎯 Goal: Developers can focus on building data apps and AI agents confidently, knowing they are grounded in data.
 
