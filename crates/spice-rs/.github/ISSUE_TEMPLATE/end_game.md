@@ -27,7 +27,7 @@ assignees: ''
   - [ ] [docs.spice.ai](https://github.com/spicehq/docs/tree/trunk/sdks/rust-sdk)
 - [ ] Test the [`spice-rs` sample](https://github.com/spiceai/samples/tree/trunk/client-sdk/spice-rs-sdk-sample) using the latest `trunk` SDK version.
 - [ ] Update [release notes](https://github.com/spiceai/spice-rs/blob/trunk/docs/release_notes)
-  - [ ] Ensure any external contributors have been acknowledged.
+  - [ ] Ensure all contributors have been acknowledged.
 - [ ] Verify the version in `Cargo.toml` is correct and match the milestone version.
 - [ ] Run [Test CI](https://github.com/spiceai/spice-rs/actions/workflows/build.yml) and ensure it is green on the trunk branch.
 - [ ] QA DRI sign-off
