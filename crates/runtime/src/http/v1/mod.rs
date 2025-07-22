@@ -204,13 +204,12 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let builder = QueryBuilder::new(sql, df);
-    let builder = if let Some(parameters) = parameters {
-        builder.parameters(parameters)
-    } else {
-        builder
-    };
-    let query_res = builder.build().run().await?;
+    let query_res = QueryBuilder::new(sql, df)
+        .parameters(parameters)
+        .build()
+        .run()
+        .await?;
+
     Ok((
         query_res.data.try_collect::<Vec<RecordBatch>>().await?,
         query_res.cache_status,

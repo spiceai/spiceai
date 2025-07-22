@@ -38,6 +38,7 @@ pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
     cache_control: CacheControl,
+    user_cache_key: Option<String>,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
@@ -168,6 +169,11 @@ impl RequestContext {
         self.cache_control
     }
 
+    #[must_use]
+    pub fn user_cache_key(&self) -> &Option<String> {
+        &self.user_cache_key
+    }
+
     pub fn extension<T>(&self) -> Option<Arc<T>>
     where
         T: 'static + Send + Sync + Clone,
@@ -211,6 +217,7 @@ impl AuthRequestContext for RequestContext {
 pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
+    user_cache_key: Option<String>,
     app: Option<Arc<App>>,
     df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
@@ -224,6 +231,7 @@ impl RequestContextBuilder {
         Self {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
+            user_cache_key: None,
             app: None,
             df: None,
             user_agent: UserAgent::Absent,
@@ -257,6 +265,15 @@ impl RequestContextBuilder {
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
         self.cache_control = CacheControl::from_headers(headers);
+        self.user_cache_key = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::User) =>
+                headers
+                    .get("x-spice-cache-key")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string()),
+            _ => None
+        };
+
         self.baggage.extend(baggage::from_headers(headers));
 
         let app = self.app.as_ref().map(Arc::clone);
@@ -340,6 +357,7 @@ impl RequestContextBuilder {
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
+            user_cache_key: self.user_cache_key,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),

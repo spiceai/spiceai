@@ -58,10 +58,12 @@ impl SearchKey {
     }
 }
 
+#[derive(Clone)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
+    User(&'a str),
 }
 
 impl CacheKey<'_> {
@@ -88,6 +90,7 @@ impl CacheKey<'_> {
                     }
                 }
             }
+            Self::User(user_key) => user_key.hash(&mut hasher),
         }
         RawCacheKey(hasher.finish())
     }

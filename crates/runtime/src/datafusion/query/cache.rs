@@ -18,8 +18,8 @@ use std::{collections::HashSet, hash::Hasher, sync::Arc};
 
 use cache::{
     key::{CacheKey, RawCacheKey},
-    result::CacheStatus,
     result::query::CachedStream,
+    result::CacheStatus,
     to_cached_record_batch_stream,
 };
 use datafusion::{
@@ -31,13 +31,12 @@ use datafusion::{
 use snafu::ResultExt;
 use tracing::Span;
 
-use crate::{
-    datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode},
-    request::{CacheControl, CacheKeyType, RequestContext},
-};
-
 use super::{
-    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
+    attach_query_tracker_to_stream, BindingParametersSnafu, Query, QueryResult, QueryTracker,
+};
+use crate::{
+    datafusion::{error::find_datafusion_root, query::error_code::ErrorCode, DataFusion},
+    request::{CacheControl, CacheKeyType, RequestContext},
 };
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
@@ -64,10 +63,43 @@ impl RequestCacheManager {
     }
 }
 
+struct CacheResponse<'a> {
+    input_key: &'a CacheKey<'a>,
+    result: CacheResult,
+    status: CacheStatus,
+    tracker: Option<QueryTracker>,
+    raw_key: Option<RawCacheKey>,
+}
+
+impl<'a> CacheResponse<'a> {
+    fn from(
+        input_key: &'a CacheKey<'a>,
+        result: CacheResult,
+        status: CacheStatus,
+    ) -> Self {
+        Self {
+            input_key,
+            result,
+            status,
+            raw_key: None,
+            tracker: None,
+        }
+    }
+    fn with_raw_key(mut self, raw_key: Option<RawCacheKey>) -> Self {
+        self.raw_key = raw_key;
+        self
+    }
+
+    fn with_query_tracker(mut self, tracker: Option<QueryTracker>) -> Self {
+        self.tracker = tracker;
+        self
+    }
+}
+
 enum CacheResult {
     Hit(QueryResult),
-    MissOrSkipped(Option<QueryTracker>, CacheStatus),
-    WrongCacheKeyType(Option<QueryTracker>),
+    MissOrSkipped,
+    WrongCacheKeyType,
 }
 
 impl Query {
@@ -81,29 +113,26 @@ impl Query {
         tracker: Option<QueryTracker>,
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
-        let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
-        let (tracker, cache_status, sql_raw_cache_key) = match Self::try_get_cached_result(
+        let sql_or_user_cache_key = match request_context.user_cache_key() {
+            Some(user_key) => CacheKey::User(user_key),
+            _ => CacheKey::Query(sql, parameters.as_ref())
+        };
+
+        let CacheResponse { tracker, raw_key, .. } = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
-            &sql_cache_key,
-        )
-        .await?
-        {
-            (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
-            (CacheResult::MissOrSkipped(tracker, status), sql_raw_cache_key) => {
-                (tracker, Some(status), sql_raw_cache_key)
-            }
-            (CacheResult::WrongCacheKeyType(tracker), sql_raw_cache_key) => {
-                (tracker, None, sql_raw_cache_key)
-            }
+            &sql_or_user_cache_key,
+        ).await? {
+            CacheResponse { result: CacheResult::Hit(result), .. } => return Ok(PlanOrCached::Cached(result)),
+            response => response
         };
 
-        let sql_raw_cache_key =
-            sql_raw_cache_key.unwrap_or_else(|| sql_cache_key.as_raw_key(Self::plan_hasher(df)));
+        let raw_cache_key =
+            raw_key.unwrap_or_else(|| sql_or_user_cache_key.as_raw_key(Self::plan_hasher(df)));
 
         let plan = match df
-            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
+            .get_or_create_logical_plan(session, &raw_cache_key, sql)
             .await
         {
             Ok(plan) => plan,
@@ -127,28 +156,20 @@ impl Query {
         };
 
         // Try to get cached results from plan
-        let (mut tracker, cache_status, plan_cache_key) = match Self::try_get_cached_result(
+        let CacheResponse { mut tracker, raw_key, status, .. } = match
+        Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
             &CacheKey::LogicalPlan(&plan),
-        )
-        .await?
-        {
-            (CacheResult::Hit(result), _) => return Ok(PlanOrCached::Cached(result)),
-            (CacheResult::MissOrSkipped(tracker, status), plan_cache_key) => {
-                (tracker, status, plan_cache_key)
-            }
-            (CacheResult::WrongCacheKeyType(tracker), plan_cache_key) => (
-                tracker,
-                cache_status.unwrap_or(CacheStatus::CacheMiss),
-                plan_cache_key,
-            ),
+        ).await? {
+            CacheResponse { result: CacheResult::Hit(result), .. } => return Ok(PlanOrCached::Cached(result)),
+            response => response,
         };
 
-        let raw_cache_key = plan_cache_key.unwrap_or(sql_raw_cache_key);
+        let raw_cache_key = raw_key.unwrap_or(raw_cache_key);
 
-        let cache_status = Self::should_cache_results(df, &plan, cache_status);
+        let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
@@ -166,17 +187,20 @@ impl Query {
         )
     }
 
-    async fn try_get_cached_result(
+    async fn try_get_cached_result<'a>(
         df: &DataFusion,
         request_context: Arc<RequestContext>,
         mut tracker: Option<QueryTracker>,
-        key: &CacheKey<'_>,
-    ) -> super::Result<(CacheResult, Option<RawCacheKey>)> {
+        key: &'a CacheKey<'a>,
+    ) -> super::Result<CacheResponse<'a>> {
         let Some(cache_provider) = df.results_cache_provider() else {
-            return Ok((
-                CacheResult::MissOrSkipped(tracker, CacheStatus::CacheDisabled),
-                None,
-            ));
+            return Ok(
+                CacheResponse::from(
+                    key,
+                    CacheResult::MissOrSkipped,
+                    CacheStatus::CacheDisabled,
+                ).with_query_tracker(tracker)
+            );
         };
 
         let cache_control = request_context.cache_control();
@@ -184,15 +208,18 @@ impl Query {
         // Validate that the provided cache key is the correct type for this request
         match (cache_control, &key) {
             (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
-            | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _)) => {}
+                | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _))
+                | (CacheControl::Cache(CacheKeyType::User), CacheKey::User(_)) => { /* no-op */ }
             (CacheControl::NoCache, _) => {
-                return Ok((
-                    CacheResult::MissOrSkipped(tracker, CacheStatus::CacheBypass),
-                    Some(key.as_raw_key(cache_provider.hasher())),
-                ));
+                return Ok(
+                    CacheResponse::from(key, CacheResult::MissOrSkipped, CacheStatus::CacheBypass)
+                        .with_query_tracker(tracker)
+                );
             }
             _ => {
-                return Ok((CacheResult::WrongCacheKeyType(tracker), None));
+                return Ok(
+                    CacheResponse::from(key, CacheResult::WrongCacheKeyType, CacheStatus::CacheMiss)
+                );
             }
         }
 
@@ -201,10 +228,11 @@ impl Query {
         let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
             Ok(None) => {
-                return Ok((
-                    CacheResult::MissOrSkipped(tracker, CacheStatus::CacheMiss),
-                    Some(raw_key),
-                ));
+                return Ok(
+                    CacheResponse::from(key, CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
+                        .with_query_tracker(tracker)
+                        .with_raw_key(Some(raw_key))
+                );
             }
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };
@@ -216,18 +244,21 @@ impl Query {
 
         let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
 
-        Ok((
-            CacheResult::Hit(QueryResult::new(
-                attach_query_tracker_to_stream(
-                    Span::current(),
-                    request_context,
-                    tracker,
-                    Box::pin(record_batch_stream),
-                ),
+        Ok(
+            CacheResponse::from(
+                key,
+                CacheResult::Hit(QueryResult::new(
+                    attach_query_tracker_to_stream(
+                        Span::current(),
+                        request_context,
+                        tracker,
+                        Box::pin(record_batch_stream),
+                    ),
+                    CacheStatus::CacheHit,
+                )),
                 CacheStatus::CacheHit,
-            )),
-            Some(raw_key),
-        ))
+            ).with_raw_key(Some(raw_key))
+        )
     }
 
     pub(super) fn should_cache_results(
@@ -265,13 +296,13 @@ mod tests {
     use futures::TryStreamExt;
 
     use cache::{
-        Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
+        key::CacheKey, result::CacheStatus, Caching, QueryResultsCacheProvider, SimpleCache,
     };
     use spicepod::component::caching::SQLResultsCacheConfig;
 
     use crate::{
         builder::RuntimeBuilder,
-        datafusion::{DataFusion, query::QueryBuilder},
+        datafusion::{query::QueryBuilder, DataFusion},
         request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };
