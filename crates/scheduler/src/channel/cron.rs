@@ -131,21 +131,23 @@ impl TaskRequestChannel for CronRequestChannel {
                     .find_next_occurrence(&time, false)
                     .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
 
+                println!("Next cron run time: {next}");
+
                 let duration_till = next.signed_duration_since(time);
                 // .to_std() errors when the duration is less than zero - the next expression time is in the past
                 let interval = duration_till.to_std().unwrap_or(Duration::from_secs(1));
 
                 tokio::select! {
                     () = cancellation.cancelled() => {
-                        tracing::debug!("Cron evaluator cancelled");
+                        println!("Cron evaluator cancelled");
                         return Ok(());
                     }
                     () = reset.notified() => {
-                        tracing::debug!("Cron evaluator reset");
+                        println!("Cron evaluator reset");
                         continue;
                     }
                     () = tokio::time::sleep(interval) => {
-                        tracing::debug!("Cron evaluator time elapsed");
+                        println!("Cron evaluator time elapsed");
                     }
                 }
 
