@@ -75,7 +75,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "2137319
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.86"
-aws-config = "1.6.1"
+aws-config = "1.8.2"
 aws-credential-types = "1.2"
 aws-smithy-types = "1.3"
 axum = { version = "0.8", features = ["macros"] }
