@@ -44,7 +44,7 @@ impl GitHubTableArgs for MembersTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Default(0),
+            UnnestBehavior::Depth(0),
             Some(gql_schema()),
         )
     }

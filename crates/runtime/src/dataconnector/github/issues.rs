@@ -150,7 +150,7 @@ impl GitHubTableArgs for IssuesTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Default(2),
+            UnnestBehavior::Depth(2),
             Some(gql_schema()),
         )
     }

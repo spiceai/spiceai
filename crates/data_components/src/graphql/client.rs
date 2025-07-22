@@ -52,14 +52,14 @@ enum DuplicateBehavior {
 type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
 
 pub enum UnnestBehavior {
-    Default(usize),
+    Depth(usize),
     Custom(UnnestHandler),
 }
 
 impl std::fmt::Debug for UnnestBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnnestBehavior::Default(depth) => write!(f, "Default({depth})"),
+            UnnestBehavior::Depth(depth) => write!(f, "Default({depth})"),
             UnnestBehavior::Custom(_) => write!(f, "Custom"),
         }
     }
@@ -616,7 +616,7 @@ pub fn unnest_json_object_default(
 
 fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
     match unnest_parameters.behavior {
-        UnnestBehavior::Default(depth) => {
+        UnnestBehavior::Depth(depth) => {
             unnest_json_object_default(unnest_parameters, object, depth)
         }
         UnnestBehavior::Custom(ref func) => func(object),
@@ -843,8 +843,8 @@ impl GraphQLClient {
         }?;
 
         unwrapped = match self.unnest_parameters.behavior {
-            UnnestBehavior::Default(0) => unwrapped,
-            UnnestBehavior::Default(_) | UnnestBehavior::Custom(_) => {
+            UnnestBehavior::Depth(0) => unwrapped,
+            UnnestBehavior::Depth(_) | UnnestBehavior::Custom(_) => {
                 unnest_json_objects(&self.unnest_parameters, &unwrapped)?
             }
         };
@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn test_json_object_unnesting() {
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(100),
+            behavior: UnnestBehavior::Depth(100),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
@@ -1475,7 +1475,7 @@ mod tests {
         );
 
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(100),
+            behavior: UnnestBehavior::Depth(100),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object =
@@ -1497,7 +1497,7 @@ mod tests {
     #[test]
     fn test_json_object_unnesting_respects_unnest_depth() {
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(0),
+            behavior: UnnestBehavior::Depth(0),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
@@ -1518,7 +1518,7 @@ mod tests {
         );
 
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(1),
+            behavior: UnnestBehavior::Depth(1),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object =
@@ -1546,7 +1546,7 @@ mod tests {
     #[test]
     fn test_json_array_unnesting() {
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(100),
+            behavior: UnnestBehavior::Depth(100),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str("[1, 2, 3]").expect("Valid json");
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn test_unnesting_duplicate_column_names_errors() {
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(100),
+            behavior: UnnestBehavior::Depth(100),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": 1, "c": {"b": {"a": 2}}}"#).expect("Valid json");

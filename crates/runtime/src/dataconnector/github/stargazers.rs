@@ -65,7 +65,7 @@ impl GitHubTableArgs for StargazersTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Default(1),
+            UnnestBehavior::Depth(1),
             Some(gql_schema()),
         )
     }
