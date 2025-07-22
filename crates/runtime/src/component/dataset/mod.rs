@@ -220,7 +220,7 @@ impl Display for ReadyState {
 pub enum CheckAvailability {
     /// The dataset is checked for availability if it isn't accelerated.
     #[default]
-    Default,
+    Auto,
     /// The dataset is not checked for availability.
     Disabled,
 }
@@ -228,7 +228,7 @@ pub enum CheckAvailability {
 impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
     fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
         match monitor {
-            spicepod_dataset::CheckAvailability::Default => CheckAvailability::Default,
+            spicepod_dataset::CheckAvailability::Auto => CheckAvailability::Auto,
             spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
         }
     }
@@ -237,7 +237,7 @@ impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
 impl Display for CheckAvailability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CheckAvailability::Default => write!(f, "default"),
+            CheckAvailability::Auto => write!(f, "auto"),
             CheckAvailability::Disabled => write!(f, "disabled"),
         }
     }
