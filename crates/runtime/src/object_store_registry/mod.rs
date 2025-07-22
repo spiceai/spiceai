@@ -101,7 +101,11 @@ impl SpiceObjectStoreRegistry {
                     s3_builder = s3_builder.with_skip_signature(true);
                     load_credentials_from_environment = false;
                 }
-                None => {}
+                None => {
+                    // Default to public if no auth is provided
+                    s3_builder = s3_builder.with_skip_signature(true);
+                    load_credentials_from_environment = false;
+                }
                 Some(auth) => {
                     return Err(DataFusionError::Configuration(format!(
                         "Unexpected S3 auth method: {auth}",

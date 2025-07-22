@@ -14,6 +14,7 @@ datasets:
   - from: s3://spiceai-seoul-glue/parquet_taxi_trips_2023/
     name: private_taxi
     params:
+      s3_auth: iam_role
       file_format: parquet
       s3_region: ap-northeast-2
 
