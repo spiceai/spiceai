@@ -195,7 +195,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
         dataconnector: String,
