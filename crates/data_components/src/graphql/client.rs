@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn test_json_object_unnesting_respects_unnest_depth() {
         let unnest_parameters = super::UnnestParameters {
-            behavior: UnnestBehavior::Default(1),
+            behavior: UnnestBehavior::Default(0),
             duplicate_behavior: DuplicateBehavior::Error,
         };
         let object = serde_json::from_str(r#"{"a": {"b": 1}}"#).expect("Valid json");
