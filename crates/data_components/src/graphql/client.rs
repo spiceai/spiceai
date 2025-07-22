@@ -59,7 +59,7 @@ pub enum UnnestBehavior {
 impl std::fmt::Debug for UnnestBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnnestBehavior::Depth(depth) => write!(f, "Default({depth})"),
+            UnnestBehavior::Depth(depth) => write!(f, "Depth({depth})"),
             UnnestBehavior::Custom(_) => write!(f, "Custom"),
         }
     }
