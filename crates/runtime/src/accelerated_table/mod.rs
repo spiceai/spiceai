@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
@@ -24,23 +23,20 @@ use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
-use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::Caching;
 use data_components::cdc::ChangesStream;
-use data_components::delete::get_deletion_provider;
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
-    execution::context::SessionContext,
     logical_expr::Expr,
 };
 use opentelemetry::KeyValue;
@@ -50,7 +46,6 @@ use synchronized_table::SynchronizedTable;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::TableScanParams;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
@@ -62,6 +57,7 @@ mod metrics;
 pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
+mod retention;
 mod sink;
 mod synchronized_table;
 
@@ -575,131 +571,6 @@ impl AcceleratedTable {
 
         Ok(())
     }
-
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
-    async fn start_retention_check(
-        dataset_name: TableReference,
-        accelerator: Arc<dyn TableProvider>,
-        retention: Retention,
-        caching: Option<Arc<Caching>>,
-    ) {
-        let time_column = retention.time_column;
-        let retention_period = retention.period;
-        let schema = accelerator.schema();
-        let field = schema
-            .column_with_name(time_column.as_str())
-            .map(|(_, f)| f);
-        let partition_field =
-            retention
-                .time_partition_column
-                .as_ref()
-                .and_then(|time_partition_column| {
-                    schema
-                        .column_with_name(time_partition_column.as_str())
-                        .map(|(_, f)| f)
-                });
-
-        let mut interval_timer = tokio::time::interval(retention.check_interval);
-
-        let Some(timestamp_filter_converter) = TimestampFilterConvert::create(
-            field.cloned(),
-            Some(time_column.clone()),
-            retention.time_format,
-            partition_field.cloned(),
-            retention.time_partition_column.clone(),
-            retention.time_partition_format,
-        ) else {
-            tracing::error!(
-                "[retention] Failed to get the expression time format for {time_column}, check schema and time format"
-            );
-            return;
-        };
-
-        loop {
-            interval_timer.tick().await;
-
-            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
-                let ctx = SessionContext::new();
-
-                let start = SystemTime::now() - retention_period;
-
-                let timestamp = refresh::get_timestamp(start);
-                let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
-
-                let timestamp = if let Some(value) =
-                    chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
-                {
-                    value.to_rfc3339()
-                } else {
-                    tracing::warn!("[retention] Unable to convert timestamp");
-                    continue;
-                };
-
-                if is_spice_internal_dataset(&dataset_name) {
-                    tracing::trace!(
-                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
-                        timestamp
-                    );
-                } else {
-                    tracing::info!(
-                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
-                        timestamp
-                    );
-                }
-
-                tracing::trace!("[retention] Expr {expr:?}");
-
-                let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &vec![expr])
-                    .await;
-                match plan {
-                    Ok(plan) => match collect(plan, ctx.task_ctx()).await {
-                        Err(e) => {
-                            tracing::error!("[retention] Error running retention check: {e}");
-                        }
-                        Ok(deleted) => {
-                            let num_records = deleted.first().map_or(0, |f| {
-                                f.column(0)
-                                    .as_any()
-                                    .downcast_ref::<UInt64Array>()
-                                    .map_or(0, |v| v.values().first().map_or(0, |f| *f))
-                            });
-
-                            if is_spice_internal_dataset(&dataset_name) {
-                                tracing::trace!(
-                                    "[retention] Evicted {num_records} records for {dataset_name}"
-                                );
-                            } else {
-                                tracing::info!(
-                                    "[retention] Evicted {num_records} records for {dataset_name}"
-                                );
-                            }
-
-                            if num_records > 0 {
-                                if let Some(cache_provider) = caching.as_ref() {
-                                    if let Err(e) =
-                                        cache_provider.invalidate_for_table(dataset_name.clone())
-                                    {
-                                        tracing::error!(
-                                            "Failed to invalidate cached results for dataset {}: {e}",
-                                            &dataset_name
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!("[retention] Error running retention check: {e}");
-                    }
-                }
-            } else {
-                tracing::error!("[retention] Accelerated table does not support delete");
-            }
-        }
-    }
 }
 
 impl Drop for AcceleratedTable {
@@ -818,42 +689,157 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
+#[derive(Debug)]
+pub enum DataRetentionFilter {
+    Time {
+        period: Duration,
+        time_column: String,
+        time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
+    },
+    Expression {
+        delete_expr: Expr,
+    },
+}
+
+pub struct RetentionBuilder {
+    time_column: Option<String>,
+    time_format: Option<TimeFormat>,
+    time_period: Option<Duration>,
+    time_partition_column: Option<String>,
+    time_partition_format: Option<TimeFormat>,
+    delete_expr: Option<Expr>,
+    check_interval: Option<Duration>,
+    enabled: bool,
+}
+
+impl RetentionBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            time_column: None,
+            time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
+            delete_expr: None,
+            time_period: None,
+            check_interval: None,
+            enabled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn time_column<S: Into<String>>(mut self, time_column: Option<S>) -> Self {
+        self.time_column = time_column.map(Into::into);
+        self
+    }
+
+    #[must_use]
+    pub fn time_format(mut self, time_format: Option<TimeFormat>) -> Self {
+        self.time_format = time_format;
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_column<S: Into<String>>(
+        mut self,
+        time_partition_column: Option<S>,
+    ) -> Self {
+        self.time_partition_column = time_partition_column.map(Into::into);
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_format(mut self, time_partition_format: Option<TimeFormat>) -> Self {
+        self.time_partition_format = time_partition_format;
+        self
+    }
+
+    #[must_use]
+    pub fn delete_expr(mut self, delete_expr: Option<Expr>) -> Self {
+        self.delete_expr = delete_expr;
+        self
+    }
+
+    #[must_use]
+    pub fn time_period(mut self, time_period: Option<Duration>) -> Self {
+        self.time_period = time_period;
+        self
+    }
+
+    #[must_use]
+    pub fn check_interval(mut self, check_interval: Option<Duration>) -> Self {
+        self.check_interval = check_interval;
+        self
+    }
+
+    #[must_use]
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> Option<Retention> {
+        if !self.enabled {
+            return None;
+        }
+
+        let check_interval = self.check_interval?;
+        let mut filters = Vec::new();
+
+        // Add time-based filter if period and time_column are provided
+        if let Some(period) = self.time_period {
+            let Some(time_column) = self.time_column else {
+                tracing::error!(
+                    "[retention] The `time_column` must be specified for time-based retention"
+                );
+                return None;
+            };
+
+            filters.push(DataRetentionFilter::Time {
+                period,
+                time_column,
+                time_format: self.time_format,
+                time_partition_column: self.time_partition_column.clone(),
+                time_partition_format: self.time_partition_format,
+            });
+        }
+
+        // Add expression-based filter
+        if let Some(delete_expr) = self.delete_expr {
+            filters.push(DataRetentionFilter::Expression { delete_expr });
+        }
+
+        if filters.is_empty() {
+            tracing::error!(
+                "[retention] The `retention_period` or `retention_sql` must be specified for retention"
+            );
+            return None;
+        }
+
+        Some(Retention {
+            filters,
+            check_interval,
+        })
+    }
+}
+
+impl Default for RetentionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Retention {
-    pub(crate) time_column: String,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) time_partition_column: Option<String>,
-    pub(crate) time_partition_format: Option<TimeFormat>,
-    pub(crate) period: Duration,
+    pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
 }
 
 impl Retention {
     #[must_use]
-    pub fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        time_partition_column: Option<String>,
-        time_partition_format: Option<TimeFormat>,
-        retention_period: Option<Duration>,
-        retention_check_interval: Option<Duration>,
-        retention_check_enabled: bool,
-    ) -> Option<Self> {
-        if !retention_check_enabled {
-            return None;
-        }
-        if let (Some(time_column), Some(period), Some(check_interval)) =
-            (time_column, retention_period, retention_check_interval)
-        {
-            Some(Self {
-                time_column,
-                time_format,
-                time_partition_column,
-                time_partition_format,
-                period,
-                check_interval,
-            })
-        } else {
-            None
-        }
+    pub fn builder() -> RetentionBuilder {
+        RetentionBuilder::new()
     }
 }

@@ -34,6 +34,7 @@ on:
           - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
+          - 'oracle'
           - 'duckdb'
           - 'duckdb-zero-results'
           - 'snowflake'
@@ -135,6 +136,18 @@ jobs:
       - name: Setup ODBC
         if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
         uses: ./.github/actions/setup-odbc
+
+      - name: Install Oracle ODPI-C
+        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'oracle') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libaio1
+          
+          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
+          mkdir linux
+          unzip basic.zip -d linux -x "META-INF/*"
+          IC_DIR=$PWD/$(ls -d linux/instantclient*)
+          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
@@ -254,6 +267,10 @@ jobs:
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
           MSSQL_TPCH_DB: tpch_sf1
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 

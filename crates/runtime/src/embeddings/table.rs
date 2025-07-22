@@ -592,6 +592,10 @@ impl TableProvider for EmbeddingTable {
             .scan(state, projection_for_base_table.as_ref(), filters, limit)
             .await?;
 
+        // If we have an engine, Don't do this. Engine has two modes:
+        //   1. List records, essentially another table provider we can JOIN ON
+        //   2. Query records, Same as above BUT, not a plain scan. Instead they've been ordered by some query payload.  BUTTTT we output a score from this???
+
         Ok(Arc::new(EmbeddingTableExec::new(
             &projected_schema,
             filters,

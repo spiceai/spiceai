@@ -179,6 +179,9 @@ pub struct Acceleration {
     pub retention_period: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_sql: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_check_interval: Option<String>,
 
     #[serde(default, skip_serializing_if = "is_false")]
@@ -236,6 +239,7 @@ impl Default for Acceleration {
             refresh_jitter_max: None,
             params: None,
             retention_period: None,
+            retention_sql: None,
             retention_check_interval: None,
             retention_check_enabled: false,
             on_zero_results: ZeroResultsAction::ReturnEmpty,

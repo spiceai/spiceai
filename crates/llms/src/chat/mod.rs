@@ -722,18 +722,19 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
-pub fn create_hf_model(
+pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
 ) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
+        .await
         .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
 #[allow(unused_variables)]
-pub fn create_local_model(
+pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
     tokenizer: Option<&str>,
@@ -755,5 +756,6 @@ pub fn create_local_model(
         generation_config.map(Path::new),
         chat_template_literal,
     )
+    .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }

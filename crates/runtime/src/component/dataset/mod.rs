@@ -32,6 +32,7 @@ use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
     semantic::Column,
+    vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
@@ -214,6 +215,34 @@ impl Display for ReadyState {
     }
 }
 
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CheckAvailability {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Auto,
+    /// The dataset is not checked for availability.
+    Disabled,
+}
+
+impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
+    fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
+        match monitor {
+            spicepod_dataset::CheckAvailability::Auto => CheckAvailability::Auto,
+            spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
+        }
+    }
+}
+
+impl Display for CheckAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckAvailability::Auto => write!(f, "auto"),
+            CheckAvailability::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -236,6 +265,8 @@ pub struct Dataset {
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
+    pub vectors: Option<VectorStore>,
+    pub check_availability: CheckAvailability,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -260,6 +291,8 @@ impl std::fmt::Debug for Dataset {
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
+            .field("vectors", &self.vectors)
+            .field("check_availability", &self.check_availability)
             .finish_non_exhaustive()
     }
 }
@@ -284,6 +317,8 @@ impl PartialEq for Dataset {
             && self.schema == other.schema
             && self.columns == other.columns
             && self.metrics == other.metrics
+            && self.vectors == other.vectors
+            && self.check_availability == other.check_availability
     }
 }
 
@@ -461,6 +496,15 @@ impl Dataset {
                     retention_period
                 );
             }
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn retention_sql(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.retention_sql.clone();
         }
 
         None

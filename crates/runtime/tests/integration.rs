@@ -47,6 +47,7 @@ mod databricks_spark_catalog;
 mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
+mod dataset_availability;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
@@ -77,6 +78,7 @@ mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
+mod retention;
 mod s3;
 #[cfg(feature = "postgres")]
 mod schema_evolution;

@@ -305,10 +305,13 @@ impl VectorGeneration {
             .primary_keys
             .iter()
             .cloned()
-            .chain(addition_projection.iter().map(|&e| e.to_string()))
+            .chain(addition_projection.iter().map(|&e| format!("{e}")))
             .chain([
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
-                format!("{} as {SEARCH_VALUE_COLUMN_NAME}", self.embedding_column),
+                format!(
+                    "\"{}\" as {SEARCH_VALUE_COLUMN_NAME}",
+                    self.embedding_column
+                ),
             ])
             .unique()
             .collect();

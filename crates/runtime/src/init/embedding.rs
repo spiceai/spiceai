@@ -50,7 +50,7 @@ impl Runtime {
 
                         embeds_map.insert(in_embed.name.clone(), Arc::new(e) as Arc<dyn Embed>);
 
-                        tracing::info!("Embedding [{}] ready to embed", in_embed.name);
+                        tracing::info!("Embedding Model {} ready", in_embed.name);
                         metrics::embeddings::COUNT.add(
                             1,
                             &[
@@ -72,7 +72,7 @@ impl Runtime {
                         self.status
                             .update_embedding(&in_embed.name, status::ComponentStatus::Error);
                         tracing::warn!(
-                            "Failed to load embedding {}.\nError: {}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",
+                            "Failed to load Embedding Model {}. {} Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",
                             in_embed.name,
                             e
                         );

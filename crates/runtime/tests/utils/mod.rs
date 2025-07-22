@@ -134,6 +134,7 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
     Ok(pretty)
 }
 
+#[allow(dead_code)]
 pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,

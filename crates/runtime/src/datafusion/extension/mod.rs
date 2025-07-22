@@ -87,6 +87,7 @@ impl ExtensionPlanner for SpiceExtensionPlanner {
             let exec_plan = Arc::new(BytesProcessedExec::new(Arc::clone(physical_input)));
             return Ok(Some(exec_plan));
         }
+
         Ok(None)
     }
 }

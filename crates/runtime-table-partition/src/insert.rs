@@ -248,7 +248,9 @@ impl ExecutionPlan for PartitionerExec {
 
                 for handle in handles {
                     if let Ok(output) = handle.await {
-                        output?;
+                        output.map_err(|e| DataFusionError::Execution(
+                            format!("An error occurred while writing to one or more partition files. Some partitions may contain outdated or corrupted data. It is recommended to delete and recreate the accelerated files: {e}")
+                        ))?;
                     }
                 }
 

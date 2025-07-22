@@ -16,3 +16,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.4.0-rc.1,2025-06-09T16:20:00Z,2025-06-11T20:20:00Z,5,10,69,69,0,AI QA engineer testing skipped—default release installation unavailable.
 1.4.0,2025-06-16T13:30:00Z,2025-06-18T19:06:00Z,7,16,73,73,2,AI QA engineer runs recipes post-release.
 1.5.0-rc.1,2025-07-07T07:20:00Z,2025-07-08T02:20:00Z,10,10,74,74,0,AI QA engineer testing skipped—default release installation unavailable.
+1.5.0-rc.2,2025-07-14T08:00:00Z,2025-07-15T03:22:00Z,10,10,74,74,0,AI QA engineer testing skipped—default release installation unavailable.

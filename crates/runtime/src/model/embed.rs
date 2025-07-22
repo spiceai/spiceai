@@ -69,7 +69,7 @@ pub async fn try_to_embedding(
     match prefix {
         EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
         EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
-        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
+        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params).await,
         EmbeddingPrefix::HuggingFace => huggingface(model_id, &params).await,
         EmbeddingPrefix::Databricks => {
             databricks(model_id, &params, Arc::clone(&token_provider_registry)).await
@@ -84,6 +84,7 @@ pub async fn try_to_embedding(
 }
 
 #[cfg(feature = "bedrock")]
+#[allow(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -125,6 +126,22 @@ async fn bedrock(
         config_builder = config_builder.credentials_provider(credentials);
     }
 
+    let rate_limit = if let Some(rpm) = params.get("requests_per_min_limit") {
+        match rpm.expose_secret().parse::<u32>() {
+            Ok(limit) => {
+                Some(bedrock::embed::BedrockRateLimitConfig::with_requests_per_minute(limit))
+            }
+            Err(e) => {
+                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}")
+                        .into(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     let config = config_builder.load().await;
     let client = BedrockClient::new(&config);
 
@@ -160,7 +177,9 @@ async fn bedrock(
             });
         }
 
-        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
+        Ok(Arc::new(bedrock::embed::new_titan_v2(
+            client, normalize, dimensions, rate_limit,
+        )) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
         let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
             CohereEmbeddingTruncate::from_str(truncate_str)
@@ -190,6 +209,7 @@ async fn bedrock(
             truncate,
             input_type,
             CohereEmbeddingType::Float,
+            rate_limit,
         )) as Arc<dyn Embed>)
     } else {
         Err(EmbedError::ModelDoesNotExist {
@@ -317,7 +337,7 @@ async fn databricks(
     }
 }
 
-fn file(
+async fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
@@ -346,13 +366,16 @@ fn file(
         .map(SecretBox::expose_secret)
         .map(String::from);
     let max_seq_len = max_seq_length_from_params(params)?;
-    Ok(Arc::new(TeiEmbed::from_local(
-        Path::new(&weights_path),
-        Path::new(&config_path),
-        Path::new(&tokenizer_path),
-        pooling,
-        max_seq_len,
-    )?))
+    Ok(Arc::new(
+        TeiEmbed::from_local(
+            Path::new(&weights_path),
+            Path::new(&config_path),
+            Path::new(&tokenizer_path),
+            pooling,
+            max_seq_len,
+        )
+        .await?,
+    ))
 }
 
 fn azure(
