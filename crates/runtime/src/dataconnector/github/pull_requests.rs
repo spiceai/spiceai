@@ -61,8 +61,7 @@ impl TryFrom<&str> for PullRequestCommentType {
             "discussion" => Ok(PullRequestCommentType::Discussion),
             "none" => Ok(PullRequestCommentType::None),
             _ => Err(format!(
-                "Invalid comment type: {}. Supported values are 'all', 'review', 'discussion', 'none'.",
-                value
+                "Invalid comment type: {value}. Supported values are 'all', 'review', 'discussion', 'none'.",
             )),
         }
     }
@@ -103,8 +102,8 @@ impl GraphQLContext for PullRequestTableArgs {
 }
 
 impl PullRequestTableArgs {
-    fn base_requested_nodes(&self) -> &str {
-        r#"
+    fn base_requested_nodes() -> &'static str {
+        r"
             title
             number
             id
@@ -124,12 +123,12 @@ impl PullRequestTableArgs {
             labels(first: 100) { labels: nodes { name } }
             commits(first: 100) { commits_count: totalCount, hashes: nodes { id } }
             assignees(first: 100) { assignees: nodes { login } }
-        "#
+        "
     }
 
     fn review_thread_nodes(&self) -> String {
         format!(
-            r#"
+            r"
             reviewThreads(first: 20) {{
                 thread_comments: nodes {{
                     comments(first: {comments_to_fetch}) {{
@@ -143,14 +142,14 @@ impl PullRequestTableArgs {
                     }}
                 }}
             }}
-        "#,
+        ",
             comments_to_fetch = self.max_comments_fetched
         )
     }
 
     fn discussion_nodes(&self) -> String {
         format!(
-            r#"
+            r"
             comments_info: comments(first: {comments_to_fetch}) {{
                 discussion: nodes {{
                     body
@@ -160,7 +159,7 @@ impl PullRequestTableArgs {
                     }}
                 }}
             }}
-        "#,
+        ",
             comments_to_fetch = self.max_comments_fetched
         )
     }
@@ -169,21 +168,21 @@ impl PullRequestTableArgs {
         match self.include_comments {
             PullRequestCommentType::All => format!(
                 "{}\n{}\n{}",
-                self.base_requested_nodes(),
+                Self::base_requested_nodes(),
                 self.review_thread_nodes(),
                 self.discussion_nodes()
             ),
             PullRequestCommentType::Review => format!(
                 "{}\n{}",
-                self.base_requested_nodes(),
+                Self::base_requested_nodes(),
                 self.review_thread_nodes()
             ),
             PullRequestCommentType::Discussion => format!(
                 "{}\n{}",
-                self.base_requested_nodes(),
+                Self::base_requested_nodes(),
                 self.discussion_nodes()
             ),
-            PullRequestCommentType::None => self.base_requested_nodes().to_string(),
+            PullRequestCommentType::None => Self::base_requested_nodes().to_string(),
         }
     }
 }
@@ -261,7 +260,7 @@ fn flatten_author_field(comment: &mut Value) {
 fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
     // Unnest normally, then handle the `thread_comments` and `discussion` fields
     unnest_json_object_to_depth(object, 1, &DuplicateBehavior::Error).map(|mut values| {
-        values.iter_mut().for_each(|value| {
+        for value in &mut values {
             if let Value::Object(obj) = value {
                 if let Some(thread_comments) = obj.remove("thread_comments") {
                     let review_comments = extract_review_comments(thread_comments);
@@ -272,7 +271,7 @@ fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
                     discussion_array.iter_mut().for_each(flatten_author_field);
                 }
             }
-        });
+        }
 
         values
     })
@@ -290,7 +289,7 @@ fn extract_review_comments(thread_comments: Value) -> Vec<Value> {
                         .and_then(|comments| comments.as_object())
                         .and_then(|comments_obj| comments_obj.get("reviews"))
                         .and_then(|reviews| reviews.as_array())
-                        .map(|reviews| reviews.clone())
+                        .cloned()
                 } else {
                     None
                 }
@@ -305,7 +304,10 @@ fn extract_review_comments(thread_comments: Value) -> Vec<Value> {
     }
 }
 
-fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
+fn add_fields_based_on_comment_type(
+    field_vector: &mut Vec<Field>,
+    comments_type: &PullRequestCommentType,
+) {
     let comment_data_type = DataType::Struct(
         vec![
             Arc::new(Field::new("body", DataType::Utf8, true)),
@@ -319,6 +321,42 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
         .into(),
     );
 
+    match comments_type {
+        PullRequestCommentType::All => {
+            field_vector.push(Field::new(
+                "discussion",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    comment_data_type.clone(),
+                    true,
+                ))),
+                true,
+            ));
+            field_vector.push(Field::new(
+                "review_comments",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::Review => {
+            field_vector.push(Field::new(
+                "review_comments",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::Discussion => {
+            field_vector.push(Field::new(
+                "discussion",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::None => {}
+    }
+}
+
+fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
     let mut field_vector = vec![
         Field::new("additions", DataType::Int64, true),
         Field::new(
@@ -381,39 +419,7 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
         Field::new("url", DataType::Utf8, true),
     ];
 
-    match comments_type {
-        PullRequestCommentType::All => {
-            field_vector.push(Field::new(
-                "discussion",
-                DataType::List(Arc::new(Field::new(
-                    "item",
-                    comment_data_type.clone(),
-                    true,
-                ))),
-                true,
-            ));
-            field_vector.push(Field::new(
-                "review_comments",
-                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
-                true,
-            ));
-        }
-        PullRequestCommentType::Review => {
-            field_vector.push(Field::new(
-                "review_comments",
-                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
-                true,
-            ));
-        }
-        PullRequestCommentType::Discussion => {
-            field_vector.push(Field::new(
-                "discussion",
-                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
-                true,
-            ));
-        }
-        PullRequestCommentType::None => {}
-    }
+    add_fields_based_on_comment_type(&mut field_vector, comments_type);
 
     Arc::new(Schema::new(field_vector))
 }

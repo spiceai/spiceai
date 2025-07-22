@@ -451,6 +451,7 @@ impl std::str::FromStr for GitHubQueryMode {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self
@@ -484,7 +485,7 @@ impl DataConnector for Github {
                     DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "github".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
-                        message: e.into(),
+                        message: e,
                     }
                 })
             })
