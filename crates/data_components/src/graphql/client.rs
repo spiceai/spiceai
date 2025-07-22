@@ -45,7 +45,7 @@ pub enum Auth {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum DuplicateBehavior {
+pub enum DuplicateBehavior {
     Error,
 }
 
@@ -533,11 +533,11 @@ impl PaginationParameters {
 }
 
 fn unnest_json_object_duplicate_columns(
-    unnest_parameters: &UnnestParameters,
     new_object: &mut Map<String, Value>,
     key: &str,
+    duplicate_behavior: &DuplicateBehavior,
 ) -> Result<String> {
-    match unnest_parameters.duplicate_behavior {
+    match duplicate_behavior {
         DuplicateBehavior::Error => {
             if new_object.contains_key(key) {
                 return Err(Error::InvalidObjectAccess {
@@ -550,10 +550,10 @@ fn unnest_json_object_duplicate_columns(
     }
 }
 
-pub fn unnest_json_object_default(
-    unnest_parameters: &UnnestParameters,
+pub fn unnest_json_object_to_depth(
     object: &Value,
     depth: usize,
+    duplicate_behavior: &DuplicateBehavior,
 ) -> Result<Vec<Value>> {
     let mut new_objects = Vec::new();
     if let Value::Object(obj) = object {
@@ -591,8 +591,11 @@ pub fn unnest_json_object_default(
 
             // add the staged additions back to the root object
             for (key, value) in additions {
-                let new_key =
-                    unnest_json_object_duplicate_columns(unnest_parameters, &mut new_object, &key)?;
+                let new_key = unnest_json_object_duplicate_columns(
+                    &mut new_object,
+                    &key,
+                    duplicate_behavior,
+                )?;
 
                 new_object.insert(new_key, value);
             }
@@ -617,7 +620,7 @@ pub fn unnest_json_object_default(
 fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> Result<Vec<Value>> {
     match unnest_parameters.behavior {
         UnnestBehavior::Depth(depth) => {
-            unnest_json_object_default(unnest_parameters, object, depth)
+            unnest_json_object_to_depth(object, depth, &unnest_parameters.duplicate_behavior)
         }
         UnnestBehavior::Custom(ref func) => func(object),
     }
