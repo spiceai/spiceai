@@ -15,7 +15,7 @@ async-openai.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 llms = { path = "../llms" }
-rand = { version = "0.9.0" }
+rand = { version = "0.9.2" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
