@@ -62,7 +62,7 @@ fn collect_conditions(
     }
 }
 
-/// Transforms partition_by expression by replacing column with filter_value and evaluates it.
+/// Transforms `partition_by` expression by replacing column with `filter_value` and evaluates it.
 fn transform_and_evaluate(
     partition_by: &Expr,
     col: &Column,
@@ -85,6 +85,7 @@ fn transform_and_evaluate(
 }
 
 /// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn prune_partition(
     filters: &[Expr],
     partition_by: &Expr,
@@ -199,7 +200,7 @@ pub(crate) fn prune_partition(
     Ok(false)
 }
 
-/// Evaluates if the partition_by expression with the column substituted by filter_value equals partition_value.
+/// Evaluates if the `partition_by` expression with the column substituted by `filter_value` equals `partition_value`.
 fn filter_or_udf_value_matches(
     col: &Column,
     partition_by: &Expr,
@@ -230,7 +231,7 @@ fn evaluate_inequality(
     Ok(is_filter_satisfied && &result != partition_value)
 }
 
-/// Evaluates a function-based filter (e.g., date_trunc, truncate).
+/// Evaluates a function-based filter (e.g., `date_trunc`, truncate).
 fn evaluate_function_filter(
     func: &Arc<ScalarUDF>,
     args: &[Expr],
@@ -259,7 +260,7 @@ fn evaluate_expr(expr: &Expr) -> Result<ScalarValue, DataFusionError> {
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let args = args
                 .iter()
-                .map(|arg| evaluate_expr(arg))
+                .map(evaluate_expr)
                 .collect::<Result<Vec<_>, _>>()?;
 
             call(func.as_ref(), args)
@@ -331,6 +332,8 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
 }
 
 /// Used for testing only (unit and integration)
+#[must_use]
+#[allow(clippy::expect_used, clippy::missing_panics_doc)]
 pub fn timestamp_nanos(datetime: &str) -> i64 {
     let naive =
         NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
@@ -701,6 +704,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_prune_partition_date_trunc() -> Result<(), DataFusionError> {
         let filter_date =
             ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 00:00:00")), None);
@@ -816,10 +820,7 @@ mod tests {
                 assert_eq!(
                     prune_partition(filters, &partition_by, &partition_value)?,
                     should_prune,
-                    "granularity = {}, partition_value = {:?}, should_prune = {}",
-                    granularity,
-                    partition_value,
-                    should_prune
+                    "granularity = {granularity}, partition_value = {partition_value:?}, should_prune = {should_prune}"
                 );
             }
         }

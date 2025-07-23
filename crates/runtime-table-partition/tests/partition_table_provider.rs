@@ -658,8 +658,8 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
         df.write_table("test_table", DataFrameWriteOptions::new())
             .await?;
 
-        let query =
-            format!("SELECT * FROM test_table WHERE timestamp = TIMESTAMP '2025-07-15 12:34:56'",);
+        let query = "SELECT * FROM test_table WHERE timestamp = TIMESTAMP '2025-07-15 12:34:56'"
+            .to_string();
         let df = ctx.sql(&query).await?;
         let physical_plan = df.create_physical_plan().await?;
         let partition_values = collect_partition_values(&physical_plan);
@@ -690,14 +690,11 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
         assert_eq!(
             partition_values.len(),
             1,
-            "Expected one partition for filtered query with granularity {}. Found: {:?}",
-            granularity,
-            partition_values
+            "Expected one partition for filtered query with granularity {granularity}. Found: {partition_values:?}"
         );
         assert_eq!(
             partition_values[0], expected_timestamp,
-            "Expected partition value for granularity {}. Found: {:?}",
-            granularity, partition_values
+            "Expected partition value for granularity {granularity}. Found: {partition_values:?}"
         );
 
         // Verify unfiltered query includes all partitions
@@ -706,20 +703,14 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
         let partition_values = collect_partition_values(&physical_plan);
         let expected_partition_count = match granularity {
             "year" => 1,
-            "month" => 2,
-            "day" => 2,
-            "hour" => 3,
-            "minute" => 3,
-            "second" => 3,
+            "month" | "day" => 2,
+            "hour" | "minute" | "second" => 3,
             _ => panic!("Unexpected granularity"),
         };
         assert_eq!(
             partition_values.len(),
             expected_partition_count,
-            "Expected {} partitions for unfiltered query with granularity {}. Found: {:?}",
-            expected_partition_count,
-            granularity,
-            partition_values
+            "Expected {expected_partition_count} partitions for unfiltered query with granularity {granularity}. Found: {partition_values:?}"
         );
     }
 
