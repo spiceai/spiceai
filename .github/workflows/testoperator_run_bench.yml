@@ -58,7 +58,7 @@ on:
         type: choice
         options:
           - 'spicehq-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-large-runners'
       scale_factor:
         description: 'Scale factor for the benchmark'
         required: false

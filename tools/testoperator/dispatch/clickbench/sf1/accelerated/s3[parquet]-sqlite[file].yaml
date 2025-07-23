@@ -3,5 +3,5 @@ tests:
     spicepod_path: accelerated/s3[parquet]-sqlite[file].yaml
     query_set: clickbench
     query_overrides: sqlite
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     ready_wait: 1800

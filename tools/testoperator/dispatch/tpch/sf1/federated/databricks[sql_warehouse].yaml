@@ -9,10 +9,10 @@ tests:
     spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800
