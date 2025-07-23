@@ -177,9 +177,10 @@ impl VectorSearch {
             let cache_control = request_context.cache_control();
 
             let cache_key = match request_context.user_cache_key() {
-                Some(cache_key) if cache_control == CacheControl::Cache(CacheKeyType::User) =>
-                    CacheKey::User(&cache_key),
-                _ => CacheKey::Search(&search_key)
+                Some(cache_key) if cache_control == CacheControl::Cache(CacheKeyType::User) => {
+                    CacheKey::User(cache_key)
+                }
+                _ => CacheKey::Search(&search_key),
             };
 
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());

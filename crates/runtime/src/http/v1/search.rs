@@ -152,7 +152,11 @@ pub(crate) async fn post(
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let cache_provider = vs.df.search_cache_provider();
     match vs
-        .search_with_cache(&search_request, cache_provider, request_context.clone())
+        .search_with_cache(
+            &search_request,
+            cache_provider,
+            Arc::clone(&request_context),
+        )
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {

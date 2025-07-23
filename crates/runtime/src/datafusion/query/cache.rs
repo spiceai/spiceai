@@ -18,8 +18,8 @@ use std::{collections::HashSet, hash::Hasher, sync::Arc};
 
 use cache::{
     key::{CacheKey, RawCacheKey},
-    result::query::CachedStream,
     result::CacheStatus,
+    result::query::CachedStream,
     to_cached_record_batch_stream,
 };
 use datafusion::{
@@ -32,10 +32,10 @@ use snafu::ResultExt;
 use tracing::Span;
 
 use super::{
-    attach_query_tracker_to_stream, BindingParametersSnafu, Query, QueryResult, QueryTracker,
+    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
 };
 use crate::{
-    datafusion::{error::find_datafusion_root, query::error_code::ErrorCode, DataFusion},
+    datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode},
     request::{CacheControl, CacheKeyType, RequestContext},
 };
 
@@ -63,22 +63,16 @@ impl RequestCacheManager {
     }
 }
 
-struct CacheResponse<'a> {
-    input_key: &'a CacheKey<'a>,
+struct CacheResponse {
     result: CacheResult,
     status: CacheStatus,
     tracker: Option<QueryTracker>,
     raw_key: Option<RawCacheKey>,
 }
 
-impl<'a> CacheResponse<'a> {
-    fn from(
-        input_key: &'a CacheKey<'a>,
-        result: CacheResult,
-        status: CacheStatus,
-    ) -> Self {
+impl CacheResponse {
+    fn from(result: CacheResult, status: CacheStatus) -> Self {
         Self {
-            input_key,
             result,
             status,
             raw_key: None,
@@ -115,17 +109,24 @@ impl Query {
         // Try to get cached results first from sql
         let sql_or_user_cache_key = match request_context.user_cache_key() {
             Some(user_key) => CacheKey::User(user_key),
-            _ => CacheKey::Query(sql, parameters.as_ref())
+            _ => CacheKey::Query(sql, parameters.as_ref()),
         };
 
-        let CacheResponse { tracker, raw_key, .. } = match Self::try_get_cached_result(
+        let CacheResponse {
+            tracker, raw_key, ..
+        } = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
             &sql_or_user_cache_key,
-        ).await? {
-            CacheResponse { result: CacheResult::Hit(result), .. } => return Ok(PlanOrCached::Cached(result)),
-            response => response
+        )
+        .await?
+        {
+            CacheResponse {
+                result: CacheResult::Hit(result),
+                ..
+            } => return Ok(PlanOrCached::Cached(result)),
+            response => response,
         };
 
         let raw_cache_key =
@@ -156,14 +157,23 @@ impl Query {
         };
 
         // Try to get cached results from plan
-        let CacheResponse { mut tracker, raw_key, status, .. } = match
-        Self::try_get_cached_result(
+        let CacheResponse {
+            mut tracker,
+            raw_key,
+            status,
+            ..
+        } = match Self::try_get_cached_result(
             df,
             Arc::clone(&request_context),
             tracker,
             &CacheKey::LogicalPlan(&plan),
-        ).await? {
-            CacheResponse { result: CacheResult::Hit(result), .. } => return Ok(PlanOrCached::Cached(result)),
+        )
+        .await?
+        {
+            CacheResponse {
+                result: CacheResult::Hit(result),
+                ..
+            } => return Ok(PlanOrCached::Cached(result)),
             response => response,
         };
 
@@ -192,14 +202,11 @@ impl Query {
         request_context: Arc<RequestContext>,
         mut tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
-    ) -> super::Result<CacheResponse<'a>> {
+    ) -> super::Result<CacheResponse> {
         let Some(cache_provider) = df.results_cache_provider() else {
             return Ok(
-                CacheResponse::from(
-                    key,
-                    CacheResult::MissOrSkipped,
-                    CacheStatus::CacheDisabled,
-                ).with_query_tracker(tracker)
+                CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheDisabled)
+                    .with_query_tracker(tracker),
             );
         };
 
@@ -208,18 +215,20 @@ impl Query {
         // Validate that the provided cache key is the correct type for this request
         match (cache_control, &key) {
             (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
-                | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _))
-                | (CacheControl::Cache(CacheKeyType::User), CacheKey::User(_)) => { /* no-op */ }
+            | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _))
+            | (CacheControl::Cache(CacheKeyType::User), CacheKey::User(_)) => { /* no-op */ }
             (CacheControl::NoCache, _) => {
-                return Ok(
-                    CacheResponse::from(key, CacheResult::MissOrSkipped, CacheStatus::CacheBypass)
-                        .with_query_tracker(tracker)
-                );
+                return Ok(CacheResponse::from(
+                    CacheResult::MissOrSkipped,
+                    CacheStatus::CacheBypass,
+                )
+                .with_query_tracker(tracker));
             }
             _ => {
-                return Ok(
-                    CacheResponse::from(key, CacheResult::WrongCacheKeyType, CacheStatus::CacheMiss)
-                );
+                return Ok(CacheResponse::from(
+                    CacheResult::WrongCacheKeyType,
+                    CacheStatus::CacheMiss,
+                ));
             }
         }
 
@@ -229,9 +238,9 @@ impl Query {
             Ok(Some(result)) => result,
             Ok(None) => {
                 return Ok(
-                    CacheResponse::from(key, CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
+                    CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
                         .with_query_tracker(tracker)
-                        .with_raw_key(Some(raw_key))
+                        .with_raw_key(Some(raw_key)),
                 );
             }
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
@@ -244,21 +253,19 @@ impl Query {
 
         let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
 
-        Ok(
-            CacheResponse::from(
-                key,
-                CacheResult::Hit(QueryResult::new(
-                    attach_query_tracker_to_stream(
-                        Span::current(),
-                        request_context,
-                        tracker,
-                        Box::pin(record_batch_stream),
-                    ),
-                    CacheStatus::CacheHit,
-                )),
+        Ok(CacheResponse::from(
+            CacheResult::Hit(QueryResult::new(
+                attach_query_tracker_to_stream(
+                    Span::current(),
+                    request_context,
+                    tracker,
+                    Box::pin(record_batch_stream),
+                ),
                 CacheStatus::CacheHit,
-            ).with_raw_key(Some(raw_key))
+            )),
+            CacheStatus::CacheHit,
         )
+        .with_raw_key(Some(raw_key)))
     }
 
     pub(super) fn should_cache_results(
@@ -298,19 +305,22 @@ mod tests {
     use futures::TryStreamExt;
 
     use cache::{
-        key::CacheKey, result::CacheStatus, Caching, QueryResultsCacheProvider, SimpleCache,
+        Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
     use spicepod::component::caching::SQLResultsCacheConfig;
 
     use crate::{
         builder::RuntimeBuilder,
-        datafusion::{query::QueryBuilder, DataFusion},
+        datafusion::{DataFusion, query::QueryBuilder},
         request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };
 
     // Helper function to create a test RequestContext
-    fn create_test_request_context(cache_control: CacheControl, user_cache_key: Option<String>) -> Arc<RequestContext> {
+    fn create_test_request_context(
+        cache_control: CacheControl,
+        user_cache_key: Option<String>,
+    ) -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(cache_control)
@@ -361,7 +371,8 @@ mod tests {
         );
 
         // Test with SQL cache key
-        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
         let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
         let query = query_builder.build();
         Arc::clone(&request_context)
@@ -441,8 +452,10 @@ mod tests {
             .await;
 
         // Test with user cache key
-        let request_context =
-            create_test_request_context(CacheControl::Cache(CacheKeyType::User), Some("foo".to_string()));
+        let request_context = create_test_request_context(
+            CacheControl::Cache(CacheKeyType::User),
+            Some("foo".to_string()),
+        );
         let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
         let query = query_builder.build();
         Arc::clone(&request_context)
@@ -458,7 +471,15 @@ mod tests {
                     .expect("should collect");
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].num_rows(), 1);
-                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 1);
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
             })
             .await;
 
@@ -479,12 +500,23 @@ mod tests {
                 assert_eq!(records[0].num_rows(), 1);
 
                 // If the query ran, this value would be 2. But the cached result is served
-                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 1);
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
             })
             .await;
 
         // Make a request with the same "SELECT 2" query, but an invalid cache key
-        let invalid_user_key_ctx = create_test_request_context(CacheControl::Cache(CacheKeyType::User), Some("bar$".to_string()));
+        let invalid_user_key_ctx = create_test_request_context(
+            CacheControl::Cache(CacheKeyType::User),
+            Some("bar$".to_string()),
+        );
 
         let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df));
         let query = query_builder.build();
@@ -504,7 +536,15 @@ mod tests {
                 assert_eq!(records[0].num_rows(), 1);
 
                 // The query was run
-                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 2);
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    2
+                );
             })
             .await;
 
@@ -555,8 +595,10 @@ mod tests {
 
         let parameters = ParamValues::List(vec![1.into()]);
 
-        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+        let query_builder =
+            QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -575,7 +617,8 @@ mod tests {
 
         let parameters = ParamValues::List(vec![2.into()]);
 
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
+        let query_builder =
+            QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -619,7 +662,8 @@ mod tests {
 
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
+        let query_builder =
+            QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -638,7 +682,8 @@ mod tests {
 
         let parameters = ParamValues::List(vec![2.into()]);
 
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
+        let query_builder =
+            QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -658,7 +703,8 @@ mod tests {
         let parameters = ParamValues::List(vec![2.into()]);
 
         // Repeat the same query to ensure a cache hit
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
+        let query_builder =
+            QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {

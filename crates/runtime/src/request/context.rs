@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     future::Future,
     marker::PhantomData,
-    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock, RwLock},
+    sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
 
 use app::App;
@@ -32,7 +32,7 @@ use tracing::warn;
 
 use crate::datafusion::DataFusion;
 
-use super::{baggage, CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent};
+use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
@@ -54,9 +54,9 @@ tokio::task_local! {
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-static USER_CACHE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([\w-]{1,128})$").expect("Must compile regex")
-});
+#[allow(clippy::expect_used)]
+static USER_CACHE_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([\w-]{1,128})$").expect("Must compile regex"));
 
 #[derive(Copy, Clone)]
 pub struct AsyncMarker {
@@ -272,12 +272,11 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.user_cache_key = match self.cache_control {
-            CacheControl::Cache(CacheKeyType::User) =>
-                headers
-                    .get("x-spice-cache-key")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string()),
-            _ => None
+            CacheControl::Cache(CacheKeyType::User) => headers
+                .get("x-spice-cache-key")
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string),
+            _ => None,
         };
 
         self.baggage.extend(baggage::from_headers(headers));
@@ -365,12 +364,12 @@ impl RequestContextBuilder {
             CacheControl::Cache(CacheKeyType::Default) => {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::Cache(cache_key_type)
-            },
+            }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::User) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
             }
-            cache_control => cache_control
+            cache_control => cache_control,
         };
 
         RequestContext {
@@ -387,8 +386,11 @@ impl RequestContextBuilder {
         if USER_CACHE_KEY_REGEX.is_match(&key) {
             Some(key)
         } else {
-            warn!("X-Spice-Cache-Key provided for request ({}) is invalid. A valid cache key is \
-            at most 128 characters containing: [A-Za-z0-9_-].", key);
+            warn!(
+                "X-Spice-Cache-Key provided for request ({}) is invalid. A valid cache key is \
+            at most 128 characters containing: [A-Za-z0-9_-].",
+                key
+            );
             None
         }
     }
@@ -411,7 +413,10 @@ mod tests {
             .from_headers(&headers)
             .build();
 
-        assert_eq!(ctx_happy_path.cache_control, CacheControl::Cache(CacheKeyType::User));
+        assert_eq!(
+            ctx_happy_path.cache_control,
+            CacheControl::Cache(CacheKeyType::User)
+        );
         assert_eq!(ctx_happy_path.user_cache_key, Some(String::from("foo")));
 
         // Test invalid user cache key falling back to default behavior
@@ -422,7 +427,10 @@ mod tests {
             .from_headers(&headers)
             .build();
 
-        assert_eq!(ctx_bad_user_key.cache_control, CacheControl::Cache(CacheKeyType::Default));
+        assert_eq!(
+            ctx_bad_user_key.cache_control,
+            CacheControl::Cache(CacheKeyType::Default)
+        );
         assert_eq!(ctx_bad_user_key.user_cache_key, None);
     }
 }

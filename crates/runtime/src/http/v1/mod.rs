@@ -57,6 +57,7 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
+use crate::request::{AsyncMarker, RequestContext};
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -65,7 +66,6 @@ use utoipa::{
     },
     schema,
 };
-use crate::request::{AsyncMarker, RequestContext};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -247,7 +247,11 @@ pub async fn to_http_response(
         headers.insert(CONTENT_TYPE, header_value);
     }
 
-    attach_cache_headers(&mut headers, cache_status, request_context.user_cache_key().is_some());
+    attach_cache_headers(
+        &mut headers,
+        cache_status,
+        request_context.user_cache_key().is_some(),
+    );
 
     (StatusCode::OK, headers, body).into_response()
 }

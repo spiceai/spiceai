@@ -21,15 +21,14 @@ use tracing_futures::Instrument;
 
 use crate::request::{AsyncMarker, RequestContext};
 use crate::{
-    request::{CacheControl, CacheKeyType},
+    Runtime,
     search::{
         request::{SearchRequest, SearchRequestAIJson},
         types::to_pretty,
         util::parse_explicit_primary_keys,
         vector_search::VectorSearch,
     },
-    tools::{utils::parameters, SpiceModelTool},
-    Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 
 pub struct DocumentSimilarityTool {
