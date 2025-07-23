@@ -249,8 +249,8 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // wait for the next 30th second, and wait 15 seconds for the job to succeed
-            tokio::time::sleep(time_till_second(10, Some(7))).await;
+            // wait for the next 10th second, and wait 5 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(10, Some(5))).await;
 
             for dataset_name in dataset_names.clone() {
                 snapshot_names_from_runtime(
