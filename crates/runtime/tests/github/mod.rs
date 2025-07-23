@@ -328,6 +328,8 @@ async fn test_github_stargazers() -> Result<(), String> {
 }
 
 #[tokio::test]
+// Temporary disabled due to The API returned a 'FORBIDDEN' error.
+#[ignore]
 async fn test_github_org_members() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
