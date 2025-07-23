@@ -575,7 +575,8 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use data_components::s3_vectors::{
-        MetadataColumn, MetadataColumns, query_provider::S3_VECTOR_DISTANCE_NAME,
+        MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+        query_provider::S3_VECTOR_DISTANCE_NAME,
     };
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
@@ -602,7 +603,12 @@ mod tests {
     /// Wraps a [`ExecutionPlan`] with a new [`DisplayAs`] to show what filters have been pushed down.
     /// This is useful for testing explain plans.
     #[derive(Debug)]
-    pub struct ExplainExecutionPlan(Arc<dyn ExecutionPlan>, Vec<Expr>, Option<usize>);
+    pub struct ExplainExecutionPlan(
+        Arc<dyn ExecutionPlan>,
+        Vec<Expr>,
+        Option<usize>,
+        Option<Vec<usize>>,
+    );
 
     impl ExecutionPlan for ExplainExecutionPlan {
         fn name(&self) -> &str {
@@ -629,6 +635,7 @@ mod tests {
                 Arc::clone(&self.0).with_new_children(children)?,
                 self.1.clone(),
                 self.2,
+                self.3.clone(),
             )))
         }
 
@@ -647,10 +654,18 @@ mod tests {
             _t: datafusion::physical_plan::DisplayFormatType,
             f: &mut std::fmt::Formatter,
         ) -> std::fmt::Result {
+            let columns: Vec<String> = self
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .cloned()
+                .collect();
+
             write!(
                 f,
-                "ExplainExecutionPlan: filter={:?} limit={:?}",
-                self.1, self.2
+                "ExplainExecutionPlan: projection={columns:?} filter={:?} limit={:?}",
+                self.1, self.2,
             )?;
             Ok(())
         }
@@ -681,6 +696,7 @@ mod tests {
                 self.0.scan(state, projection, filters, limit).await?,
                 filters.to_vec(),
                 limit,
+                projection.cloned(),
             )) as Arc<dyn ExecutionPlan>)
         }
 
@@ -692,15 +708,16 @@ mod tests {
         }
     }
 
+    /// An implementation of [`VectorIndex`] that has one row. Useful for testing explain plans.
     #[derive(Debug)]
-    pub struct EmptyIndex {
+    pub struct PretendVectorIndex {
         embedded_column: String,
         primary_columns: Vec<Field>,
         schema: Schema,
     }
 
     #[async_trait::async_trait]
-    impl VectorIndex for EmptyIndex {
+    impl VectorIndex for PretendVectorIndex {
         fn embedded_column(&self) -> String {
             self.embedded_column.clone()
         }
@@ -727,7 +744,9 @@ mod tests {
                 .fields()
                 .iter()
                 .filter_map(|f| {
-                    if f.name() == "key" || f.name() == "data" {
+                    if f.name() == S3_VECTOR_PRIMARY_KEY_NAME
+                        || f.name() == S3_VECTOR_EMBEDDING_NAME
+                    {
                         return None;
                     }
                     if f.metadata().get("filterable") == Some(&"true".to_string()) {
@@ -757,6 +776,7 @@ mod tests {
                     false,
                 ))],
             );
+            println!("In query_table_provider schema={:?}", schema);
             Ok(Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     schema.clone(),
@@ -835,6 +855,7 @@ mod tests {
         }
     }
 
+    /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
     fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema
             .fields()
@@ -860,13 +881,13 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            vector_index: Arc::new(EmptyIndex {
+            vector_index: Arc::new(PretendVectorIndex {
                 embedded_column: "body".to_string(),
                 primary_columns: vec![Field::new("pk", DataType::Int64, false)],
                 schema: Schema::new(vec![
-                    Field::new("key", DataType::Utf8, false),
+                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
                     Field::new(
-                        "data",
+                        S3_VECTOR_EMBEDDING_NAME,
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),
@@ -921,13 +942,13 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            vector_index: Arc::new(EmptyIndex {
+            vector_index: Arc::new(PretendVectorIndex {
                 embedded_column: "body".to_string(),
                 primary_columns: vec![Field::new("pk", DataType::Int64, false)],
                 schema: Schema::new(vec![
-                    Field::new("key", DataType::Utf8, false),
+                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
                     Field::new(
-                        "data",
+                        S3_VECTOR_EMBEDDING_NAME,
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),
