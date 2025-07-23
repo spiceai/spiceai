@@ -25,10 +25,11 @@ use data_components::{
     github::error_checker,
     graphql::{
         ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{GraphQLQuery, UnnestBehavior},
+        client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
     },
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
+use serde_json::Value;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
@@ -38,6 +39,32 @@ pub struct PullRequestTableArgs {
     pub repo: String,
     pub query_mode: GitHubQueryMode,
     pub component: ConnectorComponent,
+    pub include_comments: PullRequestCommentType,
+    pub max_comments_fetched: u32,
+}
+
+#[derive(Debug)]
+pub enum PullRequestCommentType {
+    All,
+    Review,
+    Discussion,
+    None,
+}
+
+impl TryFrom<&str> for PullRequestCommentType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "all" => Ok(PullRequestCommentType::All),
+            "review" => Ok(PullRequestCommentType::Review),
+            "discussion" => Ok(PullRequestCommentType::Discussion),
+            "none" => Ok(PullRequestCommentType::None),
+            _ => Err(format!(
+                "Invalid comment type: {value}. Supported values are 'all', 'review', 'discussion', 'none'.",
+            )),
+        }
+    }
 }
 
 impl GraphQLContext for PullRequestTableArgs {
@@ -74,6 +101,92 @@ impl GraphQLContext for PullRequestTableArgs {
     }
 }
 
+impl PullRequestTableArgs {
+    fn base_requested_nodes() -> &'static str {
+        r"
+            title
+            number
+            id
+            url
+            body
+            state
+            created_at: createdAt
+            updated_at: updatedAt
+            merged_at: mergedAt
+            closed_at: closedAt
+            number
+            reviews { reviews_count: totalCount }
+            author: author { author: login }
+            additions
+            deletions
+            changed_files: changedFiles
+            labels(first: 100) { labels: nodes { name } }
+            commits(first: 100) { commits_count: totalCount, hashes: nodes { id } }
+            assignees(first: 100) { assignees: nodes { login } }
+        "
+    }
+
+    fn review_thread_nodes(&self) -> String {
+        format!(
+            r"
+            reviewThreads(first: 20) {{
+                thread_comments: nodes {{
+                    comments(first: {comments_to_fetch}) {{
+                        review_comments: nodes {{
+                            body
+                            created_at: createdAt
+                            author {{
+                                author: login
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        ",
+            comments_to_fetch = self.max_comments_fetched
+        )
+    }
+
+    fn discussion_nodes(&self) -> String {
+        format!(
+            r"
+            comments_info: comments(first: {comments_to_fetch}) {{
+                discussion: nodes {{
+                    body
+                    created_at: createdAt
+                    author {{
+                        author: login
+                    }}
+                }}
+            }}
+        ",
+            comments_to_fetch = self.max_comments_fetched
+        )
+    }
+
+    fn get_requested_nodes(&self) -> String {
+        match self.include_comments {
+            PullRequestCommentType::All => format!(
+                "{}\n{}\n{}",
+                Self::base_requested_nodes(),
+                self.review_thread_nodes(),
+                self.discussion_nodes()
+            ),
+            PullRequestCommentType::Review => format!(
+                "{}\n{}",
+                Self::base_requested_nodes(),
+                self.review_thread_nodes()
+            ),
+            PullRequestCommentType::Discussion => format!(
+                "{}\n{}",
+                Self::base_requested_nodes(),
+                self.discussion_nodes()
+            ),
+            PullRequestCommentType::None => Self::base_requested_nodes().to_string(),
+        }
+    }
+}
+
 impl GitHubTableArgs for PullRequestTableArgs {
     fn get_component(&self) -> ConnectorComponent {
         self.component.clone()
@@ -91,32 +204,14 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     }}
                     nodes {{
                         ... on PullRequest {{
-                            title
-                            number
-                            id
-                            url
-                            body
-                            state
-                            created_at: createdAt
-                            updated_at: updatedAt
-                            merged_at: mergedAt
-                            closed_at: closedAt
-                            number
-                            reviews {{reviews_count: totalCount}}
-                            author: author {{ author: login }}
-                            additions
-                            deletions
-                            changed_files: changedFiles
-                            labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{comments_count: totalCount}}
-                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
-                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            {nodes}
                         }}
                     }}
                 }}
             }}"#,
                     owner = self.owner,
                     name = self.repo,
+                    nodes = self.get_requested_nodes()
                 )
             }
             GitHubQueryMode::Auto => {
@@ -130,26 +225,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                             endCursor
                         }}
                         nodes {{
-                            title
-                            number
-                            id
-                            url
-                            body
-                            state
-                            created_at: createdAt
-                            updated_at: updatedAt
-                            merged_at: mergedAt
-                            closed_at: closedAt
-                            number
-                            reviews {{reviews_count: totalCount}}
-                            author: author {{ author: login }}
-                            additions
-                            deletions
-                            changed_files: changedFiles
-                            labels(first: 100) {{ labels: nodes {{ name }} }}
-                            comments(first: 100) {{comments_count: totalCount}}
-                            commits(first: 100) {{commits_count: totalCount, hashes: nodes{{ id }} }}
-                            assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            {nodes}
                         }}
                     }}
                 }}
@@ -157,6 +233,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
             "#,
                     owner = self.owner,
                     name = self.repo,
+                    nodes = self.get_requested_nodes()
                 )
             }
         };
@@ -164,14 +241,123 @@ impl GitHubTableArgs for PullRequestTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(1),
-            Some(gql_schema()),
+            UnnestBehavior::Custom(Box::new(custom_unnestter)),
+            Some(gql_schema(&self.include_comments)),
         )
     }
 }
 
-fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+fn flatten_author_field(comment: &mut Value) {
+    if let Value::Object(comment_obj) = comment {
+        if let Some(Value::Object(author_obj)) = comment_obj.get("author") {
+            if let Some(Value::String(author_name)) = author_obj.get("author") {
+                comment_obj.insert("author".to_string(), Value::String(author_name.clone()));
+            }
+        }
+    }
+}
+
+fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
+    // Unnest normally, then handle the `thread_comments` and `discussion` fields
+    unnest_json_object_to_depth(object, 1, &DuplicateBehavior::Error).map(|mut values| {
+        for value in &mut values {
+            if let Value::Object(obj) = value {
+                if let Some(thread_comments) = obj.remove("thread_comments") {
+                    let review_comments = extract_review_comments(thread_comments);
+                    obj.insert("review_comments".to_string(), Value::Array(review_comments));
+                }
+
+                if let Some(Value::Array(discussion_array)) = obj.get_mut("discussion") {
+                    discussion_array.iter_mut().for_each(flatten_author_field);
+                }
+            }
+        }
+
+        values
+    })
+}
+
+// Flattens the `thread_comments` field match the schema expected by the table
+fn extract_review_comments(thread_comments: Value) -> Vec<Value> {
+    match thread_comments {
+        Value::Array(thread_array) => thread_array
+            .into_iter()
+            .filter_map(|thread| {
+                if let Value::Object(thread_obj) = thread {
+                    thread_obj
+                        .get("comments")
+                        .and_then(|comments| comments.as_object())
+                        .and_then(|comments_obj| comments_obj.get("review_comments"))
+                        .and_then(|reviews| reviews.as_array())
+                        .cloned()
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .map(|mut review| {
+                flatten_author_field(&mut review);
+                review
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn add_fields_based_on_comment_type(
+    field_vector: &mut Vec<Field>,
+    comments_type: &PullRequestCommentType,
+) {
+    let comment_data_type = DataType::Struct(
+        vec![
+            Arc::new(Field::new("body", DataType::Utf8, true)),
+            Arc::new(Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            )),
+            Arc::new(Field::new("author", DataType::Utf8, true)),
+        ]
+        .into(),
+    );
+
+    match comments_type {
+        PullRequestCommentType::All => {
+            field_vector.push(Field::new(
+                "discussion",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    comment_data_type.clone(),
+                    true,
+                ))),
+                true,
+            ));
+            field_vector.push(Field::new(
+                "review_comments",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::Review => {
+            field_vector.push(Field::new(
+                "review_comments",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::Discussion => {
+            field_vector.push(Field::new(
+                "discussion",
+                DataType::List(Arc::new(Field::new("item", comment_data_type, true))),
+                true,
+            ));
+        }
+        PullRequestCommentType::None => {}
+    }
+}
+
+fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
+    let mut field_vector = vec![
         Field::new("additions", DataType::Int64, true),
         Field::new(
             "assignees",
@@ -190,7 +376,6 @@ fn gql_schema() -> SchemaRef {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
             true,
         ),
-        Field::new("comments_count", DataType::Int64, true),
         Field::new("commits_count", DataType::Int64, true),
         Field::new(
             "created_at",
@@ -232,5 +417,9 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
         Field::new("url", DataType::Utf8, true),
-    ]))
+    ];
+
+    add_fields_based_on_comment_type(&mut field_vector, comments_type);
+
+    Arc::new(Schema::new(field_vector))
 }
