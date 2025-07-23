@@ -170,13 +170,9 @@ pub struct LoadArgs {
 /// Represents the type of runner to use in the action
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum RunnerType {
-    #[serde(rename = "spiceai-runners")]
-    SelfHosted,
-    #[serde(rename = "spiceai-large-runners")]
-    LargeSelfHosted,
     #[serde(rename = "spicehq-dev-runners")]
     Dev,
-    #[serde(rename = "spiceai-dev-large-runners")]
+    #[serde(rename = "spicehq-dev-large-runners")]
     DevLarge,
 }
 
