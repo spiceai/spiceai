@@ -10,8 +10,15 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: cratesio
+    permissions:
+      id-token: write # Required for OIDC token exchange with crates.io
     steps:
       - uses: actions/checkout@v4
+
+      # Using a tag for a 3rd party Action that is not pinned to a commit can lead to executing an untrusted Action through a supply chain attack.
+      # https://github.com/rust-lang/crates-io-auth-action/releases/tag/v1.0.1
+      - uses: rust-lang/crates-io-auth-action@e919bc7605cde86df457cf5b93c5e103838bd879
+        id: auth
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
@@ -24,4 +31,4 @@ jobs:
 
       - run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
