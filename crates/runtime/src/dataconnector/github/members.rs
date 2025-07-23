@@ -2,6 +2,7 @@ use crate::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_components::graphql::client::UnnestBehavior;
 use std::sync::Arc;
 
 pub struct MembersTableArgs {
@@ -40,7 +41,12 @@ impl GitHubTableArgs for MembersTableArgs {
             org = self.org
         );
 
-        GitHubTableGraphQLParams::new(query.into(), None, 0, Some(gql_schema()))
+        GitHubTableGraphQLParams::new(
+            query.into(),
+            None,
+            UnnestBehavior::Depth(0),
+            Some(gql_schema()),
+        )
     }
 }
 
