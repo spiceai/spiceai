@@ -293,6 +293,8 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
+    use arrow::array::Int64Array;
+
     use futures::TryStreamExt;
 
     use cache::{
@@ -308,10 +310,11 @@ mod tests {
     };
 
     // Helper function to create a test RequestContext
-    fn create_test_request_context(cache_control: CacheControl) -> Arc<RequestContext> {
+    fn create_test_request_context(cache_control: CacheControl, user_cache_key: Option<String>) -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
                 .with_cache_control(cache_control)
+                .with_user_cache_key(user_cache_key)
                 .build(),
         )
     }
@@ -358,7 +361,7 @@ mod tests {
         );
 
         // Test with SQL cache key
-        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw));
+        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
         let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
         let query = query_builder.build();
         Arc::clone(&request_context)
@@ -398,7 +401,7 @@ mod tests {
 
         // Test with plan cache key
         let request_context =
-            create_test_request_context(CacheControl::Cache(CacheKeyType::Default));
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
         let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
         let query = query_builder.build();
         Arc::clone(&request_context)
@@ -436,6 +439,88 @@ mod tests {
                 assert_eq!(result.cache_status, CacheStatus::CacheHit);
             })
             .await;
+
+        // Test with user cache key
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::User), Some("foo".to_string()));
+        let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                // Expect to miss cache because it is the first request
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                // Need to drain the stream to ensure the cache is populated
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 1);
+            })
+            .await;
+
+        // Repeat a request with the same user key and a different query
+        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+
+                // If the query ran, this value would be 2. But the cached result is served
+                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 1);
+            })
+            .await;
+
+        // Make a request with the same "SELECT 2" query, but an invalid cache key
+        let invalid_user_key_ctx = create_test_request_context(CacheControl::Cache(CacheKeyType::User), Some("bar$".to_string()));
+
+        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&invalid_user_key_ctx)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+
+                // An invalid key results in a cache miss
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+
+                // The query was run
+                assert_eq!(records[0].column(0).as_any().downcast_ref::<Int64Array>().expect("must read i64 array").value(0), 2);
+            })
+            .await;
+
+        // Issue the same "SELECT 2" query with the invalid cache key to verify that we fall back
+        // on the default behavior if the user sets a cache-control header
+        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&invalid_user_key_ctx)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+
+                // Since cache-control is set, an invalid key with repeated query will fall back
+                // to the default plan-key behavior and result in a cache hit
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -470,7 +555,7 @@ mod tests {
 
         let parameters = ParamValues::List(vec![1.into()]);
 
-        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw));
+        let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
         let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
@@ -533,7 +618,7 @@ mod tests {
         let parameters = ParamValues::List(vec![1.into()]);
 
         let request_context =
-            create_test_request_context(CacheControl::Cache(CacheKeyType::Default));
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
         let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)

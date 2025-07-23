@@ -305,6 +305,12 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
+    pub fn with_user_cache_key(mut self, user_key: Option<String>) -> Self {
+        self.user_cache_key = user_key;
+        self
+    }
+
+    #[must_use]
     pub fn with_baggage(mut self, baggage: Vec<KeyValue>) -> Self {
         self.baggage = baggage;
         self
