@@ -108,7 +108,7 @@ impl Query {
     ) -> super::Result<PlanOrCached> {
         // Try to get cached results first from sql
         let sql_or_user_cache_key = match request_context.user_cache_key() {
-            Some(user_key) => CacheKey::User(user_key),
+            Some(user_key) => CacheKey::ClientSupplied(user_key),
             _ => CacheKey::Query(sql, parameters.as_ref()),
         };
 
@@ -216,7 +216,8 @@ impl Query {
         match (cache_control, &key) {
             (CacheControl::Cache(CacheKeyType::Default), CacheKey::LogicalPlan(_))
             | (CacheControl::Cache(CacheKeyType::Raw), CacheKey::Query(_, _))
-            | (CacheControl::Cache(CacheKeyType::User), CacheKey::User(_)) => { /* no-op */ }
+            | (CacheControl::Cache(CacheKeyType::ClientSupplied), CacheKey::ClientSupplied(_)) => { /* no-op */
+            }
             (CacheControl::NoCache, _) => {
                 return Ok(CacheResponse::from(
                     CacheResult::MissOrSkipped,
@@ -453,7 +454,7 @@ mod tests {
 
         // Test with user cache key
         let request_context = create_test_request_context(
-            CacheControl::Cache(CacheKeyType::User),
+            CacheControl::Cache(CacheKeyType::ClientSupplied),
             Some("foo".to_string()),
         );
         let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
@@ -514,7 +515,7 @@ mod tests {
 
         // Make a request with the same "SELECT 2" query, but an invalid cache key
         let invalid_user_key_ctx = create_test_request_context(
-            CacheControl::Cache(CacheKeyType::User),
+            CacheControl::Cache(CacheKeyType::ClientSupplied),
             Some("bar$".to_string()),
         );
 

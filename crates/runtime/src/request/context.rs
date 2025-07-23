@@ -272,7 +272,7 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.user_cache_key = match self.cache_control {
-            CacheControl::Cache(CacheKeyType::User) => headers
+            CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
                 .get("x-spice-cache-key")
                 .and_then(|h| h.to_str().ok())
                 .map(str::to_string),
@@ -366,7 +366,7 @@ impl RequestContextBuilder {
                 CacheControl::Cache(cache_key_type)
             }
             // If sanitized out, fall back to default
-            CacheControl::Cache(CacheKeyType::User) if user_cache_key.is_none() => {
+            CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
             }
             cache_control => cache_control,
@@ -415,7 +415,7 @@ mod tests {
 
         assert_eq!(
             ctx_happy_path.cache_control,
-            CacheControl::Cache(CacheKeyType::User)
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
         );
         assert_eq!(ctx_happy_path.user_cache_key, Some(String::from("foo")));
 

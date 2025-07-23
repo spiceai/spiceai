@@ -27,8 +27,8 @@ pub enum CacheKeyType {
     Default,
     /// Use the raw input (e.g., unparsed SQL string) as the cache key.
     Raw,
-    /// Use a user-provided cache key via the X-Spice-Cache-Key header.
-    User,
+    /// Use a client-supplied cache key via the X-Spice-Cache-Key header.
+    ClientSupplied,
 }
 
 impl CacheKeyType {
@@ -75,7 +75,7 @@ impl CacheControl {
     pub fn from_headers(headers: &HeaderMap) -> Self {
         // This will be updated later if the runtime parameter `runtime.results_cache.cache_key_type` is present.
         let cache_key_type = match headers.get("x-spice-cache-key") {
-            Some(header) if !header.is_empty() => CacheKeyType::User,
+            Some(header) if !header.is_empty() => CacheKeyType::ClientSupplied,
             _ => CacheKeyType::Default,
         };
 
