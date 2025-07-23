@@ -152,7 +152,7 @@ pub(crate) async fn post(
     let context = RequestContext::current(AsyncMarker::new().await);
     let cache_provider = vs.df.search_cache_provider();
     match vs
-        .search_with_cache(&search_request, cache_provider, context.cache_control())
+        .search_with_cache(&search_request, cache_provider, context)
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {

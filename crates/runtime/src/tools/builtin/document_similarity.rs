@@ -19,8 +19,8 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
+use crate::request::{AsyncMarker, RequestContext};
 use crate::{
-    Runtime,
     request::{CacheControl, CacheKeyType},
     search::{
         request::{SearchRequest, SearchRequestAIJson},
@@ -28,7 +28,8 @@ use crate::{
         util::parse_explicit_primary_keys,
         vector_search::VectorSearch,
     },
-    tools::{SpiceModelTool, utils::parameters},
+    tools::{utils::parameters, SpiceModelTool},
+    Runtime,
 };
 
 pub struct DocumentSimilarityTool {
@@ -77,11 +78,13 @@ impl SpiceModelTool for DocumentSimilarityTool {
             );
 
             let search_request = SearchRequest::try_from(req)?;
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+
             let (result, _) = vs
                 .search_with_cache(
                     &search_request,
                     self.rt.datafusion().search_cache_provider(),
-                    CacheControl::Cache(CacheKeyType::Default),
+                    request_context,
                 )
                 .await
                 .boxed()?;
