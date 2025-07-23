@@ -20,6 +20,7 @@ use std::collections::HashMap;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
+use serde_json::Value;
 
 use crate::component::embeddings::EmbeddingChunkConfig;
 
@@ -37,15 +38,41 @@ pub struct Column {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_search: Option<FullTextSearchConfig>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
 }
 
 impl Column {
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+            embeddings: Vec::new(),
+            full_text_search: None,
+            metadata: HashMap::new(),
+        }
+    }
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+    #[must_use]
+    pub fn with_embeddings(mut self, embeddings: Vec<ColumnLevelEmbeddingConfig>) -> Self {
+        self.embeddings = embeddings;
+        self
+    }
     /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
             metadata.insert("description".to_string(), d.to_string());
+        }
+        for (k, v) in &self.metadata {
+            metadata.insert(k.to_string(), v.to_string());
         }
         metadata
     }

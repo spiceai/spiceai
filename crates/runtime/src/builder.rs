@@ -22,10 +22,11 @@ use crate::{
     dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
+    embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc},
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
-    search::full_text::udtf::TextSearchTableFunc,
+    search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc},
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -208,8 +209,12 @@ impl RuntimeBuilder {
 
         // UDFs that require a weak reference to the DataFusion instance defined here.
         df.ctx.register_udtf(
-            "text_search",
+            TEXT_SEARCH_UDTF_NAME,
             Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
+        );
+        df.ctx.register_udtf(
+            VECTOR_SEARCH_UDTF_NAME,
+            Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&df))),
         );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {

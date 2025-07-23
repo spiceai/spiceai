@@ -23,7 +23,7 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
-use datafusion::prelude::{Expr, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
@@ -32,7 +32,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_table_partition::expression::partition_by_expressions;
+use runtime_table_partition::expression::{PartitionBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -42,6 +42,8 @@ use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "duckdb")]
+use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
 #[cfg(feature = "sqlite")]
@@ -52,6 +54,8 @@ pub mod behaviors;
 use behaviors::Behaviors;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod partitioned_duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
@@ -103,11 +107,11 @@ impl AcceleratorEngineRegistry {
 
     async fn register_accelerator_engine(
         &self,
-        name: Engine,
+        engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(name, accelerator_engine);
+        registry.insert(engine, accelerator_engine);
     }
 
     pub(crate) async fn register_all(&self) {
@@ -116,6 +120,12 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "duckdb")]
         self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
             .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::PartitionedDuckDB,
+            Arc::new(PartitionedDuckDBAccelerator::new()),
+        )
+        .await;
         #[cfg(feature = "postgres")]
         self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
             .await;
@@ -144,11 +154,12 @@ impl AcceleratorEngineRegistry {
     ) -> Result<(Arc<dyn TableProvider>, Behaviors)> {
         let engine = acceleration_settings.engine;
 
-        let accelerator = self.get_accelerator_engine(engine).await.ok_or_else(|| {
-            Error::InvalidConfiguration {
+        let accelerator = self
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::InvalidConfiguration {
                 msg: format!("Unknown engine: {engine}"),
-            }
-        })?;
+            })?;
 
         if let Err(e) = acceleration_settings.validate_indexes(&schema) {
             InvalidConfigurationSnafu {
@@ -240,9 +251,14 @@ impl AcceleratorEngineRegistry {
         let df_schema = DFSchema::try_from(schema)
             .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
-        let partition_by =
-            partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
-                .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
+        let partition_by = if acceleration_settings.partition_by.is_empty() {
+            None
+        } else {
+            Some(
+                partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
+                    .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
+            )
+        };
 
         let table_provider = accelerator
             .create_external_table(external_table, source, partition_by)
@@ -265,7 +281,7 @@ pub trait DataAccelerator: Send + Sync {
         &self,
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<Expr>,
+        partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator

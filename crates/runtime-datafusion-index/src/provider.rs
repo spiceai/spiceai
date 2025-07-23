@@ -59,12 +59,17 @@ impl IndexedTableProvider {
 
     #[must_use]
     pub fn get_index<T: Index + 'static>(&self) -> Option<&T> {
-        for index in &self.indexes {
-            if let Some(index) = (index as &dyn Any).downcast_ref::<T>() {
-                return Some(index);
-            }
-        }
-        None
+        self.indexes
+            .iter()
+            .find_map(|i| i.as_any().downcast_ref::<T>())
+    }
+
+    #[must_use]
+    pub fn get_indexes<T: Index + 'static>(&self) -> Vec<&T> {
+        self.indexes
+            .iter()
+            .filter_map(|i| i.as_any().downcast_ref::<T>())
+            .collect()
     }
 
     #[must_use]

@@ -16,7 +16,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::Catalog,
+    dataconnector::parameters::{ConnectorParams, aws::load_config},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
@@ -25,6 +27,7 @@ use data_components::{
     iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
 };
 use iceberg::{Namespace, NamespaceIdent};
+use iceberg_aws_sdk::S3CredentialProvider;
 use iceberg_catalog_rest::RestCatalogConfig;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
@@ -230,9 +233,35 @@ impl CatalogConnector for IcebergCatalog {
                 })?;
         }
 
+        let aws_sdk_config = load_config(
+            "IcebergCatalogConnector",
+            "s3_region",
+            "s3_access_key_id",
+            "s3_secret_access_key",
+            "s3_session_token",
+            &self.params,
+        )
+        .await
+        .map_err(|e| super::Error::InvalidConfiguration {
+            connector: "iceberg".into(),
+            message: e.to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: Box::new(e),
+        })?;
+
+        let custom_credential_loader = S3CredentialProvider::from_config(&aws_sdk_config)
+            .map_err(|e| super::Error::InvalidConfiguration {
+                connector: "iceberg".into(),
+                message: e.to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(e),
+            })?
+            .into_custom_loader();
+
         let catalog_config = get_rest_catalog_config(base_uri, props);
 
-        let catalog_client = RestCatalog::new(catalog_config);
+        let catalog_client =
+            RestCatalog::new(catalog_config).with_file_io_extension(custom_credential_loader);
 
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),

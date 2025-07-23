@@ -33,34 +33,47 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to serialize scalar value: {source}"))]
+    #[snafu(display("Failed to serialize: {source}"))]
     Serialize { source: serde_qs::Error },
 
-    #[snafu(display("Failed to deserialize scalar value: {source}"))]
+    #[snafu(display("Failed to deserialize: {source}"))]
     Deserialize { source: serde_qs::Error },
 
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
     UnsupportedType { data_type: DataType },
 }
 
-/// Converts a [`ScalarValue`] to its [`String`] representation.
+#[derive(Serialize, Deserialize)]
+struct SerializablePair {
+    scalar: SupportedScalarValue,
+    exprs_hash: u64,
+}
+
+/// Encodes a [`ScalarValue`] and a hash of the `partition_by` expressions
 ///
 /// # Errors
-/// Returns an error if the [`ScalarValue`] is not supported.
-pub fn encode_scalar_value(value: &ScalarValue) -> Result<String, Error> {
-    let supported_value = SupportedScalarValue::try_from(value.clone())?;
-    let encoded = serde_qs::to_string(&supported_value).context(SerializeSnafu)?;
+/// Returns an error if the [`ScalarValue`] is not supported or cannot be
+/// serialized.
+pub fn encode_pair(scalar: &ScalarValue, exprs_hash: u64) -> Result<String, Error> {
+    let supported_scalar = SupportedScalarValue::try_from(scalar.clone())?;
+    let pair = SerializablePair {
+        scalar: supported_scalar,
+        exprs_hash,
+    };
+    let encoded = serde_qs::to_string(&pair).context(SerializeSnafu)?;
     Ok(encoded)
 }
 
-/// Converts a [`String`] back to a [`ScalarValue`].
+/// Decodes a [`String`] back into a [`ScalarValue`] and the hash of the
+/// `partition_by` expressions.
 ///
 /// # Errors
-/// Returns an error if a [`ScalarValue`] cannot be created.
-pub fn decode_scalar_value(value: &str) -> Result<ScalarValue, Error> {
-    let decoded: SupportedScalarValue = serde_qs::from_str(value).context(DeserializeSnafu)?;
-    let value = ScalarValue::try_from(decoded)?;
-    Ok(value)
+/// Returns an error if the str cannot be deserialized or converted to a
+/// [`ScalarValue`]
+pub fn decode_pair(value: &str) -> Result<(ScalarValue, u64), Error> {
+    let pair: SerializablePair = serde_qs::from_str(value).context(DeserializeSnafu)?;
+    let scalar = ScalarValue::try_from(pair.scalar)?;
+    Ok((scalar, pair.exprs_hash))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +90,17 @@ enum SupportedScalarValue {
     Utf8(Option<String>),
     Utf8View(Option<String>),
     LargeUtf8(Option<String>),
+    Date32(Option<i32>),
+    Date64(Option<i64>),
+    Time32Second(Option<i32>),
+    Time32Millisecond(Option<i32>),
+    Time64Microsecond(Option<i64>),
+    Time64Nanosecond(Option<i64>),
+    TimestampSecond(Option<i64>, Option<String>),
+    TimestampMillisecond(Option<i64>, Option<String>),
+    TimestampMicrosecond(Option<i64>, Option<String>),
+    TimestampNanosecond(Option<i64>, Option<String>),
+    IntervalYearMonth(Option<i32>),
 }
 
 impl TryFrom<ScalarValue> for SupportedScalarValue {
@@ -96,6 +120,25 @@ impl TryFrom<ScalarValue> for SupportedScalarValue {
             ScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             ScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             ScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
+            ScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
+            ScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
+            ScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
+            ScalarValue::Time32Millisecond(maybe_value) => Self::Time32Millisecond(maybe_value),
+            ScalarValue::Time64Microsecond(maybe_value) => Self::Time64Microsecond(maybe_value),
+            ScalarValue::Time64Nanosecond(maybe_value) => Self::Time64Nanosecond(maybe_value),
+            ScalarValue::TimestampSecond(maybe_value, maybe_str) => {
+                Self::TimestampSecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
+                Self::TimestampMillisecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
+                Self::TimestampMicrosecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
+                Self::TimestampNanosecond(maybe_value, maybe_str.map(|s| s.to_string()))
+            }
+            ScalarValue::IntervalYearMonth(maybe_value) => Self::IntervalYearMonth(maybe_value),
             _ => {
                 return UnsupportedTypeSnafu {
                     data_type: value.data_type(),
@@ -123,6 +166,33 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
             SupportedScalarValue::Utf8(maybe_value) => Self::Utf8(maybe_value),
             SupportedScalarValue::Utf8View(maybe_value) => Self::Utf8View(maybe_value),
             SupportedScalarValue::LargeUtf8(maybe_value) => Self::LargeUtf8(maybe_value),
+            SupportedScalarValue::Date32(maybe_value) => Self::Date32(maybe_value),
+            SupportedScalarValue::Date64(maybe_value) => Self::Date64(maybe_value),
+            SupportedScalarValue::Time32Second(maybe_value) => Self::Time32Second(maybe_value),
+            SupportedScalarValue::Time32Millisecond(maybe_value) => {
+                Self::Time32Millisecond(maybe_value)
+            }
+            SupportedScalarValue::Time64Microsecond(maybe_value) => {
+                Self::Time64Microsecond(maybe_value)
+            }
+            SupportedScalarValue::Time64Nanosecond(maybe_value) => {
+                Self::Time64Nanosecond(maybe_value)
+            }
+            SupportedScalarValue::TimestampSecond(maybe_value, maybe_str) => {
+                Self::TimestampSecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampMillisecond(maybe_value, maybe_str) => {
+                Self::TimestampMillisecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampMicrosecond(maybe_value, maybe_str) => {
+                Self::TimestampMicrosecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::TimestampNanosecond(maybe_value, maybe_str) => {
+                Self::TimestampNanosecond(maybe_value, maybe_str.map(Into::into))
+            }
+            SupportedScalarValue::IntervalYearMonth(maybe_value) => {
+                Self::IntervalYearMonth(maybe_value)
+            }
         })
     }
 }
@@ -131,18 +201,23 @@ impl TryFrom<SupportedScalarValue> for ScalarValue {
 mod tests {
     use super::*;
 
+    const EXPRS_HASH: u64 = 7;
+
     #[test]
     fn test_encode_decode_boolean() {
         let values = vec![Some(true), Some(false), None];
         for value in values {
             let scalar = ScalarValue::Boolean(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode boolean scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode boolean scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode boolean pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode boolean pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Boolean value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for boolean {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -152,12 +227,16 @@ mod tests {
         let values = vec![Some(42_i8), Some(-42_i8), None];
         for value in values {
             let scalar = ScalarValue::Int8(value);
-            let encoded = encode_scalar_value(&scalar).expect("Failed to encode int8 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode int8 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int8 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode int8 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Int8 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for int8 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -167,13 +246,16 @@ mod tests {
         let values = vec![Some(1000_i16), Some(-1000_i16), None];
         for value in values {
             let scalar = ScalarValue::Int16(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode int16 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode int16 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int16 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode int16 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Int16 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for int16 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -183,13 +265,16 @@ mod tests {
         let values = vec![Some(100_000_i32), Some(-100_000_i32), None];
         for value in values {
             let scalar = ScalarValue::Int32(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode int32 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode int32 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int32 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode int32 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Int32 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for int32 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -199,13 +284,16 @@ mod tests {
         let values = vec![Some(1_000_000_000_i64), Some(-1_000_000_000_i64), None];
         for value in values {
             let scalar = ScalarValue::Int64(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode int64 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode int64 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode int64 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode int64 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Int64 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for int64 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -215,13 +303,16 @@ mod tests {
         let values = vec![Some(255_u8), Some(0_u8), None];
         for value in values {
             let scalar = ScalarValue::UInt8(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode uint8 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode uint8 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint8 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode uint8 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "UInt8 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for uint8 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -231,13 +322,16 @@ mod tests {
         let values = vec![Some(65_535_u16), Some(0_u16), None];
         for value in values {
             let scalar = ScalarValue::UInt16(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode uint16 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode uint16 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint16 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode uint16 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "UInt16 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for uint16 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -247,13 +341,16 @@ mod tests {
         let values = vec![Some(4_294_967_295_u32), Some(0_u32), None];
         for value in values {
             let scalar = ScalarValue::UInt32(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode uint32 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode uint32 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint32 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode uint32 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "UInt32 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for uint32 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -263,13 +360,16 @@ mod tests {
         let values = vec![Some(18_446_744_073_709_551_615_u64), Some(0_u64), None];
         for value in values {
             let scalar = ScalarValue::UInt64(value);
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode uint64 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode uint64 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode uint64 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode uint64 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "UInt64 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for uint64 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -279,12 +379,16 @@ mod tests {
         let values = vec![Some("hello".to_string()), Some(String::new()), None];
         for value in values {
             let scalar = ScalarValue::Utf8(value.clone());
-            let encoded = encode_scalar_value(&scalar).expect("Failed to encode utf8 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode utf8 scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode utf8 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode utf8 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Utf8 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for utf8 {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -294,13 +398,16 @@ mod tests {
         let values = vec![Some("world".to_string()), Some(String::new()), None];
         for value in values {
             let scalar = ScalarValue::Utf8View(value.clone());
-            let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode utf8view scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode utf8view scalar value");
+            let encoded = encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode utf8view pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode utf8view pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "Utf8View value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for utf8view {value:?} failed to encode/decode correctly"
             );
         }
     }
@@ -311,12 +418,16 @@ mod tests {
         for value in values {
             let scalar = ScalarValue::LargeUtf8(value.clone());
             let encoded =
-                encode_scalar_value(&scalar).expect("Failed to encode large utf8 scalar value");
-            let decoded =
-                decode_scalar_value(&encoded).expect("Failed to decode large utf8 scalar value");
+                encode_pair(&scalar, EXPRS_HASH).expect("Failed to encode large utf8 pair");
+            let (decoded_scalar, decoded_exprs_hash) =
+                decode_pair(&encoded).expect("Failed to decode large utf8 pair");
             assert_eq!(
-                decoded, scalar,
+                decoded_scalar, scalar,
                 "LargeUtf8 value {value:?} failed to encode/decode correctly"
+            );
+            assert_eq!(
+                decoded_exprs_hash, EXPRS_HASH,
+                "Exprs hash for large utf8 {value:?} failed to encode/decode correctly"
             );
         }
     }

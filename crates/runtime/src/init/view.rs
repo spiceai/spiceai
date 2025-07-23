@@ -102,13 +102,13 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         for view in views {
-            if let Some(acceleration) = &view.acceleration {
+            if let Some(acceleration_settings) = &view.acceleration {
                 let accelerator = match self
                     .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration.engine)
+                    .get_accelerator_engine(acceleration_settings.engine)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     }) {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
@@ -123,7 +123,7 @@ impl Runtime {
 
                 if let Err(err) = accelerator.init(view.as_ref()).await.context(
                     AcceleratorInitializationFailedSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     },
                 ) {
                     let view_name = &view.name;

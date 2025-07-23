@@ -1,0 +1,31 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "cp_catalog_page_sk": 1,
+    "trunc(vector_search().score,Int64(3))": 0.947,
+    "cp_description": "In general basic characters welcome. Clearly lively friends conv",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 15,
+    "trunc(vector_search().score,Int64(3))": 0.94,
+    "cp_description": "Close customers might struggle away different memb",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 3,
+    "trunc(vector_search().score,Int64(3))": 0.937,
+    "cp_description": "Earlier different differences get just to a methods; masses includ",
+    "cp_catalog_number": 1
+  },
+  {
+    "cp_catalog_page_sk": 7,
+    "trunc(vector_search().score,Int64(3))": 0.926,
+    "cp_description": "Years must understand. Well fat thousands take. Good police l",
+    "cp_catalog_number": 1
+  }
+]

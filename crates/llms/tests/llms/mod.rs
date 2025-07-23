@@ -20,7 +20,7 @@ use llms::{accumulate::accumulate, chat::Chat};
 use serde_json::{Value, json};
 use std::{
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use crate::{TEST_ARGS, init_tracing};
@@ -53,50 +53,86 @@ macro_rules! test_case {
     }};
 }
 
-/// For a given mode name, a function that instantiates the model..
-type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<dyn Chat>>);
+/// Async function that creates a model instance
+type AsyncModelCreator = Box<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Arc<dyn Chat>, anyhow::Error>> + Send>,
+        > + Send
+        + Sync,
+>;
 
-/// A given model to test.
-type ModelDef<'a> = (&'a str, Arc<dyn Chat>);
+/// A given model to test - cached after first creation
+type ModelDef = (&'static str, Mutex<Option<Arc<dyn Chat>>>);
+
 #[allow(clippy::expect_used)]
-static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
-    let model_creators: [ModelFn; 6] = [
-        (
-            "anthropic",
-            Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
-        ),
-        ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
-        (
-            "xai",
-            Box::new(|| create::create_xai("grok-3").expect("failed to create 'grok-3' from xAI")),
-        ),
-        (
-            "hf_phi3",
-            Box::new(|| {
-                create::create_hf("microsoft/Phi-3-mini-4k-instruct")
-                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
-            }),
-        ),
-        (
-            "local_phi3",
-            Box::new(|| {
-                create::create_local("microsoft/Phi-3-mini-4k-instruct")
-                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
-            }),
-        ),
-        (
-            "perplexity",
-            Box::new(|| create::create_perplexity().expect("failed to create perplexity model")),
-        ),
-    ];
+static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = LazyLock::new(
+    || {
+        vec![
+            (
+                "anthropic",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_anthropic(None)
+                            .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {}", e))
+                    })
+                }),
+            ),
+            (
+                "openai",
+                Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
+            ),
+            (
+                "xai",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_xai("grok-3").map_err(|e| {
+                            anyhow::anyhow!("failed to create 'grok-3' from xAI: {}", e)
+                        })
+                    })
+                }),
+            ),
+            (
+                "hf_phi3",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_hf("microsoft/Phi-3-mini-4k-instruct")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF: {}", e))
+                    })
+                }),
+            ),
+            (
+                "local_phi3",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_local("microsoft/Phi-3-mini-4k-instruct")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system: {}", e))
+                    })
+                }),
+            ),
+            (
+                "perplexity",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_perplexity().map_err(|e| {
+                            anyhow::anyhow!("failed to create perplexity model: {}", e)
+                        })
+                    })
+                }),
+            ),
+        ]
+    },
+);
 
-    model_creators
+static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
+    TEST_MODEL_CREATORS
         .iter()
-        .filter_map(|(name, creator)| {
+        .filter_map(|(name, _)| {
             if TEST_ARGS.skip_model(name) {
                 None
             } else {
-                Some((*name, creator()))
+                Some((*name, Mutex::new(None)))
             }
         })
         .collect()
@@ -315,6 +351,43 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
+/// Get or create a model instance for the given name
+async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    // Find the model in TEST_MODELS
+    let (_, model_cache) = TEST_MODELS
+        .iter()
+        .find(|(name, _)| *name == model_name)
+        .ok_or_else(|| anyhow::anyhow!("model {} not found in TEST_MODELS", model_name))?;
+
+    // Check if model is already cached
+    {
+        let guard = model_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model cache could not be unlocked"))?;
+        if let Some(model) = guard.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+    }
+
+    // Model not cached, create it
+    let (_, creator) = TEST_MODEL_CREATORS
+        .iter()
+        .find(|(name, _)| *name == model_name)
+        .ok_or_else(|| anyhow::anyhow!("model creator {} not found", model_name))?;
+
+    let model = creator().await?;
+
+    // Cache the model
+    {
+        let mut guard = model_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model cache could not be locked"))?;
+        *guard = Some(Arc::clone(&model));
+    }
+
+    Ok(model)
+}
+
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
 async fn run_single_test(
     test_name: &str,
@@ -344,10 +417,9 @@ async fn run_single_test(
     }
 
     // Get and run model
-    let (_, model) = TEST_MODELS
-        .iter()
-        .find(|(name, _)| *name == model_name)
-        .unwrap_or_else(|| panic!("model {model_name} not found"));
+    let model = get_or_create_model(model_name)
+        .await
+        .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
 
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 

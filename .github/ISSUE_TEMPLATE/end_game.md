@@ -49,6 +49,7 @@ assignees: ''
 1. **Unit/Integration Tests**
 
    - [ ] Confirm local and CI tests pass without major failures.
+     - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
 1. **E2E Tests**
 
@@ -83,6 +84,7 @@ assignees: ''
      - [ ] [FTP](https://github.com/spiceai/cookbook/blob/trunk/ftp/README.md)
      - [ ] [File Connector](https://github.com/spiceai/cookbook/blob/trunk/file/README.md)
      - [ ] [GitHub](https://github.com/spiceai/cookbook/blob/trunk/github/README.md)
+     - [ ] [Glue](https://github.com/spiceai/cookbook/tree/trunk/glue/README.md)
      - [ ] [GraphQL](https://github.com/spiceai/cookbook/blob/trunk/graphql/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
@@ -104,7 +106,8 @@ assignees: ''
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
-     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md).
+     - [ ] [Glue Catalog](https://github.com/spiceai/cookbook/tree/trunk/catalogs/glue/README.md)
+     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
 
@@ -140,6 +143,7 @@ assignees: ''
      - [ ] [Federated SQL Query](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
      - [ ] [Indexes on Accelerated Data](https://github.com/spiceai/cookbook/blob/trunk/acceleration/indexes/README.md)
      - [ ] [Refresh Data Window](https://github.com/spiceai/cookbook/blob/trunk/refresh-data-window/README.md)
+     - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
      - [ ] [Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
@@ -160,6 +164,11 @@ assignees: ''
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
+  - [ ] Run [Generate Changelog](https://github.com/spiceai/spiceai/actions/workflows/generate_changelog.yml) to update the release notes.
+    - Use parameters:
+      - Previous Release Tag: the previous release tag (e.g. `v1.4.0`). This is the tag of the previous release we want to compare against.
+      - Release Branch: the release branch (e.g. `release/1.5`). This is the branch that contains the new changes that are based on the release branch. If this is a prep branch, use that branch here.
+      - The script will generate the changes it believes are in the release. It also generates a list of changes that are only in trunk but not in the release branch, but this is not always accurate. Please review the changes and copy any changes that are missing into the release notes changelog.
 
 - [ ] Add references to any SDK releases in the release notes:
 
@@ -169,6 +178,8 @@ assignees: ''
   - [ ] [spice-java](https://github.com/spiceai/spice-java/releases)
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
+
+- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
 
 - [ ] Run [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) **on the release branch** to update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md).
 
@@ -193,7 +204,6 @@ assignees: ''
 ## Post-Release Housekeeping
 
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
-  - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
@@ -208,7 +218,7 @@ assignees: ''
 - [ ] Update the supported version in `SECURITY.md` if necessary.
 - [ ] QA DRI: Run SpiceQA via [Github Action](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml), with the correct `input.spice_version`.
   - [ ] Redeploy the SpiceQA app in the Spice.ai Cloud Platform (SCP). Ensure the deployment is successful.
-  - [ ] Run the [SpiceQA Workflow](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml) in GitHub Actions. Verify the artifact for each cookbook recipe are present and confirm that all tests pass as expected.
+  - [ ] Run the [SpiceQA Workflow](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml) in GitHub Actions. Verify the job passing status for each recipe (green - pass, red - failure).
 - [ ] QA DRI: Add metrics to [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv).
   - Use number of recipes total from [spiceai.org/docs/cookbook](https://spiceai.org/docs/cookbook).
 

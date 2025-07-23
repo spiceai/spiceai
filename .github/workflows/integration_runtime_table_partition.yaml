@@ -1,0 +1,123 @@
+---
+name: integration tests (runtime-table-partition)
+
+on:
+  push:
+    branches:
+      - trunk
+      - release/*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
+      - 'bin/spice/**'
+
+  workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
+
+jobs:
+  build:
+    name: Build Partition Table Test Binary
+    runs-on: spiceai-dev-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Build partition table test binary
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: partition-table-test-archive
+          path: ./partition_table_test.tar.zst
+          retention-days: 1
+
+  test:
+    name: Partition Table Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: partition-table-test-archive
+          path: ./partition_table_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Use public ECR for forks
+        if: github.repository != 'spiceai/spiceai'
+        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
+
+      - name: Run partition table integration test
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
