@@ -536,7 +536,7 @@ impl DataConnector for Github {
                 let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
                     value if value > MAX_COMMENTS_FETCHED => {
                         tracing::warn!(
-                            "The maximum number of comments fetched per pull request is capped at {MAX_COMMENTS_FETCHED} for {component}. The value {MAX_COMMENTS_FETCHED} will be used instead."
+                            "Due to GitHub API rate limits, the number of comments fetched for {component} per pull request is limited to {MAX_COMMENTS_FETCHED}."
                         );
                         MAX_COMMENTS_FETCHED
                     }
