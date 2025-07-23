@@ -458,7 +458,7 @@ fn warn_if_provided(
     for (param, present) in parameters {
         if present {
             tracing::warn!(
-                "Parameter '{param}' is not supported for the '{table_type}' table type in {connector_component} and will be ignored."
+                "The parameter '{param}' is not supported for the {connector_component}, as a '{table_type}' table. For details, visit: https://spiceai.org/docs/components/data-connectors/github"
             );
         }
     }
