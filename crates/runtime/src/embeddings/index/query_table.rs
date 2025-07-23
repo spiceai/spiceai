@@ -620,13 +620,6 @@ mod tests {
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             self.0.children()
         }
-        // fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        //     let mut stats = Statistics::default().with_num_rows(Precision::Exact(100));
-        //     for _ in self.schema().fields.iter() {
-        //         stats = stats.add_column_statistics(ColumnStatistics::new_unknown());
-        //     }
-        //     Ok(stats)
-        // }
 
         fn with_new_children(
             self: Arc<Self>,
@@ -676,14 +669,6 @@ mod tests {
         fn table_type(&self) -> TableType {
             self.0.table_type()
         }
-
-        // fn statistics(&self) -> Option<Statistics> {
-        //     let mut stats = Statistics::default().with_num_rows(Precision::Exact(100));
-        //     for _ in self.schema().fields.iter() {
-        //         stats = stats.add_column_statistics(ColumnStatistics::new_unknown());
-        //     }
-        //     Some(stats)
-        // }
 
         async fn scan(
             &self,
@@ -846,9 +831,6 @@ mod tests {
                         .unwrap(),
                 ))
             }
-            // DataType::new_fixed_size_list(DataType::Float32, 10, false),
-            // Add more types as needed (e.g., Date32, Timestamp, etc.)
-            // For unsupported/complex types, use a single null:
             _ => new_null_array(dt, 1),
         }
     }
@@ -872,13 +854,11 @@ mod tests {
         ]));
         let p = VectorQueryTableProvider {
             table_provider: Arc::new(
-                // ExplainMemTable(
                 MemTable::try_new(
                     schema.clone(),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-                // )
             ),
             vector_index: Arc::new(EmptyIndex {
                 embedded_column: "body".to_string(),
@@ -934,13 +914,13 @@ mod tests {
             Field::new("not_where", DataType::Utf8, false),
         ]));
         let p = VectorQueryTableProvider {
-            table_provider: Arc::new(ExplainMemTable(
+            table_provider: Arc::new(
                 MemTable::try_new(
                     schema.clone(),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
-            )),
+            ),
             vector_index: Arc::new(EmptyIndex {
                 embedded_column: "body".to_string(),
                 primary_columns: vec![Field::new("pk", DataType::Int64, false)],
