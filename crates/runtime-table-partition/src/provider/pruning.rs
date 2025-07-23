@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use chrono::{Datelike as _, TimeZone, Timelike as _, Utc};
+use chrono::{NaiveDateTime, TimeZone, Utc};
 use datafusion::{
-    arrow::temporal_conversions::NANOSECONDS,
     common::tree_node::{Transformed, TreeNode as _},
     error::DataFusionError,
     logical_expr::{
@@ -29,12 +28,16 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-/// Collects equality conditions from nested OR expressions.
-fn collect_or_equalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
+/// Collects conditions (equalities or inequalities) from nested expressions for a given operator.
+fn collect_conditions(
+    expr: &Expr,
+    combining_op: Operator,
+    condition_op: Operator,
+) -> Option<(String, Vec<ScalarValue>)> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
-            let left_result = collect_or_equalities(left);
-            let right_result = collect_or_equalities(right);
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == combining_op => {
+            let left_result = collect_conditions(left, combining_op, condition_op);
+            let right_result = collect_conditions(right, combining_op, condition_op);
             match (left_result, right_result) {
                 (Some((col_left, mut lits_left)), Some((col_right, lits_right)))
                     if col_left == col_right =>
@@ -45,36 +48,7 @@ fn collect_or_equalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
                 _ => None,
             }
         }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(lit))
-                | (Expr::Literal(lit), Expr::Column(col)) => {
-                    Some((col.name().to_string(), vec![lit.clone()]))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Collects inequality conditions from nested AND expressions.
-fn collect_and_inequalities(expr: &Expr) -> Option<(String, Vec<ScalarValue>)> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
-            let left_result = collect_and_inequalities(left);
-            let right_result = collect_and_inequalities(right);
-            match (left_result, right_result) {
-                (Some((col_left, mut lits_left)), Some((col_right, lits_right)))
-                    if col_left == col_right =>
-                {
-                    lits_left.extend(lits_right);
-                    Some((col_left, lits_left))
-                }
-                _ => None,
-            }
-        }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::NotEq => {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(col), Expr::Literal(lit))
                 | (Expr::Literal(lit), Expr::Column(col)) => {
@@ -96,6 +70,7 @@ pub(crate) fn prune_partition(
     let partition_by_columns = partition_by.column_refs();
 
     for filter in filters {
+        // Skip if the filter does not contain the columns in the partition_by Expr
         if filter
             .column_refs()
             .iter()
@@ -135,7 +110,9 @@ pub(crate) fn prune_partition(
                         }
                     }
                     _ => {
-                        if let Some((col_name, literals)) = collect_or_equalities(filter) {
+                        if let Some((col_name, literals)) =
+                            collect_conditions(filter, Operator::Or, Operator::Eq)
+                        {
                             let mut any_matches = false;
                             for lit in literals {
                                 let is_match = filter_or_udf_value_matches(
@@ -149,7 +126,8 @@ pub(crate) fn prune_partition(
                             if !any_matches {
                                 return Ok(true);
                             }
-                        } else if let Some((col_name, literals)) = collect_and_inequalities(filter)
+                        } else if let Some((col_name, literals)) =
+                            collect_conditions(filter, Operator::And, Operator::NotEq)
                         {
                             for lit in literals {
                                 let is_match = filter_or_udf_value_matches(
@@ -310,6 +288,7 @@ fn evaluate_function_filter(
         .map(|arg| match arg {
             Expr::Literal(lit) => Ok(lit.clone()),
             Expr::Column(col) => {
+                // Replace the column with the partition_value
                 let transformed = partition_by
                     .clone()
                     .transform(|e| {
@@ -322,6 +301,7 @@ fn evaluate_function_filter(
                     })
                     .map_err(|e| DataFusionError::Plan(format!("Failed to transform: {e}")))?
                     .data;
+
                 evaluate_expr(&transformed)
             }
             _ => Err(DataFusionError::Plan(
@@ -343,49 +323,8 @@ fn evaluate_expr(expr: &Expr) -> Result<ScalarValue, DataFusionError> {
                 .iter()
                 .map(|arg| evaluate_expr(arg))
                 .collect::<Result<Vec<_>, _>>()?;
-            if func.name() == "date_trunc" {
-                if let [
-                    ScalarValue::Utf8(Some(granularity)),
-                    ScalarValue::TimestampNanosecond(Some(ts), _),
-                ] = args.as_slice()
-                {
-                    if granularity == "month" {
-                        let seconds = ts / NANOSECONDS;
-                        let nanos = (ts % NANOSECONDS) as u32;
-                        let dt = Utc.timestamp_opt(seconds, nanos).single().ok_or_else(|| {
-                            DataFusionError::Plan(format!("Invalid timestamp: {} ns", ts))
-                        })?;
-                        let truncated = dt
-                            .with_day(1)
-                            .and_then(|d| d.with_hour(0))
-                            .and_then(|d| d.with_minute(0))
-                            .and_then(|d| d.with_second(0))
-                            .and_then(|d| d.with_nanosecond(0))
-                            .ok_or_else(|| {
-                                DataFusionError::Plan(format!(
-                                    "Failed to truncate timestamp: {} ns",
-                                    ts
-                                ))
-                            })?;
-                        Ok(ScalarValue::TimestampNanosecond(
-                            Some(truncated.timestamp_nanos_opt().unwrap_or(0)),
-                            None,
-                        ))
-                    } else {
-                        Err(DataFusionError::Plan(format!(
-                            "Unsupported date_trunc arguments: {:?}",
-                            args
-                        )))
-                    }
-                } else {
-                    Err(DataFusionError::Plan(format!(
-                        "Unsupported date_trunc arguments: {:?}",
-                        args
-                    )))
-                }
-            } else {
-                call(func.as_ref(), args)
-            }
+
+            call(func.as_ref(), args)
         }
         Expr::Case(case) => {
             for (when, then) in &case.when_then_expr {
@@ -451,6 +390,18 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
     };
 
     Ok(bucket_value)
+}
+
+pub fn timestamp_nanos(datetime: &str) -> i64 {
+    let naive =
+        NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
+
+    // Assume UTC; convert NaiveDateTime to a DateTime<Utc>
+    let datetime_utc = Utc.from_utc_datetime(&naive);
+
+    datetime_utc
+        .timestamp_nanos_opt()
+        .expect("timestamp_nanos_opt is ok")
 }
 
 #[cfg(test)]
@@ -812,23 +763,127 @@ mod tests {
 
     #[test]
     fn test_prune_partition_date_trunc() -> Result<(), DataFusionError> {
-        let partition_by = date_trunc(lit("month"), col("date"));
-        let filters = &[col("date").eq(lit(ScalarValue::TimestampNanosecond(
-            Some(1752537600000000000), // 2025-07-15
-            None,
-        )))];
-        let partition_value = ScalarValue::TimestampNanosecond(Some(1751328000000000000), None); // 2025-07-01
-        assert_eq!(
-            prune_partition(filters, &partition_by, &partition_value)?,
-            false,
-            "partition_value = {partition_value:?}, should_prune = false"
-        );
-        let partition_value = ScalarValue::TimestampNanosecond(Some(1754016000000000000), None); // 2025-08-01
-        assert_eq!(
-            prune_partition(filters, &partition_by, &partition_value)?,
-            true,
-            "partition_value = {partition_value:?}, should_prune = true"
-        );
+        let filter_date =
+            ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 00:00:00")), None);
+        let filters = &[col("date").eq(lit(filter_date.clone()))];
+
+        // Test multiple granularities
+        let granularities = vec!["year", "month", "day", "hour", "minute", "second"];
+        for granularity in granularities {
+            let partition_by = date_trunc(lit(granularity), col("date"));
+
+            // Define partition values for each granularity
+            let partition_values = match granularity {
+                "year" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-01-01 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2026-01-01 00:00:00")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                "month" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-01 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-08-01 00:00:00")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                "day" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-16 00:00:00")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                "hour" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 01:00:00")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                "minute" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:01:00")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                "second" => vec![
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:00:00")),
+                            None,
+                        ),
+                        false,
+                    ),
+                    (
+                        ScalarValue::TimestampNanosecond(
+                            Some(timestamp_nanos("2025-07-15 00:00:01")),
+                            None,
+                        ),
+                        true,
+                    ),
+                ],
+                _ => vec![],
+            };
+
+            for (partition_value, should_prune) in partition_values {
+                assert_eq!(
+                    prune_partition(filters, &partition_by, &partition_value)?,
+                    should_prune,
+                    "granularity = {}, partition_value = {:?}, should_prune = {}",
+                    granularity,
+                    partition_value,
+                    should_prune
+                );
+            }
+        }
         Ok(())
     }
 

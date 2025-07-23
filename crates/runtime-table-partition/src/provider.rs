@@ -36,7 +36,7 @@ use crate::{
     insert::PartitionerExec,
 };
 
-mod pruning;
+pub mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
