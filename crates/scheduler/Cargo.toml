@@ -12,7 +12,7 @@ version.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-croner = "2.2.0"
+croner = "3.0.0"
 futures.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["time"] }
