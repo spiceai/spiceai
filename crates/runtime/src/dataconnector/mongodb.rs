@@ -71,10 +71,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("user").secret(),
     ParameterSpec::component("pass").secret(),
     ParameterSpec::component("host"),
-    ParameterSpec::component("tcp_port"),
+    ParameterSpec::component("port"),
     ParameterSpec::component("db"),
     ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("auth_source"),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default("10"),

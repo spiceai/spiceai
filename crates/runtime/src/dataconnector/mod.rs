@@ -396,7 +396,7 @@ pub async fn register_all() {
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
     register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
     register_connector_factory("memory", memory::MemoryConnectorFactory::new_arc()).await;
-    // #[cfg(feature = "mongodb")]
+    #[cfg(feature = "mongodb")]
     register_connector_factory("mongodb", mongodb::MongoDBFactory::new_arc()).await;
     #[cfg(feature = "mssql")]
     register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;

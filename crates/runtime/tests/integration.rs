@@ -63,6 +63,8 @@ mod graphql;
 mod iceberg;
 mod iceberg_api;
 mod metadata;
+#[cfg(feature = "mongodb")]
+mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
 #[cfg(feature = "mysql")]
