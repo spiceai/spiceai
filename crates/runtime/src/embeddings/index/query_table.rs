@@ -561,25 +561,151 @@ fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{any::Any, collections::HashMap, sync::Arc};
 
-    use arrow::{array::RecordBatch, util::pretty};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::{
+        array::{
+            ArrayData, ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array,
+            Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+        },
+        buffer::Buffer,
+        datatypes::Float32Type,
+        util::pretty,
+    };
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use data_components::s3_vectors::{
         MetadataColumn, MetadataColumns, query_provider::S3_VECTOR_DISTANCE_NAME,
     };
     use datafusion::{
-        catalog::{MemTable, TableProvider},
-        prelude::SessionContext,
+        catalog::{MemTable, Session, TableProvider},
+        common::{ColumnStatistics, Statistics, stats::Precision},
+        datasource::TableType,
+        error::DataFusionError,
+        logical_expr::TableProviderFilterPushDown,
+        physical_plan::{DisplayAs, ExecutionPlan},
+        prelude::{Expr, SessionContext},
         sql::TableReference,
     };
-    use search::SEARCH_SCORE_COLUMN_NAME;
     use snafu::ResultExt;
 
     use crate::embeddings::{
         index::{VectorIndex, VectorQueryTableProvider},
         udtf::append_fields,
     };
+
+    /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
+    /// This is useful for testing explain plans.
+    #[derive(Debug)]
+    pub struct ExplainMemTable(MemTable);
+
+    /// Wraps a [`ExecutionPlan`] with a new [`DisplayAs`] to show what filters have been pushed down.
+    /// This is useful for testing explain plans.
+    #[derive(Debug)]
+    pub struct ExplainExecutionPlan(Arc<dyn ExecutionPlan>, Vec<Expr>, Option<usize>);
+
+    impl ExecutionPlan for ExplainExecutionPlan {
+        fn name(&self) -> &str {
+            "ExplainExecutionPlan"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+            self.0.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.0.children()
+        }
+        // fn statistics(&self) -> Result<Statistics, DataFusionError> {
+        //     let mut stats = Statistics::default().with_num_rows(Precision::Exact(100));
+        //     for _ in self.schema().fields.iter() {
+        //         stats = stats.add_column_statistics(ColumnStatistics::new_unknown());
+        //     }
+        //     Ok(stats)
+        // }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(ExplainExecutionPlan(
+                Arc::clone(&self.0).with_new_children(children)?,
+                self.1.clone(),
+                self.2,
+            )))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+            self.0.execute(partition, context)
+        }
+    }
+
+    impl DisplayAs for ExplainExecutionPlan {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(
+                f,
+                "ExplainExecutionPlan: filter={:?} limit={:?}",
+                self.1, self.2
+            )?;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for ExplainMemTable {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.0.table_type()
+        }
+
+        // fn statistics(&self) -> Option<Statistics> {
+        //     let mut stats = Statistics::default().with_num_rows(Precision::Exact(100));
+        //     for _ in self.schema().fields.iter() {
+        //         stats = stats.add_column_statistics(ColumnStatistics::new_unknown());
+        //     }
+        //     Some(stats)
+        // }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+            Ok(Arc::new(ExplainExecutionPlan(
+                self.0.scan(state, projection, filters, limit).await?,
+                filters.to_vec(),
+                limit,
+            )) as Arc<dyn ExecutionPlan>)
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        }
+    }
 
     #[derive(Debug)]
     pub struct EmptyIndex {
@@ -599,7 +725,15 @@ mod tests {
         }
 
         fn list_table_provider(&self) -> Arc<dyn TableProvider> {
-            Arc::new(MemTable::try_new(Arc::new(self.schema.clone()), vec![vec![]]).unwrap())
+            Arc::new(ExplainMemTable(
+                MemTable::try_new(
+                    Arc::new(self.schema.clone()),
+                    vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
+                        self.schema.clone(),
+                    ))]],
+                )
+                .unwrap(),
+            ))
         }
 
         fn metadata_columns(&self) -> MetadataColumns {
@@ -638,8 +772,13 @@ mod tests {
                     false,
                 ))],
             );
-            let mem = MemTable::try_new(schema, vec![vec![]]).boxed()?;
-            Ok(Arc::new(mem) as Arc<dyn TableProvider>)
+            Ok(Arc::new(ExplainMemTable(
+                MemTable::try_new(
+                    schema.clone(),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .boxed()?,
+            )) as Arc<dyn TableProvider>)
         }
     }
 
@@ -670,19 +809,76 @@ mod tests {
         Ok(())
     }
 
+    fn default_value_array(dt: &DataType) -> ArrayRef {
+        match dt {
+            DataType::Int8 => Arc::new(Int8Array::from(vec![0])) as ArrayRef,
+            DataType::Int16 => Arc::new(Int16Array::from(vec![0])) as ArrayRef,
+            DataType::Int32 => Arc::new(Int32Array::from(vec![0])) as ArrayRef,
+            DataType::Int64 => Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+            DataType::UInt8 => Arc::new(UInt8Array::from(vec![0])) as ArrayRef,
+            DataType::UInt16 => Arc::new(UInt16Array::from(vec![0])) as ArrayRef,
+            DataType::UInt32 => Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+            DataType::UInt64 => Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+            DataType::Float32 => Arc::new(Float32Array::from(vec![0.0])) as ArrayRef,
+            DataType::Float64 => Arc::new(Float64Array::from(vec![0.0])) as ArrayRef,
+            DataType::Boolean => Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+            DataType::Utf8 => Arc::new(StringArray::from(vec![""])) as ArrayRef,
+            DataType::FixedSizeList(_, length) => {
+                let list_data_type = DataType::FixedSizeList(
+                    Arc::new(Field::new_list_field(DataType::Float32, false)),
+                    *length,
+                );
+                Arc::new(FixedSizeListArray::from(
+                    ArrayData::builder(list_data_type.clone())
+                        .len(1)
+                        .add_child_data(
+                            ArrayData::builder(DataType::Float32)
+                                .len(*length as usize)
+                                .add_buffer(Buffer::from_slice_ref(
+                                    &(0..(*length as usize))
+                                        .map(|s| s as f32)
+                                        .collect::<Vec<_>>(),
+                                ))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build()
+                        .unwrap(),
+                ))
+            }
+            // DataType::new_fixed_size_list(DataType::Float32, 10, false),
+            // Add more types as needed (e.g., Date32, Timestamp, etc.)
+            // For unsupported/complex types, use a single null:
+            _ => new_null_array(dt, 1),
+        }
+    }
+
+    fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|field| default_value_array(field.data_type()))
+            .collect();
+
+        RecordBatch::try_new(Arc::clone(schema), arrays).unwrap()
+    }
+
     #[tokio::test]
-    pub async fn test_hello() -> Result<(), String> {
+    pub async fn test_vector_query_basic() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+        ]));
         let p = VectorQueryTableProvider {
             table_provider: Arc::new(
+                // ExplainMemTable(
                 MemTable::try_new(
-                    Arc::new(Schema::new(vec![
-                        Field::new("pk", DataType::Int64, false),
-                        Field::new("body", DataType::Utf8, false),
-                        Field::new("another_column", DataType::Utf8, false),
-                    ])),
-                    vec![vec![]],
+                    schema.clone(),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
+                // )
             ),
             vector_index: Arc::new(EmptyIndex {
                 embedded_column: "body".to_string(),
@@ -720,8 +916,99 @@ mod tests {
         test_explain(
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
-            "SELECT pk, score from my_vectored_table WHERE another_column = 'something' ORDER BY score desc LIMIT 5",
+            "SELECT pk, score from my_vectored_table WHERE another_column != 'something' ORDER BY score desc LIMIT 5",
             "join_for_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_vector_query_index_metadata() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorQueryTableProvider {
+            table_provider: Arc::new(ExplainMemTable(
+                MemTable::try_new(
+                    schema.clone(),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            )),
+            vector_index: Arc::new(EmptyIndex {
+                embedded_column: "body".to_string(),
+                primary_columns: vec![Field::new("pk", DataType::Int64, false)],
+                schema: Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new(
+                        "data",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            }),
+            query: "just a query".to_string(),
+            pre_limit: None,
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "basic",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "join_for_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "join_for_projection_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, score from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY score desc LIMIT 5",
+            "join_for_filter_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "no_join_for_metadata_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, score from my_vectored_table WHERE a_number > 0 ORDER BY score desc LIMIT 5",
+            "no_join_for_metadata_filter",
         )
         .await?;
 
