@@ -1,6 +1,6 @@
 [package]
 name = "spiceai"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 description = "SDK for Spice.ai, an open-source runtime and platform for building AI-driven software."
 license = "Apache-2.0"
