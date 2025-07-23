@@ -24,7 +24,9 @@ use arrow::datatypes::SchemaRef;
 use arrow_schema::{ArrowError, Field, Schema};
 use async_trait::async_trait;
 
-use data_components::s3_vectors::{MetadataColumns, S3_VECTOR_PRIMARY_KEY_NAME};
+use data_components::s3_vectors::{
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+};
 
 use datafusion::{
     catalog::Session,
@@ -281,7 +283,7 @@ impl VectorQueryTableProvider {
                 pk.name().to_string(),
             )),
             Expr::Alias(Alias::new(
-                Expr::Column(Column::new_unqualified("data")),
+                Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
                 None::<TableReference>,
                 embedding_col!(self.vector_index.embedded_column()),
             )),
@@ -297,7 +299,7 @@ impl VectorQueryTableProvider {
         ];
 
         query_table_projection_exprs.extend(metadata_columns_to_exprs(
-            self.vector_index.metadata_columns(),
+            &self.vector_index.metadata_columns(),
         ));
 
         let query_table_scan = TableScan::try_new(
@@ -554,4 +556,175 @@ fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
         .iter()
         .map(|c| Expr::Column(Column::new_unqualified(c.name())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::sync::Arc;
+
+    use arrow::{array::RecordBatch, util::pretty};
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::s3_vectors::{
+        MetadataColumn, MetadataColumns, query_provider::S3_VECTOR_DISTANCE_NAME,
+    };
+    use datafusion::{
+        catalog::{MemTable, TableProvider},
+        prelude::SessionContext,
+        sql::TableReference,
+    };
+    use search::SEARCH_SCORE_COLUMN_NAME;
+    use snafu::ResultExt;
+
+    use crate::embeddings::{
+        index::{VectorIndex, VectorQueryTableProvider},
+        udtf::append_fields,
+    };
+
+    #[derive(Debug)]
+    pub struct EmptyIndex {
+        embedded_column: String,
+        primary_columns: Vec<Field>,
+        schema: Schema,
+    }
+
+    #[async_trait::async_trait]
+    impl VectorIndex for EmptyIndex {
+        fn embedded_column(&self) -> String {
+            self.embedded_column.clone()
+        }
+
+        fn primary_fields(&self) -> Vec<Field> {
+            self.primary_columns.clone()
+        }
+
+        fn list_table_provider(&self) -> Arc<dyn TableProvider> {
+            Arc::new(MemTable::try_new(Arc::new(self.schema.clone()), vec![vec![]]).unwrap())
+        }
+
+        fn metadata_columns(&self) -> MetadataColumns {
+            let cols = self
+                .schema
+                .fields()
+                .iter()
+                .filter_map(|f| {
+                    if f.name() == "key" || f.name() == "data" {
+                        return None;
+                    }
+                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
+                        Some(MetadataColumn::Filterable(Arc::clone(f)))
+                    } else {
+                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
+                    }
+                })
+                .collect::<Vec<_>>();
+            MetadataColumns::from(cols)
+        }
+
+        fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+            table
+        }
+
+        async fn write(&self, record: &RecordBatch) {}
+        async fn query_table_provider(
+            &self,
+            query: &str,
+        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+            let schema = append_fields(
+                &Arc::new(self.schema.clone()),
+                vec![Arc::new(Field::new(
+                    S3_VECTOR_DISTANCE_NAME,
+                    DataType::Float64,
+                    false,
+                ))],
+            );
+            let mem = MemTable::try_new(schema, vec![vec![]]).boxed()?;
+            Ok(Arc::new(mem) as Arc<dyn TableProvider>)
+        }
+    }
+
+    pub async fn test_explain(
+        provider: Arc<dyn TableProvider>,
+        tbl: TableReference,
+        sql: &str,
+        snapshot_name: &str,
+    ) -> Result<(), String> {
+        let session = SessionContext::new();
+        session
+            .register_table(tbl, provider)
+            .map_err(|e| e.to_string())?;
+
+        let df = session
+            .sql(format!("EXPLAIN {sql}").as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let col = df.collect().await.map_err(|e| e.to_string())?;
+        insta::assert_snapshot!(
+            snapshot_name,
+            format!(
+                "{}",
+                pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_hello() -> Result<(), String> {
+        let p = VectorQueryTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new("body", DataType::Utf8, false),
+                        Field::new("another_column", DataType::Utf8, false),
+                    ])),
+                    vec![vec![]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            vector_index: Arc::new(EmptyIndex {
+                embedded_column: "body".to_string(),
+                primary_columns: vec![Field::new("pk", DataType::Int64, false)],
+                schema: Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new(
+                        "data",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                ]),
+            }),
+            query: "just a query".to_string(),
+            pre_limit: None,
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "basic",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "join_for_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, score from my_vectored_table WHERE another_column = 'something' ORDER BY score desc LIMIT 5",
+            "join_for_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
 }
