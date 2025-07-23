@@ -563,7 +563,9 @@ impl Refresher {
                         "Skipped refresh for {}: existing acceleration is available",
                         self.dataset_name
                     );
-                    return None;
+                    // To ensure refresh via API is still possible, we return a large value for next refresh duration to keep refresher alive.
+                    // 10,000 years is used instead of Duration::MAX to avoid potential overflow issues if jitter is applied.
+                    Duration::from_secs(10_000 * 365 * 24 * 60 * 60)
                 }
                 NextRefresh::WaitFor(duration) => {
                     if !duration.is_zero() {

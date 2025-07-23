@@ -21,6 +21,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::CommitsTableArgs;
+use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
     graphql::{
@@ -79,8 +80,8 @@ pub struct GitHubTableGraphQLParams {
 
     /// The JSON pointer to the data in the response. If not provided, it will be inferred from the query.
     json_pointer: Option<&'static str>,
-    /// The depth to unnest the data
-    unnest_depth: usize,
+    /// The behavior to use for unnesting the response data
+    unnest_behavior: UnnestBehavior,
     /// The GraphQL schema of the response data, if available
     schema: Option<SchemaRef>,
 }
@@ -90,13 +91,13 @@ impl GitHubTableGraphQLParams {
     pub fn new(
         query: Arc<str>,
         json_pointer: Option<&'static str>,
-        unnest_depth: usize,
+        unnest_behavior: UnnestBehavior,
         schema: Option<SchemaRef>,
     ) -> Self {
         Self {
             query,
             json_pointer,
-            unnest_depth,
+            unnest_behavior,
             schema,
         }
     }
@@ -127,7 +128,7 @@ impl Github {
 
         GraphQLClientBuilder::new(
             Url::parse(&format!("{endpoint}/graphql")).boxed()?,
-            gql_client_params.unnest_depth,
+            gql_client_params.unnest_behavior,
         )
         .with_token_provider(token)
         .with_json_pointer(gql_client_params.json_pointer)
