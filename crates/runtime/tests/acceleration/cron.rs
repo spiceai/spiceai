@@ -176,7 +176,7 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 app = app.with_dataset(get_dataset(
                     "file:test_multiple_cron_schedule_creates.csv",
                     format!("names_{i}").as_str(),
-                    "*/30 * * * * *", // every 30 seconds
+                    "*/10 * * * * *", // every 10 seconds
                 ));
             }
 
@@ -189,6 +189,9 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                     .build()
                     .await,
             );
+
+            // align schedule start to be at least a few seconds before the next 10th second
+            tokio::time::sleep(time_till_second(10, Some(2))).await;
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -246,8 +249,8 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // wait for the next 30th second, and wait 10 seconds for the job to succeed
-            tokio::time::sleep(time_till_second(30, Some(10))).await;
+            // wait for the next 10th second, and wait 5 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(10, Some(5))).await;
 
             for dataset_name in dataset_names.clone() {
                 snapshot_names_from_runtime(

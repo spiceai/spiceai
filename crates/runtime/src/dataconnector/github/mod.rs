@@ -464,6 +464,8 @@ fn warn_if_provided(
     }
 }
 
+const MAX_COMMENTS_FETCHED: u32 = 100;
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
@@ -531,13 +533,23 @@ impl DataConnector for Github {
 
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
+                let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
+                    value if value > MAX_COMMENTS_FETCHED => {
+                        tracing::warn!(
+                            "Due to GitHub API rate limits, the number of comments fetched for {component} per pull request is limited to {MAX_COMMENTS_FETCHED}."
+                        );
+                        MAX_COMMENTS_FETCHED
+                    }
+                    value => value,
+                };
+
                 let table_args = Arc::new(PullRequestTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
-                    component: ConnectorComponent::from(dataset),
+                    component,
                     include_comments: include_comments.unwrap_or(PullRequestCommentType::None),
-                    max_comments_fetched: max_comments_fetched.unwrap_or(100),
+                    max_comments_fetched,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
