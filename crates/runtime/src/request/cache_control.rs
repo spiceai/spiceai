@@ -20,7 +20,7 @@ use app::App;
 use http::{HeaderMap, header::CACHE_CONTROL};
 use spicepod::component::caching::SQLResultsCacheConfig;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum CacheKeyType {
     /// Use the server's default logic (e.g., `LogicalPlan` hash).
     #[default]
@@ -58,7 +58,7 @@ impl CacheKeyType {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CacheControl {
     Cache(CacheKeyType),
     NoCache,

@@ -19,18 +19,20 @@ use std::{
     collections::HashMap,
     future::Future,
     marker::PhantomData,
-    sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
+    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock, RwLock},
 };
 
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
+use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
+use tracing::warn;
 
 use crate::datafusion::DataFusion;
 
-use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
+use super::{baggage, CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent};
 
 type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
@@ -51,6 +53,10 @@ tokio::task_local! {
 /// An internal request context that is used outside the context of a client request.
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
+
+static USER_CACHE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([\w-]{1,128})$").expect("Must compile regex")
+});
 
 #[derive(Copy, Clone)]
 pub struct AsyncMarker {
@@ -346,21 +352,71 @@ impl RequestContextBuilder {
             }
         }
 
+        let user_cache_key = self.user_cache_key.and_then(Self::sanitize_cache_key);
+
         // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
-        let cache_control = if let CacheControl::Cache(CacheKeyType::Default) = self.cache_control {
-            let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
-            CacheControl::Cache(cache_key_type)
-        } else {
-            self.cache_control
+        let cache_control = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::Cache(cache_key_type)
+            },
+            // If sanitized out, fall back to default
+            CacheControl::Cache(CacheKeyType::User) if user_cache_key.is_none() => {
+                CacheControl::Cache(CacheKeyType::Default)
+            }
+            cache_control => cache_control
         };
 
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
-            user_cache_key: self.user_cache_key,
+            user_cache_key,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
         }
+    }
+
+    fn sanitize_cache_key(key: String) -> Option<String> {
+        if USER_CACHE_KEY_REGEX.is_match(&key) {
+            Some(key)
+        } else {
+            warn!("X-Spice-Cache-Key provided for request ({}) is invalid. A valid cache key is \
+            at most 128 characters containing: [A-Za-z0-9_-].", key);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::request::CacheControl;
+    use crate::request::{CacheKeyType, Protocol, RequestContextBuilder};
+    use http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn test_bind_user_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.append("cache-control", HeaderValue::from_static("cache"));
+
+        // Test user-provided cache key
+        headers.append("x-spice-cache-key", HeaderValue::from_static("foo"));
+        let ctx_happy_path = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx_happy_path.cache_control, CacheControl::Cache(CacheKeyType::User));
+        assert_eq!(ctx_happy_path.user_cache_key, Some(String::from("foo")));
+
+        // Test invalid user cache key falling back to default behavior
+        headers.remove("x-spice-cache-key");
+        headers.append("x-spice-cache-key", HeaderValue::from_static("foo$$"));
+
+        let ctx_bad_user_key = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx_bad_user_key.cache_control, CacheControl::Cache(CacheKeyType::Default));
+        assert_eq!(ctx_bad_user_key.user_cache_key, None);
     }
 }

@@ -471,7 +471,7 @@ mod tests {
         let parameters = ParamValues::List(vec![1.into()]);
 
         let request_context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw));
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -490,7 +490,7 @@ mod tests {
 
         let parameters = ParamValues::List(vec![2.into()]);
 
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -534,7 +534,7 @@ mod tests {
 
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Default));
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -553,7 +553,7 @@ mod tests {
 
         let parameters = ParamValues::List(vec![2.into()]);
 
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
@@ -573,7 +573,7 @@ mod tests {
         let parameters = ParamValues::List(vec![2.into()]);
 
         // Repeat the same query to ensure a cache hit
-        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(parameters);
+        let query_builder = QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
         let query = query_builder.build();
         Arc::clone(&request_context)
             .scope(async move {
