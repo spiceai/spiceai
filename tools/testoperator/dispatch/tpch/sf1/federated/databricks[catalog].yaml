@@ -9,10 +9,10 @@ tests:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800

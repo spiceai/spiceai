@@ -60,7 +60,7 @@ on:
         type: choice
         options:
           - 'spicehq-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-large-runners'
 
 jobs:
   run-throughput:

@@ -58,7 +58,7 @@ on:
         type: choice
         options:
           - 'spicehq-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-large-runners'
       concurrency_count:
         description: 'How many concurrent client connections to use?'
         required: true
