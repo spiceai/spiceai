@@ -1,1 +1,1 @@
-1.5.0-enterprise-beta
+1.6.0-enterprise-beta
