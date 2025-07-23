@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use datafusion::{
-    common::tree_node::{Transformed, TreeNode as _},
+    common::{
+        Column,
+        tree_node::{Transformed, TreeNode as _},
+    },
     error::DataFusionError,
     logical_expr::{
         BinaryExpr, ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF,
@@ -33,7 +36,7 @@ fn collect_conditions(
     expr: &Expr,
     combining_op: Operator,
     condition_op: Operator,
-) -> Option<(String, Vec<ScalarValue>)> {
+) -> Option<(Column, Vec<ScalarValue>)> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == combining_op => {
             let left_result = collect_conditions(left, combining_op, condition_op);
@@ -51,14 +54,34 @@ fn collect_conditions(
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(col), Expr::Literal(lit))
-                | (Expr::Literal(lit), Expr::Column(col)) => {
-                    Some((col.name().to_string(), vec![lit.clone()]))
-                }
+                | (Expr::Literal(lit), Expr::Column(col)) => Some((col.clone(), vec![lit.clone()])),
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Transforms partition_by expression by replacing column with filter_value and evaluates it.
+fn transform_and_evaluate(
+    partition_by: &Expr,
+    col: &Column,
+    filter_value: &ScalarValue,
+) -> Result<ScalarValue, DataFusionError> {
+    let transformed_expr = partition_by
+        .clone()
+        .transform(|e| {
+            Ok(match e {
+                Expr::Column(expr_col) if expr_col.name() == col.name() => {
+                    Transformed::yes(Expr::Literal(filter_value.clone()))
+                }
+                _ => Transformed::no(e),
+            })
+        })
+        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {e}")))?
+        .data;
+
+    evaluate_expr(&transformed_expr)
 }
 
 /// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
@@ -82,30 +105,23 @@ pub(crate) fn prune_partition(
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 match (left.as_ref(), op, right.as_ref()) {
-                    (Expr::Column(_), Operator::Eq, Expr::Literal(lit))
-                    | (Expr::Literal(lit), Operator::Eq, Expr::Column(_)) => {
-                        if !filter_or_udf_value_matches(left, partition_by, partition_value, lit)? {
+                    (Expr::Column(col), Operator::Eq, Expr::Literal(lit))
+                    | (Expr::Literal(lit), Operator::Eq, Expr::Column(col)) => {
+                        if !filter_or_udf_value_matches(col, partition_by, partition_value, lit)? {
                             return Ok(true);
                         }
                     }
                     (
-                        Expr::Column(_),
+                        Expr::Column(col),
                         op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
                         Expr::Literal(lit),
                     )
                     | (
                         Expr::Literal(lit),
                         op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
-                        Expr::Column(_),
+                        Expr::Column(col),
                     ) => {
-                        if evaluate_inequality(
-                            left,
-                            *op,
-                            right,
-                            partition_by,
-                            partition_value,
-                            lit,
-                        )? {
+                        if evaluate_inequality(col, *op, lit, partition_by, partition_value)? {
                             return Ok(true);
                         }
                     }
@@ -116,7 +132,7 @@ pub(crate) fn prune_partition(
                             let mut any_matches = false;
                             for lit in literals {
                                 let is_match = filter_or_udf_value_matches(
-                                    &Expr::Column(col_name.clone().into()),
+                                    &col_name,
                                     partition_by,
                                     partition_value,
                                     &lit,
@@ -131,7 +147,7 @@ pub(crate) fn prune_partition(
                         {
                             for lit in literals {
                                 let is_match = filter_or_udf_value_matches(
-                                    &Expr::Column(col_name.clone().into()),
+                                    &col_name,
                                     partition_by,
                                     partition_value,
                                     &lit,
@@ -149,12 +165,12 @@ pub(crate) fn prune_partition(
                 list,
                 negated,
             }) => {
-                if let Expr::Column(_) = expr.as_ref() {
+                if let Expr::Column(col) = expr.as_ref() {
                     let mut any_matches = false;
                     for lit in list {
                         if let Expr::Literal(lit_val) = lit {
                             let is_match = filter_or_udf_value_matches(
-                                expr,
+                                col,
                                 partition_by,
                                 partition_value,
                                 lit_val,
@@ -185,91 +201,29 @@ pub(crate) fn prune_partition(
 
 /// Evaluates if the partition_by expression with the column substituted by filter_value equals partition_value.
 fn filter_or_udf_value_matches(
-    column: &Expr,
+    col: &Column,
     partition_by: &Expr,
     partition_value: &ScalarValue,
     filter_value: &ScalarValue,
 ) -> Result<bool, DataFusionError> {
-    let Expr::Column(col) = column else {
-        return Err(DataFusionError::Plan("Expected column expression".into()));
-    };
-
-    // Replace column reference with filter value in partition_by expression
-    let transformed_expr = partition_by
-        .clone()
-        .transform(|e| {
-            Ok(match e {
-                Expr::Column(expr_col) if expr_col == *col => {
-                    Transformed::yes(Expr::Literal(filter_value.clone()))
-                }
-                _ => Transformed::no(e),
-            })
-        })
-        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {e}")))?
-        .data;
-
-    let result = evaluate_expr(&transformed_expr)?;
+    let result = transform_and_evaluate(partition_by, col, filter_value)?;
     Ok(&result == partition_value)
 }
 
 /// Evaluates inequality conditions to determine if they exclude the partition value.
 fn evaluate_inequality(
-    left: &Expr,
+    col: &Column,
     op: Operator,
-    right: &Expr,
+    filter_value: &ScalarValue,
     partition_by: &Expr,
     partition_value: &ScalarValue,
-    filter_value: &ScalarValue,
 ) -> Result<bool, DataFusionError> {
-    let col = match (left, right) {
-        (Expr::Column(c), _) => c,
-        (_, Expr::Column(c)) => c,
-        _ => {
-            return Err(DataFusionError::Plan(
-                "Expected column expression".to_string(),
-            ));
-        }
-    };
-
-    let transformed_expr = partition_by
-        .clone()
-        .transform(|e| {
-            Ok(match e {
-                Expr::Column(expr_col) if expr_col == *col => {
-                    Transformed::yes(Expr::Literal(filter_value.clone()))
-                }
-                _ => Transformed::no(e),
-            })
-        })
-        .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {e}")))?
-        .data;
-
-    let result = evaluate_expr(&transformed_expr)?;
-    let is_filter_satisfied = match (left, op, right) {
-        (Expr::Column(_), Operator::Gt, Expr::Literal(lit)) => {
-            filter_value.partial_cmp(lit) == Some(std::cmp::Ordering::Greater)
-        }
-        (Expr::Column(_), Operator::GtEq, Expr::Literal(lit)) => {
-            filter_value.partial_cmp(lit) != Some(std::cmp::Ordering::Less)
-        }
-        (Expr::Column(_), Operator::Lt, Expr::Literal(lit)) => {
-            filter_value.partial_cmp(lit) == Some(std::cmp::Ordering::Less)
-        }
-        (Expr::Column(_), Operator::LtEq, Expr::Literal(lit)) => {
-            filter_value.partial_cmp(lit) != Some(std::cmp::Ordering::Greater)
-        }
-        (Expr::Literal(lit), Operator::Gt, Expr::Column(_)) => {
-            lit.partial_cmp(filter_value) == Some(std::cmp::Ordering::Greater)
-        }
-        (Expr::Literal(lit), Operator::GtEq, Expr::Column(_)) => {
-            lit.partial_cmp(filter_value) != Some(std::cmp::Ordering::Less)
-        }
-        (Expr::Literal(lit), Operator::Lt, Expr::Column(_)) => {
-            lit.partial_cmp(filter_value) == Some(std::cmp::Ordering::Less)
-        }
-        (Expr::Literal(lit), Operator::LtEq, Expr::Column(_)) => {
-            lit.partial_cmp(filter_value) != Some(std::cmp::Ordering::Greater)
-        }
+    let result = transform_and_evaluate(partition_by, col, filter_value)?;
+    let is_filter_satisfied = match op {
+        Operator::Gt => filter_value.partial_cmp(&result) == Some(Ordering::Greater),
+        Operator::GtEq => filter_value.partial_cmp(&result) != Some(Ordering::Less),
+        Operator::Lt => filter_value.partial_cmp(&result) == Some(Ordering::Less),
+        Operator::LtEq => filter_value.partial_cmp(&result) != Some(Ordering::Greater),
         _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
     };
 
@@ -287,23 +241,7 @@ fn evaluate_function_filter(
         .iter()
         .map(|arg| match arg {
             Expr::Literal(lit) => Ok(lit.clone()),
-            Expr::Column(col) => {
-                // Replace the column with the partition_value
-                let transformed = partition_by
-                    .clone()
-                    .transform(|e| {
-                        Ok(match e {
-                            Expr::Column(expr_col) if expr_col == *col => {
-                                Transformed::yes(Expr::Literal(partition_value.clone()))
-                            }
-                            _ => Transformed::no(e),
-                        })
-                    })
-                    .map_err(|e| DataFusionError::Plan(format!("Failed to transform: {e}")))?
-                    .data;
-
-                evaluate_expr(&transformed)
-            }
+            Expr::Column(col) => transform_and_evaluate(partition_by, col, partition_value),
             _ => Err(DataFusionError::Plan(
                 "Unsupported argument type".to_string(),
             )),
@@ -392,6 +330,7 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
     Ok(bucket_value)
 }
 
+/// Used for testing only (unit and integration)
 pub fn timestamp_nanos(datetime: &str) -> i64 {
     let naive =
         NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
