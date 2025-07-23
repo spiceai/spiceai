@@ -5,7 +5,8 @@ datasets:
   - from: spice.ai:spiceai/tpch/datasets/tpch.customer
     name: customer
     params: &spicecloud_params
-      spiceai_api_key: ${secrets:SPICEAI_TPCH_API_KEY}
+      spiceai_api_key: ${secrets:SPICEAI_TEST_TPCH_API_KEY}
+      spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}
     acceleration: &acceleration
       enabled: true
       engine: arrow
