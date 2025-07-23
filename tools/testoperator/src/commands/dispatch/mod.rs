@@ -161,7 +161,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             index = index + 1,
         );
         GitHubWorkflow::new(
-            "spiceai",
+            "spicehq",
             "spiceai",
             test_type.workflow(),
             &args.workflow_commit,
