@@ -89,6 +89,8 @@ async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
+    use llms::bedrock::embed::BedrockRateLimitConfigBuilder;
+
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
             model_source: "bedrock".to_string(),
@@ -126,21 +128,35 @@ async fn bedrock(
         config_builder = config_builder.credentials_provider(credentials);
     }
 
-    let rate_limit = if let Some(rpm) = params.get("requests_per_min_limit") {
-        match rpm.expose_secret().parse::<u32>() {
+    let mut rate_limit_builder = BedrockRateLimitConfigBuilder::new();
+    params
+        .get("requests_per_min_limit")
+        .map(|rpm| match rpm.expose_secret().parse::<u32>() {
             Ok(limit) => {
-                Some(bedrock::embed::BedrockRateLimitConfig::with_requests_per_minute(limit))
+                let _ = rate_limit_builder.requests_per_minute(limit);
+                Ok(())
             }
-            Err(e) => {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}")
-                        .into(),
-                });
+            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}").into(),
+            }),
+        })
+        .transpose()?;
+
+    params
+        .get("max_concurrent_invocations")
+        .map(|mci| match mci.expose_secret().parse::<usize>() {
+            Ok(limit) => {
+                let _ = rate_limit_builder.max_concurrent_invocations(limit);
+                Ok(())
             }
-        }
-    } else {
-        None
-    };
+            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'max_concurrent_invocations' parameter: {e}")
+                    .into(),
+            }),
+        })
+        .transpose()?;
+
+    let rate_limit = rate_limit_builder.build();
 
     let config = config_builder.load().await;
     let client = BedrockClient::new(&config);
