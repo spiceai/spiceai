@@ -274,7 +274,7 @@ fn attach_cache_headers(
 
     // Tell CDN entry is unique per user cache key
     if user_key_specified {
-        headers.insert("Vary", HeaderValue::from_static("X-Spice-Cache-Key"));
+        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
     }
 }
 

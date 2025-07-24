@@ -28,7 +28,6 @@ use opentelemetry::KeyValue;
 use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
-use tracing::warn;
 
 use crate::datafusion::DataFusion;
 
@@ -54,9 +53,11 @@ tokio::task_local! {
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-#[allow(clippy::expect_used)]
-static USER_CACHE_KEY_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([\w-]{1,128})$").expect("Must compile regex"));
+static CLIENT_CACHE_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"^([\w-]{1,128})$") {
+        Ok(compiled) => compiled,
+        Err(e) => unreachable!("Unable to compile regexp: {}", e),
+    });
 
 #[derive(Copy, Clone)]
 pub struct AsyncMarker {
@@ -273,7 +274,7 @@ impl RequestContextBuilder {
         self.cache_control = CacheControl::from_headers(headers);
         self.user_cache_key = match self.cache_control {
             CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
-                .get("x-spice-cache-key")
+                .get("Spice-Cache-Key")
                 .and_then(|h| h.to_str().ok())
                 .map(str::to_string),
             _ => None,
@@ -383,14 +384,9 @@ impl RequestContextBuilder {
     }
 
     fn sanitize_cache_key(key: String) -> Option<String> {
-        if USER_CACHE_KEY_REGEX.is_match(&key) {
+        if CLIENT_CACHE_KEY_REGEX.is_match(&key) {
             Some(key)
         } else {
-            warn!(
-                "X-Spice-Cache-Key provided for request ({}) is invalid. A valid cache key is \
-            at most 128 characters containing: [A-Za-z0-9_-].",
-                key
-            );
             None
         }
     }
@@ -408,7 +404,7 @@ mod tests {
         headers.append("cache-control", HeaderValue::from_static("cache"));
 
         // Test user-provided cache key
-        headers.append("x-spice-cache-key", HeaderValue::from_static("foo"));
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo"));
         let ctx_happy_path = RequestContextBuilder::new(Protocol::Http)
             .from_headers(&headers)
             .build();
@@ -420,8 +416,8 @@ mod tests {
         assert_eq!(ctx_happy_path.user_cache_key, Some(String::from("foo")));
 
         // Test invalid user cache key falling back to default behavior
-        headers.remove("x-spice-cache-key");
-        headers.append("x-spice-cache-key", HeaderValue::from_static("foo$$"));
+        headers.remove("Spice-Cache-Key");
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo$$"));
 
         let ctx_bad_user_key = RequestContextBuilder::new(Protocol::Http)
             .from_headers(&headers)

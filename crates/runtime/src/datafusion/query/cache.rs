@@ -229,7 +229,8 @@ impl Query {
                 return Ok(CacheResponse::from(
                     CacheResult::WrongCacheKeyType,
                     CacheStatus::CacheMiss,
-                ));
+                )
+                .with_query_tracker(tracker));
             }
         }
 
