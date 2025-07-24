@@ -273,9 +273,9 @@ impl GraphQLTableProviderExec {
 impl std::fmt::Debug for GraphQLTableProviderExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let limit_str = if let Some(limit) = self.limit {
-            format!("limit=[{}]", limit)
+            format!("limit=[{limit}]")
         } else {
-            "".to_string()
+            String::new()
         };
         write!(f, "GraphQLTableProviderExec {limit_str}")
     }
@@ -284,9 +284,9 @@ impl std::fmt::Debug for GraphQLTableProviderExec {
 impl DisplayAs for GraphQLTableProviderExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let limit_str = if let Some(limit) = self.limit {
-            format!("limit=[{}]", limit)
+            format!("limit=[{limit}]")
         } else {
-            "".to_string()
+            String::new()
         };
         write!(f, "GraphQLTableProviderExec {limit_str}")
     }
