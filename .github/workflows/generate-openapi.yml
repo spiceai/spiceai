@@ -79,6 +79,7 @@ jobs:
             gh pr create \
               --title "Update openapi.json" \
               --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
+              --label 'kind/documentation' \
               --base trunk \
               --head openapi/${GITHUB_RUN_ID}
           fi

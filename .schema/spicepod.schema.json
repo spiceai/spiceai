@@ -163,6 +163,12 @@
             }
           ]
         },
+        "partition_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "primary_key": {
           "type": [
             "string",
@@ -257,6 +263,12 @@
           ]
         },
         "retention_period": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retention_sql": {
           "type": [
             "string",
             "null"
@@ -373,7 +385,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CacheKeyType": {
       "type": "string",
@@ -405,7 +418,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Catalog": {
       "type": "object",
@@ -474,6 +488,21 @@
         "name"
       ]
     },
+    "CheckAvailability": {
+      "description": "Controls whether the federated table periodically has its availability checked.",
+      "oneOf": [
+        {
+          "description": "The dataset is checked for availability if it isn't accelerated.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "The dataset is not checked for availability.",
+          "type": "string",
+          "const": "disabled"
+        }
+      ]
+    },
     "Column": {
       "type": "object",
       "properties": {
@@ -499,6 +528,10 @@
               "type": "null"
             }
           ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
         },
         "name": {
           "type": "string"
@@ -707,6 +740,10 @@
             }
           ]
         },
+        "check_availability": {
+          "description": "Configures whether the dataset availability monitor is enabled for this dataset.\n When enabled, the runtime will periodically check dataset availability\n and report metrics. Dataset availability is only checked if the dataset is not accelerated.",
+          "$ref": "#/$defs/CheckAvailability"
+        },
         "columns": {
           "type": "array",
           "items": {
@@ -813,6 +850,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
             },
             {
               "type": "null"
@@ -1292,7 +1339,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RouterConfig": {
       "anyOf": [
@@ -1480,7 +1528,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Secret": {
       "description": "The secrets configuration for a Spicepod.\n\n Example:\n ```yaml\n secrets:\n   - from: env\n     name: env\n   - from: kubernetes:my_secret_name\n     name: k8s\n ```",
@@ -1704,6 +1753,32 @@
         "full",
         "disabled"
       ]
+    },
+    "VectorStore": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "engine": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "View": {
       "type": "object",

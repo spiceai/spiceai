@@ -28,6 +28,7 @@ pub struct Schedule {
     name: Arc<str>,
     triggers: Vec<Arc<RwLock<dyn TaskRequestChannel>>>,
     task: Arc<dyn ScheduledTask>,
+    pub(crate) notification_channels: Arc<NotificationChannels>,
 }
 
 impl Schedule {
@@ -38,10 +39,16 @@ impl Schedule {
 
     #[must_use]
     pub fn new(name: Arc<str>, task: Arc<dyn ScheduledTask>) -> Self {
+        let notification_channels = Arc::new(NotificationChannels {
+            completion: Arc::new(Notify::default()),
+            reset: Arc::new(Notify::default()),
+        });
+
         Self {
             name,
             triggers: Vec::new(),
             task,
+            notification_channels,
         }
     }
 
@@ -90,7 +97,6 @@ impl Schedule {
     pub(crate) fn start(
         self: Arc<Self>,
         request_channels: TaskRequestChannels,
-        notification_channels: Arc<NotificationChannels>,
         cancellation_token: Arc<tokio_util::sync::CancellationToken>,
     ) -> tokio::task::JoinHandle<crate::Result<()>> {
         let schedule_name = self.name();
@@ -139,10 +145,10 @@ impl Schedule {
                                     }
 
                                     // Notify task request channels to reset their clocks if applicable
-                                    notification_channels.reset.notify_waiters();
+                                    self.notification_channels.reset.notify_waiters();
 
                                     // Execute all components for this schedule
-                                    running_task = Some(self.execute(Arc::clone(&notification_channels.completion)));
+                                    running_task = Some(self.execute(Arc::clone(&self.notification_channels.completion)));
                                 }
                                 None => {
                                     // Channel closed, exit loop

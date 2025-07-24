@@ -112,7 +112,7 @@ prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
-rand = "0.9.1"
+rand = "0.9.2"
 regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
