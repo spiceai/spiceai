@@ -565,12 +565,11 @@ mod tests {
 
     use arrow::{
         array::{
-            ArrayData, ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array,
-            Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-            UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+            ArrayData, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
+            Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt8Array,
+            UInt16Array, UInt32Array, UInt64Array, new_null_array,
         },
         buffer::Buffer,
-        datatypes::Float32Type,
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -580,12 +579,11 @@ mod tests {
     };
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
-        common::{ColumnStatistics, Statistics, stats::Precision},
         datasource::TableType,
         error::DataFusionError,
         logical_expr::TableProviderFilterPushDown,
         physical_plan::{DisplayAs, ExecutionPlan},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
     use snafu::ResultExt;
@@ -611,7 +609,7 @@ mod tests {
     );
 
     impl ExecutionPlan for ExplainExecutionPlan {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "ExplainExecutionPlan"
         }
 
@@ -762,7 +760,7 @@ mod tests {
                         self.schema.clone(),
                     ))]],
                 )
-                .unwrap(),
+                .expect("Could not build PretendVectorIndex::list_table_provider"),
             ))
         }
 
@@ -774,10 +772,10 @@ mod tests {
             table
         }
 
-        async fn write(&self, record: &RecordBatch) {}
+        async fn write(&self, _record: &RecordBatch) {}
         async fn query_table_provider(
             &self,
-            query: &str,
+            _query: &str,
         ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
@@ -790,7 +788,7 @@ mod tests {
             println!("In query_table_provider schema={:?}", schema);
             Ok(Arc::new(ExplainMemTable(
                 MemTable::try_new(
-                    schema.clone(),
+                    Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .boxed()?,
@@ -804,7 +802,8 @@ mod tests {
         sql: &str,
         snapshot_name: &str,
     ) -> Result<(), String> {
-        let session = SessionContext::new();
+        let session =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
         session
             .register_table(tbl, provider)
             .map_err(|e| e.to_string())?;
@@ -825,6 +824,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn default_value_array(dt: &DataType) -> ArrayRef {
         match dt {
             DataType::Int8 => Arc::new(Int8Array::from(vec![0])) as ArrayRef,
@@ -851,15 +851,15 @@ mod tests {
                             ArrayData::builder(DataType::Float32)
                                 .len(*length as usize)
                                 .add_buffer(Buffer::from_slice_ref(
-                                    &(0..(*length as usize))
+                                    (0..(*length as usize))
                                         .map(|s| s as f32)
                                         .collect::<Vec<_>>(),
                                 ))
                                 .build()
-                                .unwrap(),
+                                .expect("unable to build FixedSizeListArray's ArrayData"),
                         )
                         .build()
-                        .unwrap(),
+                        .expect("unable to build FixedSizeListArray"),
                 ))
             }
             _ => new_null_array(dt, 1),
@@ -874,7 +874,8 @@ mod tests {
             .map(|field| default_value_array(field.data_type()))
             .collect();
 
-        RecordBatch::try_new(Arc::clone(schema), arrays).unwrap()
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .expect("could not build RecordBatch with one row")
     }
 
     #[tokio::test]
@@ -887,7 +888,7 @@ mod tests {
         let p = VectorQueryTableProvider {
             table_provider: Arc::new(
                 MemTable::try_new(
-                    schema.clone(),
+                    Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
@@ -948,7 +949,7 @@ mod tests {
         let p = VectorQueryTableProvider {
             table_provider: Arc::new(
                 MemTable::try_new(
-                    schema.clone(),
+                    Arc::clone(&schema),
                     vec![vec![one_row_default_record_batch_for_schema(&schema)]],
                 )
                 .expect("could not make MemTable"),
