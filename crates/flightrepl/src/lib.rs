@@ -29,6 +29,7 @@ use arrow_flight::{
     flight_service_client::FlightServiceClient,
 };
 
+use crate::completer::SchemaCache;
 use clap::Parser;
 use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
@@ -41,7 +42,9 @@ use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::history::FileHistory;
-use rustyline::{Completer, CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator};
+use rustyline::{
+    Completer, CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
+};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -50,11 +53,10 @@ use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
-use crate::completer::SchemaCache;
 
 pub mod cache_control;
-mod config;
 mod completer;
+mod config;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -179,7 +181,6 @@ impl EditorHelper {
     }
 }
 
-
 impl Highlighter for EditorHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
@@ -248,7 +249,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     let mut rl = Editor::with_config(config)?;
 
-    rl.set_helper(Some(EditorHelper::new(Some(client.clone()), repl_config.api_key.clone(), user_agent.to_string())));
+    rl.set_helper(Some(EditorHelper::new(
+        Some(client.clone()),
+        repl_config.api_key.clone(),
+        user_agent.to_string(),
+    )));
     if let Some(helper) = rl.helper_mut() {
         helper.start_refreshing(300);
     }

@@ -1,15 +1,16 @@
+use crate::EditorHelper;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use datafusion::arrow::array::{Array, StringArray};
+use rustyline::Context;
+use rustyline::completion::{Completer, Pair};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use arrow_flight::flight_service_client::FlightServiceClient;
-use datafusion::arrow::array::{StringArray, Array};
-use rustyline::completion::{Completer, Pair};
-use rustyline::Context;
 use tokio::sync::oneshot;
 use tokio::time::interval;
 use tonic::transport::Channel;
-use crate::EditorHelper;
 
+#[rustfmt::skip]
 const SQL_KEYWORDS: &[&str] = &[
     // Core SQL keywords
     "select", "from", "where", "and", "or", "not", "in", "like", "is", "null",
@@ -26,6 +27,7 @@ const SQL_KEYWORDS: &[&str] = &[
     "create", "table", "alter", "drop", "index", "view", "database", "schema",
 ];
 
+#[rustfmt::skip]
 const FUNCTION_NAMES: &[&str] = &[
     // Aggregate functions
     "count", "sum", "avg", "min", "max", "stddev", "variance",
@@ -84,12 +86,8 @@ impl EditorHelper {
             let mut interval = interval(Duration::from_secs(refresh_interval));
 
             // Do initial refresh immediately
-            refresh_schema_static(
-                client.clone(),
-                &schema_cache,
-                api_key.as_ref(),
-                &user_agent,
-            ).await;
+            refresh_schema_static(client.clone(), &schema_cache, api_key.as_ref(), &user_agent)
+                .await;
 
             loop {
                 tokio::select! {
@@ -137,9 +135,12 @@ impl Completer for EditorHelper {
         let word_lower = word.to_lowercase();
         let mut matches = Vec::new();
 
-        let cache = self.schema_cache.read().map_err(|_| rustyline::error::ReadlineError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, "Cache lock error")
-        ))?;
+        let cache = self.schema_cache.read().map_err(|_| {
+            rustyline::error::ReadlineError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Cache lock error",
+            ))
+        })?;
 
         // Only complete table names after FROM
         let before_cursor = &line[..pos].to_lowercase();
@@ -213,7 +214,6 @@ async fn refresh_schema_static(
     }
 }
 
-
 async fn get_tables(
     client: &mut FlightServiceClient<Channel>,
     api_key: Option<&String>,
@@ -227,7 +227,8 @@ async fn get_tables(
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
-    ).await?;
+    )
+    .await?;
 
     let mut tables = Vec::new();
     for batch in records.0 {
@@ -256,7 +257,8 @@ async fn get_columns(
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
-    ).await?;
+    )
+    .await?;
 
     let mut columns = Vec::new();
     for batch in records.0 {
@@ -315,10 +317,10 @@ fn is_word_boundary(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, RwLock};
-    use rustyline::completion::Completer;
     use rustyline::Context;
+    use rustyline::completion::Completer;
     use rustyline::history::MemHistory;
+    use std::sync::{Arc, RwLock};
 
     fn create_test_editor_helper() -> EditorHelper {
         let schema_cache = Arc::new(RwLock::new(SchemaCache {
@@ -420,7 +422,11 @@ mod tests {
         assert!(completions.contains(&"user_profiles ".to_string()));
 
         // Should not have keywords or columns
-        assert!(completions.iter().all(|d| d == "users " || d == "user_profiles "));
+        assert!(
+            completions
+                .iter()
+                .all(|d| d == "users " || d == "user_profiles ")
+        );
     }
 
     #[test]
@@ -452,7 +458,8 @@ mod tests {
     fn test_complex_completion() {
         let helper = create_test_editor_helper();
 
-        let sql = "SELECT u.name, p.price FROM users u JOIN products p ON u.id = p.user_id WHERE u.a";
+        let sql =
+            "SELECT u.name, p.price FROM users u JOIN products p ON u.id = p.user_id WHERE u.a";
         let completions = get_completions(&helper, sql, sql.len());
 
         assert!(completions.contains(&"age ".to_string()));
@@ -492,7 +499,11 @@ mod tests {
 
         for sql in test_cases {
             let completions = get_completions(&helper, sql, sql.len());
-            assert!(completions.contains(&"age ".to_string()), "Failed for: {}", sql);
+            assert!(
+                completions.contains(&"age ".to_string()),
+                "Failed for: {}",
+                sql
+            );
         }
     }
 }
