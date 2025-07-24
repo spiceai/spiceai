@@ -15,11 +15,10 @@ limitations under the License.
 */
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::Display;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ansi_term::Colour;
@@ -47,7 +46,7 @@ use rustyline::{
 };
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};

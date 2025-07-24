@@ -3,10 +3,9 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use datafusion::arrow::array::{Array, StringArray};
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{RwLock, oneshot};
 use tokio::time::interval;
 use tonic::transport::Channel;
 
@@ -85,15 +84,13 @@ impl EditorHelper {
         let handle = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(refresh_interval));
 
-            // Do initial refresh immediately
-            refresh_schema_static(client.clone(), &schema_cache, api_key.as_ref(), &user_agent)
-                .await;
+            // Initial refresh
+            refresh_schema(client.clone(), &schema_cache, api_key.as_ref(), &user_agent).await;
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        // Time for scheduled refresh
-                        refresh_schema_static(
+                        refresh_schema(
                             client.clone(),
                             &schema_cache,
                             api_key.as_ref(),
@@ -101,7 +98,6 @@ impl EditorHelper {
                         ).await;
                     }
                     _ = &mut shutdown_rx => {
-                        // Shutdown signal received
                         break;
                     }
                 }
@@ -135,7 +131,7 @@ impl Completer for EditorHelper {
         let word_lower = word.to_lowercase();
         let mut matches = Vec::new();
 
-        let cache = self.schema_cache.read().map_err(|_| {
+        let cache = self.schema_cache.try_read().map_err(|_| {
             rustyline::error::ReadlineError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Cache lock error",
@@ -195,20 +191,20 @@ impl Completer for EditorHelper {
     }
 }
 
-async fn refresh_schema_static(
+async fn refresh_schema(
     mut client: FlightServiceClient<Channel>,
     schema_cache: &Arc<RwLock<SchemaCache>>,
     api_key: Option<&String>,
     user_agent: &str,
 ) {
     if let Ok(tables) = get_tables(&mut client, api_key, user_agent).await {
-        if let Ok(mut cache) = schema_cache.write() {
+        if let Ok(mut cache) = schema_cache.try_write() {
             cache.update_tables(tables);
         }
     }
 
     if let Ok(columns) = get_columns(&mut client, api_key, user_agent).await {
-        if let Ok(mut cache) = schema_cache.write() {
+        if let Ok(mut cache) = schema_cache.try_write() {
             cache.update_columns(columns);
         }
     }
@@ -317,10 +313,7 @@ fn is_word_boundary(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyline::Context;
-    use rustyline::completion::Completer;
     use rustyline::history::MemHistory;
-    use std::sync::{Arc, RwLock};
 
     fn create_test_editor_helper() -> EditorHelper {
         let schema_cache = Arc::new(RwLock::new(SchemaCache {
