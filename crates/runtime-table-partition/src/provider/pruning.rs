@@ -16,17 +16,22 @@ limitations under the License.
 
 use std::{cmp::Ordering, sync::Arc};
 
+use arrow_schema::Schema;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use datafusion::{
     common::{
-        Column,
+        Column, ToDFSchema as _,
         tree_node::{Transformed, TreeNode as _},
     },
     error::DataFusionError,
+    execution::context::ExecutionProps,
     logical_expr::{
         BinaryExpr, ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF,
         expr::{InList, ScalarFunction},
+        interval_arithmetic::NullableInterval,
+        simplify::SimplifyContext,
     },
+    optimizer::simplify_expressions::ExprSimplifier,
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -67,6 +72,7 @@ fn transform_and_evaluate(
     partition_by: &Expr,
     col: &Column,
     filter_value: &ScalarValue,
+    schema: &Schema,
 ) -> Result<ScalarValue, DataFusionError> {
     let transformed_expr = partition_by
         .clone()
@@ -81,206 +87,61 @@ fn transform_and_evaluate(
         .map_err(|e| DataFusionError::Plan(format!("Failed to transform expression: {e}")))?
         .data;
 
-    evaluate_expr(&transformed_expr)
+    evaluate_expr(
+        &transformed_expr,
+        schema,
+        vec![(
+            Expr::Column(col.clone()),
+            NullableInterval::from(filter_value.clone()),
+        )],
+    )
 }
 
-/// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn prune_partition(
-    filters: &[Expr],
-    partition_by: &Expr,
-    partition_value: &ScalarValue,
-) -> Result<bool, DataFusionError> {
-    let partition_by_columns = partition_by.column_refs();
+/// Evaluates an expression to a scalar value using ExprSimplifier, falling back to direct evaluation if needed.
+fn evaluate_expr(
+    expr: &Expr,
+    schema: &Schema,
+    guarantees: Vec<(Expr, NullableInterval)>,
+) -> Result<ScalarValue, DataFusionError> {
+    let dfschema = schema.clone().to_dfschema_ref()?;
+    let props = ExecutionProps::new();
+    let context = SimplifyContext::new(&props).with_schema(dfschema);
+    let simplifier = ExprSimplifier::new(context).with_guarantees(guarantees.clone());
 
-    for filter in filters {
-        // Skip if the filter does not contain the columns in the partition_by Expr
-        if filter
-            .column_refs()
-            .iter()
-            .any(|col| !partition_by_columns.contains(col))
-        {
-            continue;
-        }
+    let simplified_expr = simplifier.simplify(expr.clone())?;
 
-        match filter {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                match (left.as_ref(), op, right.as_ref()) {
-                    (Expr::Column(col), Operator::Eq, Expr::Literal(lit))
-                    | (Expr::Literal(lit), Operator::Eq, Expr::Column(col)) => {
-                        if !filter_or_udf_value_matches(col, partition_by, partition_value, lit)? {
-                            return Ok(true);
-                        }
-                    }
-                    (
-                        Expr::Column(col),
-                        op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
-                        Expr::Literal(lit),
-                    )
-                    | (
-                        Expr::Literal(lit),
-                        op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
-                        Expr::Column(col),
-                    ) => {
-                        if evaluate_inequality(col, *op, lit, partition_by, partition_value)? {
-                            return Ok(true);
-                        }
-                    }
-                    _ => {
-                        if let Some((col_name, literals)) =
-                            collect_conditions(filter, Operator::Or, Operator::Eq)
-                        {
-                            let mut any_matches = false;
-                            for lit in literals {
-                                let is_match = filter_or_udf_value_matches(
-                                    &col_name,
-                                    partition_by,
-                                    partition_value,
-                                    &lit,
-                                )?;
-                                any_matches |= is_match;
-                            }
-                            if !any_matches {
-                                return Ok(true);
-                            }
-                        } else if let Some((col_name, literals)) =
-                            collect_conditions(filter, Operator::And, Operator::NotEq)
-                        {
-                            for lit in literals {
-                                let is_match = filter_or_udf_value_matches(
-                                    &col_name,
-                                    partition_by,
-                                    partition_value,
-                                    &lit,
-                                )?;
-                                if is_match {
-                                    return Ok(true);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Expr::InList(InList {
-                expr,
-                list,
-                negated,
-            }) => {
-                if let Expr::Column(col) = expr.as_ref() {
-                    let mut any_matches = false;
-                    for lit in list {
-                        if let Expr::Literal(lit_val) = lit {
-                            let is_match = filter_or_udf_value_matches(
-                                col,
-                                partition_by,
-                                partition_value,
-                                lit_val,
-                            )?;
-                            if is_match && *negated {
-                                return Ok(true);
-                            }
-                            any_matches |= is_match;
-                        }
-                    }
-                    if !any_matches && !negated {
-                        return Ok(true);
-                    }
-                }
-            }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                let result = evaluate_function_filter(func, args, partition_by, partition_value)?;
-                if !result {
-                    return Ok(true);
-                }
-            }
-            _ => {}
-        }
+    if let Expr::Literal(lit) = simplified_expr {
+        return Ok(lit);
     }
 
-    Ok(false)
-}
-
-/// Evaluates if the `partition_by` expression with the column substituted by `filter_value` equals `partition_value`.
-fn filter_or_udf_value_matches(
-    col: &Column,
-    partition_by: &Expr,
-    partition_value: &ScalarValue,
-    filter_value: &ScalarValue,
-) -> Result<bool, DataFusionError> {
-    let result = transform_and_evaluate(partition_by, col, filter_value)?;
-    Ok(&result == partition_value)
-}
-
-/// Evaluates inequality conditions to determine if they exclude the partition value.
-fn evaluate_inequality(
-    col: &Column,
-    op: Operator,
-    filter_value: &ScalarValue,
-    partition_by: &Expr,
-    partition_value: &ScalarValue,
-) -> Result<bool, DataFusionError> {
-    let result = transform_and_evaluate(partition_by, col, filter_value)?;
-    let is_filter_satisfied = match op {
-        Operator::Gt => filter_value.partial_cmp(&result) == Some(Ordering::Greater),
-        Operator::GtEq => filter_value.partial_cmp(&result) != Some(Ordering::Less),
-        Operator::Lt => filter_value.partial_cmp(&result) == Some(Ordering::Less),
-        Operator::LtEq => filter_value.partial_cmp(&result) != Some(Ordering::Greater),
-        _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
-    };
-
-    Ok(is_filter_satisfied && &result != partition_value)
-}
-
-/// Evaluates a function-based filter (e.g., `date_trunc`, truncate).
-fn evaluate_function_filter(
-    func: &Arc<ScalarUDF>,
-    args: &[Expr],
-    partition_by: &Expr,
-    partition_value: &ScalarValue,
-) -> Result<bool, DataFusionError> {
-    let evaluated_args = args
-        .iter()
-        .map(|arg| match arg {
-            Expr::Literal(lit) => Ok(lit.clone()),
-            Expr::Column(col) => transform_and_evaluate(partition_by, col, partition_value),
-            _ => Err(DataFusionError::Plan(
-                "Unsupported argument type".to_string(),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let result = call(func, evaluated_args)?;
-    Ok(&result == partition_value)
-}
-
-/// Evaluates an expression to a scalar value.
-fn evaluate_expr(expr: &Expr) -> Result<ScalarValue, DataFusionError> {
-    match expr {
+    // Fallback to direct evaluation if simplification doesn't yield a literal
+    // An example of this occurs in `test_prune_partition_case` because regex_match
+    // function is used and the Simplifier cannot simplify to a literal
+    match &simplified_expr {
         Expr::Literal(lit) => Ok(lit.clone()),
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let args = args
                 .iter()
-                .map(evaluate_expr)
+                .map(|arg| evaluate_expr(arg, schema, guarantees.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
-
             call(func.as_ref(), args)
         }
         Expr::Case(case) => {
             for (when, then) in &case.when_then_expr {
-                let condition = evaluate_expr(when)?;
+                let condition = evaluate_expr(when, schema, guarantees.clone())?;
                 if matches!(condition, ScalarValue::Boolean(Some(true))) {
-                    return evaluate_expr(then);
+                    return evaluate_expr(then, schema, guarantees);
                 }
             }
             if let Some(else_expr) = &case.else_expr {
-                evaluate_expr(else_expr)
+                evaluate_expr(else_expr, schema, guarantees)
             } else {
                 Ok(ScalarValue::Null)
             }
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let left_val = evaluate_expr(left)?;
-            let right_val = evaluate_expr(right)?;
+            let left_val = evaluate_expr(left, schema, guarantees.clone())?;
+            let right_val = evaluate_expr(right, schema, guarantees)?;
             match op {
                 Operator::Plus => left_val.add(&right_val),
                 Operator::Minus => left_val.sub(&right_val),
@@ -311,6 +172,196 @@ fn evaluate_expr(expr: &Expr) -> Result<ScalarValue, DataFusionError> {
             "Unsupported expression type".to_string(),
         )),
     }
+}
+
+/// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn prune_partition(
+    filters: &[Expr],
+    partition_by: &Expr,
+    partition_value: &ScalarValue,
+    schema: &Schema, // Added schema parameter
+) -> Result<bool, DataFusionError> {
+    let partition_by_columns = partition_by.column_refs();
+
+    for filter in filters {
+        // Skip if the filter does not contain the columns in the partition_by Expr
+        if filter
+            .column_refs()
+            .iter()
+            .any(|col| !partition_by_columns.contains(col))
+        {
+            continue;
+        }
+
+        match filter {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                match (left.as_ref(), op, right.as_ref()) {
+                    (Expr::Column(col), Operator::Eq, Expr::Literal(lit))
+                    | (Expr::Literal(lit), Operator::Eq, Expr::Column(col)) => {
+                        if !filter_or_udf_value_matches(
+                            col,
+                            partition_by,
+                            partition_value,
+                            lit,
+                            schema,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    (
+                        Expr::Column(col),
+                        op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
+                        Expr::Literal(lit),
+                    )
+                    | (
+                        Expr::Literal(lit),
+                        op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
+                        Expr::Column(col),
+                    ) => {
+                        if evaluate_inequality(
+                            col,
+                            *op,
+                            lit,
+                            partition_by,
+                            partition_value,
+                            schema,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    _ => {
+                        if let Some((col_name, literals)) =
+                            collect_conditions(filter, Operator::Or, Operator::Eq)
+                        {
+                            let mut any_matches = false;
+                            for lit in literals {
+                                let is_match = filter_or_udf_value_matches(
+                                    &col_name,
+                                    partition_by,
+                                    partition_value,
+                                    &lit,
+                                    schema,
+                                )?;
+                                any_matches |= is_match;
+                            }
+                            if !any_matches {
+                                return Ok(true);
+                            }
+                        } else if let Some((col_name, literals)) =
+                            collect_conditions(filter, Operator::And, Operator::NotEq)
+                        {
+                            for lit in literals {
+                                let is_match = filter_or_udf_value_matches(
+                                    &col_name,
+                                    partition_by,
+                                    partition_value,
+                                    &lit,
+                                    schema,
+                                )?;
+                                if is_match {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::InList(InList {
+                expr,
+                list,
+                negated,
+            }) => {
+                if let Expr::Column(col) = expr.as_ref() {
+                    let mut any_matches = false;
+                    for lit in list {
+                        if let Expr::Literal(lit_val) = lit {
+                            let is_match = filter_or_udf_value_matches(
+                                col,
+                                partition_by,
+                                partition_value,
+                                lit_val,
+                                schema,
+                            )?;
+                            if is_match && *negated {
+                                return Ok(true);
+                            }
+                            any_matches |= is_match;
+                        }
+                    }
+                    if !any_matches && !negated {
+                        return Ok(true);
+                    }
+                }
+            }
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                let result =
+                    evaluate_function_filter(func, args, partition_by, partition_value, schema)?;
+                if !result {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
+/// Evaluates if the `partition_by` expression with the column substituted by `filter_value` equals `partition_value`.
+fn filter_or_udf_value_matches(
+    col: &Column,
+    partition_by: &Expr,
+    partition_value: &ScalarValue,
+    filter_value: &ScalarValue,
+    schema: &Schema,
+) -> Result<bool, DataFusionError> {
+    let result = transform_and_evaluate(partition_by, col, filter_value, schema)?;
+    Ok(&result == partition_value)
+}
+
+/// Evaluates inequality conditions to determine if they exclude the partition value.
+fn evaluate_inequality(
+    col: &Column,
+    op: Operator,
+    filter_value: &ScalarValue,
+    partition_by: &Expr,
+    partition_value: &ScalarValue,
+    schema: &Schema,
+) -> Result<bool, DataFusionError> {
+    let result = transform_and_evaluate(partition_by, col, filter_value, schema)?;
+    let is_filter_satisfied = match op {
+        Operator::Gt => filter_value.partial_cmp(&result) == Some(Ordering::Greater),
+        Operator::GtEq => filter_value.partial_cmp(&result) != Some(Ordering::Less),
+        Operator::Lt => filter_value.partial_cmp(&result) == Some(Ordering::Less),
+        Operator::LtEq => filter_value.partial_cmp(&result) != Some(Ordering::Greater),
+        _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
+    };
+
+    Ok(is_filter_satisfied && &result != partition_value)
+}
+
+/// Evaluates a function-based filter (e.g., `date_trunc`, truncate).
+fn evaluate_function_filter(
+    func: &Arc<ScalarUDF>,
+    args: &[Expr],
+    partition_by: &Expr,
+    partition_value: &ScalarValue,
+    schema: &Schema,
+) -> Result<bool, DataFusionError> {
+    let evaluated_args = args
+        .iter()
+        .map(|arg| match arg {
+            Expr::Literal(lit) => Ok(lit.clone()),
+            Expr::Column(col) => transform_and_evaluate(partition_by, col, partition_value, schema),
+            _ => Err(DataFusionError::Plan(
+                "Unsupported argument type".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let result = call(func, evaluated_args)?;
+    Ok(&result == partition_value)
 }
 
 fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusionError> {
@@ -349,6 +400,7 @@ pub fn timestamp_nanos(datetime: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, TimeUnit};
     use datafusion::{
         functions::regex::regexp_match,
         prelude::{case, col, date_trunc, in_list, lit},
@@ -357,11 +409,11 @@ mod tests {
     use std::sync::Arc;
 
     macro_rules! assert_prune_partition {
-        ($filters:expr, $partition_by:expr, $scalar_variant:ident, [$(($val:expr, $should_prune:expr)),*]) => {
+        ($filters:expr, $partition_by:expr, $schema:expr, $scalar_variant:ident, [$(($val:expr, $should_prune:expr)),*]) => {
             $(
                 let partition_value = ScalarValue::$scalar_variant(Some($val));
                 assert_eq!(
-                    prune_partition($filters, &$partition_by, &partition_value)?,
+                    prune_partition($filters, &$partition_by, &partition_value, &$schema)?,
                     $should_prune,
                     "partition_value = {partition_value:?}, should_prune = {}",
                     $should_prune,
@@ -372,20 +424,32 @@ mod tests {
 
     #[test]
     fn test_prune_partition_multiple_columns() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("col2", DataType::Utf8, false),
+        ]);
         let partition_by = col("region");
         let filters = &[col("col2").eq(partition_by.clone())];
-        assert_prune_partition!(filters, &partition_by, Utf8, [("us-east-1".into(), false)]);
+        assert_prune_partition!(
+            filters,
+            &partition_by,
+            schema,
+            Utf8,
+            [("us-east-1".into(), false)]
+        );
         Ok(())
     }
 
     #[test]
     fn test_prune_partition_exact_match() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
         let partition_by = col("region");
         let region = "us-east-2";
         let filters = &[col("region").eq(lit(region))];
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Utf8,
             [("us-east-2".into(), false), ("ap-northeast-2".into(), true)]
         );
@@ -394,6 +458,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_inlist() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filters = &[in_list(
             partition_by.clone(),
@@ -403,6 +468,7 @@ mod tests {
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Int32,
             [
                 (1, false),
@@ -418,6 +484,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_not_inlist() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filters = &[in_list(
             partition_by.clone(),
@@ -427,6 +494,7 @@ mod tests {
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Int32,
             [
                 (1, true),
@@ -442,6 +510,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_or_equalities_2_items() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filter = col("account_id")
             .eq(lit(1))
@@ -449,6 +518,7 @@ mod tests {
         assert_prune_partition!(
             &[filter.clone()],
             &partition_by,
+            schema,
             Int32,
             [(1, false), (2, false), (3, true), (4, true)]
         );
@@ -457,6 +527,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_or_equalities_3_items() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filter = col("account_id")
             .eq(lit(1))
@@ -465,6 +536,7 @@ mod tests {
         assert_prune_partition!(
             &[filter.clone()],
             &partition_by,
+            schema,
             Int32,
             [
                 (1, false),
@@ -480,6 +552,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_and_inequalities_2_items() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filter = col("account_id")
             .not_eq(lit(1))
@@ -487,6 +560,7 @@ mod tests {
         assert_prune_partition!(
             &[filter.clone()],
             &partition_by,
+            schema,
             Int32,
             [(1, true), (2, true), (3, false), (4, false)]
         );
@@ -495,6 +569,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_and_inequalities_3_items() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = col("account_id");
         let filter = col("account_id")
             .not_eq(lit(1))
@@ -503,6 +578,7 @@ mod tests {
         assert_prune_partition!(
             &[filter.clone()],
             &partition_by,
+            schema,
             Int32,
             [
                 (1, true),
@@ -523,6 +599,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_hash_exact() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
         let partition_by = bucket_expr(vec![lit(10i64), col("region")]);
         let region = "us-east-2";
         let filters = &[col("region").eq(lit(region))];
@@ -550,6 +627,7 @@ mod tests {
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Int32,
             [(us_east_2, false), (ap_northeast_2, true)]
         );
@@ -558,6 +636,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_hash_inlist() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = bucket_expr(vec![lit(10i64), col("account_id")]);
         let filters = &[in_list(
             col("account_id"),
@@ -580,7 +659,7 @@ mod tests {
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i > 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
-                prune_partition(filters, &partition_by, &partition_value)?,
+                prune_partition(filters.as_slice(), &partition_by, &partition_value, &schema)?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
@@ -590,6 +669,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_hash_not_inlist() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = bucket_expr(vec![lit(10i64), col("account_id")]);
         let filters = &[in_list(
             col("account_id"),
@@ -612,7 +692,7 @@ mod tests {
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
-                prune_partition(filters, &partition_by, &partition_value)?,
+                prune_partition(filters.as_slice(), &partition_by, &partition_value, &schema)?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
@@ -622,6 +702,7 @@ mod tests {
 
     #[test]
     fn test_prune_partition_hash_and_inequalities_3_items() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("account_id", DataType::Int32, false)]);
         let partition_by = bucket_expr(vec![lit(10i64), col("account_id")]);
         let filter = col("account_id")
             .not_eq(lit(1))
@@ -643,7 +724,7 @@ mod tests {
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i <= 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
-                prune_partition(&[filter.clone()], &partition_by, &partition_value)?,
+                prune_partition(&[filter.clone()], &partition_by, &partition_value, &schema)?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
@@ -653,11 +734,13 @@ mod tests {
 
     #[test]
     fn test_prune_partition_region() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
         let partition_by = col("region");
         let filters = &[col("region").eq(lit("us-east-2"))];
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Utf8,
             [("us-east-2".into(), false), ("ap-northeast-2".into(), true)]
         );
@@ -666,11 +749,13 @@ mod tests {
 
     #[test]
     fn test_prune_partition_greater_than() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let partition_by = col("a").gt(lit(5));
         let filters = &[col("a").eq(lit(4))];
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Boolean,
             [(true, true), (false, false)]
         );
@@ -679,14 +764,22 @@ mod tests {
 
     #[test]
     fn test_prune_partition_modulo() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let partition_by = col("a") % lit(10);
         let filters = &[col("a").eq(lit(12))];
-        assert_prune_partition!(filters, &partition_by, Int32, [(2, false), (3, true)]);
+        assert_prune_partition!(
+            filters,
+            &partition_by,
+            schema,
+            Int32,
+            [(2, false), (3, true)]
+        );
         Ok(())
     }
 
     #[test]
     fn test_prune_partition_case() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
         let partition_by = case(Expr::ScalarFunction(ScalarFunction {
             func: regexp_match(),
             args: vec![col("a"), lit("^DATAFUSION(-cli)*")],
@@ -697,6 +790,7 @@ mod tests {
         assert_prune_partition!(
             filters,
             &partition_by,
+            schema,
             Utf8,
             [("datafusion".into(), false), ("other".into(), true)]
         );
@@ -706,6 +800,11 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_prune_partition_date_trunc() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new(
+            "date",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
         let filter_date =
             ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 00:00:00")), None);
         let filters = &[col("date").eq(lit(filter_date.clone()))];
@@ -818,7 +917,7 @@ mod tests {
 
             for (partition_value, should_prune) in partition_values {
                 assert_eq!(
-                    prune_partition(filters, &partition_by, &partition_value)?,
+                    prune_partition(filters.as_slice(), &partition_by, &partition_value, &schema)?,
                     should_prune,
                     "granularity = {granularity}, partition_value = {partition_value:?}, should_prune = {should_prune}"
                 );
@@ -829,17 +928,25 @@ mod tests {
 
     #[test]
     fn test_prune_partition_truncate() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("sales_volume", DataType::Int64, false)]);
         let partition_by = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
             args: vec![lit(1000i64), col("sales_volume")],
         });
         let filters = &[col("sales_volume").eq(lit(1234i64))];
-        assert_prune_partition!(filters, &partition_by, Int64, [(1000, false), (2000, true)]);
+        assert_prune_partition!(
+            filters,
+            &partition_by,
+            schema,
+            Int64,
+            [(1000, false), (2000, true)]
+        );
         Ok(())
     }
 
     #[test]
     fn test_prune_partition_bucket() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let partition_by = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
             args: vec![lit(10i64), col("a")],
@@ -861,7 +968,7 @@ mod tests {
         for (val, should_prune) in hashed_values.into_iter().zip((1..=6).map(|i| i > 3)) {
             let partition_value = ScalarValue::Int32(Some(val));
             assert_eq!(
-                prune_partition(&filters[..], &partition_by, &partition_value)?,
+                prune_partition(&filters[..], &partition_by, &partition_value, &schema)?,
                 should_prune,
                 "partition_value = {partition_value:?}, should_prune = {should_prune}",
             );
