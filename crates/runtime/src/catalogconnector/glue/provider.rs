@@ -146,18 +146,13 @@ impl GlueCatalogProvider {
     }
 
     async fn create_schema_provider(&self, database: String) -> Result<Arc<dyn SchemaProvider>> {
-        let mut tables_builder = self
-            .client
-            .get_tables()
-            .database_name(&database);
+        let mut tables_builder = self.client.get_tables().database_name(&database);
 
         if let Some(catalog_id) = &self.catalog_id {
             tables_builder = tables_builder.catalog_id(catalog_id);
         }
 
-        let mut paginator = tables_builder
-            .into_paginator()
-            .send();
+        let mut paginator = tables_builder.into_paginator().send();
 
         let mut tables = HashMap::new();
 
@@ -177,7 +172,10 @@ impl GlueCatalogProvider {
                 .collect::<Vec<_>>();
 
             for table in some_tables {
-                let connector = GlueDataConnector::new_with_catalog_id(self.parameters.parameters.clone(), self.catalog_id.clone());
+                let connector = GlueDataConnector::new_with_catalog_id(
+                    self.parameters.parameters.clone(),
+                    self.catalog_id.clone(),
+                );
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
@@ -248,17 +246,13 @@ impl CatalogProvider for GlueCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for GlueCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
-        let mut databases_builder = self.client
-            .get_databases();
+        let mut databases_builder = self.client.get_databases();
 
         if let Some(catalog_id) = &self.catalog_id {
             databases_builder = databases_builder.catalog_id(catalog_id);
         }
 
-        let mut paginator = databases_builder
-            .into_paginator()
-            .send();
+        let mut paginator = databases_builder.into_paginator().send();
 
         let mut databases = HashMap::new();
 
