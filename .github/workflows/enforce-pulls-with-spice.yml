@@ -1,7 +1,7 @@
 name: Enforce Pulls with Spice
 
 on:
-  pull_request:
+  pull_request_target:
     types:
       [labeled, unlabeled, opened, edited, synchronize, assigned, unassigned]
   merge_group:
