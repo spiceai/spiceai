@@ -58,7 +58,7 @@ impl SearchKey {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),

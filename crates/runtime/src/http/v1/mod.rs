@@ -250,7 +250,7 @@ pub async fn to_http_response(
     attach_cache_headers(
         &mut headers,
         cache_status,
-        request_context.user_cache_key().is_some(),
+        request_context.client_supplied_cache_key().is_some(),
     );
 
     (StatusCode::OK, headers, body).into_response()

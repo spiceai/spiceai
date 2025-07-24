@@ -168,7 +168,7 @@ pub(crate) async fn post(
                 }
 
                 // Tell CDN entry is unique per user cache key
-                if request_context.user_cache_key().is_some() {
+                if request_context.client_supplied_cache_key().is_some() {
                     headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
                 }
 

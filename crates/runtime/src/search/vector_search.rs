@@ -176,7 +176,7 @@ impl VectorSearch {
             let search_key = SearchKey::from(req.clone());
             let cache_control = request_context.cache_control();
 
-            let cache_key = match request_context.user_cache_key() {
+            let cache_key = match request_context.client_supplied_cache_key() {
                 Some(cache_key)
                     if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
                 {

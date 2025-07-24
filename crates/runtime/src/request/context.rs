@@ -39,7 +39,7 @@ pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
     cache_control: CacheControl,
-    user_cache_key: Option<String>,
+    client_supplied_cache_key: Option<String>,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
@@ -177,8 +177,8 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn user_cache_key(&self) -> &Option<String> {
-        &self.user_cache_key
+    pub fn client_supplied_cache_key(&self) -> &Option<String> {
+        &self.client_supplied_cache_key
     }
 
     pub fn extension<T>(&self) -> Option<Arc<T>>
@@ -224,7 +224,7 @@ impl AuthRequestContext for RequestContext {
 pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
-    user_cache_key: Option<String>,
+    client_supplied_cache_key: Option<String>,
     app: Option<Arc<App>>,
     df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
@@ -238,7 +238,7 @@ impl RequestContextBuilder {
         Self {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
-            user_cache_key: None,
+            client_supplied_cache_key: None,
             app: None,
             df: None,
             user_agent: UserAgent::Absent,
@@ -272,7 +272,7 @@ impl RequestContextBuilder {
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
         self.cache_control = CacheControl::from_headers(headers);
-        self.user_cache_key = match self.cache_control {
+        self.client_supplied_cache_key = match self.cache_control {
             CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
                 .get("Spice-Cache-Key")
                 .and_then(|h| h.to_str().ok())
@@ -305,8 +305,8 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
-    pub fn with_user_cache_key(mut self, user_key: Option<String>) -> Self {
-        self.user_cache_key = user_key;
+    pub fn with_client_supplied_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.client_supplied_cache_key = cache_key;
         self
     }
 
@@ -358,7 +358,9 @@ impl RequestContextBuilder {
             }
         }
 
-        let user_cache_key = self.user_cache_key.and_then(Self::sanitize_cache_key);
+        let user_cache_key = self
+            .client_supplied_cache_key
+            .and_then(Self::sanitize_cache_key);
 
         // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
         let cache_control = match self.cache_control {
@@ -376,7 +378,7 @@ impl RequestContextBuilder {
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
-            user_cache_key,
+            client_supplied_cache_key: user_cache_key,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
@@ -399,7 +401,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue};
 
     #[test]
-    fn test_bind_user_cache_key() {
+    fn test_bind_client_supplied_cache_key() {
         let mut headers = HeaderMap::new();
         headers.append("cache-control", HeaderValue::from_static("cache"));
 
@@ -413,7 +415,10 @@ mod tests {
             ctx_happy_path.cache_control,
             CacheControl::Cache(CacheKeyType::ClientSupplied)
         );
-        assert_eq!(ctx_happy_path.user_cache_key, Some(String::from("foo")));
+        assert_eq!(
+            ctx_happy_path.client_supplied_cache_key,
+            Some(String::from("foo"))
+        );
 
         // Test invalid user cache key falling back to default behavior
         headers.remove("Spice-Cache-Key");
@@ -427,6 +432,6 @@ mod tests {
             ctx_bad_user_key.cache_control,
             CacheControl::Cache(CacheKeyType::Default)
         );
-        assert_eq!(ctx_bad_user_key.user_cache_key, None);
+        assert_eq!(ctx_bad_user_key.client_supplied_cache_key, None);
     }
 }
