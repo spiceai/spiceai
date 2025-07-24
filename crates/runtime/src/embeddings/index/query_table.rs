@@ -299,7 +299,7 @@ impl VectorQueryTableProvider {
         ];
 
         query_table_projection_exprs.extend(metadata_columns_to_exprs(
-            &self.vector_index.metadata_columns(),
+            self.vector_index.metadata_columns(),
         ));
 
         let query_table_scan = TableScan::try_new(
@@ -717,9 +717,8 @@ mod tests {
         metadata: MetadataColumns,
     }
     impl PretendVectorIndex {
-        pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) {
-            let cols = self
-                .schema
+        pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
+            let cols = schema
                 .fields()
                 .iter()
                 .filter_map(|f| {
