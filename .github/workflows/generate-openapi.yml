@@ -19,9 +19,6 @@ jobs:
       - name: Check out PR branch
         uses: actions/checkout@v4
         with:
-          # we need full history to push back
-          fetch-depth: 0
-          # checkout the head branch of the PR
           ref: ${{ github.head_ref }}
 
       - name: Install Rust stable
