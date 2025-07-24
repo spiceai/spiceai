@@ -54,7 +54,7 @@ pub mod titan;
 const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 // Maximum number of concurrently running requests.
 // The overall request rate is controlled by the rate_limiter.
-const EMBED_TEXT_MAX_CONCURRENT_INVOCATIONS: usize = 40;
+const DEFAULT_MAX_CONCURRENT_INVOCATIONS: usize = 40;
 
 fn default_retry_strategy() -> FibonacciBackoff {
     FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
@@ -373,6 +373,12 @@ pub struct BedrockRateLimitConfigBuilder {
     max_concurrent_invocations: Option<usize>,
 }
 
+impl Default for BedrockRateLimitConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BedrockRateLimitConfigBuilder {
     #[must_use]
     pub fn new() -> Self {
@@ -400,7 +406,7 @@ impl BedrockRateLimitConfigBuilder {
             requests_per_minute_limit: self.requests_per_minute_limit.unwrap_or(1_500),
             max_concurrent_invocations: self
                 .max_concurrent_invocations
-                .unwrap_or(EMBED_TEXT_MAX_CONCURRENT_INVOCATIONS),
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_INVOCATIONS),
         }
     }
 }
@@ -413,14 +419,6 @@ pub struct BedrockRateLimitConfig {
 
 impl BedrockRateLimitConfig {
     #[must_use]
-    pub fn with_requests_per_minute(requests_per_minute_limit: u32) -> Self {
-        Self {
-            requests_per_minute_limit,
-            max_concurrent_invocations: EMBED_TEXT_MAX_CONCURRENT_INVOCATIONS,
-        }
-    }
-
-    #[must_use]
     pub fn to_quota(&self) -> Quota {
         Quota::per_minute(
             NonZeroU32::new(self.requests_per_minute_limit).unwrap_or_else(|| {
@@ -429,14 +427,5 @@ impl BedrockRateLimitConfig {
                 )
             }),
         )
-    }
-}
-
-impl Default for BedrockRateLimitConfig {
-    fn default() -> Self {
-        Self {
-            requests_per_minute_limit: 1_500,
-            max_concurrent_invocations: EMBED_TEXT_MAX_CONCURRENT_INVOCATIONS,
-        }
     }
 }

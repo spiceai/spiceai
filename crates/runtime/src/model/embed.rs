@@ -136,30 +136,25 @@ async fn bedrock(
                 let _ = rate_limit_builder.requests_per_minute(limit);
                 Ok(())
             }
-            Err(e) => {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}")
-                        .into(),
-                });
-            }
-        });
+            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}").into(),
+            }),
+        })
+        .transpose()?;
 
-    params.get("max_concurrent_invocations").map(|mci| {
-        match mci.expose_secret().parse::<usize>() {
+    params
+        .get("max_concurrent_invocations")
+        .map(|mci| match mci.expose_secret().parse::<usize>() {
             Ok(limit) => {
                 let _ = rate_limit_builder.max_concurrent_invocations(limit);
                 Ok(())
             }
-            Err(e) => {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'max_concurrent_invocations' parameter: {e}")
-                        .into(),
-                });
-            }
-        }
-    });
-
-    tracing::debug!("Rate limit config: {rate_limit_builder:?}");
+            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'max_concurrent_invocations' parameter: {e}")
+                    .into(),
+            }),
+        })
+        .transpose()?;
 
     let rate_limit = rate_limit_builder.build();
 
