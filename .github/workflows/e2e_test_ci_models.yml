@@ -1,7 +1,7 @@
 name: E2E Test CI (models)
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - trunk
       - release-*
@@ -78,6 +78,8 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
