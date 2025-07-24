@@ -22,6 +22,8 @@ use datafusion::{
     prelude::Expr,
 };
 
+use crate::SEARCH_SCORE_COLUMN_NAME;
+
 /// [`ReciprocalRankFusionProvider`] is a [`TableProvider`] equivalent of [`super::ReciprocalRankFusion`].
 ///
 /// Each [`TableProvider`] of `ranked_retrieved` is expected to have
@@ -45,8 +47,19 @@ impl ReciprocalRankFusionProvider {
             let schema = input.schema();
             if !schema.contains(&primary_key_schema) {
                 return Err(DataFusionError::Plan(format!(
-                    "{i}th input to reciprocal rank fusion does not have required primary key fields. Primary key fields: {:?}. Input schema: {}",
-                    primary_key, schema
+                    "{i}th input to reciprocal rank fusion does not have required primary key fields. Primary key fields: {primary_key:?}. Input schema: {schema}",
+                )));
+            }
+            let Some((_, score_field)) = schema.column_with_name(SEARCH_SCORE_COLUMN_NAME) else {
+                return Err(DataFusionError::Plan(format!(
+                    "{i}th input to reciprocal rank fusion does not have a numeric {SEARCH_SCORE_COLUMN_NAME} column. Input schema: {schema}"
+                )));
+            };
+            // Doesn't have to be Float64, but any numeric can be cast to it.
+            if !score_field.data_type().is_numeric() {
+                return Err(DataFusionError::Plan(format!(
+                    "{i}th input to reciprocal rank fusion has a non-numeric {SEARCH_SCORE_COLUMN_NAME} column. Data type {}",
+                    score_field.data_type()
                 )));
             }
         }
