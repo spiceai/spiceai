@@ -49,7 +49,7 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     fn embedded_column(&self) -> String;
     fn primary_fields(&self) -> Vec<Field>;
     fn list_table_provider(&self) -> Arc<dyn TableProvider>;
-    fn metadata_columns(&self) -> MetadataColumns;
+    fn metadata_columns(&self) -> &MetadataColumns;
     fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider>;
     async fn write(&self, record: &RecordBatch);
     async fn query_table_provider(
@@ -92,8 +92,8 @@ impl VectorIndex for S3Vector {
         Arc::new(S3VectorsListTable::from(self.index.table.clone()))
     }
 
-    fn metadata_columns(&self) -> MetadataColumns {
-        self.index.metadata_columns.clone()
+    fn metadata_columns(&self) -> &MetadataColumns {
+        &self.index.metadata_columns
     }
 
     fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {

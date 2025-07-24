@@ -714,6 +714,35 @@ mod tests {
         embedded_column: String,
         primary_columns: Vec<Field>,
         schema: Schema,
+        metadata: MetadataColumns,
+    }
+    impl PretendVectorIndex {
+        pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) {
+            let cols = self
+                .schema
+                .fields()
+                .iter()
+                .filter_map(|f| {
+                    if f.name() == S3_VECTOR_PRIMARY_KEY_NAME
+                        || f.name() == S3_VECTOR_EMBEDDING_NAME
+                    {
+                        return None;
+                    }
+                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
+                        Some(MetadataColumn::Filterable(Arc::clone(f)))
+                    } else {
+                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            Self {
+                embedded_column,
+                primary_columns,
+                schema,
+                metadata: MetadataColumns::from(cols),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -738,25 +767,8 @@ mod tests {
             ))
         }
 
-        fn metadata_columns(&self) -> MetadataColumns {
-            let cols = self
-                .schema
-                .fields()
-                .iter()
-                .filter_map(|f| {
-                    if f.name() == S3_VECTOR_PRIMARY_KEY_NAME
-                        || f.name() == S3_VECTOR_EMBEDDING_NAME
-                    {
-                        return None;
-                    }
-                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
-                        Some(MetadataColumn::Filterable(Arc::clone(f)))
-                    } else {
-                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
-                    }
-                })
-                .collect::<Vec<_>>();
-            MetadataColumns::from(cols)
+        fn metadata_columns(&self) -> &MetadataColumns {
+            &self.metadata
         }
 
         fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
@@ -881,10 +893,10 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            vector_index: Arc::new(PretendVectorIndex {
-                embedded_column: "body".to_string(),
-                primary_columns: vec![Field::new("pk", DataType::Int64, false)],
-                schema: Schema::new(vec![
+            vector_index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
                     Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
                     Field::new(
                         S3_VECTOR_EMBEDDING_NAME,
@@ -892,7 +904,7 @@ mod tests {
                         false,
                     ),
                 ]),
-            }),
+            )),
             query: "just a query".to_string(),
             pre_limit: None,
         };
@@ -942,10 +954,10 @@ mod tests {
                 )
                 .expect("could not make MemTable"),
             ),
-            vector_index: Arc::new(PretendVectorIndex {
-                embedded_column: "body".to_string(),
-                primary_columns: vec![Field::new("pk", DataType::Int64, false)],
-                schema: Schema::new(vec![
+            vector_index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
                     Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
                     Field::new(
                         S3_VECTOR_EMBEDDING_NAME,
@@ -959,7 +971,7 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            }),
+            )),
             query: "just a query".to_string(),
             pre_limit: None,
         };
