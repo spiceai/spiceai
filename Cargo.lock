@@ -5012,6 +5012,7 @@ dependencies = [
  "reqwest",
  "rustyline",
  "serde_json",
+ "tokio",
  "tonic",
  "winver",
 ]
