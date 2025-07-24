@@ -42,10 +42,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # configure commit author
-          git config user.name "Spice Schema Bot"
-          git config user.email "schema-bot@spice.ai"
-
+          git config --global user.name 'Spice Schema Bot'
+          git config --global user.email 'schema-bot@spice.ai'
+          
           # see if there are any changes
           if git diff --quiet .schema/openapi.json; then
             echo "✅ openapi.json is up to date; nothing to commit."
