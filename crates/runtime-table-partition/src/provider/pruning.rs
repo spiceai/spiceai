@@ -97,7 +97,7 @@ fn transform_and_evaluate(
     )
 }
 
-/// Evaluates an expression to a scalar value using ExprSimplifier, falling back to direct evaluation if needed.
+/// Evaluates an expression to a scalar value using `ExprSimplifier`, falling back to direct evaluation if needed.
 fn evaluate_expr(
     expr: &Expr,
     schema: &Schema,
