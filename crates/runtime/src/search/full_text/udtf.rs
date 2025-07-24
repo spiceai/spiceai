@@ -207,6 +207,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
 #[derive(Debug, Clone)]
 pub(super) struct TextSearchUDTFProvider {
     pub args: TextSearchTableFuncArgs,
+    // TODO: move to using `FullTextSearchFieldIndex` so that i can move to search crate.
     pub index: FullTextDatabaseIndex,
     pub underlying: Arc<dyn TableProvider>,
 }
