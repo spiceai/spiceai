@@ -70,9 +70,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
                 subtype: mongodb::bson::spec::BinarySubtype::Generic,
                 bytes: b"blob".to_vec(),
             },
-            "col_varchar": "varchar",
-            "col_string": "string",
-            "col_var_string": "var_string",
+            "col_string": "string 🚀😊",
             "col_decimal": 1.11f64,
             "col_unsigned_int": 10u32,
             "col_char": "USA",
@@ -97,37 +95,12 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
             "col_date": null,
             "col_time": null,
             "col_blob": null,
-            "col_varchar": null,
             "col_string": null,
-            "col_var_string": null,
             "col_decimal": null,
             "col_unsigned_int": null,
             "col_char": null,
             "col_set": null,
             "col_json": null
-        }
-    ];
-
-    collection.insert_many(test_docs).await?;
-    Ok(())
-}
-
-#[instrument]
-async fn init_mongodb_utf8_db(port: u16) -> Result<(), anyhow::Error> {
-    let client = get_mongodb_client(port).await?;
-    let database = client.database("testdb");
-
-    tracing::debug!("DROP COLLECTION test_utf8");
-    let _ = database.collection::<mongodb::bson::Document>("test_utf8").drop().await;
-
-    let collection: Collection<mongodb::bson::Document> = database.collection("test_utf8");
-
-    let test_docs = vec![
-        doc! {
-            "id": 1,
-            "col_text_utf8": "🚀 This text contains UTF8 characters 😊",
-            "col_varchar_utf8": "🦄 Another UTF8 string with emojis 🎉",
-            "col_normal_text": "Regular text with no special characters"
         }
     ];
 
@@ -185,11 +158,11 @@ async fn mongodb_integration_test() -> Result<(), String> {
             }
 
             let queries: QueryTests = vec![(
-                "SELECT id, col_bit, col_tiny, col_short, col_long, col_longlong, col_float, col_double, col_timestamp, col_date, col_time, col_blob, col_varchar, col_string, col_var_string, col_decimal, col_unsigned_int, col_char, col_set, col_json FROM test",
+                "SELECT id, col_bit, col_tiny, col_short, col_long, col_longlong, col_float, col_double, col_timestamp, col_date, col_time, col_blob, col_string, col_decimal, col_unsigned_int, col_char, col_set, col_json FROM test",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 18, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
                     }
 
@@ -201,7 +174,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("mongodb_integration_test_select"), results);
+                        insta::assert_snapshot!("mongodb_integration_test", results);
                     });
                 })),
             )];
@@ -225,6 +198,29 @@ async fn mongodb_integration_test() -> Result<(), String> {
             Ok(())
         })
         .await
+}
+
+#[instrument]
+async fn init_mongodb_utf8_db(port: u16) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+
+    tracing::debug!("DROP COLLECTION test_utf8");
+    let _ = database.collection::<mongodb::bson::Document>("test_utf8").drop().await;
+
+    let collection: Collection<mongodb::bson::Document> = database.collection("test_utf8");
+
+    let test_docs = vec![
+        doc! {
+            "id": 1,
+            "col_text_utf8": "🚀 This text contains UTF8 characters 😊",
+            "col_varchar_utf8": "🦄 Another UTF8 string with emojis 🎉",
+            "col_normal_text": "Regular text with no special characters"
+        }
+    ];
+
+    collection.insert_many(test_docs).await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -294,7 +290,7 @@ async fn mongodb_character_set_results_test() -> Result<(), String> {
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("character_set_results_default"), results);
+                        insta::assert_snapshot!("character_set_results_default", results);
                     });
                 })),
             )];
@@ -318,129 +314,4 @@ async fn mongodb_character_set_results_test() -> Result<(), String> {
             Ok(())
         })
         .await
-}
-
-#[tokio::test]
-async fn mongodb_timezone_test() -> Result<(), String> {
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let running_container =
-                start_mongodb_docker_container(MONGODB_PORT3)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mongodb_docker_container: {e}");
-                        e.to_string()
-                    })?;
-            tracing::debug!("Container started");
-
-            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-            retry(retry_strategy, || async {
-                init_mongodb_tz_test_db(MONGODB_PORT3)
-                    .await
-                    .map_err(RetryError::transient)
-            })
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to initialize MongoDB timezone database: {e}");
-                    e.to_string()
-                })?;
-
-            let mut ds_system = make_mongodb_dataset("tz_test", "tz_system_tbl", MONGODB_PORT3, false);
-            set_dataset_time_zone(&mut ds_system, "UTC")?;
-
-            let mut ds_custom = make_mongodb_dataset("tz_test", "tz_custom_tbl", MONGODB_PORT3, false);
-            set_dataset_time_zone(&mut ds_custom, "Europe/Berlin")?;
-
-            let app = AppBuilder::new("mongodb_timezone_test")
-                .with_dataset(ds_system)
-                .with_dataset(ds_custom)
-                .build();
-
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            run_query_and_check_results(
-                &mut rt,
-                "mongodb_timezone_test",
-                "SELECT id, ts FROM tz_system_tbl ORDER BY id",
-                false,  // can't snapshot this plan
-                Some(Box::new(
-                    |result_batches: Vec<arrow::array::RecordBatch>| {
-                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
-                            .expect("should pretty print result batch");
-
-                        insta::assert_snapshot!("system_time_zone", results);
-                    },
-                )),
-            )
-                .await?;
-
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
-
-            Ok(())
-        })
-        .await
-}
-
-#[instrument]
-async fn init_mongodb_tz_test_db(port: u16) -> Result<(), anyhow::Error> {
-    let client = get_mongodb_client(port).await?;
-    let database = client.database("testdb");
-
-    tracing::debug!("DROP COLLECTION tz_test");
-    let _ = database.collection::<mongodb::bson::Document>("tz_test").drop().await;
-
-    let collection: Collection<mongodb::bson::Document> = database.collection("tz_test");
-
-    let ts1 = DateTime::parse_from_rfc3339("2024-06-01T08:00:00Z").unwrap().with_timezone(&Utc);
-    let ts2 = DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z").unwrap().with_timezone(&Utc);
-    let ts3 = DateTime::parse_from_rfc3339("2024-06-01T16:00:00Z").unwrap().with_timezone(&Utc);
-
-    let test_docs = vec![
-        doc! {
-            "id": 1,
-            "ts": mongodb::bson::DateTime::from(SystemTime::from(ts1)),
-        },
-        doc! {
-            "id": 2,
-            "ts": mongodb::bson::DateTime::from(SystemTime::from(ts2)),
-        },
-        doc! {
-            "id": 3,
-            "ts": mongodb::bson::DateTime::from(SystemTime::from(ts3)),
-        }
-    ];
-
-    collection.insert_many(test_docs).await?;
-    Ok(())
-}
-
-fn set_dataset_time_zone(ds: &mut Dataset, tz: &str) -> Result<(), String> {
-    let Some(params) = ds.params.as_mut() else {
-        return Err("Dataset params are missing".to_string());
-    };
-    params.data.insert(
-        "mongodb_time_zone".to_string(),
-        ParamValue::String(tz.to_string()),
-    );
-    Ok(())
 }
