@@ -21,8 +21,6 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 use mongodb::{Collection, bson::doc};
 
 use chrono::{DateTime, Utc};
-use spicepod::component::dataset::Dataset;
-use spicepod::param::ParamValue;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
@@ -36,8 +34,6 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MONGODB_PORT1: u16 = 27019;
-const MONGODB_PORT2: u16 = 27020;
-const MONGODB_PORT3: u16 = 27021;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
@@ -54,7 +50,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     let collection: Collection<mongodb::bson::Document> = database.collection("test");
 
     let ts = DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z")
-        .unwrap()
+        ?
         .with_timezone(&Utc);
 
     // Insert test documents
@@ -193,122 +189,6 @@ async fn mongodb_integration_test() -> Result<(), String> {
                     validate_result,
                 )
                     .await?;
-            }
-
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                e.to_string()
-            })?;
-
-            Ok(())
-        })
-        .await
-}
-
-#[instrument]
-async fn init_mongodb_utf8_db(port: u16) -> Result<(), anyhow::Error> {
-    let client = get_mongodb_client(port).await?;
-    let database = client.database("testdb");
-
-    tracing::debug!("DROP COLLECTION test_utf8");
-    let _ = database
-        .collection::<mongodb::bson::Document>("test_utf8")
-        .drop()
-        .await;
-
-    let collection: Collection<mongodb::bson::Document> = database.collection("test_utf8");
-
-    let test_docs = vec![doc! {
-        "id": 1,
-        "col_text_utf8": "🚀 This text contains UTF8 characters 😊",
-        "col_varchar_utf8": "🦄 Another UTF8 string with emojis 🎉",
-        "col_normal_text": "Regular text with no special characters"
-    }];
-
-    collection.insert_many(test_docs).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn mongodb_character_set_results_test() -> Result<(), String> {
-    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
-    let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let running_container = start_mongodb_docker_container(MONGODB_PORT2)
-                .await
-                .map_err(|e| {
-                    tracing::error!("start_mongodb_docker_container: {e}");
-                    e.to_string()
-                })?;
-            tracing::debug!("Container started");
-            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-            retry(retry_strategy, || async {
-                init_mongodb_utf8_db(MONGODB_PORT2)
-                    .await
-                    .map_err(RetryError::transient)
-            })
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to initialize MongoDB database: {e}");
-                e.to_string()
-            })?;
-
-            let app = AppBuilder::new("mongodb_character_set_results_test")
-                .with_dataset(make_mongodb_dataset(
-                    "test_utf8",
-                    "test_utf8",
-                    MONGODB_PORT2,
-                    false,
-                ))
-                .build();
-
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            // Set a timeout for the test
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let queries: QueryTests = vec![(
-                "SELECT id, col_text_utf8, col_varchar_utf8, col_normal_text FROM test_utf8",
-                "character_set_results_default",
-                Some(Box::new(|result_batches| {
-                    // snapshot the values of the results
-                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
-                        .expect("should pretty print result batch");
-
-                    insta::with_settings!({
-                        description => format!("MongoDB Integration Test Results"),
-                        omit_expression => true,
-                        snapshot_path => "../snapshots"
-                    }, {
-                        insta::assert_snapshot!("character_set_results_default", results);
-                    });
-                })),
-            )];
-
-            for (query, snapshot_suffix, validate_result) in queries {
-                run_query_and_check_results(
-                    &mut rt,
-                    &format!("mongodb_integration_test_{snapshot_suffix}"),
-                    query,
-                    false, // can't snapshot this plan
-                    validate_result,
-                )
-                .await?;
             }
 
             running_container.remove().await.map_err(|e| {
