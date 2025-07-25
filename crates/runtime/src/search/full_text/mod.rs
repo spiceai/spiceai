@@ -1,3 +1,17 @@
+use std::sync::Arc;
+
+use datafusion::{
+    execution::runtime_env::RuntimeEnvBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+use search::generation::{
+    CandidateGeneration, post_apply::PostApplyCandidateGeneration,
+    text_search::index::FullTextDatabaseIndex,
+};
+use snafu::ResultExt;
+
+use crate::object_store_registry::SpiceObjectStoreRegistry;
+
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -13,19 +27,39 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use snafu::Snafu;
-use tantivy::TantivyError;
-
 pub mod connector;
-pub mod index;
 pub mod udtf;
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum Error {
-    #[snafu(display("Failed to create a full text search index: {source}.",))]
-    IndexCreationError { source: TantivyError },
+/// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
+///
+/// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::generation::text_search::udtf::TextSearchIndexProvider`].
+pub async fn as_candidate_generations(
+    database_index: &FullTextDatabaseIndex,
+) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+    let mut generators = vec![];
+    for search_field in database_index.search_fields.as_slice() {
+        let base = database_index
+            .full_text_search_field_index(search_field.as_str())
+            .await
+            .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
-    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
-    IndexInsertionError { source: TantivyError },
+        let post_apply = PostApplyCandidateGeneration::new(
+            Arc::clone(&database_index.base_table),
+            Arc::new(base),
+            database_index.primary_key.clone(),
+        )
+        .with_ctx(Arc::new(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnvBuilder::default()
+                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+                    .build()
+                    .boxed()
+                    .map_err(|source| search::generation::Error::InternalError { source })?,
+            ),
+        )));
+        generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
+    }
+
+    Ok(generators)
 }

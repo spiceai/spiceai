@@ -33,7 +33,7 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
-use crate::search::full_text::index::as_candidate_generations;
+use crate::search::full_text::as_candidate_generations;
 
 use super::{Error, Result};
 

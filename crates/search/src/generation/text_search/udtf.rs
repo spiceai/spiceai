@@ -59,17 +59,16 @@ impl TextSearchIndexProvider {
         filters: &[Expr],
     ) -> Result<bool, ArrowError> {
         Ok(
-            self.text_index_table_has_projection(&index_table, projection)?
-                && self.text_index_table_has_filter_columns(index_table, filters)?,
+            self.text_index_table_has_projection(index_table, projection)?
+                && Self::text_index_table_has_filter_columns(index_table, filters),
         )
     }
 
     fn text_index_table_has_filter_columns(
-        &self,
         index_table: &FullTextSearchQuery,
         filters: &[Expr],
-    ) -> Result<bool, ArrowError> {
-        let mut columns_in_index: Vec<Column> = index_table
+    ) -> bool {
+        let columns_in_index: Vec<Column> = index_table
             .schema()
             .fields()
             .iter()
@@ -77,9 +76,9 @@ impl TextSearchIndexProvider {
             .collect();
         let columns_in_index_ref: HashSet<&Column> = columns_in_index.iter().collect();
 
-        Ok(filters
+        filters
             .iter()
-            .all(|f| f.column_refs().is_subset(&columns_in_index_ref)))
+            .all(|f| f.column_refs().is_subset(&columns_in_index_ref))
     }
 
     fn text_index_table_has_projection(
@@ -120,7 +119,7 @@ impl TextSearchIndexProvider {
 
         let search_score_idx = self
             .schema()
-            .column_with_name(&SEARCH_SCORE_COLUMN_NAME)
+            .column_with_name(SEARCH_SCORE_COLUMN_NAME)
             .map(|(idx, _)| idx);
 
         projection
@@ -132,6 +131,85 @@ impl TextSearchIndexProvider {
                     || search_score_idx.is_some_and(|i| i == idx))
             })
             .collect()
+    }
+
+    fn construct_join(
+        &self,
+        index_table_scan: LogicalPlan,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let underlying_table_scan = LogicalPlan::TableScan(TableScan::try_new(
+            "base_table",
+            Arc::new(DefaultTableSource::new(
+                Arc::clone(&self.underlying) as Arc<dyn TableProvider>
+            )),
+            Some(self.projection_for_underlying(projection)),
+            vec![],
+            None,
+        )?);
+
+        let primary_key_columns: Vec<Column> = self
+            .index
+            .primary_key
+            .iter()
+            .map(|pk| Column::new_unqualified(pk.clone()))
+            .collect();
+        let pk_col_refs: HashSet<&Column> = primary_key_columns.iter().collect();
+
+        // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
+        let (pre_join_filters, post_join_filters): (Vec<Expr>, Vec<Expr>) = filters
+            .iter()
+            .cloned()
+            .partition(|f| f.column_refs().is_disjoint(&pk_col_refs)); // If disjoint, can safely apply filter pre join.
+
+        let on: Vec<(Expr, Expr)> = primary_key_columns
+            .iter()
+            .map(|c| {
+                (
+                    Expr::Column(Column::new_unqualified(c.name())),
+                    Expr::Column(Column::new_unqualified(c.name())),
+                )
+            })
+            .collect();
+        let join_schema = index_table_scan
+            .schema()
+            .join(underlying_table_scan.schema())?;
+        let join = LogicalPlan::Join(Join {
+            left: Arc::new(index_table_scan),
+            right: Arc::new(underlying_table_scan),
+            join_type: JoinType::Left,
+            join_constraint: JoinConstraint::On,
+            on,
+            filter: fold_binary(pre_join_filters.as_slice(), Operator::And),
+            schema: join_schema.into(),
+            null_equals_null: false,
+        });
+
+        // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
+        // case, we will remove first.
+        let deduped_schema = DFSchema::new_with_metadata(
+            join.schema()
+                .iter()
+                .filter(|(tbl, f)| {
+                    !(self.index.primary_key.contains(f.name())
+                        && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+                })
+                .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
+                .collect(),
+            HashMap::default(),
+        )?;
+
+        let proj = LogicalPlan::Projection(Projection::new_from_schema(
+            join.into(),
+            deduped_schema.into(),
+        ));
+
+        if let Some(filter) = fold_binary(post_join_filters.as_slice(), Operator::And) {
+            Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
+        } else {
+            Ok(proj)
+        }
     }
 }
 
@@ -169,7 +247,7 @@ impl TableProvider for TextSearchIndexProvider {
             .ok()
         else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
-            return Err(DataFusionError::Internal(format!("blame jeadie")));
+            return Err(DataFusionError::Internal("blame jeadie".to_string()));
         };
         let index_table = Arc::new(FullTextSearchQuery {
             index: field_index,
@@ -191,96 +269,13 @@ impl TableProvider for TextSearchIndexProvider {
             .map_err(|e| DataFusionError::ArrowError(e, None))?
         {
             // Let DataFusion handle pushing filters.
-
             if let Some(filter) = fold_binary(filters, Operator::And) {
                 LogicalPlan::Filter(Filter::try_new(filter, index_table_scan.into())?)
             } else {
                 index_table_scan
             }
         } else {
-            tracing::error!("in my insufficient");
-            let underlying_table_scan = LogicalPlan::TableScan(TableScan::try_new(
-                "base_table",
-                Arc::new(DefaultTableSource::new(
-                    Arc::clone(&self.underlying) as Arc<dyn TableProvider>
-                )),
-                Some(self.projection_for_underlying(projection)),
-                vec![],
-                None, // TODO
-            )?);
-            tracing::error!("have a 'underlying_table_scan'");
-            let join_schema = index_table_scan
-                .schema()
-                .join(underlying_table_scan.schema())?;
-
-            tracing::error!("have a 'join_schema'={join_schema:?}");
-            let primary_key_columns: Vec<Column> = self
-                .index
-                .primary_key
-                .iter()
-                .map(|pk| Column::new_unqualified(pk.clone()))
-                .collect();
-
-            tracing::error!("have a 'primary_key_columns'={primary_key_columns:?}");
-            let pk_col_refs: HashSet<&Column> = primary_key_columns.iter().collect();
-
-            // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
-            let (pre_join_filters, post_join_filters): (Vec<Expr>, Vec<Expr>) = filters
-                .iter()
-                .cloned()
-                .partition(|f| f.column_refs().is_disjoint(&pk_col_refs)); // If disjoint, can safely apply filter pre join.
-
-            tracing::error!(
-                "have a 'pre_join_filters'={pre_join_filters:?}.post_join_filters={post_join_filters:?}"
-            );
-            let on: Vec<(Expr, Expr)> = primary_key_columns
-                .iter()
-                .map(|c| {
-                    (
-                        Expr::Column(Column::new_unqualified(c.name())),
-                        Expr::Column(Column::new_unqualified(c.name())),
-                    )
-                })
-                .collect();
-
-            tracing::error!("have a 'on'={on:?}");
-
-            let join = LogicalPlan::Join(Join {
-                left: Arc::new(index_table_scan),
-                right: Arc::new(underlying_table_scan),
-                join_type: JoinType::Left,
-                join_constraint: JoinConstraint::On,
-                on,
-                filter: fold_binary(pre_join_filters.as_slice(), Operator::And),
-                schema: join_schema.into(),
-                null_equals_null: false,
-            });
-
-            // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
-            // case, we will remove first.
-            let deduped_schema = DFSchema::new_with_metadata(
-                join.schema()
-                    .iter()
-                    .filter(|(tbl, f)| {
-                        !(self.index.primary_key.contains(f.name())
-                            && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
-                    })
-                    .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
-                    .collect(),
-                HashMap::default(),
-            )?;
-            tracing::error!("have a 'deduped_schema'={deduped_schema:?}");
-
-            let proj = LogicalPlan::Projection(Projection::new_from_schema(
-                join.into(),
-                deduped_schema.into(),
-            ));
-
-            if let Some(filter) = fold_binary(post_join_filters.as_slice(), Operator::And) {
-                LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
-            } else {
-                proj
-            }
+            self.construct_join(index_table_scan, projection, filters)?
         };
 
         let sort = LogicalPlan::Sort(Sort {
@@ -309,8 +304,6 @@ impl TableProvider for TextSearchIndexProvider {
                 HashMap::default(),
             )?),
         ));
-
-        tracing::error!("final projection={final_proj:?}");
 
         state.create_physical_plan(&final_proj).await
     }
