@@ -1,6 +1,7 @@
 use crate::EditorHelper;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use datafusion::arrow::array::{Array, StringArray};
+use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
 use std::sync::Arc;
@@ -9,52 +10,22 @@ use tokio::sync::{RwLock, oneshot};
 use tokio::time::interval;
 use tonic::transport::Channel;
 
-#[rustfmt::skip]
-const SQL_KEYWORDS: &[&str] = &[
-    // Core SQL keywords
-    "select", "from", "where", "and", "or", "not", "in", "like", "is", "null",
-    "true", "false", "asc", "desc", "limit", "offset", "order", "by", "group",
-    "having", "as", "distinct", "case", "when", "then", "else", "end",
-
-    // JOIN operations
-    "join", "inner", "left", "right", "full", "outer", "cross", "natural", "using", "on",
-
-    // DML operations
-    "insert", "into", "values", "update", "set", "delete",
-
-    // DDL operations
-    "create", "table", "alter", "drop", "index", "view", "database", "schema",
-];
-
-#[rustfmt::skip]
-const FUNCTION_NAMES: &[&str] = &[
-    // Aggregate functions
-    "count", "sum", "avg", "min", "max", "stddev", "variance",
-
-    // String functions
-    "concat", "substring", "length", "upper", "lower", "trim", "replace",
-
-    // Date functions
-    "now", "current_date", "current_time", "current_timestamp", "extract",
-
-    // Window functions
-    "over", "partition", "row_number", "rank", "dense_rank", "lag", "lead",
-
-    // Conditionals
-    "if", "ifnull", "coalesce", "nullif",
-];
-
 #[derive(Debug, Clone)]
 pub struct SchemaCache {
+    udfs: Vec<String>,
     tables: Vec<String>,
     columns: Vec<String>,
+
+    keywords: Vec<String>,
 }
 
 impl SchemaCache {
-    pub fn new(ttl_seconds: u64) -> Self {
+    pub fn new() -> Self {
         Self {
+            udfs: Vec::new(),
             tables: Vec::new(),
             columns: Vec::new(),
+            keywords: ALL_KEYWORDS.iter().map(|k| k.to_lowercase()).collect(),
         }
     }
 
@@ -64,6 +35,10 @@ impl SchemaCache {
 
     fn update_columns(&mut self, columns: Vec<String>) {
         self.columns = columns;
+    }
+
+    fn update_udfs(&mut self, udfs: Vec<String>) {
+        self.udfs = udfs;
     }
 }
 
@@ -150,20 +125,20 @@ impl Completer for EditorHelper {
                 }
             }
         } else {
-            for &keyword in SQL_KEYWORDS {
+            for keyword in &cache.keywords {
                 if keyword.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: keyword.to_lowercase(),
+                        display: format!("{} (keyword)", keyword.to_lowercase()),
                         replacement: format!("{} ", keyword.to_lowercase()),
                     });
                 }
             }
 
-            for &fn_name in FUNCTION_NAMES {
-                if fn_name.starts_with(&word_lower) {
+            for udf_name in &cache.udfs {
+                if udf_name.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: fn_name.to_lowercase(),
-                        replacement: fn_name.to_lowercase(),
+                        display: format!("{} (udf)", udf_name.to_lowercase()),
+                        replacement: udf_name.to_lowercase(),
                     });
                 }
             }
@@ -171,7 +146,7 @@ impl Completer for EditorHelper {
             for table in &cache.tables {
                 if table.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: table.to_string(),
+                        display: format!("{} (table)", table),
                         replacement: format!("{} ", table),
                     });
                 }
@@ -180,7 +155,7 @@ impl Completer for EditorHelper {
             for column in &cache.columns {
                 if column.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: column.to_string(),
+                        display: format!("{} (column)", column),
                         replacement: format!("{} ", column),
                     });
                 }
@@ -197,15 +172,27 @@ async fn refresh_schema(
     api_key: Option<&String>,
     user_agent: &str,
 ) {
-    if let Ok(tables) = get_tables(&mut client, api_key, user_agent).await {
-        if let Ok(mut cache) = schema_cache.try_write() {
+    let mut client1 = client.clone();
+    let mut client2 = client.clone();
+    let mut client3 = client;
+
+    let (tables_result, columns_result, udfs_result) = tokio::join!(
+        get_tables(&mut client1, api_key, user_agent),
+        get_columns(&mut client2, api_key, user_agent),
+        get_udfs(&mut client3, api_key, user_agent)
+    );
+
+    if let Ok(mut cache) = schema_cache.try_write() {
+        if let Ok(tables) = tables_result {
             cache.update_tables(tables);
         }
-    }
 
-    if let Ok(columns) = get_columns(&mut client, api_key, user_agent).await {
-        if let Ok(mut cache) = schema_cache.try_write() {
+        if let Ok(columns) = columns_result {
             cache.update_columns(columns);
+        }
+
+        if let Ok(udfs) = udfs_result {
+            cache.update_udfs(udfs);
         }
     }
 }
@@ -214,7 +201,7 @@ async fn get_tables(
     client: &mut FlightServiceClient<Channel>,
     api_key: Option<&String>,
     user_agent: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let query = "SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime')";
 
     let records = crate::get_records(
@@ -244,7 +231,7 @@ async fn get_columns(
     client: &mut FlightServiceClient<Channel>,
     api_key: Option<&String>,
     user_agent: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let query = "SELECT column_name FROM information_schema.columns";
 
     let records = crate::get_records(
@@ -268,6 +255,36 @@ async fn get_columns(
     }
 
     Ok(columns)
+}
+
+async fn get_udfs(
+    client: &mut FlightServiceClient<Channel>,
+    api_key: Option<&String>,
+    user_agent: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let query = "SELECT name FROM list_udfs()";
+
+    let records = crate::get_records(
+        client.clone(),
+        &query,
+        api_key,
+        user_agent,
+        crate::cache_control::CacheControl::NoCache,
+    )
+    .await?;
+
+    let mut udfs = Vec::new();
+    for batch in records.0 {
+        if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
+            for value in array.iter() {
+                if let Some(column_name) = value {
+                    udfs.push(column_name.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(udfs)
 }
 
 fn extract_word(line: &str, pos: usize) -> (usize, &str) {
@@ -317,6 +334,7 @@ mod tests {
 
     fn create_test_editor_helper() -> EditorHelper {
         let schema_cache = Arc::new(RwLock::new(SchemaCache {
+            udfs: vec!["count".to_string(), "sum".to_string(), "concat".to_string()],
             tables: vec![
                 "users".to_string(),
                 "products".to_string(),
@@ -334,6 +352,7 @@ mod tests {
                 "order_date".to_string(),
                 "profile_picture".to_string(),
             ],
+            keywords: ALL_KEYWORDS.iter().map(|k| k.to_lowercase()).collect(),
         }));
 
         EditorHelper {

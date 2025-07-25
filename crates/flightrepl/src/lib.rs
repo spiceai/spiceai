@@ -170,7 +170,7 @@ impl EditorHelper {
         user_agent: String,
     ) -> Self {
         Self {
-            schema_cache: Arc::new(RwLock::new(SchemaCache::new(300))),
+            schema_cache: Arc::new(RwLock::new(SchemaCache::new())),
             flight_client,
             api_key,
             user_agent,
