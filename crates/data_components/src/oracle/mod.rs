@@ -52,6 +52,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to initialize Oracle client: {source}"))]
+    OracleInitError { source: oracle::Error },
+
     #[snafu(display("Error executing query: {source}"))]
     QueryError { source: oracle::Error },
 

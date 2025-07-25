@@ -80,7 +80,7 @@ impl ParamValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Params {
     #[cfg_attr(feature = "schemars", schemars(flatten))]

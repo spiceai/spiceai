@@ -17,7 +17,10 @@ limitations under the License.
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr,
+    scalar::ScalarValue,
+};
 use snafu::prelude::*;
 
 use crate::Partition;
@@ -27,11 +30,16 @@ pub mod filename;
 type StdError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to create an accelerated partition: {source}"))]
     CreatePartition { source: StdError },
     #[snafu(display("Failed to infer accelerated partitions: {source}"))]
     InferringPartitions { source: StdError },
+    #[snafu(display(
+        "The 'partition_by' expressions are different from the expressions used to create the existing partition files. Revert the 'partition_by' expressions, delete the partition files, or change the location the partition files are stored to create new partitions."
+    ))]
+    PartitionByExpressionsChanged,
 }
 
 #[async_trait]
@@ -42,9 +50,18 @@ pub trait PartitionCreator: Debug + Send + Sync {
     /// Returns an error when creating a [`Partition`] is unsuccessful.
     async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
 
-    /// Find and load previously created [`Parition`]s.
+    /// Find and load previously created [`Partition`]s
     ///
     /// # Errors
     /// Returns an error when [`Partition`]s cannot be inferred.
     async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+
+    /// See [`TableProvider::supports_filters_pushdown`].
+    ///
+    /// # Errors
+    /// See [`TableProvider::supports_filters_pushdown`].
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
 }

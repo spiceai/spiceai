@@ -6,7 +6,7 @@ require (
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a
-	github.com/hashicorp/go-retryablehttp v0.7.7
+	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/joho/godotenv v1.5.1
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/manifoldco/promptui v0.9.0
@@ -16,7 +16,7 @@ require (
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.19.0
 	github.com/stretchr/testify v1.10.0
-	golang.org/x/mod v0.25.0
+	golang.org/x/mod v0.26.0
 )
 
 require (
@@ -47,10 +47,10 @@ require (
 	github.com/rivo/uniseg v0.4.6 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.6.0 // indirect
-	github.com/spf13/pflag v1.0.6
+	github.com/spf13/pflag v1.0.7
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/sys v0.33.0
+	golang.org/x/sys v0.34.0
 	golang.org/x/text v0.17.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1

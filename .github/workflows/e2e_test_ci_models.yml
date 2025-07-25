@@ -1,7 +1,7 @@
 name: E2E Test CI (models)
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - trunk
       - release-*
@@ -53,7 +53,7 @@ on:
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 jobs:
@@ -78,6 +78,8 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -116,6 +118,10 @@ jobs:
 
       - name: Build spiced (macOS)
         if: matrix.target.target_os == 'darwin'
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
 

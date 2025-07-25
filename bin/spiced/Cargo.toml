@@ -72,6 +72,8 @@ default = [
   "dynamodb",
   "imap",
   "alloc-snmalloc",
+  "oracle",
+  "runtime/s3_vectors",
   "mongodb",
 ]
 delta_lake = ["runtime/delta_lake"]

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -139,8 +140,7 @@ impl ExecutionPlan for SchemaCastScanExec {
             {
                 stream! {
                     while let Some(batch) = stream.next().await {
-                        let batch = arrow_tools::record_batch::try_cast_to(batch?, Arc::clone(&schema));
-                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                        yield record_batch::try_cast_to(batch?, Arc::clone(&schema)).map_err(From::from);
                     }
                 }
             },

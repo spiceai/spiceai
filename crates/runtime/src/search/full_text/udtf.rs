@@ -53,7 +53,13 @@ use search::{
     },
 };
 
-use crate::{datafusion::DataFusion, search::full_text::index::FullTextDatabaseIndex};
+use crate::{
+    datafusion::DataFusion,
+    search::{
+        full_text::index::FullTextDatabaseIndex,
+        util::{find_concrete_table_provider, table_ref_from_column_expr},
+    },
+};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 
@@ -85,16 +91,12 @@ impl TextSearchTableFunc {
         let mut args = args.iter();
 
         let tbl = args.next();
-        let Some(Expr::Column(Column {
-            relation: None,
-            name: table_name,
-            ..
-        })) = tbl
-        else {
+        let Some(Expr::Column(c)) = tbl else {
             return Err(DataFusionError::Plan(format!(
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
+        let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
         let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
@@ -108,7 +110,7 @@ impl TextSearchTableFunc {
             (None, None, None) => (None, None, Some(true)),
 
             // Single argument cases
-            (Some(Expr::Literal(ScalarValue::Utf8(Some(col)))), None, None) => {
+            (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
             (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
@@ -120,12 +122,12 @@ impl TextSearchTableFunc {
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
@@ -137,7 +139,7 @@ impl TextSearchTableFunc {
 
             // All three arguments provided
             (
-                Some(Expr::Literal(ScalarValue::Utf8(Some(col)))),
+                Some(Expr::Column(Column { name: col, .. })),
                 Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
@@ -145,12 +147,12 @@ impl TextSearchTableFunc {
             // Invalid argument combinations
             (a, b, c) => {
                 return Err(DataFusionError::Plan(format!(
-                    "Invalid arguments: ({table_name}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
+                    "Invalid arguments: ({tbl_ref:?}, {q}, {a:?}, {b:?}, {c:?}. Expected (table, query, [column, limit, include_score])."
                 )));
             }
         };
         Ok(TextSearchTableFuncArgs {
-            tbl: table_name.into(),
+            tbl: tbl_ref,
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
@@ -174,15 +176,15 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let index_table_provider = table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Table '{}' does not have a full text search index.",
-                    args.tbl.clone()
-                ))
-            })?;
+        let index_table_provider = find_concrete_table_provider::<IndexedTableProvider>(
+            &table_provider,
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not have a full text search index.",
+                args.tbl.clone()
+            ))
+        })?;
 
         let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
             return Err(DataFusionError::Plan(format!(
@@ -194,7 +196,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         Ok(Arc::new(TextSearchUDTFProvider {
             args,
             index: fts_index.clone(),
-            underlying: index_table_provider.get_underlying(),
+            underlying: table_provider,
         }))
     }
 }
@@ -206,7 +208,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
 pub(super) struct TextSearchUDTFProvider {
     pub args: TextSearchTableFuncArgs,
     pub index: FullTextDatabaseIndex,
-    underlying: Arc<dyn TableProvider>,
+    pub underlying: Arc<dyn TableProvider>,
 }
 
 impl TextSearchUDTFProvider {
@@ -294,16 +296,20 @@ impl TextSearchUDTFProvider {
     }
 
     fn search_field_index_schema(field_index: &FullTextSearchFieldIndex) -> SchemaRef {
-        let tantivy_schema = field_index.tantivy_schema();
+        let tantivy_schema = &field_index.search_schema;
 
         let fields = field_index
             .all_columns()
             .iter()
             .filter_map(|field_name| {
-                let f = tantivy_schema.get_field(field_name).ok()?;
-                let entry = tantivy_schema.get_field_entry(f);
-                let data_type = tantivy_to_arrow_type(entry.field_type())?;
-                Some(Field::new(field_name, data_type, false))
+                let (data_type, nullable) = if let Some(f) = field_index.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = tantivy_schema.get_field(field_name).ok()?;
+                    let entry = tantivy_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                };
+                Some(Field::new(field_name, data_type, nullable))
             })
             .chain([Field::new(
                 SEARCH_SCORE_COLUMN_NAME,
@@ -357,7 +363,12 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let col = self.column()?;
 
-        let Some(field_index) = self.index.full_text_search_field_index(col.as_str()).ok() else {
+        let Some(field_index) = self
+            .index
+            .full_text_search_field_index(col.as_str())
+            .await
+            .ok()
+        else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
             return Err(DataFusionError::Internal(format!(
                 "User function 'text_search' is called on table '{tbl}'. Unexpectedly, text search cannot be performed on '{col}' column. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues."
@@ -368,13 +379,16 @@ impl TableProvider for TextSearchUDTFProvider {
         let underlying_projection =
             self.convert_projection(projection, &search_field_index_schema)?;
 
-        Ok(Arc::new(FullTextSearchExec::try_new(
-            field_index,
-            query.clone(),
-            search_field_index_schema,
-            Some(&underlying_projection),
-            filters.to_vec(),
-            limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
-        )?))
+        Ok(Arc::new(
+            FullTextSearchExec::try_new(
+                field_index,
+                query.clone(),
+                search_field_index_schema,
+                Some(&underlying_projection),
+                filters.to_vec(),
+                limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
+            )
+            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+        ))
     }
 }

@@ -127,6 +127,7 @@ pub enum Engine {
     #[default]
     Arrow,
     DuckDB,
+    PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
     Void,
@@ -136,7 +137,7 @@ impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
             Engine::Void => write!(f, "void"),
@@ -273,6 +274,8 @@ pub struct Acceleration {
 
     pub retention_period: Option<String>,
 
+    pub retention_sql: Option<String>,
+
     pub retention_check_interval: Option<String>,
 
     pub retention_check_enabled: bool,
@@ -310,6 +313,7 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -354,7 +358,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
+        let engine =
+            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
+                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                    Engine::PartitionedDuckDB
+                }
+                engine => engine,
+            };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -414,6 +424,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
             retention_period: acceleration.retention_period,
+            retention_sql: acceleration.retention_sql,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
             disable_federation,
@@ -444,6 +455,7 @@ impl Default for Acceleration {
             refresh_jitter_max: None,
             params: HashMap::default(),
             retention_period: None,
+            retention_sql: None,
             retention_check_interval: None,
             retention_check_enabled: false,
             on_zero_results: ZeroResultsAction::ReturnEmpty,

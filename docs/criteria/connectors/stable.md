@@ -28,7 +28,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | PostgreSQL                       | ✅             | @peasee         |
 | Sharepoint                       | ➖             |                 |
 | Snowflake                        | ➖             |                 |
-| Spice.ai Cloud Platform          | ➖             |                 |
+| Spice.ai Cloud Platform          | ✅             | @Sevenannn      |
 | S3                               | ✅             | @ewgenius       |
 | Azure BlobFS                     | ➖             |                 |
 | Spark                            | ➖             |                 |

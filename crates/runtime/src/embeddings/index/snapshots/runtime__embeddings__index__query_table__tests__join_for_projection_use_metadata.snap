@@ -1,0 +1,22 @@
+---
+source: crates/runtime/src/embeddings/index/query_table.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                    |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.score DESC NULLS FIRST, fetch=5                                                                                 |
+|               |   TableScan: my_vectored_table projection=[pk, another_column, not_where, score]                                                        |
+| physical_plan | SortPreservingMergeExec: [score@3 DESC], fetch=5                                                                                        |
+|               |   SortExec: TopK(fetch=5), expr=[score@3 DESC], preserve_partitioning=[true]                                                            |
+|               |     ProjectionExec: expr=[pk@1 as pk, another_column@0 as another_column, not_where@3 as not_where, score@2 as score]                   |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                       |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                     |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(pk@0, pk@0)], projection=[another_column@1, pk@2, score@3, not_where@4] |
+|               |             DataSourceExec: partitions=1, partition_sizes=[1]                                                                           |
+|               |             ProjectionExec: expr=[CAST(key@0 AS Int64) as pk, 1 - distance@2 as score, not_where@1 as not_where]                        |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                      |
+|               |                 ExplainExecutionPlan: projection=["key", "not_where", "distance"] filter=[] limit=None                                  |
+|               |                                                                                                                                         |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------+

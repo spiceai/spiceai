@@ -140,7 +140,7 @@ impl Runtime {
                 let Ok(_guard) = semaphore.acquire().await else {
                     unreachable!("Semaphore is never closed.");
                 };
-                tracing::info!("Initializing dataset {ds}");
+                tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
             spawned_tasks.push(handle);
@@ -326,7 +326,7 @@ impl Runtime {
                     FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector)).await
                 {
                     tracing::warn!(
-                        "Unable to connect to the remote source for {}. Data will be served from the pre-existing accelerated table for {} while attempting to establish the connection.\n\n{err}",
+                        "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
                         ds.name,
                         ds.name
                     );
@@ -470,7 +470,7 @@ impl Runtime {
             Ok(connector) => {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
-                    tracing::info!("Updating accelerated dataset {}...", &ds.name);
+                    tracing::info!("Accelerated Dataset {} updating...", &ds.name);
                     if let Ok(()) = Arc::clone(&self)
                         .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
                         .await
@@ -617,6 +617,7 @@ impl Runtime {
             data_connector = Arc::new(EmbeddingConnector::new(
                 data_connector,
                 Arc::clone(&self.embeds),
+                self.secrets(),
             ));
         }
 
@@ -681,7 +682,7 @@ impl Runtime {
         }
 
         self.accelerator_engine_registry
-            .get_accelerator_engine(accelerator_engine)
+            .get_accelerator_engine(acceleration_settings.engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -792,13 +793,13 @@ impl Runtime {
 
         let mut initialized_datasets = vec![];
         for ds in datasets {
-            if let Some(acceleration) = &ds.acceleration {
+            if let Some(acceleration_settings) = &ds.acceleration {
                 let accelerator = match self
                     .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration.engine)
+                    .get_accelerator_engine(acceleration_settings.engine)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     }) {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
@@ -813,7 +814,7 @@ impl Runtime {
 
                 match accelerator.init(ds.as_ref()).await.context(
                     AcceleratorInitializationFailedSnafu {
-                        name: acceleration.engine.to_string(),
+                        name: acceleration_settings.engine.to_string(),
                     },
                 ) {
                     Ok(()) => {

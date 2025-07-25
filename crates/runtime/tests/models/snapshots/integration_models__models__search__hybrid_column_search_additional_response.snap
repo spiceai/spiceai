@@ -12,23 +12,26 @@ snapshot_kind: text
       },
       "dataset": "hybrid_column_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends conv",
+          "In general basic characters welcome. Clearly lively friends conv"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.016
+      "score": 0.032
     },
     {
       "data": {
-        "cp_catalog_number": 32
+        "cp_catalog_number": 1
       },
       "dataset": "hybrid_column_search",
       "matches": {
-        "cp_description": "Levels will attend ago general, basic ideas. Physical, "
+        "cp_description": "Close customers might struggle away different memb"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 3404
+        "cp_catalog_page_sk": 15
       },
       "score": 0.016
     }

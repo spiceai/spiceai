@@ -20,7 +20,7 @@ use datafusion::common::ParamValues;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, tracker::QueryTracker};
 
@@ -48,8 +48,8 @@ impl<'a> QueryBuilder<'a> {
     }
 
     #[must_use]
-    pub fn parameters(mut self, parameters: ParamValues) -> Self {
-        self.parameters = Some(parameters);
+    pub fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
+        self.parameters = parameters;
         self
     }
 
@@ -76,8 +76,10 @@ impl<'a> QueryBuilder<'a> {
 
         Query {
             df: Arc::clone(&self.df),
-            sql: Arc::clone(&sql),
-            parameters: self.parameters,
+            sql: QueryMethod::Text {
+                sql: Arc::clone(&sql),
+                parameters: self.parameters,
+            },
             tracker,
         }
     }

@@ -44,9 +44,13 @@ __pycache__
 venv
 .venv
 
+# Output of the benchmarks and tests setup
 /test/tpc-bench/tmp/
 /test/tpc-bench/tpch-kit
 /test/tpc-bench/tpcds-kit
+/test/tpc-bench/oracle/*.log
+/test/tpc-bench/oracle/*.csv
+/test/tpc-bench/oracle/*.bad
 
 .vscode/settings.json
 
@@ -58,6 +62,7 @@ venv
 .data/
 data/
 ./testoperator
+.oracle
 !test/spicepods/
 !test/nsql_bench/spicepod.yaml
 !test/nsql_bench/data

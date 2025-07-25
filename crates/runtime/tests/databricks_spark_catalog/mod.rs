@@ -25,6 +25,10 @@ use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);

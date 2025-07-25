@@ -30,69 +30,59 @@ pub mod candle;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to run an Embedding health check.\nAn error occurred: {source}\nVerify the embedding configuration."
+        "Embedding health check failed. {source}. Verify the embedding configuration."
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to prepare input for embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to prepare input for embedding. {source}"))]
     FailedToPrepareInput {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create embedding. {source}."))]
     FailedToCreateEmbedding {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Invalid value for `pooling` parameter: {value}.\nSpecify a valid pooling value of `cls`, `mean`, `splade`, or `last_token`."
+        "Invalid `pooling` parameter value: {value}. Use `cls`, `mean`, `splade`, or `last_token`."
     ))]
     InvalidPoolingMode { value: String },
 
-    #[snafu(display(
-        "Failed to create chunker.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create chunker. {source}."))]
     FailedToCreateChunker {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to create tokenizer. {source}."))]
     FailedToCreateTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "Failed to create embedding model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to load embedding model. {source}."))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "When preparing an embedding model, an issue occurred with the Huggingface API\n{source}\nVerify the model configuration, and try again."
+        "When preparing an embedding model, an issue occurred with the Huggingface API. {source}. Verify the model configuration, and try again."
     ))]
     FailedWithHFApi { source: HfApiError },
 
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
     ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
-        "The specified model '{model_name}' does not exist.\nVerify the model name and try again."
+        "The specified model '{model_name}' does not exist. Verify the model name and try again."
     ))]
     ModelDoesNotExist { model_name: String },
 
     #[snafu(display(
-        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+        "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
 
@@ -184,5 +174,32 @@ pub trait Embed: Debug + Sync + Send {
                 total_tokens: 0,
             },
         })
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub async fn get_or_infer_size(inner: &Arc<dyn Embed>) -> Result<i32> {
+    let size = inner.size();
+    if size != -1 {
+        // Don't need to infer.
+        return Ok(size);
+    }
+    match inner
+        .embed(EmbeddingInput::String("infer_size".to_string()))
+        .await
+    {
+        Ok(vec) => match vec.first() {
+            Some(first) => {
+                tracing::trace!("Inferred size of embedding model vectors={}", first.len());
+                Ok(first.len() as i32)
+            }
+            None => Err(Error::FailedToCreateEmbedding {
+                source: "Failed to infer size of embedding model, empty response".into(),
+            }),
+        },
+        Err(e) => {
+            tracing::warn!("Failed to infer size of embedding model");
+            Err(e)
+        }
     }
 }

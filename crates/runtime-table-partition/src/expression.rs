@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Write as _;
+use std::{
+    fmt::Write as _,
+    hash::{DefaultHasher, Hash as _, Hasher},
+};
 
 use arrow_schema::DataType;
 use datafusion::{
@@ -50,6 +53,12 @@ pub enum Error {
 
 pub type ValidationResult = Result<(), Error>;
 
+#[derive(Debug)]
+pub struct PartitionBy {
+    pub expressions_hash: u64,
+    pub expressions: Vec<Expr>,
+}
+
 /// Converts the spicepod `partition_by` list of [`String`]s into [`Expr`]s,
 /// validating that they meet the expression criteria.
 ///
@@ -60,8 +69,12 @@ pub fn partition_by_expressions(
     partition_by: &[String],
     ctx: &SessionContext,
     df_schema: &DFSchema,
-) -> Result<Vec<Expr>, Error> {
-    partition_by
+) -> Result<PartitionBy, Error> {
+    let mut hasher = DefaultHasher::new();
+    partition_by.hash(&mut hasher);
+    let expressions_hash = hasher.finish();
+
+    let expressions = partition_by
         .iter()
         .map(|sql| {
             let expr = ctx
@@ -70,7 +83,12 @@ pub fn partition_by_expressions(
             PartitionCriteria.validate(&expr, df_schema)?;
             Ok(expr)
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PartitionBy {
+        expressions_hash,
+        expressions,
+    })
 }
 
 /// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].

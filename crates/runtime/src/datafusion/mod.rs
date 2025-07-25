@@ -35,6 +35,7 @@ use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
+use crate::datafusion::query::Query;
 use crate::datafusion::schema::SpiceSchemaProvider;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -88,6 +89,7 @@ pub mod filter_converter;
 pub mod param_utils;
 pub mod refresh_sql;
 pub mod request_context_extension;
+pub mod retention_sql;
 pub mod schema;
 pub mod udf;
 
@@ -126,6 +128,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     RefreshSql { source: refresh_sql::Error },
+
+    #[snafu(display("{source}"))]
+    RetentionSql { source: retention_sql::Error },
 
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
@@ -635,7 +640,7 @@ impl DataFusion {
         let federated_table = FederatedTable::new_unchecked(read_provider);
 
         tracing::info!(
-            "Loading data for dataset {}",
+            "Dataset {} loading data...",
             pending_registration.dataset.name
         );
         self.register_accelerated_table(
@@ -973,15 +978,30 @@ impl DataFusion {
             refresh,
         );
 
-        accelerated_table_builder.retention(Retention::new(
-            dataset.time_column.clone(),
-            dataset.time_format,
-            dataset.time_partition_column.clone(),
-            dataset.time_partition_format,
-            dataset.retention_period(),
-            dataset.retention_check_interval(),
-            acceleration_settings.retention_check_enabled,
-        ));
+        let retention_delete_expr = match dataset.retention_sql() {
+            Some(retention_sql) => Some(
+                retention_sql::parse_retention_sql(
+                    &dataset.name,
+                    retention_sql.as_str(),
+                    source_table_provider.schema(),
+                )
+                .context(RetentionSqlSnafu)?,
+            ),
+            None => None,
+        };
+
+        let retention = Retention::builder()
+            .time_column(dataset.time_column.clone())
+            .time_format(dataset.time_format)
+            .time_partition_column(dataset.time_partition_column.clone())
+            .time_partition_format(dataset.time_partition_format)
+            .time_period(dataset.retention_period())
+            .check_interval(dataset.retention_check_interval())
+            .enabled(acceleration_settings.retention_check_enabled)
+            .delete_expr(retention_delete_expr)
+            .build();
+
+        accelerated_table_builder.retention(retention);
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
@@ -1610,6 +1630,13 @@ impl DataFusion {
                 schema: SPICE_DEFAULT_SCHEMA.to_string(),
             })?
             .table_names())
+    }
+
+    /// Create a [`Query`] based on a constructed [`LogicalPlan`].
+    ///
+    /// The `plan` should be valid, constructed off the [`DataFusion`]'s [`SessionContext`].
+    pub fn query_from_logical_plan(self: &Arc<Self>, plan: &LogicalPlan) -> Query {
+        Query::from_logical_plan(self, plan)
     }
 
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {

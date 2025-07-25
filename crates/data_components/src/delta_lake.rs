@@ -133,14 +133,40 @@ impl DeltaTable {
             }
         }
 
-        let engine = Arc::new(
-            DefaultEngine::try_new(
-                table.location(),
-                storage_options,
+        let mut load_credentials_from_environment = true;
+        if let (Some(_), Some(_)) = (
+            storage_options.get("aws_access_key_id"),
+            storage_options.get("aws_secret_access_key"),
+        ) {
+            load_credentials_from_environment = false;
+        }
+
+        let table_object_store = match (
+            load_credentials_from_environment,
+            object_store_aws_sdk::get_sdk_config(),
+        ) {
+            (true, Some(sdk_config)) => {
+                let region = storage_options.get("aws_region").map(ToString::to_string);
+                object_store_aws_sdk::from_s3_url_and_config(table.location(), region, sdk_config)
+                    .ok()
+            }
+            _ => None,
+        };
+
+        let engine = match table_object_store {
+            Some(object_store) => Arc::new(DefaultEngine::new(
+                object_store.into(),
                 Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .map_err(handle_delta_error)?,
-        );
+            )),
+            None => Arc::new(
+                DefaultEngine::try_new(
+                    table.location(),
+                    storage_options,
+                    Arc::new(TokioBackgroundExecutor::new()),
+                )
+                .map_err(handle_delta_error)?,
+            ),
+        };
 
         let snapshot = table
             .snapshot(engine.as_ref(), None)

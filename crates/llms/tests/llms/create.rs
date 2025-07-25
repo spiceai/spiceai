@@ -66,7 +66,7 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, 
     Ok(Arc::new(Anthropic::new(auth, model_id, None, None)?))
 }
 
-pub(crate) fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
+pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
     create_hf_model(
         model_id,
         None,
@@ -76,15 +76,13 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
             .map(SecretString::from)
             .as_ref(),
     )
+    .await
 }
 
 pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     let mut params: HashMap<String, SecretString> = HashMap::new();
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
-        params.insert(
-            "perplexity_auth_token".to_string(),
-            SecretString::from(api_key),
-        );
+        params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
     let sonar = PerplexitySonar::from_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
@@ -92,7 +90,7 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     Ok(Arc::new(sonar))
 }
 
-pub(crate) fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let (temp_dir, model_weights) =
         download_hf_model_artifacts(model_id, None, std::env::var("HF_TOKEN").ok())?;
 
@@ -104,6 +102,7 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Erro
         None,
         None,
     )
+    .await
     .map_err(anyhow::Error::from)?;
     Ok(model)
 }

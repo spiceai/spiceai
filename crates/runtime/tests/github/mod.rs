@@ -29,32 +29,76 @@ use crate::{
     utils::test_request_context,
 };
 
-fn make_github_dataset(owner: &str, repo: &str, query_type: &str, query_mode: &str) -> Dataset {
-    let mut dataset = Dataset::new(
-        format!("github:github.com/{owner}/{repo}/{query_type}"),
-        format!("{repo}_{query_type}_{query_mode}"),
-    );
-    let params = HashMap::from([
+enum GithubDatasetType {
+    RepoSpecific {
+        owner: String,
+        repo: String,
+        query_type: String,
+    },
+    OrgSpecific {
+        org: String,
+        query_type: String,
+    },
+}
+
+fn make_github_dataset(
+    kind: GithubDatasetType,
+    query_mode: &str,
+    additional_params: Option<HashMap<String, String>>,
+) -> Dataset {
+    let mut dataset = match kind {
+        GithubDatasetType::RepoSpecific {
+            owner,
+            repo,
+            query_type,
+        } => Dataset::new(
+            format!("github:github.com/{owner}/{repo}/{query_type}"),
+            format!("{repo}_{query_type}_{query_mode}"),
+        ),
+        GithubDatasetType::OrgSpecific { org, query_type } => Dataset::new(
+            format!("github:github.com/{org}/{query_type}"),
+            format!("{org}_{query_type}_{query_mode}"),
+        ),
+    };
+    let mut params = HashMap::from([
         ("github_query_mode".to_string(), query_mode.to_string()),
         (
             "github_token".to_string(),
             "${secrets:GITHUB_TOKEN}".to_string(),
         ),
     ]);
+
+    params.extend(additional_params.unwrap_or_default());
+
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_github_issues() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
-                .with_dataset(make_github_dataset("spiceai", "spiceai", "issues", "auto"))
                 .with_dataset(make_github_dataset(
-                    "spiceai", "spiceai", "issues", "search",
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "issues".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "issues".to_string(),
+                    },
+                    "search",
+                    None,
                 ))
                 .build();
             let mut rt = Runtime::builder()
@@ -158,7 +202,15 @@ async fn test_github_commits() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
-                .with_dataset(make_github_dataset("spiceai", "spiceai", "commits", "auto"))
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "commits".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
                 .build();
 
             let mut rt = Runtime::builder()
@@ -213,10 +265,13 @@ async fn test_github_stargazers() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    "spiceai",
-                    "spiceai",
-                    "stargazers",
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "stargazers".to_string(),
+                    },
                     "auto",
+                    None,
                 ))
                 .build();
 
@@ -258,6 +313,221 @@ async fn test_github_stargazers() -> Result<(), String> {
 
             // LIMIT should stop this query from retrieving every stargazer, so it shouldn't take that long
             assert!(elapsed < 15, "elapsed: {elapsed}");
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_org_members() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::OrgSpecific {
+                        org: "spiceai".to_string(),
+                        query_type: "members".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_org_members_auto",
+                "SELECT * FROM spiceai_members_auto LIMIT 10",
+                false,
+                Some(Box::new(|result_batches| {
+                    let mut row_count = 0;
+                    for batch in result_batches {
+                        let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                        assert_eq!(batch.num_columns(), 9, "num_cols: {}", batch.num_columns());
+                        row_count += batch.num_rows();
+                    }
+                    assert!(row_count <= 10, "num_rows: {row_count}");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    Some(HashMap::from([
+                        ("github_include_comments".to_string(), "all".to_string()),
+                        ("github_max_comments_fetched".to_string(), "100".to_string()),
+                    ])),
+                ))
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_pull_requests_auto",
+                "SELECT additions, review_comments, discussion FROM spiceai_pulls_auto LIMIT 10",
+                true,
+                Some(Box::new(|result_batches| {
+                    let mut row_count = 0;
+                    for batch in result_batches {
+                        let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                        row_count += batch.num_rows();
+                    }
+                    assert_eq!(row_count, 10, "num_rows: {row_count}");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    Some(HashMap::from([
+                        ("github_include_comments".to_string(), "review".to_string()),
+                        ("github_max_comments_fetched".to_string(), "100".to_string()),
+                    ])),
+                ))
+                .with_dataset(make_github_dataset(
+                    GithubDatasetType::RepoSpecific {
+                        owner: "apache".to_string(),
+                        repo: "datafusion".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    Some(HashMap::from([
+                        (
+                            "github_include_comments".to_string(),
+                            "discussion".to_string(),
+                        ),
+                        ("github_max_comments_fetched".to_string(), "100".to_string()),
+                    ])),
+                ))
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let dataset_columns_tests = vec![
+                ("spiceai_pulls_auto", "review_comments"),
+                ("datafusion_pulls_auto", "discussion"),
+            ];
+
+            for (dataset_name, column_name) in dataset_columns_tests {
+                // Check that the schema is the right shape
+                run_query_and_check_results(
+                    &mut rt,
+                    "test_github_pull_requests_auto",
+                    format!("SELECT * FROM {dataset_name} LIMIT 10;").as_str(),
+                    false,
+                    Some(Box::new(|result_batches| {
+                        let mut row_count = 0;
+                        for batch in result_batches {
+                            let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                            assert_eq!(
+                                batch.num_columns(),
+                                20,
+                                "num_cols: {}",
+                                batch.num_columns()
+                            );
+                            row_count += batch.num_rows();
+                        }
+                        assert_eq!(row_count, 10, "num_rows: {row_count}");
+                    })),
+                )
+                .await?;
+
+                run_query_and_check_results(
+                    &mut rt,
+                    "test_github_pull_requests_schema",
+                    format!("SELECT {column_name} FROM {dataset_name} LIMIT 10;").as_str(),
+                    false,
+                    Some(Box::new(|result_batches| {
+                        let mut row_count = 0;
+                        for batch in result_batches {
+                            let batch: RecordBatch = batch; // Rust can't type infer here for some reason
+                            assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
+                            row_count += batch.num_rows();
+                        }
+                        assert_eq!(row_count, 10, "num_rows: {row_count}");
+                    })),
+                )
+                .await?;
+            }
 
             Ok(())
         })

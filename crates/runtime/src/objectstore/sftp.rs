@@ -29,7 +29,7 @@ use chrono::DateTime;
 use futures::stream::BoxStream;
 use object_store::{
     Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, path::Path,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use ssh2::Session;
 
@@ -135,7 +135,7 @@ impl ObjectStore for SFTPObjectStore {
     async fn put_multipart_opts(
         &self,
         _location: &Path,
-        _opts: PutMultipartOpts,
+        _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         unimplemented!()
     }
