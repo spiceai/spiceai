@@ -36,7 +36,10 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
         ("mongodb_host".to_string(), "localhost".to_string()),
         ("mongodb_port".to_string(), port.to_string()),
         ("mongodb_user".to_string(), "root".to_string()),
-        ("mongodb_pass".to_string(), MONGODB_ROOT_PASSWORD.to_string()),
+        (
+            "mongodb_pass".to_string(),
+            MONGODB_ROOT_PASSWORD.to_string(),
+        ),
         ("mongodb_db".to_string(), "testdb".to_string()),
         ("mongodb_auth_source".to_string(), "admin".to_string()),
         ("mongodb_sslmode".to_string(), "disabled".to_string()),
@@ -84,9 +87,8 @@ pub async fn start_mongodb_docker_container(
 
 #[instrument]
 pub async fn get_mongodb_client(port: u16) -> Result<mongodb::Client, anyhow::Error> {
-    let uri = format!(
-        "mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin"
-    );
+    let uri =
+        format!("mongodb://root:{MONGODB_ROOT_PASSWORD}@localhost:{port}/testdb?authSource=admin");
     tracing::debug!("Connecting to MongoDB at {}", uri);
     let client = mongodb::Client::with_uri_str(&uri).await?;
     Ok(client)

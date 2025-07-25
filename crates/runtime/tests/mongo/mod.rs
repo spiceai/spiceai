@@ -18,12 +18,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
-use mongodb::{bson::doc, Collection};
+use mongodb::{Collection, bson::doc};
 
+use chrono::{DateTime, Utc};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::ParamValue;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
-use chrono::{DateTime, Utc};
 
 use crate::init_tracing;
 use crate::utils::{runtime_ready_check, test_request_context};
@@ -46,11 +46,16 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     let database = client.database("testdb");
 
     tracing::debug!("DROP COLLECTION test");
-    let _ = database.collection::<mongodb::bson::Document>("test").drop().await;
+    let _ = database
+        .collection::<mongodb::bson::Document>("test")
+        .drop()
+        .await;
 
     let collection: Collection<mongodb::bson::Document> = database.collection("test");
 
-    let ts = DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+    let ts = DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
 
     // Insert test documents
     let test_docs = vec![
@@ -101,7 +106,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
             "col_char": null,
             "col_set": null,
             "col_json": null
-        }
+        },
     ];
 
     collection.insert_many(test_docs).await?;
@@ -206,18 +211,19 @@ async fn init_mongodb_utf8_db(port: u16) -> Result<(), anyhow::Error> {
     let database = client.database("testdb");
 
     tracing::debug!("DROP COLLECTION test_utf8");
-    let _ = database.collection::<mongodb::bson::Document>("test_utf8").drop().await;
+    let _ = database
+        .collection::<mongodb::bson::Document>("test_utf8")
+        .drop()
+        .await;
 
     let collection: Collection<mongodb::bson::Document> = database.collection("test_utf8");
 
-    let test_docs = vec![
-        doc! {
-            "id": 1,
-            "col_text_utf8": "🚀 This text contains UTF8 characters 😊",
-            "col_varchar_utf8": "🦄 Another UTF8 string with emojis 🎉",
-            "col_normal_text": "Regular text with no special characters"
-        }
-    ];
+    let test_docs = vec![doc! {
+        "id": 1,
+        "col_text_utf8": "🚀 This text contains UTF8 characters 😊",
+        "col_varchar_utf8": "🦄 Another UTF8 string with emojis 🎉",
+        "col_normal_text": "Regular text with no special characters"
+    }];
 
     collection.insert_many(test_docs).await?;
     Ok(())
@@ -230,13 +236,12 @@ async fn mongodb_character_set_results_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mongodb_docker_container(MONGODB_PORT2)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mongodb_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mongodb_docker_container(MONGODB_PORT2)
+                .await
+                .map_err(|e| {
+                    tracing::error!("start_mongodb_docker_container: {e}");
+                    e.to_string()
+                })?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
@@ -244,11 +249,11 @@ async fn mongodb_character_set_results_test() -> Result<(), String> {
                     .await
                     .map_err(RetryError::transient)
             })
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to initialize MongoDB database: {e}");
-                    e.to_string()
-                })?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MongoDB database: {e}");
+                e.to_string()
+            })?;
 
             let app = AppBuilder::new("mongodb_character_set_results_test")
                 .with_dataset(make_mongodb_dataset(
@@ -303,7 +308,7 @@ async fn mongodb_character_set_results_test() -> Result<(), String> {
                     false, // can't snapshot this plan
                     validate_result,
                 )
-                    .await?;
+                .await?;
             }
 
             running_container.remove().await.map_err(|e| {
