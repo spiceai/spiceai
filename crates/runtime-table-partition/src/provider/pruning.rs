@@ -17,7 +17,6 @@ limitations under the License.
 use std::{cmp::Ordering, sync::Arc};
 
 use arrow_schema::Schema;
-use chrono::{NaiveDateTime, TimeZone, Utc};
 use datafusion::{
     common::{
         Column, ToDFSchema as _,
@@ -382,25 +381,11 @@ fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusion
     Ok(bucket_value)
 }
 
-/// Used for testing only (unit and integration)
-#[must_use]
-#[allow(clippy::expect_used, clippy::missing_panics_doc)]
-pub fn timestamp_nanos(datetime: &str) -> i64 {
-    let naive =
-        NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
-
-    // Assume UTC; convert NaiveDateTime to a DateTime<Utc>
-    let datetime_utc = Utc.from_utc_datetime(&naive);
-
-    datetime_utc
-        .timestamp_nanos_opt()
-        .expect("timestamp_nanos_opt is ok")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
+    use chrono::{NaiveDateTime, TimeZone as _, Utc};
     use datafusion::{
         functions::regex::regexp_match,
         prelude::{case, col, date_trunc, in_list, lit},
@@ -420,6 +405,18 @@ mod tests {
                 );
             )*
         };
+    }
+
+    fn timestamp_nanos(datetime: &str) -> i64 {
+        let naive =
+            NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
+
+        // Assume UTC; convert NaiveDateTime to a DateTime<Utc>
+        let datetime_utc = Utc.from_utc_datetime(&naive);
+
+        datetime_utc
+            .timestamp_nanos_opt()
+            .expect("timestamp_nanos_opt is ok")
     }
 
     #[test]

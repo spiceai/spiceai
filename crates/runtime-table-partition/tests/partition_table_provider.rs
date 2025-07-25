@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow_schema::TimeUnit;
 use async_trait::async_trait;
+use chrono::{NaiveDateTime, TimeZone as _, Utc};
 use datafusion::arrow::array::{
     ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
@@ -34,7 +35,6 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
-use runtime_table_partition::provider::pruning::timestamp_nanos;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -715,4 +715,17 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
     }
 
     Ok(())
+}
+
+#[allow(clippy::expect_used)]
+fn timestamp_nanos(datetime: &str) -> i64 {
+    let naive =
+        NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
+
+    // Assume UTC; convert NaiveDateTime to a DateTime<Utc>
+    let datetime_utc = Utc.from_utc_datetime(&naive);
+
+    datetime_utc
+        .timestamp_nanos_opt()
+        .expect("timestamp_nanos_opt is ok")
 }
