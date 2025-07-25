@@ -11492,6 +11492,7 @@ version = "1.5.0"
 dependencies = [
  "arrow-schema",
  "async-trait",
+ "chrono",
  "datafusion",
  "futures",
  "parking_lot 0.12.4",

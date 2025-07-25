@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 arrow-schema.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 parking_lot = "0.12"
