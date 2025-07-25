@@ -13,19 +13,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use snafu::Snafu;
-use tantivy::TantivyError;
 
-pub mod connector;
-pub mod index;
-pub mod udtf;
+use datafusion::{logical_expr::Operator, prelude::Expr};
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum Error {
-    #[snafu(display("Failed to create a full text search index: {source}.",))]
-    IndexCreationError { source: TantivyError },
-
-    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
-    IndexInsertionError { source: TantivyError },
+/// For a set of binary filter [`Expr`] = {f1, f2, .., fn} and binary operation op, return expression: `(((f1 op f2) op ...) op fn)`.
+#[must_use]
+pub fn fold_binary(exprs: &[Expr], op: Operator) -> Option<Expr> {
+    let mut iter = exprs.iter();
+    let first = iter.next()?.clone();
+    Some(iter.fold(first, |acc, expr| {
+        Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+            Box::new(acc),
+            op,
+            Box::new(expr.clone()),
+        ))
+    }))
 }

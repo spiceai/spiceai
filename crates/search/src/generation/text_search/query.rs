@@ -1,0 +1,94 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+     https://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use std::{any::Any, sync::Arc};
+
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME,
+    generation::text_search::{
+        DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec,
+        tantivy_to_arrow_type,
+    },
+};
+use arrow::datatypes::{Field, Schema};
+use async_trait::async_trait;
+use datafusion::{
+    catalog::{Session, TableProvider},
+    datasource::TableType,
+    error::DataFusionError,
+    physical_plan::ExecutionPlan,
+};
+
+/// [`FullTextSearchQuery`] represents a [`TableProvider`] on a full text search index for a given query.
+/// [`RecordBatch`] results will be ordered by the relevancy score.
+#[derive(Debug)]
+pub struct FullTextSearchQuery {
+    pub index: FullTextSearchFieldIndex,
+    pub query: String,
+    // self.pre_limit
+}
+
+#[async_trait]
+impl TableProvider for FullTextSearchQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        let fields = self
+            .index
+            .all_columns()
+            .iter()
+            .filter_map(|field_name| {
+                let (data_type, nullable) = if let Some(f) = self.index.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = self.index.search_schema.get_field(field_name).ok()?;
+                    let entry = self.index.search_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                };
+                Some(Field::new(field_name, data_type, nullable))
+            })
+            .chain([Field::new(
+                SEARCH_SCORE_COLUMN_NAME,
+                arrow::datatypes::DataType::Float64,
+                false,
+            )])
+            .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(Arc::new(
+            FullTextSearchExec::try_new(
+                self.index.clone(),
+                self.query.clone(),
+                self.schema(), // This might need to be adjusted
+                projection,
+                filters.to_vec(),
+                limit.unwrap_or(DEFAULT_BATCH_SIZE),
+            )
+            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+        ))
+    }
+}

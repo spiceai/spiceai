@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use runtime_datafusion_index::IndexedTableProvider;
-use search::SEARCH_SCORE_COLUMN_NAME;
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::fold_binary};
 
 use tokio_stream::StreamExt;
 
@@ -531,20 +531,6 @@ impl TableProvider for VectorQueryTableProvider {
 
         state.create_physical_plan(&final_proj).await
     }
-}
-
-/// For a set of binary filter [`Expr`] = {f1, f2, .., fn} and binary operation op, return expression: `(((f1 op f2) op ...) op fn)`.
-#[must_use]
-pub fn fold_binary(exprs: &[Expr], op: Operator) -> Option<Expr> {
-    let mut iter = exprs.iter();
-    let first = iter.next()?.clone();
-    Some(iter.fold(first, |acc, expr| {
-        Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
-            Box::new(acc),
-            op,
-            Box::new(expr.clone()),
-        ))
-    }))
 }
 
 /// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.

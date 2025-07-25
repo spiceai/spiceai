@@ -23,7 +23,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 
-use super::index::FullTextDatabaseIndex;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 
 #[derive(Debug)]
 pub struct FullTextConnector {

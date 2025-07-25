@@ -35,8 +35,8 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use search::generation::util::fold_binary;
 
-use crate::embeddings::index::query_table::fold_binary;
 use crate::embeddings::udtf::append_fields;
 use crate::{embedding_col, embeddings::index::VectorIndex};
 

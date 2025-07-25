@@ -16,370 +16,59 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::DataType};
-
-use crate::search::{
-    full_text::util::{array_to_terms, with_json_subset_column},
-    util::get_primary_keys,
-};
-use crate::{datafusion::query::write_to_json_string, search::full_text::Error};
-use crate::{
-    object_store_registry::SpiceObjectStoreRegistry,
-    search::full_text::{
-        FailedToInsertDataIntoIndexSnafu, IndexCreationSnafu, InvalidIndexingSnafu,
-    },
-};
-use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
+use crate::object_store_registry::SpiceObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use logos::Source;
-use runtime_datafusion_index::Index;
-use search::generation::CandidateGeneration;
-use search::generation::post_apply::PostApplyCandidateGeneration;
-use search::generation::text_search::FullTextSearchFieldIndex;
+use search::generation::{
+    CandidateGeneration,
+    post_apply::PostApplyCandidateGeneration,
+    text_search::{FullTextSearchFieldIndex, index::FullTextDatabaseIndex},
+};
 use snafu::ResultExt;
-use std::collections::HashSet;
-use tantivy::schema::DocParsingError;
-use tantivy::{TantivyDocument, TantivyError};
-use tokio::sync::RwLock;
 
-/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
-pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
-pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
-
-#[derive(Clone)]
-pub struct FullTextDatabaseIndex {
-    pub search_fields: Vec<String>,
-    pub primary_key: Vec<String>,
-    pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<RwLock<tantivy::Index>>,
+pub async fn full_text_search_field_index(
+    database_index: &FullTextDatabaseIndex,
+    search_field: &str,
+) -> Result<FullTextSearchFieldIndex, search::generation::text_search::Error> {
+    let index_read = database_index.index.read().await;
+    let mut search_index = FullTextSearchFieldIndex::try_new(
+        &index_read,
+        search_field.to_string(),
+        database_index.primary_key.clone(),
+        Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
+    )?;
+    search_index.add_type_hints(&database_index.underlying_table().schema());
+    Ok(search_index)
 }
 
-impl std::fmt::Debug for FullTextDatabaseIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FullTextDatabaseIndex")
-            .field("base_table", &self.base_table)
-            .field("search_fields", &self.search_fields)
-            .field("primary_key", &self.primary_key)
-            .finish_non_exhaustive()
-    }
-}
+/// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
+pub async fn as_candidate_generations(
+    database_index: &FullTextDatabaseIndex,
+) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+    let mut generators = vec![];
+    for search_field in database_index.search_fields.as_slice() {
+        let base = database_index
+            .full_text_search_field_index(search_field.as_str())
+            .await
+            .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
-#[async_trait]
-impl Index for FullTextDatabaseIndex {
-    fn name(&self) -> &'static str {
-        "full_text"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn required_columns(&self) -> Vec<String> {
-        // Return both the primary key and search fields, deduplicated.
-        let mut required_columns = HashSet::new();
-        required_columns.extend(self.primary_key.iter().cloned());
-        required_columns.extend(self.search_fields.iter().cloned());
-        required_columns.into_iter().collect()
-    }
-
-    async fn compute_index(&self, batches: Vec<RecordBatch>) {
-        if let Err(e) = self.update_index(batches.as_slice()).await {
-            tracing::error!("Failed to update full text search index: {e}");
-        }
-    }
-}
-
-impl FullTextDatabaseIndex {
-    pub async fn try_new(
-        inner: Arc<dyn TableProvider>,
-        search_fields: Vec<String>,
-        primary_key_override: Option<Vec<String>>,
-    ) -> Result<Self, Error> {
-        // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(&inner).await) {
-            (Some(pks), _) => pks,
-            (None, Ok(pks)) if !pks.is_empty() => pks,
-            (None, _) => {
-                return Err(Error::NoPrimaryKey);
-            }
-        };
-
-        // INDEX_UNIQUE_FIELD_NAME is a reserved field name.
-        if pks.contains(&INDEX_UNIQUE_FIELD_NAME.to_string()) {
-            return Err(Error::PrimaryKeyInvalidName {
-                column: INDEX_UNIQUE_FIELD_NAME.to_string(),
-            });
-        }
-
-        let index = Self::create_index(&inner, search_fields.as_slice(), pks.as_slice())?;
-
-        Ok(Self {
-            base_table: inner,
-            search_fields,
-            index,
-            primary_key: pks,
-        })
-    }
-
-    /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
-    /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
-    fn existing_terms_to_delete(
-        &self,
-        index_schema: &tantivy::schema::Schema,
-        rb: &[RecordBatch],
-    ) -> Result<Vec<tantivy::Term>, Error> {
-        let Some(pk) = self.primary_key.first() else {
-            // Should not occur, but no primary key implies none must be deleted.
-            return Ok(vec![]);
-        };
-
-        let (pk_field, pk) = if self.primary_key.len() == 1 {
-            let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
-                return Err(Error::FailedToRetrieveDataFromIndex {
-                    source: TantivyError::FieldNotFound(pk.clone()),
-                });
-            };
-            (pk_field, pk.clone())
-        } else {
-            // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
-            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
-                return Err(Error::InvalidIndexingError {
-                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
-                    context: format!(
-                        "Full text search has multiple primary key columns, so the column '{INDEX_UNIQUE_FIELD_NAME}' should be present, but is not.",
-                    ),
-                });
-            };
-            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
-        };
-
-        Ok(rb
-            .iter()
-            .filter_map(|r| r.column_by_name(pk.as_str()))
-            .map(|arr| array_to_terms(pk_field, arr))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::FailedToRetrieveDataFromSource {
-                source: DataFusionError::ArrowError(e, None),
-            })?
-            .into_iter()
-            .flatten()
-            .collect())
-    }
-
-    /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
-    /// columns present will be ignored.
-    ///
-    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
-    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), Error> {
-        // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
-        let rb = if self.primary_key.len() > 1 {
-            rb.iter()
-                .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
-                .collect::<Result<Vec<RecordBatch>, _>>()
-                .context(InvalidIndexingSnafu {
-                    context: "An error occured creating the a unique column for the full text search index".to_string(),
-                })?
-        } else {
-            rb.to_vec()
-        };
-
-        let index_writable = self.index.write().await;
-        // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        // Deletion.
-        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
-            index_writer.delete_term(t);
-        }
-
-        // Insertion.
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
-        }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
-
-    #[must_use]
-    pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
-        Arc::clone(&self.base_table)
-    }
-
-    /// Construct a new [`FullTextDatabaseIndex`] with an updated [`TableProvider`].
-    ///
-    /// No Checks are done to confirm compatibility between the current index and the provided [`TableProvider`].
-    #[must_use]
-    pub fn with_new_base(&self, base_table: Arc<dyn TableProvider>) -> Self {
-        Self {
-            search_fields: self.search_fields.clone(),
-            primary_key: self.primary_key.clone(),
-            index: Arc::clone(&self.index),
-            base_table,
-        }
-    }
-
-    fn create_index(
-        base_table: &Arc<dyn TableProvider>,
-        search_fields: &[String],
-        primary_key: &[String],
-    ) -> Result<Arc<RwLock<tantivy::Index>>, Error> {
-        let schema = base_table.schema();
-        let mut schema_builder = tantivy::schema::Schema::builder();
-        for p in primary_key {
-            if search_fields.contains(p) {
-                // Added below, tokenized.
-                continue;
-            }
-            let Some((_, field)) = schema.column_with_name(p) else {
-                return Err(Error::PrimaryKeyNotFound { column: p.clone() });
-            };
-            match field.data_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    schema_builder.add_i64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Boolean => {
-                    schema_builder.add_bool_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
-                    schema_builder.add_text_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::STRING,
-                    );
-                }
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                dt => {
-                    return Err(Error::PrimaryKeyInvalidType {
-                        data_type: dt.clone(),
-                        column: p.clone(),
-                    });
-                }
-            }
-        }
-
-        // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
-        if primary_key.len() > 1 {
-            schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STRING);
-        }
-
-        for s in search_fields {
-            schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
-        }
-        let schema = schema_builder.build();
-        Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
-    }
-
-    fn new_ctx() -> Result<Arc<SessionContext>, DataFusionError> {
-        Ok(Arc::new(SessionContext::new_with_config_rt(
+        let post_apply = PostApplyCandidateGeneration::new(
+            Arc::clone(&database_index.base_table),
+            Arc::new(base),
+            database_index.primary_key.clone(),
+        )
+        .with_ctx(Arc::new(SessionContext::new_with_config_rt(
             SessionConfig::default(),
             Arc::new(
                 RuntimeEnvBuilder::default()
                     .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
-                    .build()?,
-            ),
-        )))
-    }
-
-    pub async fn full_text_search_field_index(
-        &self,
-        search_field: &str,
-    ) -> Result<FullTextSearchFieldIndex, search::generation::text_search::Error> {
-        let index_read = self.index.read().await;
-        let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
-            search_field.to_string(),
-            self.primary_key.clone(),
-            Some(vec![]), // Explicitly do not return other `self.search_fields` columns in search results.
-        )?;
-        search_index.add_type_hints(&self.underlying_table().schema());
-        Ok(search_index)
-    }
-
-    /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
-    pub async fn as_candidate_generations(
-        &self,
-    ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
-        let mut generators = vec![];
-        for search_field in self.search_fields.as_slice() {
-            let base = self
-                .full_text_search_field_index(search_field.as_str())
-                .await
-                .map_err(|source| search::generation::Error::TextSearchError { source })?;
-
-            let post_apply = PostApplyCandidateGeneration::new(
-                Arc::clone(&self.base_table),
-                Arc::new(base),
-                self.primary_key.clone(),
-            )
-            .with_ctx(
-                Self::new_ctx()
+                    .build()
                     .boxed()
                     .map_err(|source| search::generation::Error::InternalError { source })?,
-            );
-            generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
-        }
-
-        Ok(generators)
+            ),
+        )));
+        generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
     }
-}
 
-/// An implementation of [`TantivyDocument::parse_json`] that can parse a JSON array of JSON
-/// objects that will deserialize to [`TantivyDocument`].
-fn parse_json_array(
-    schema: &tantivy::schema::Schema,
-    doc_json: &str,
-) -> Result<Vec<TantivyDocument>, TantivyError> {
-    let json_obj: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(doc_json)
-        .map_err(|_| {
-            Into::<TantivyError>::into(DocParsingError::InvalidJson(
-                doc_json.slice(0..20).unwrap_or_default().to_string(),
-            ))
-        })?;
-
-    Ok(json_obj
-        .into_iter()
-        .map(|obj| TantivyDocument::from_json_object(schema, obj))
-        .collect::<Result<Vec<_>, _>>()?)
+    Ok(generators)
 }

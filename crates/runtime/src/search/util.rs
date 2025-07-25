@@ -24,6 +24,7 @@ use datafusion::{common::Constraint, datasource::TableProvider, sql::TableRefere
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::CandidateGeneration;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -32,7 +33,7 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
-use crate::search::full_text::index::FullTextDatabaseIndex;
+use crate::search::full_text::index::as_candidate_generations;
 
 use super::{Error, Result};
 
@@ -235,8 +236,7 @@ pub async fn full_text_search_candidates(
     };
 
     Some(
-        fts.with_new_base(table_provider)
-            .as_candidate_generations()
+        as_candidate_generations(&fts.with_new_base(table_provider))
             .await
             .context(SearchGenerationSnafu),
     )
