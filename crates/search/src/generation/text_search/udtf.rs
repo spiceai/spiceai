@@ -26,7 +26,7 @@ use datafusion::{
     common::{Column, DFSchema, JoinConstraint, JoinType},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
-    logical_expr::{Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr, TableScan},
+    logical_expr::{Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableScan},
     physical_plan::ExecutionPlan,
     prelude::Expr,
     sql::TableReference,
@@ -249,15 +249,16 @@ impl TableProvider for TextSearchIndexProvider {
         let index_table = Arc::new(FullTextSearchQuery {
             index: field_index,
             query: self.query.clone(),
+            pre_limit: self.pre_limit,
         });
         let index_table_scan = LogicalPlan::TableScan(TableScan::try_new(
             "index_table",
             Arc::new(DefaultTableSource::new(
                 Arc::clone(&index_table) as Arc<dyn TableProvider>
             )),
-            None, // TODO
+            None,
             vec![],
-            None, // TODO
+            None,
         )?);
 
         // Only join on base table if required.
@@ -266,7 +267,7 @@ impl TableProvider for TextSearchIndexProvider {
             .map_err(|e| DataFusionError::ArrowError(e, None))?
         {
             // Let DataFusion handle pushing filters.
-            if let Some(filter) = filters.to_vec().into_iter().reduce(Expr::and) {
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
                 LogicalPlan::Filter(Filter::try_new(filter, index_table_scan.into())?)
             } else {
                 index_table_scan

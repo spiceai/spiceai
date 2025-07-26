@@ -10,13 +10,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{any::Any, sync::Arc};
+
+use std::{any::Any, cmp::min, sync::Arc};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    generation::text_search::{
-        DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec,
-        tantivy_to_arrow_type,
+    generation::{
+        text_search::{DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec},
+        util::append_fields,
     },
 };
 use arrow::datatypes::{Field, Schema};
@@ -34,7 +35,27 @@ use datafusion::{
 pub struct FullTextSearchQuery {
     pub index: FullTextSearchFieldIndex,
     pub query: String,
-    // self.pre_limit
+
+    /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
+    /// unsupported by the index (i.e. via its[`TableProvider::supports_filters_pushdown`] ), then
+    ///  `< N` will be returned in the overall SQL query.
+    /// If a `limit` is provided such that `limit` < `pre_limit`, `limit` will be used.
+    pub pre_limit: Option<usize>,
+}
+
+impl FullTextSearchQuery {
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The pre-limit configured in [`FullTextSearchQuery::pre_limit`].
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.pre_limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
+        }
+    }
 }
 
 #[async_trait]
@@ -44,28 +65,17 @@ impl TableProvider for FullTextSearchQuery {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        let fields = self
-            .index
-            .all_columns()
-            .iter()
-            .filter_map(|field_name| {
-                let (data_type, nullable) = if let Some(f) = self.index.get_type_hint(field_name) {
-                    (f.data_type().clone(), f.is_nullable())
-                } else {
-                    let f = self.index.search_schema.get_field(field_name).ok()?;
-                    let entry = self.index.search_schema.get_field_entry(f);
-                    (tantivy_to_arrow_type(entry.field_type())?, false)
-                };
-                Some(Field::new(field_name, data_type, nullable))
-            })
-            .chain([Field::new(
-                SEARCH_SCORE_COLUMN_NAME,
-                arrow::datatypes::DataType::Float64,
-                false,
-            )])
-            .collect::<Vec<_>>();
-
-        Arc::new(Schema::new(fields))
+        append_fields(
+            &self.index.schema(),
+            vec![
+                Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    arrow::datatypes::DataType::Float64,
+                    false,
+                )
+                .into(),
+            ],
+        )
     }
 
     fn table_type(&self) -> TableType {
@@ -83,10 +93,10 @@ impl TableProvider for FullTextSearchQuery {
             FullTextSearchExec::try_new(
                 self.index.clone(),
                 self.query.clone(),
-                self.schema(), // This might need to be adjusted
+                self.schema(),
                 projection,
                 filters.to_vec(),
-                limit.unwrap_or(DEFAULT_BATCH_SIZE),
+                self.limit_to_use(limit).unwrap_or(DEFAULT_BATCH_SIZE),
             )
             .map_err(|e| DataFusionError::ArrowError(e, None))?,
         ))

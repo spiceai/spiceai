@@ -1,4 +1,3 @@
-use datafusion::{catalog::TableProvider, common::Constraint};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -32,31 +31,6 @@ use arrow_schema::{Field as ArrowField, Schema, SchemaRef};
 use tantivy::{Term, schema::Field};
 
 use serde_json::to_string;
-
-pub(crate) async fn get_primary_keys(
-    tbl: &Arc<dyn TableProvider>,
-) -> Result<Vec<String>, ArrowError> {
-    let constraint_idx = tbl
-        .constraints()
-        .map(|c| c.iter())
-        .unwrap_or_default()
-        .find_map(|c| match c {
-            Constraint::PrimaryKey(columns) => Some(columns),
-            Constraint::Unique(_) => None,
-        })
-        .cloned()
-        .unwrap_or(Vec::new());
-
-    tbl.schema()
-        .project(&constraint_idx)
-        .map(|schema_projection| {
-            schema_projection
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect::<Vec<_>>()
-        })
-}
 
 /// Adds an additional [`StringArray`] column to a [`RecordBatch`] as a JSON-string representation
 /// from a subset of the columns present.

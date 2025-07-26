@@ -1,17 +1,3 @@
-use std::sync::Arc;
-
-use datafusion::{
-    execution::runtime_env::RuntimeEnvBuilder,
-    prelude::{SessionConfig, SessionContext},
-};
-use search::generation::{
-    CandidateGeneration, post_apply::PostApplyCandidateGeneration,
-    text_search::index::FullTextDatabaseIndex,
-};
-use snafu::ResultExt;
-
-use crate::object_store_registry::SpiceObjectStoreRegistry;
-
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -27,6 +13,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::sync::Arc;
+
+use datafusion::{
+    execution::runtime_env::RuntimeEnvBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+use search::generation::{
+    CandidateGeneration, post_apply::PostApplyCandidateGeneration,
+    text_search::index::FullTextDatabaseIndex,
+};
+use snafu::ResultExt;
+
+use crate::object_store_registry::SpiceObjectStoreRegistry;
+
 pub mod connector;
 pub mod udtf;
 

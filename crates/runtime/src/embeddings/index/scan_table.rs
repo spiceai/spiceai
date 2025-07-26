@@ -28,16 +28,16 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        Cast, Expr, Join, Limit, LogicalPlan, Operator, Projection, TableProviderFilterPushDown,
-        TableScan, expr::Alias,
+        Cast, Expr, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan,
+        expr::Alias,
     },
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
     sql::TableReference,
 };
 
-use crate::embeddings::udtf::append_fields;
 use crate::{embedding_col, embeddings::index::VectorIndex};
+use search::generation::util::append_fields;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -285,7 +285,7 @@ impl TableProvider for VectorScanTableProvider {
             join_type: JoinType::Right,
             join_constraint: JoinConstraint::On,
             on: self.join_on_expr()?,
-            filter: filters.to_vec().into_iter().reduce(Expr::and),
+            filter: filters.iter().cloned().reduce(Expr::and),
             schema: self.qualified_schema(projection),
             null_equals_null: false,
         });

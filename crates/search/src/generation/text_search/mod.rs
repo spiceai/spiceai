@@ -223,6 +223,26 @@ impl FullTextSearchFieldIndex {
         Ok(fts)
     }
 
+    ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
+    fn schema(&self) -> Arc<Schema> {
+        let fields = self
+            .all_columns()
+            .iter()
+            .filter_map(|field_name| {
+                let (data_type, nullable) = if let Some(f) = self.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = self.search_schema.get_field(field_name).ok()?;
+                    let entry = self.search_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                };
+                Some(Field::new(field_name, data_type, nullable))
+            })
+            .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
+    }
+
     /// Add type hints for all fields in [`SchemaRef`].
     ///
     /// Fields in `schema` but not in the underlying [`FullTextSearchIndex::idx`] are added.
@@ -502,7 +522,6 @@ fn make_stream(
                     Ok(h) => h,
                     Err(e) => {yield Err(e); return}
                 };
-            tracing::warn!("FullTextSearchFieldIndex::make_stream hits={:?}", hits.first());
             offset += limit;
             remaining_limit -= limit;
 

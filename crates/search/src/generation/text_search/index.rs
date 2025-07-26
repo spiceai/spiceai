@@ -29,13 +29,12 @@ use tantivy::{TantivyDocument, TantivyError};
 use tokio::sync::RwLock;
 
 use crate::aggregation::write_to_json_string;
-use crate::generation::text_search::util::{
-    array_to_terms, get_primary_keys, with_json_subset_column,
-};
+use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu,
 };
+use crate::generation::util::get_primary_keys;
 
 /// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
 pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;

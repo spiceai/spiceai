@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
+    cmp::min,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -47,8 +48,9 @@ use search::SEARCH_SCORE_COLUMN_NAME;
 
 use tokio_stream::StreamExt;
 
+use crate::search::util::find_concrete_table_provider;
 use crate::{embedding_col, embeddings::index::VectorIndex};
-use crate::{embeddings::udtf::append_fields, search::util::find_concrete_table_provider};
+use search::generation::util::append_fields;
 
 /// An [`IndexedTableProvider`] embued with a [`VectorIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by vector similarity to a query (similarity with respect to associated embedded column in [`VectorIndex`]).
 #[derive(Debug, Clone)]
@@ -66,6 +68,7 @@ pub struct VectorQueryTableProvider {
     /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
     /// unsupported by the index (i.e. via its[`TableProvider::supports_filters_pushdown`] ), then
     ///  `< N` will be returned in the overall SQL query.
+    /// If a `limit` is provided such that `limit` < `pre_limit`, `limit` will be used.
     pub pre_limit: Option<usize>,
 }
 
@@ -315,13 +318,26 @@ impl VectorQueryTableProvider {
                     .collect(),
                 filters,
             ),
-            self.pre_limit.or(limit),
+            self.limit_to_use(limit),
         )?;
 
         Ok(LogicalPlan::Projection(Projection::try_new(
             query_table_projection_exprs.clone(),
             Arc::new(LogicalPlan::TableScan(query_table_scan)),
         )?))
+    }
+
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The pre-limit configured in [`VectorQueryTableProvider::pre_limit`].
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.pre_limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
+        }
     }
 
     // Returns true if the vector index table has all requested columns and can handle all filters (i.e. filters pertain to vector index column, even if they must be post-applied in DataFusion).
@@ -432,7 +448,7 @@ impl TableProvider for VectorQueryTableProvider {
         let base_logical_plan: LogicalPlan =
             if self.vector_index_table_is_sufficient(&vector_index_table, projection, filters)? {
                 // Let DataFusion handle pushing filters.
-                if let Some(filter) = filters.to_vec().into_iter().reduce(Expr::and) {
+                if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
                     LogicalPlan::Filter(Filter::try_new(filter, vector_index_table.into())?)
                 } else {
                     vector_index_table
