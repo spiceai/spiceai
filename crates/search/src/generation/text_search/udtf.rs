@@ -34,10 +34,7 @@ use datafusion::{
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    generation::{
-        text_search::{index::FullTextDatabaseIndex, query::FullTextSearchQuery},
-        util::fold_binary,
-    },
+    generation::text_search::{index::FullTextDatabaseIndex, query::FullTextSearchQuery},
 };
 
 /// [`TextSearchIndexProvider`] performs full text search on a column within a [`FullTextDatabaseIndex`] for a given query, and augments the results with the `underlying`, associated [`TableProvider`] (i.e. [`FullTextDatabaseIndex`] is an index on the `underlying` [`TableProvider`]).
@@ -181,7 +178,7 @@ impl TextSearchIndexProvider {
             join_type: JoinType::Left,
             join_constraint: JoinConstraint::On,
             on,
-            filter: fold_binary(pre_join_filters.as_slice(), Operator::And),
+            filter: pre_join_filters.into_iter().reduce(Expr::and),
             schema: join_schema.into(),
             null_equals_null: false,
         });
@@ -205,7 +202,7 @@ impl TextSearchIndexProvider {
             deduped_schema.into(),
         ));
 
-        if let Some(filter) = fold_binary(post_join_filters.as_slice(), Operator::And) {
+        if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
             Ok(LogicalPlan::Filter(Filter::try_new(filter, proj.into())?))
         } else {
             Ok(proj)
@@ -269,7 +266,7 @@ impl TableProvider for TextSearchIndexProvider {
             .map_err(|e| DataFusionError::ArrowError(e, None))?
         {
             // Let DataFusion handle pushing filters.
-            if let Some(filter) = fold_binary(filters, Operator::And) {
+            if let Some(filter) = filters.to_vec().into_iter().reduce(Expr::and) {
                 LogicalPlan::Filter(Filter::try_new(filter, index_table_scan.into())?)
             } else {
                 index_table_scan

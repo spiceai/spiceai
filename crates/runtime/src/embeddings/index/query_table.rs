@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use runtime_datafusion_index::IndexedTableProvider;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::fold_binary};
+use search::SEARCH_SCORE_COLUMN_NAME;
 
 use tokio_stream::StreamExt;
 
@@ -201,7 +201,8 @@ impl VectorQueryTableProvider {
             vec![],
             None, // Cannot restrict, as dependent on vector query scan.
         )?);
-        let plan = if let Some(filter) = fold_binary(underlying_filters.as_slice(), Operator::And) {
+
+        let plan = if let Some(filter) = underlying_filters.into_iter().reduce(Expr::and) {
             LogicalPlan::Filter(Filter::try_new(filter, scan.into())?)
         } else {
             scan
@@ -431,7 +432,7 @@ impl TableProvider for VectorQueryTableProvider {
         let base_logical_plan: LogicalPlan =
             if self.vector_index_table_is_sufficient(&vector_index_table, projection, filters)? {
                 // Let DataFusion handle pushing filters.
-                if let Some(filter) = fold_binary(filters, Operator::And) {
+                if let Some(filter) = filters.to_vec().into_iter().reduce(Expr::and) {
                     LogicalPlan::Filter(Filter::try_new(filter, vector_index_table.into())?)
                 } else {
                     vector_index_table
@@ -477,7 +478,7 @@ impl TableProvider for VectorQueryTableProvider {
                         Expr::Column(Column::new_unqualified(pk.name().clone())),
                         Expr::Column(Column::new_unqualified(pk.name().clone())),
                     )],
-                    filter: fold_binary(pre_join_filters.as_slice(), Operator::And),
+                    filter: pre_join_filters.into_iter().reduce(Expr::and),
                     schema: join_schema.into(),
                     null_equals_null: false,
                 });
@@ -501,7 +502,7 @@ impl TableProvider for VectorQueryTableProvider {
                     deduped_schema.into(),
                 ));
 
-                if let Some(filter) = fold_binary(post_join_filters.as_slice(), Operator::And) {
+                if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
                     LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
                 } else {
                     proj

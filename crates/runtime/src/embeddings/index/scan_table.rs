@@ -35,7 +35,6 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use search::generation::util::fold_binary;
 
 use crate::embeddings::udtf::append_fields;
 use crate::{embedding_col, embeddings::index::VectorIndex};
@@ -286,7 +285,7 @@ impl TableProvider for VectorScanTableProvider {
             join_type: JoinType::Right,
             join_constraint: JoinConstraint::On,
             on: self.join_on_expr()?,
-            filter: fold_binary(filters, Operator::And),
+            filter: filters.to_vec().into_iter().reduce(Expr::and),
             schema: self.qualified_schema(projection),
             null_equals_null: false,
         });
