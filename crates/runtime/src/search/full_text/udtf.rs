@@ -218,7 +218,7 @@ impl TextSearchUDTFProvider {
         let TextSearchTableFuncArgs { column, tbl, .. } = &self.args;
         let col: String = if let Some(col) = column {
             if !self.index.search_fields.contains(col) {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
                     self.index.search_fields.join(", ")
                 )));
@@ -230,13 +230,13 @@ impl TextSearchUDTFProvider {
             match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
                         self.index.search_fields.len()
                     )));
                 }
                 _ => {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
                     )));
                 }
@@ -365,7 +365,7 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let Some(field_index) = self.index.full_text_search_field_index(col.as_str()).ok() else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "User function 'text_search' is called on table '{tbl}'. Unexpectedly, text search cannot be performed on '{col}' column. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues."
             )));
         };

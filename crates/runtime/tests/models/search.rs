@@ -28,6 +28,7 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -99,13 +100,48 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
+        // To avoid inconsistent snapshots when scores are equal (common when using RRF),
+        // we also order based on primary key.
+        matches.sort_by(|a, b| {
+            let Some(Value::Number(num_a)) = a.get("score") else {
+                return Ordering::Greater;
+            };
+            let Some(score_a) = num_a.as_f64() else {
+                return Ordering::Greater;
+            };
+            let Some(Value::Number(num_b)) = b.get("score") else {
+                return Ordering::Less;
+            };
+            let Some(score_b) = num_b.as_f64() else {
+                return Ordering::Less;
+            };
+
+            if score_a > score_b {
+                return Ordering::Less;
+            } else if score_a < score_b {
+                return Ordering::Greater;
+            }
+
+            let Some(Value::Object(a_pks)) = a.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            let Some(Value::Object(b_pks)) = b.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            if format!("{a_pks:?}") > format!("{b_pks:?}") {
+                return Ordering::Greater;
+            } else if format!("{a_pks:?}") < format!("{b_pks:?}") {
+                return Ordering::Less;
+            }
+            Ordering::Equal
+        });
         for m in matches {
             if let Some(obj) = m.as_object_mut() {
                 if let Some(Value::Number(n)) = obj.get("score") {
                     if let Some(score) = n.as_f64() {
                         if let Some(truncated_score) =
-                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                        // Keep 2 decimals
+                            serde_json::Number::from_f64((10000.0 * score).trunc() / 10000.0)
+                        // Keep 4 decimals
                         {
                             obj.insert("score".to_string(), Value::Number(truncated_score));
                         }
@@ -264,17 +300,19 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 name: "multi_column_basic",
                 body: json!({
                     "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_search"]
+                    "limit": 3,
+                    "datasets": ["multi_column_search"],
+                    "where": "cp_catalog_page_sk < 10"
                 }),
             },
             SearchTestCase {
                 name: "multi_column_additional",
                 body: json!({
                     "text": "new patient",
-                    "limit": 2,
+                    "limit": 3,
                     "datasets": ["multi_column_search"],
                     "additional_columns": ["cp_catalog_number"],
+                    "where": "cp_catalog_page_sk < 10"
                 }),
             },
             SearchTestCase {
@@ -282,7 +320,7 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
                 body: json!({
                     "text": "new patient",
                     "datasets": ["multi_column_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
+                    "where": "cp_catalog_page_sk < 10"
                 }),
             },
         ],
@@ -350,7 +388,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 body: json!({
                     "text": "new patient",
                     "datasets": ["multi_embedding_models"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "where": "cp_catalog_page_sk < 10"
                 }),
             },
         ],

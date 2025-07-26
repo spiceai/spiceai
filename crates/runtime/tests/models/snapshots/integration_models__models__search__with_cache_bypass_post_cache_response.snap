@@ -24,7 +24,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 15
       },
-      "score": 0.939
+      "score": 0.9398
     }
   ]
 }

@@ -9,32 +9,33 @@ snapshot_kind: text
     {
       "dataset": "multi_embedding_models",
       "matches": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 1
+      },
+      "score": 0.0327
+    },
+    {
+      "dataset": "multi_embedding_models",
+      "matches": {
         "cp_department": "DEPARTMENT"
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "score": 0.016
+      "score": 0.0161
     },
     {
       "dataset": "multi_embedding_models",
       "matches": {
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make a"
+        "cp_description": "Years must understand. Well fat thousands take. Good police l"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 8
+        "cp_catalog_page_sk": 7
       },
-      "score": 0.016
-    },
-    {
-      "dataset": "multi_embedding_models",
-      "matches": {
-        "cp_department": "DEPARTMENT"
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 4
-      },
-      "score": 0.016
+      "score": 0.0161
     }
   ]
 }

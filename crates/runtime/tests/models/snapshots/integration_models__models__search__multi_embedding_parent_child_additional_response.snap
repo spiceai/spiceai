@@ -18,7 +18,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.032
+      "score": 0.0327
     },
     {
       "data": {
@@ -32,7 +32,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "score": 0.032
+      "score": 0.0322
     },
     {
       "data": {
@@ -46,7 +46,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.031
+      "score": 0.0317
     },
     {
       "data": {
@@ -60,7 +60,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 7
       },
-      "score": 0.03
+      "score": 0.0305
     },
     {
       "data": {
@@ -88,7 +88,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 10
       },
-      "score": 0.029
+      "score": 0.0294
     },
     {
       "dataset": "multiple_columns",
@@ -98,7 +98,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 4
       },
-      "score": 0.015
+      "score": 0.0156
     },
     {
       "data": {
@@ -111,7 +111,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.015
+      "score": 0.0153
     },
     {
       "data": {
@@ -124,7 +124,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 6
       },
-      "score": 0.015
+      "score": 0.0151
     },
     {
       "data": {
@@ -137,7 +137,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 11
       },
-      "score": 0.014
+      "score": 0.0149
     }
   ]
 }
