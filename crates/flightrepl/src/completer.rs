@@ -113,9 +113,33 @@ impl Completer for EditorHelper {
             ))
         })?;
 
-        // Only complete table names after FROM
         let before_cursor = &line[..pos].to_lowercase();
-        if before_cursor.contains("from ") && !before_cursor.contains("where") {
+
+        // Check if we're in a context where only tables should be suggested
+        let should_suggest_only_tables =
+            if before_cursor.contains("from ") && !before_cursor.contains("where") {
+                // Find the last occurrence of "from "
+                if let Some(from_pos) = before_cursor.rfind("from ") {
+                    let after_from = &before_cursor[from_pos + 5..].trim();
+
+                    // If nothing after "from", suggest only tables
+                    if after_from.is_empty() {
+                        true
+                    } else {
+                        // Count words after "from" - if only 1 word (potentially incomplete), suggest tables
+                        let words_after_from: Vec<&str> = after_from.split_whitespace().collect();
+                        words_after_from.len() <= 1
+                    }
+                } else {
+                    false
+                }
+            } else {
+                // Check if the last word is "join" (could be after WHERE clause)
+                before_cursor.trim().ends_with("join")
+            };
+
+        if should_suggest_only_tables {
+            // Only suggest tables
             for table in &cache.tables {
                 if table.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
@@ -125,10 +149,11 @@ impl Completer for EditorHelper {
                 }
             }
         } else {
+            // Suggest everything
             for keyword in &cache.keywords {
                 if keyword.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: format!("{} (keyword)", keyword.to_lowercase()),
+                        display: keyword.to_lowercase(),
                         replacement: format!("{} ", keyword.to_lowercase()),
                     });
                 }
@@ -137,7 +162,7 @@ impl Completer for EditorHelper {
             for udf_name in &cache.udfs {
                 if udf_name.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: format!("{} (udf)", udf_name.to_lowercase()),
+                        display: udf_name.to_lowercase(),
                         replacement: udf_name.to_lowercase(),
                     });
                 }
@@ -146,7 +171,7 @@ impl Completer for EditorHelper {
             for table in &cache.tables {
                 if table.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: format!("{} (table)", table),
+                        display: table.to_lowercase(),
                         replacement: format!("{} ", table),
                     });
                 }
@@ -155,7 +180,7 @@ impl Completer for EditorHelper {
             for column in &cache.columns {
                 if column.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: format!("{} (column)", column),
+                        display: column.to_lowercase(),
                         replacement: format!("{} ", column),
                     });
                 }
@@ -409,6 +434,12 @@ mod tests {
 
         let completions = get_completions(&helper, "SEL", 3);
         assert!(completions.contains(&"select ".to_string()));
+
+        let completions = get_completions(&helper, "select * fr", 11);
+        assert!(completions.contains(&"from ".to_string()));
+
+        let completions = get_completions(&helper, "select * from t1 w", 18);
+        assert!(completions.contains(&"where ".to_string()));
     }
 
     #[test]
