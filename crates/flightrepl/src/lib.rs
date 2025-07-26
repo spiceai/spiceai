@@ -180,6 +180,18 @@ impl EditorHelper {
     }
 }
 
+impl Drop for EditorHelper {
+    fn drop(&mut self) {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+
+        if let Some(handle) = self.refresh_task_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl Highlighter for EditorHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
