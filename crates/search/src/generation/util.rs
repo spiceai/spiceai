@@ -24,7 +24,8 @@ use datafusion::{catalog::TableProvider, common::Constraint};
 /// Create a new [`SchemaRef`] with the additional fields specified.
 ///
 /// If a new field is already in [`SchemaRef`], it will be ignored.
-#[must_use] pub fn append_fields(schema: &SchemaRef, new_fields: Vec<Arc<Field>>) -> SchemaRef {
+#[must_use]
+pub fn append_fields(schema: &SchemaRef, new_fields: Vec<Arc<Field>>) -> SchemaRef {
     let existing_names: HashSet<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
     let mut all_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
