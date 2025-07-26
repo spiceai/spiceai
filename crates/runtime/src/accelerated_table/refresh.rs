@@ -563,9 +563,7 @@ impl Refresher {
                         "Skipped refresh for {}: existing acceleration is available",
                         self.dataset_name
                     );
-                    // To ensure refresh via API is still possible, we return a large value for next refresh duration to keep refresher alive.
-                    // 10,000 years is used instead of Duration::MAX to avoid potential overflow issues if jitter is applied.
-                    Duration::from_secs(10_000 * 365 * 24 * 60 * 60)
+                    None
                 }
                 NextRefresh::WaitFor(duration) => {
                     if !duration.is_zero() {
@@ -574,7 +572,7 @@ impl Refresher {
                             duration.as_secs()
                         );
                     }
-                    duration
+                    Some(duration)
                 }
             }
         };
@@ -634,10 +632,8 @@ impl Refresher {
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
         Some(tokio::spawn(async move {
-            let mut next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
-                initial_refresh_delay,
-                max_jitter,
-            )));
+            let mut next_scheduled_refresh_timer =
+                initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =

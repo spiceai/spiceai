@@ -48,8 +48,8 @@ impl<'a> QueryBuilder<'a> {
     }
 
     #[must_use]
-    pub fn parameters(mut self, parameters: ParamValues) -> Self {
-        self.parameters = Some(parameters);
+    pub fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
+        self.parameters = parameters;
         self
     }
 
