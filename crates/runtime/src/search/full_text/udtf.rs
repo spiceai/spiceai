@@ -196,7 +196,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
         Ok(Arc::new(TextSearchUDTFProvider {
             args,
             index: fts_index.clone(),
-            underlying: index_table_provider.get_underlying(),
+            underlying: table_provider,
         }))
     }
 }
@@ -208,7 +208,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
 pub(super) struct TextSearchUDTFProvider {
     pub args: TextSearchTableFuncArgs,
     pub index: FullTextDatabaseIndex,
-    underlying: Arc<dyn TableProvider>,
+    pub underlying: Arc<dyn TableProvider>,
 }
 
 impl TextSearchUDTFProvider {
@@ -296,7 +296,7 @@ impl TextSearchUDTFProvider {
     }
 
     fn search_field_index_schema(field_index: &FullTextSearchFieldIndex) -> SchemaRef {
-        let tantivy_schema = field_index.tantivy_schema();
+        let tantivy_schema = &field_index.search_schema;
 
         let fields = field_index
             .all_columns()
@@ -363,7 +363,12 @@ impl TableProvider for TextSearchUDTFProvider {
 
         let col = self.column()?;
 
-        let Some(field_index) = self.index.full_text_search_field_index(col.as_str()).ok() else {
+        let Some(field_index) = self
+            .index
+            .full_text_search_field_index(col.as_str())
+            .await
+            .ok()
+        else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
             return Err(DataFusionError::Plan(format!(
                 "User function 'text_search' is called on table '{tbl}'. Unexpectedly, text search cannot be performed on '{col}' column. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues."

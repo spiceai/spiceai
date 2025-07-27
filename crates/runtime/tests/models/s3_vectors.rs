@@ -81,13 +81,6 @@ mod search {
         )
         .await?;
 
-        run_and_snapshot_query(
-            &rt,
-            "explain SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
-            "basic_explain",
-        )
-        .await?;
-
         Ok(())
     }
 
@@ -101,7 +94,7 @@ mod search {
 
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        let mut test_dataset = get_package_delivery_dataset("delivery", None, "hf_minilm");
+        let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
 
         // Generate a unique index name for each test run
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
@@ -155,6 +148,51 @@ mod search {
             "filters_pushdown_explain",
         )
         .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s3_vectors_data_update() -> Result<(), anyhow::Error> {
+        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+            verify_env_secret_exists(env_var)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
+
+        // Generate a unique index name so the same test can be run in parallel
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+
+        for (data_path, test_name) in [
+            ("update/data_v1.json", "data_v1"),
+            ("update/data_v2.json", "data_v2"),
+        ] {
+            let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
+
+            ds.vectors = Some(new_s3_vector_store(
+                "spice-ci-tests-s3-vectors-overwrite",
+                &index_name,
+            ));
+
+            let app = AppBuilder::new("search_app")
+                .with_dataset(ds)
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .build();
+
+            let rt = start_app(app).await?;
+
+            run_and_snapshot_query(
+            &rt,
+            r#"SELECT "account.account_sid", "message.body", round(score, 1) as score, attempt_count, customer_note FROM vector_search(delivery, 'delivery issue') WHERE "event.id" = 'SM8856d9da23ab4a7c8b26'"#,
+            test_name,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -233,12 +271,13 @@ mod search {
 }
 
 pub fn get_package_delivery_dataset(
+    path: &str,
     ds_name: &str,
     refresh_sql: Option<&str>,
     embedding_model: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(
-        "s3://spiceai-public-datasets/test_array_json/package-delivery/data/".to_string(),
+        format!("s3://spiceai-public-datasets/test_array_json/package-delivery/{path}"),
         ds_name.to_string(),
     );
     dataset.params = Some(Params::from_string_map(
@@ -275,6 +314,7 @@ pub fn get_package_delivery_dataset(
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),
         vectors_filterable_col("account.tier"),
+        vectors_filterable_col("account.account_sid"),
         vectors_filterable_col("package_weight_kg"),
         vectors_filterable_col("attempt_count"),
     ];

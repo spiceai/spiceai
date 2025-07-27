@@ -1,0 +1,17 @@
+---
+source: crates/runtime/src/embeddings/index/query_table.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
+---
++---------------+----------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                     |
++---------------+----------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.score DESC NULLS FIRST, fetch=5                                                  |
+|               |   TableScan: my_vectored_table projection=[pk, not_where, score]                                         |
+| physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=5                                                         |
+|               |   SortExec: TopK(fetch=5), expr=[score@2 DESC], preserve_partitioning=[true]                             |
+|               |     ProjectionExec: expr=[CAST(key@0 AS Int64) as pk, not_where@1 as not_where, 1 - distance@2 as score] |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                               |
+|               |         ExplainExecutionPlan: projection=["key", "not_where", "distance"] filter=[] limit=None           |
+|               |                                                                                                          |
++---------------+----------------------------------------------------------------------------------------------------------+
