@@ -57,6 +57,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Print Git version info
+        run: |
+          git log -1 --oneline
+          echo "Checked out SHA: $(git rev-parse HEAD)"
+
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
@@ -124,6 +129,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Print Git version info
+        run: |
+          git log -1 --oneline
+          echo "Checked out SHA: $(git rev-parse HEAD)"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
