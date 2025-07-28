@@ -161,10 +161,6 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    tracing::trace!("Downloading sentence transformer config for {repo_url}");
-    let _ = download_st_config(&api_repo)
-        .await
-        .context(FailedWithHFApiSnafu)?;
     Ok(root_dir)
 }
 
