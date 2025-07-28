@@ -20,8 +20,10 @@ use crate::bedrock::embed::cohere::{
     CohereConfig, CohereEmbedRequest, CohereEmbedResponse, CohereEmbeddingInputType,
     CohereEmbeddingTruncate, CohereEmbeddingType,
 };
-use crate::bedrock::embed::titan::{TitanConfig, TitanEmbedRequest, TitanEmbedResponse};
-use crate::bedrock::rate_limit::BedrockRateLimitConfig;
+use crate::bedrock::embed::titan::{
+    TITAN_TEXT_EMBED_V2, TitanConfig, TitanEmbedRequest, TitanEmbedResponse,
+};
+
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
@@ -39,8 +41,6 @@ use tracing::warn;
 
 pub mod cohere;
 pub mod titan;
-
-const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 
 #[derive(Debug, Clone)]
 pub struct BedrockEmbed<Rq, Rsp>
