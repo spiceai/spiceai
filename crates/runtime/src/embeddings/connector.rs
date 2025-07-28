@@ -264,7 +264,7 @@ impl EmbeddingConnector {
         )
         .await
         .map_err(|e| {
-            tracing::debug!("Error when getting embedding columns: {:?}", e);
+            tracing::debug!("Error when getting embedding columns: {e:?}");
             StreamError::Arrow(e.to_string())
         })?;
 
