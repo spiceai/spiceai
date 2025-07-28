@@ -204,7 +204,7 @@ fn to_sendable_stream(
     }
 }
 
-fn construct_record_batch(
+pub(crate) fn construct_record_batch(
     batch: &RecordBatch,
     projected_schema: &SchemaRef,
     embedding_cols: &HashMap<String, ArrayRef>,
