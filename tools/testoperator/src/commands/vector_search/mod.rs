@@ -86,13 +86,15 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
 
     println!("Search requests completed, calculating results...");
 
+    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
+
     // Record benchmark results
     let benchmark_resource = Resource::new(vec![
         KeyValue::new("service.name", "testoperator"),
         KeyValue::new("type", "vector_search"),
         KeyValue::new("name", app.name.clone()),
         KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-        KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
     ]);
