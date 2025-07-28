@@ -72,7 +72,7 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
-        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
+        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Ready)
             .await;
 
         while let Some(update) = changes_stream.next().await {

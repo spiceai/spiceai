@@ -459,7 +459,7 @@ impl EmbeddingTable {
         } else {
             vec![Arc::new(Field::new_fixed_size_list(
                 embedding_col!(field.name()),
-                Field::new("item", DataType::Float32, false),
+                Field::new("item", DataType::Float32, true),
                 cfg.vector_size,
                 true,
             ))]
