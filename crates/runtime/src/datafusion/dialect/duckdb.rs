@@ -59,7 +59,9 @@ pub(crate) fn cosine_distance_to_sql(
                 })
             }
             Expr::Literal(ScalarValue::FixedSizeList(array)) => {
-                let num_elements = array.value_length() as u64;
+                let num_elements = u64::try_from(array.value_length()).map_err(|e| {
+                    DataFusionError::Execution(format!("Cannot cast array length to u64 {e}"))
+                })?;
                 let array = unparser.expr_to_sql(arg)?;
 
                 // Apply required ::FLOAT[] casting. Only FLOAT embeddings are curently supported

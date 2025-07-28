@@ -26,7 +26,6 @@ use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
@@ -34,7 +33,6 @@ use data_components::cdc::StreamError;
 use data_components::debezium::arrow::changes::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
-use http_body_util::BodyExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -44,7 +42,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing_subscriber::filter::FilterExt;
 
 use super::table::EmbeddingTable;
 
