@@ -128,12 +128,7 @@ fn normalize_search_response(mut json: Value) -> String {
             let Some(Value::Object(b_pks)) = b.get("primary_key") else {
                 return Ordering::Equal;
             };
-            if format!("{a_pks:?}") > format!("{b_pks:?}") {
-                return Ordering::Greater;
-            } else if format!("{a_pks:?}") < format!("{b_pks:?}") {
-                return Ordering::Less;
-            }
-            Ordering::Equal
+            format!("{a_pks:?}").cmp(&format!("{b_pks:?}"))
         });
         for m in matches {
             if let Some(obj) = m.as_object_mut() {
