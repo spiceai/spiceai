@@ -18,10 +18,18 @@ use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
 use crate::dataconnector::DataConnectorError;
+use crate::embeddings::execution_plan::compute_additional_embedding_columns;
+use crate::embeddings::execution_plan::construct_record_batch;
+use crate::federated_table::FederatedTable;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
+use data_components::cdc::ChangeEnvelope;
+use data_components::cdc::ChangesStream;
+use data_components::cdc::StreamError;
+use data_components::debezium::arrow::changes::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
+use futures::StreamExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -287,5 +295,85 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let embedding_table = Arc::new(
+            table_provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()?
+                .clone(),
+        );
+        let underlying_table = Arc::clone(&embedding_table.base_table);
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+        let embedding_table_schema = embedding_table.schema();
+        Some(
+            self.inner_connector
+                .changes_stream(underlying_federated_table)?
+                .then(move |item| {
+                    let embedding_table_schema = Arc::clone(&embedding_table_schema);
+                    let embedding_table = Arc::clone(&embedding_table);
+                    async move {
+                        match item {
+                            Ok(envelope) => {
+                                let (change_committer, batch) = envelope.into_parts();
+                                let data_batch = batch.data_batch();
+                                match compute_additional_embedding_columns(
+                                    &data_batch,
+                                    &embedding_table.embedded_columns,
+                                    Arc::clone(&embedding_table.embedding_models),
+                                )
+                                .await
+                                {
+                                    Ok(embeddings) => {
+                                        for (column_name, embeddings) in &embeddings {
+                                            tracing::trace!(
+                                                "Embedding column computed: {column_name}, embeddings: {:?}",
+                                                embeddings.len()
+                                            );
+                                        }
+                                        match construct_record_batch(
+                                            &data_batch,
+                                            &embedding_table_schema,
+                                            &embeddings,
+                                        ) {
+                                            Ok(embedded_batch) => {
+                                                let new_change_batch = replace_change_batch_data(
+                                                    embedded_batch,
+                                                    batch,
+                                                );
+                                                return Ok(ChangeEnvelope::new(
+                                                    change_committer,
+                                                    new_change_batch,
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                return Err(StreamError::Arrow(e.to_string()));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Error when getting embedding columns: {:?}",
+                                            e
+                                        );
+                                        return Err(StreamError::Arrow(e.to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Error in underlying base stream: {e:?}");
+                                return Err(e);
+                            }
+                        }
+                    }
+                })
+                .boxed(),
+        )
     }
 }

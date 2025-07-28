@@ -38,12 +38,12 @@ use llms::{
 };
 use snafu::prelude::*;
 
-use tokio::sync::RwLock;
-use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use crate::embeddings::common::base_col;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
@@ -58,7 +58,7 @@ pub enum Error {
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
 #[derive(Clone)]
 pub struct EmbeddingTable {
-    base_table: Arc<dyn TableProvider>,
+    pub base_table: Arc<dyn TableProvider>,
 
     pub embedded_columns: HashMap<String, EmbeddingColumnConfig>,
 

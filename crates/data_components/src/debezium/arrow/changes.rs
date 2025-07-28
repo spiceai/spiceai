@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::{
     arrow::struct_builder::StructBuilder,
     cdc::{ChangeBatch, changes_schema},
@@ -23,10 +25,40 @@ use crate::{
     },
 };
 use arrow::{
-    array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
+    array::{Array, ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, StructArray},
     datatypes::SchemaRef,
 };
 use snafu::prelude::*;
+
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::needless_pass_by_value)]
+#[must_use]
+pub fn replace_change_batch_data(new_data: RecordBatch, change: ChangeBatch) -> ChangeBatch {
+    let schema = changes_schema(&new_data.schema());
+
+    let cols = change
+        .record
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "data" {
+                Arc::new(StructArray::new(
+                    new_data.schema().fields().clone(),
+                    new_data.columns().to_vec(),
+                    None,
+                )) as Arc<dyn Array>
+            } else {
+                Arc::clone(change.record.column_by_name(f.name()).unwrap())
+            }
+        })
+        .collect();
+
+    let new_changes_batch = RecordBatch::try_new(schema.into(), cols).unwrap();
+
+    ChangeBatch::try_new(new_changes_batch).unwrap()
+}
 
 /// Converts a `ChangeEvent` into a `ChangeBatch`
 pub fn to_change_batch(
