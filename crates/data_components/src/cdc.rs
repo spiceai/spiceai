@@ -118,7 +118,6 @@ pub enum ChangeOperation {
 }
 
 impl From<&str> for ChangeOperation {
-    #[must_use]
     fn from(op: &str) -> Self {
         match op {
             "c" => Self::Create,

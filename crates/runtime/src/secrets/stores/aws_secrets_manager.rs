@@ -92,7 +92,6 @@ impl AwsSecretsManager {
 
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
-    #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         tracing::trace!(
             "Getting secret {} from AWS Secrets Manager",

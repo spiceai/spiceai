@@ -41,7 +41,7 @@ pub enum Error {
     SiteNotFound { site: String },
 
     #[snafu(display("Error interacting with Microsoft Sharepoint: {e}", e=resolve_graph_failure(source)))]
-    MicrosoftGraphFailure { source: GraphFailure },
+    MicrosoftGraphFailure { source: Box<GraphFailure> },
 
     #[snafu(display("Error parsing document: {source}"))]
     DocumentParsing { source: document_parse::Error },

@@ -90,7 +90,6 @@ impl SecretStore for EnvSecretStore {
     ///
     /// However, the convention is to use uppercase for environment variables - so to make the experience
     /// consistent across secret stores that don't have this convention we will search for both original and uppercased keys.
-    #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         let uppercase_key = key.to_uppercase();
 
