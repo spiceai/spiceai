@@ -13695,6 +13695,7 @@ version = "1.6.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
+ "hf-hub",
  "reqwest",
  "serde",
  "serde_json",
