@@ -95,9 +95,7 @@ impl FuzzyMatch {
         }
 
         // Collapse multiple whitespaces
-        let normalized = no_punct.split_whitespace().collect::<Vec<&str>>().join(" ");
-
-        normalized
+        no_punct.split_whitespace().collect::<Vec<&str>>().join(" ")
     }
 }
 

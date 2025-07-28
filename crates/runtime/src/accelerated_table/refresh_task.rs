@@ -191,8 +191,8 @@ impl RefreshTask {
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
-        let max_retries = if refresh.refresh_retry_enabled {
-            refresh.refresh_retry_max_attempts
+        let max_retries = if refresh.retry_enabled {
+            refresh.retry_max_attempts
         } else {
             Some(0)
         };

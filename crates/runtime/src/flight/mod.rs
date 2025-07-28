@@ -176,6 +176,7 @@ impl Service {
         query.get_schema().await.map_err(handle_datafusion_error)
     }
 
+    #[allow(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()

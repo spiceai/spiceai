@@ -90,6 +90,7 @@ impl SchemaProvider for SpiceSchemaProvider {
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) fn ensure_schema_exists(
     ctx: &SessionContext,
     catalog: &str,
