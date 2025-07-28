@@ -103,7 +103,7 @@ impl EmbeddingConnector {
                     model: e.model.clone(),
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
-                    vector_size: e.vector_size.clone(),
+                    vector_size: e.vector_size,
                 })
             })
             .collect_vec();

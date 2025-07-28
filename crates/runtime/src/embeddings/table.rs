@@ -38,12 +38,12 @@ use llms::{
 };
 use snafu::prelude::*;
 
-use tokio::sync::RwLock;
-use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use crate::embeddings::common::base_col;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
@@ -130,7 +130,7 @@ impl EmbeddingTable {
 
                 let Some(vector_length) =
                     Self::embedding_size_from_base_table(&column, &base_schema)
-                        .or(config.vector_size.map(|sz| sz as i32))
+                        .or(config.vector_size.and_then(|sz| i32::try_from(sz).ok()))
                 else {
                     tracing::warn!(
                         "Column '{}' has embeddings in base table, but the vector length could not be determined from schema. Ignoring column. Provide a value for the vector_size key in the column's embedding configuration.",
