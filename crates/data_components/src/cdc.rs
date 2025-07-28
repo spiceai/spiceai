@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{fmt::Display, sync::Arc};
 
+use arrow::error::ArrowError;
 use arrow::{
     array::{Array, ListArray, RecordBatch, StringArray, StructArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -37,6 +38,8 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
+    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    Arrow { source: ArrowError },
 }
 
 #[derive(Debug)]

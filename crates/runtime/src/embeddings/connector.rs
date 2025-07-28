@@ -279,7 +279,8 @@ impl EmbeddingConnector {
             construct_record_batch(&data_batch, &embedding_table.schema(), &embeddings)
                 .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        let new_change_batch = replace_change_batch_data(embedded_batch, batch);
+        let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
+            .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
         Ok(ChangeEnvelope::new(change_committer, new_change_batch))
     }

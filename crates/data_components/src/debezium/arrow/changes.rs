@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::cdc::ChangeBatchError;
 use crate::{
     arrow::struct_builder::StructBuilder,
     cdc::{ChangeBatch, changes_schema},
@@ -30,11 +31,10 @@ use arrow::{
 };
 use snafu::prelude::*;
 
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::missing_panics_doc)]
-#[allow(clippy::needless_pass_by_value)]
-#[must_use]
-pub fn replace_change_batch_data(new_data: RecordBatch, change: ChangeBatch) -> ChangeBatch {
+pub fn replace_change_batch_data(
+    new_data: &RecordBatch,
+    change: &ChangeBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
     let schema = changes_schema(&new_data.schema());
 
     let cols = change
@@ -50,14 +50,17 @@ pub fn replace_change_batch_data(new_data: RecordBatch, change: ChangeBatch) -> 
                     None,
                 )) as Arc<dyn Array>
             } else {
-                Arc::clone(change.record.column_by_name(f.name()).unwrap())
+                match change.record.column_by_name(f.name()) {
+                    Some(column) => Arc::clone(column),
+                    None => unreachable!("Column {} must exist", f.name()),
+                }
             }
         })
         .collect();
 
-    let new_changes_batch = RecordBatch::try_new(schema.into(), cols).unwrap();
-
-    ChangeBatch::try_new(new_changes_batch).unwrap()
+    RecordBatch::try_new(schema.into(), cols)
+        .map_err(|source| ChangeBatchError::Arrow { source })
+        .and_then(ChangeBatch::try_new)
 }
 
 /// Converts a `ChangeEvent` into a `ChangeBatch`
