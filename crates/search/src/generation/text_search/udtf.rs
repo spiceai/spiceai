@@ -244,7 +244,7 @@ impl TableProvider for TextSearchIndexProvider {
             .ok()
         else {
             // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
-            return Err(DataFusionError::Internal("blame jeadie".to_string()));
+            return Err(DataFusionError::Internal(format!("text_search() missing required search field {}", self.column.as_str())));
         };
         let index_table = Arc::new(FullTextSearchQuery {
             index: field_index,
