@@ -38,12 +38,12 @@ use llms::{
 };
 use snafu::prelude::*;
 
-use tokio::sync::RwLock;
-
 use crate::embeddings::common::base_col;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
@@ -101,18 +101,19 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
 }
 
 impl EmbeddingTable {
-    /// When creating a new [`EmbeddingTable`], the provided columns (in `embedded_column_to_model`) must be checked to see if they are already in the base table.
+    /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
     pub async fn try_new(
         base_table: Arc<dyn TableProvider>,
-        embedded_column_to_model: HashMap<String, String>,
+        embed_columns: HashMap<String, ColumnEmbeddingConfig>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
     ) -> Result<Self, Error> {
         let base_schema = base_table.schema();
         let mut embedded_columns: HashMap<String, EmbeddingColumnConfig> = HashMap::new();
 
-        for (column, model) in embedded_column_to_model {
+        for (column, config) in embed_columns {
+            let model = config.model;
             let chunking_config_opt = embed_chunker_config.get(&column);
 
             if Self::base_table_has_embedding_column(&base_schema, &column) {
@@ -129,10 +130,10 @@ impl EmbeddingTable {
 
                 let Some(vector_length) =
                     Self::embedding_size_from_base_table(&column, &base_schema)
+                        .or(config.vector_size.and_then(|sz| i32::try_from(sz).ok()))
                 else {
                     tracing::warn!(
-                        "Column '{}' has embeddings in base table, but the vector length could not be determined. Ignoring column.",
-                        column
+                        "Column '{column}' has embeddings in base table, but the vector length could not be determined from schema. Ignoring column. Provide a value for the vector_size key in the column's embedding configuration.",
                     );
                     continue;
                 };
