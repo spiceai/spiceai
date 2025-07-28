@@ -589,12 +589,10 @@ mod tests {
         prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
+    use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::embeddings::{
-        index::{VectorIndex, VectorQueryTableProvider},
-        udtf::append_fields,
-    };
+    use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
