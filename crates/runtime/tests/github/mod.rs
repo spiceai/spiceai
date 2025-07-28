@@ -43,7 +43,7 @@ enum GithubDatasetType {
 }
 
 fn make_github_dataset(
-    kind: GithubDatasetType,
+    kind: &GithubDatasetType,
     query_mode: &str,
     additional_params: Option<HashMap<String, String>>,
 ) -> Dataset {
@@ -61,13 +61,23 @@ fn make_github_dataset(
             format!("{org}_{query_type}_{query_mode}"),
         ),
     };
-    let mut params = HashMap::from([
-        ("github_query_mode".to_string(), query_mode.to_string()),
-        (
-            "github_token".to_string(),
-            "${secrets:GITHUB_TOKEN}".to_string(),
-        ),
-    ]);
+
+    let mut params = HashMap::from([("github_query_mode".to_string(), query_mode.to_string())]);
+
+    match kind {
+        GithubDatasetType::OrgSpecific { .. } => {
+            params.insert(
+                "github_token".to_string(),
+                "${secrets:GITHUB_ORG_TOKEN}".to_string(),
+            );
+        }
+        GithubDatasetType::RepoSpecific { .. } => {
+            params.insert(
+                "github_token".to_string(),
+                "${secrets:GITHUB_TOKEN}".to_string(),
+            );
+        }
+    }
 
     params.extend(additional_params.unwrap_or_default());
 
@@ -84,7 +94,7 @@ async fn test_github_issues() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "issues".to_string(),
@@ -93,7 +103,7 @@ async fn test_github_issues() -> Result<(), String> {
                     None,
                 ))
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "issues".to_string(),
@@ -206,7 +216,7 @@ async fn test_github_commits() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "commits".to_string(),
@@ -270,7 +280,7 @@ async fn test_github_stargazers() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "stargazers".to_string(),
@@ -334,7 +344,7 @@ async fn test_github_org_members() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::OrgSpecific {
+                    &GithubDatasetType::OrgSpecific {
                         org: "spiceai".to_string(),
                         query_type: "members".to_string(),
                     },
@@ -390,7 +400,7 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "pulls".to_string(),
@@ -450,7 +460,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "spiceai".to_string(),
                         query_type: "pulls".to_string(),
@@ -462,7 +472,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
                     ])),
                 ))
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "apache".to_string(),
                         repo: "datafusion".to_string(),
                         query_type: "pulls".to_string(),
@@ -532,7 +542,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "cookbook".to_string(),
                         query_type: "pulls".to_string(),
@@ -591,7 +601,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "cookbook".to_string(),
                         query_type: "pulls".to_string(),
@@ -653,7 +663,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "cookbook".to_string(),
                         query_type: "pulls".to_string(),
@@ -718,7 +728,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
         .scope(async {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
-                    GithubDatasetType::RepoSpecific {
+                    &GithubDatasetType::RepoSpecific {
                         owner: "spiceai".to_string(),
                         repo: "cookbook".to_string(),
                         query_type: "pulls".to_string(),
