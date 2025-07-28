@@ -21,7 +21,6 @@ use app::AppBuilder;
 
 use arrow::array::RecordBatch;
 
-use arrow_flight::utils::batches_to_flight_data;
 use datafusion::common::test_util::batches_to_string;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
@@ -558,7 +557,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
                     );
                     let total_rows = result_batches
                         .iter()
-                        .map(|batch| batch.num_rows())
+                        .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 20);
                 })),
@@ -618,7 +617,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
                     );
                     let total_rows = result_batches
                         .iter()
-                        .map(|batch| batch.num_rows())
+                        .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 21);
                 })),
@@ -681,7 +680,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
                     );
                     let total_rows = result_batches
                         .iter()
-                        .map(|batch| batch.num_rows())
+                        .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 21);
                 })),
@@ -741,7 +740,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
                     );
                     let total_rows = result_batches
                         .iter()
-                        .map(|batch| batch.num_rows())
+                        .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 22);
                 })),
