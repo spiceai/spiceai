@@ -27,7 +27,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 
@@ -149,10 +149,14 @@ pub(crate) async fn post(
         }
     };
 
-    let context = RequestContext::current(AsyncMarker::new().await);
+    let request_context = RequestContext::current(AsyncMarker::new().await);
     let cache_provider = vs.df.search_cache_provider();
     match vs
-        .search_with_cache(&search_request, cache_provider, context.cache_control())
+        .search_with_cache(
+            &search_request,
+            cache_provider,
+            Arc::clone(&request_context),
+        )
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {
@@ -161,6 +165,11 @@ pub(crate) async fn post(
 
                 if let Some(val) = cache_status.to_header_string().and_then(|v| v.parse().ok()) {
                     headers.insert("Search-Results-Cache-Status", val);
+                }
+
+                // Tell CDN entry is unique per user cache key
+                if request_context.client_supplied_cache_key().is_some() {
+                    headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
                 }
 
                 (

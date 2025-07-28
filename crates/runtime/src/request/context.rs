@@ -25,6 +25,7 @@ use std::{
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
+use regex::Regex;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
@@ -38,6 +39,7 @@ pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
     cache_control: CacheControl,
+    client_supplied_cache_key: Option<String>,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
     extensions: RwLock<Extensions>,
@@ -50,6 +52,12 @@ tokio::task_local! {
 /// An internal request context that is used outside the context of a client request.
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
+
+static CLIENT_CACHE_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"^([\w-]{1,128})$") {
+        Ok(compiled) => compiled,
+        Err(e) => unreachable!("Unable to compile regexp: {}", e),
+    });
 
 #[derive(Copy, Clone)]
 pub struct AsyncMarker {
@@ -168,6 +176,11 @@ impl RequestContext {
         self.cache_control
     }
 
+    #[must_use]
+    pub fn client_supplied_cache_key(&self) -> &Option<String> {
+        &self.client_supplied_cache_key
+    }
+
     pub fn extension<T>(&self) -> Option<Arc<T>>
     where
         T: 'static + Send + Sync + Clone,
@@ -211,6 +224,7 @@ impl AuthRequestContext for RequestContext {
 pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
+    client_supplied_cache_key: Option<String>,
     app: Option<Arc<App>>,
     df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
@@ -224,6 +238,7 @@ impl RequestContextBuilder {
         Self {
             protocol,
             cache_control: CacheControl::Cache(CacheKeyType::Default),
+            client_supplied_cache_key: None,
             app: None,
             df: None,
             user_agent: UserAgent::Absent,
@@ -257,6 +272,14 @@ impl RequestContextBuilder {
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
         self.cache_control = CacheControl::from_headers(headers);
+        self.client_supplied_cache_key = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
+                .get("Spice-Cache-Key")
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string),
+            _ => None,
+        };
+
         self.baggage.extend(baggage::from_headers(headers));
 
         let app = self.app.as_ref().map(Arc::clone);
@@ -278,6 +301,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
         self.cache_control = cache_control;
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_supplied_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.client_supplied_cache_key = cache_key;
         self
     }
 
@@ -329,20 +358,80 @@ impl RequestContextBuilder {
             }
         }
 
+        let user_cache_key = self
+            .client_supplied_cache_key
+            .and_then(Self::sanitize_cache_key);
+
         // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
-        let cache_control = if let CacheControl::Cache(CacheKeyType::Default) = self.cache_control {
-            let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
-            CacheControl::Cache(cache_key_type)
-        } else {
-            self.cache_control
+        let cache_control = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::Cache(cache_key_type)
+            }
+            // If sanitized out, fall back to default
+            CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
+                CacheControl::Cache(CacheKeyType::Default)
+            }
+            cache_control => cache_control,
         };
 
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             cache_control,
+            client_supplied_cache_key: user_cache_key,
             dimensions,
             auth_principal: OnceLock::new(),
             extensions: RwLock::new(self.extensions),
         }
+    }
+
+    fn sanitize_cache_key(key: String) -> Option<String> {
+        if CLIENT_CACHE_KEY_REGEX.is_match(&key) {
+            Some(key)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::request::CacheControl;
+    use crate::request::{CacheKeyType, Protocol, RequestContextBuilder};
+    use http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn test_bind_client_supplied_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.append("cache-control", HeaderValue::from_static("cache"));
+
+        // Test user-provided cache key
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo"));
+        let ctx_happy_path = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx_happy_path.cache_control,
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
+        );
+        assert_eq!(
+            ctx_happy_path.client_supplied_cache_key,
+            Some(String::from("foo"))
+        );
+
+        // Test invalid user cache key falling back to default behavior
+        headers.remove("Spice-Cache-Key");
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo$$"));
+
+        let ctx_bad_user_key = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx_bad_user_key.cache_control,
+            CacheControl::Cache(CacheKeyType::Default)
+        );
+        assert_eq!(ctx_bad_user_key.client_supplied_cache_key, None);
     }
 }

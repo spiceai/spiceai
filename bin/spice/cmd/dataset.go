@@ -84,7 +84,7 @@ spice dataset configure
 
 		if strings.Contains(datasetName, "-") {
 			// warn that dataset name with hyphen should be quoted in queries
-			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
+			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
 		}
 
 		cmd.Print("description: ")
