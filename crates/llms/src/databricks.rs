@@ -112,8 +112,8 @@ pub struct DatabricksCreateChatCompletionStreamResponse {
     pub usage: Option<DatabricksCompletionUsage>,
 }
 
-impl Into<CreateChatCompletionStreamResponse> for DatabricksCreateChatCompletionStreamResponse {
-    fn into(self) -> CreateChatCompletionStreamResponse {
+impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletionStreamResponse {
+    fn from(val: DatabricksCreateChatCompletionStreamResponse) -> Self {
         let DatabricksCreateChatCompletionStreamResponse {
             id,
             choices,
@@ -123,7 +123,7 @@ impl Into<CreateChatCompletionStreamResponse> for DatabricksCreateChatCompletion
             system_fingerprint,
             object,
             usage,
-        } = self;
+        } = val;
         CreateChatCompletionStreamResponse {
             id,
             choices,
@@ -146,14 +146,14 @@ pub struct DatabricksCompletionUsage {
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-impl Into<CompletionUsage> for DatabricksCompletionUsage {
-    fn into(self) -> CompletionUsage {
+impl From<DatabricksCompletionUsage> for CompletionUsage {
+    fn from(val: DatabricksCompletionUsage) -> Self {
         CompletionUsage {
-            prompt_tokens: self.prompt_tokens.unwrap_or_default(),
-            completion_tokens: self.completion_tokens.unwrap_or_default(),
-            total_tokens: self.total_tokens.unwrap_or_default(),
-            prompt_tokens_details: self.prompt_tokens_details,
-            completion_tokens_details: self.completion_tokens_details,
+            prompt_tokens: val.prompt_tokens.unwrap_or_default(),
+            completion_tokens: val.completion_tokens.unwrap_or_default(),
+            total_tokens: val.total_tokens.unwrap_or_default(),
+            prompt_tokens_details: val.prompt_tokens_details,
+            completion_tokens_details: val.completion_tokens_details,
         }
     }
 }
