@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_schema::TimeUnit;
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
+use chrono::{NaiveDateTime, TimeZone as _, Utc};
+use datafusion::arrow::array::{
+    ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
@@ -28,8 +32,8 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, TableProviderFilterPushDown};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
-use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,15 +185,15 @@ impl PartitionCreator for TestPartitionCreator {
         &self,
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
-        let empty_batch = RecordBatch::try_new(
-            Arc::clone(&self.schema),
-            vec![
-                Arc::new(Int64Array::new(vec![].into(), None)),
-                Arc::new(StringArray::from(Vec::<String>::new())),
-                Arc::new(Int64Array::new(vec![].into(), None)),
-            ],
-        )
-        .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+        let empty_columns: Vec<ArrayRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+
+        let empty_batch = RecordBatch::try_new(Arc::clone(&self.schema), empty_columns)
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         let mem_table = Arc::new(
             MemTable::try_new(Arc::clone(&self.schema), vec![vec![empty_batch]])
@@ -607,4 +611,121 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let granularities = vec!["year", "month", "day", "hour", "minute", "second"];
+
+    for granularity in granularities {
+        let partition_by = date_trunc(lit(granularity), col("timestamp"));
+        let table_provider = PartitionTableProvider::new(
+            Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+            vec![partition_by.clone()],
+            Arc::clone(&schema),
+        )
+        .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", Arc::new(table_provider))?;
+
+        let timestamps = vec![
+            timestamp_nanos("2025-07-15 12:34:56"),
+            timestamp_nanos("2025-08-15 12:34:56"),
+            timestamp_nanos("2025-07-15 13:00:00"),
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(TimestampNanosecondArray::from(timestamps)),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+
+        let query = "SELECT * FROM test_table WHERE timestamp = TIMESTAMP '2025-07-15 12:34:56'"
+            .to_string();
+        let df = ctx.sql(&query).await?;
+        let physical_plan = df.create_physical_plan().await?;
+        let partition_values = collect_partition_values(&physical_plan);
+
+        // Expected partition value based on granularity
+        let expected_timestamp = match granularity {
+            "year" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-01-01 00:00:00")), None)
+            }
+            "month" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-01 00:00:00")), None)
+            }
+            "day" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 00:00:00")), None)
+            }
+            "hour" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 12:00:00")), None)
+            }
+            "minute" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 12:34:00")), None)
+            }
+            "second" => {
+                ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 12:34:56")), None)
+            }
+            _ => panic!("Unsupported granularity"),
+        };
+
+        assert_eq!(
+            partition_values.len(),
+            1,
+            "Expected one partition for filtered query with granularity {granularity}. Found: {partition_values:?}"
+        );
+        assert_eq!(
+            partition_values[0], expected_timestamp,
+            "Expected partition value for granularity {granularity}. Found: {partition_values:?}"
+        );
+
+        // Verify unfiltered query includes all partitions
+        let df = ctx.sql("SELECT * FROM test_table").await?;
+        let physical_plan = df.create_physical_plan().await?;
+        let partition_values = collect_partition_values(&physical_plan);
+        let expected_partition_count = match granularity {
+            "year" => 1,
+            "month" | "day" => 2,
+            "hour" | "minute" | "second" => 3,
+            _ => panic!("Unexpected granularity"),
+        };
+        assert_eq!(
+            partition_values.len(),
+            expected_partition_count,
+            "Expected {expected_partition_count} partitions for unfiltered query with granularity {granularity}. Found: {partition_values:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::expect_used)]
+fn timestamp_nanos(datetime: &str) -> i64 {
+    let naive =
+        NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
+
+    // Assume UTC; convert NaiveDateTime to a DateTime<Utc>
+    let datetime_utc = Utc.from_utc_datetime(&naive);
+
+    datetime_utc
+        .timestamp_nanos_opt()
+        .expect("timestamp_nanos_opt is ok")
 }

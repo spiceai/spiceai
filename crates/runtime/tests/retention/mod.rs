@@ -28,13 +28,36 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
 };
 
-fn make_spiceai_dataset(path: &str, name: &str, retention_sql: String) -> Dataset {
+fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &str) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai/{path}"), name.to_string());
     ds.acceleration = Some(Acceleration {
         enabled: true,
-        retention_sql: Some(retention_sql),
+        engine: Some(engine.to_string()),
+        retention_sql: Some(retention_sql.to_string()),
         retention_check_enabled: true,
         retention_check_interval: Some("200ms".to_string()),
+        ..Default::default()
+    });
+    ds
+}
+
+fn make_s3_dataset(
+    path: &str,
+    name: &str,
+    engine: &str,
+    retention_sql: &str,
+    time_column: Option<&str>,
+    retention_period: Option<&str>,
+) -> Dataset {
+    let mut ds = Dataset::new(format!("s3://{path}"), name.to_string());
+    ds.time_column = time_column.map(ToString::to_string);
+    ds.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        retention_sql: Some(retention_sql.to_string()),
+        retention_check_enabled: true,
+        retention_check_interval: Some("200ms".to_string()),
+        retention_period: retention_period.map(ToString::to_string),
         ..Default::default()
     });
     ds
@@ -53,7 +76,17 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
                 .with_dataset(make_spiceai_dataset(
                     "spiceai/tpch/datasets/tpch.nation",
                     "nation",
-                    "DELETE FROM nation WHERE n_nationkey >= 5 OR n_name NOT LIKE '%A'".to_string(),
+                    "arrow",
+                    // keep only ALGERIA, ARGENTINA and CANADA
+                    "DELETE FROM nation WHERE n_nationkey >= 5 OR n_name NOT LIKE '%A'",
+                ))
+                .with_dataset(make_s3_dataset(
+                    "spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                    "taxi_trips",
+                    "duckdb",
+                    "DELETE FROM taxi_trips WHERE VendorID != 2 OR Airport_fee != 1.75",
+                    Some("tpep_pickup_datetime"),
+                    Some("1000000000w"), // Some large retention period to ensure data is not fitlered out by time
                 ))
                 .build();
 
@@ -76,24 +109,22 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 
             tokio::time::sleep(Duration::from_secs(1)).await; // Allow retention to complete
 
-            let query = rt
-                .datafusion()
-                .query_builder("SELECT * FROM nation")
-                .build()
-                .run()
-                .await?;
+            for (sql, snapshot_name) in [
+                (
+                    "SELECT n_nationkey, n_name, n_regionkey FROM nation",
+                    "retention_sql",
+                ),
+                ("SELECT VendorID, Airport_fee, tpep_pickup_datetime, passenger_count, trip_distance FROM taxi_trips", "retention_sql_and_time_column"),
+            ] {
+                let query = rt.datafusion().query_builder(sql).build().run().await?;
 
-            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
-            // keep only ALGERIA, ARGENTINA and CANADA
-            assert_eq!(
-                results.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                3,
-                "Expected retention SQL to filter out all rows except ALGERIA, ARGENTINA and CANADA"
-            );
+                let results: Vec<RecordBatch> =
+                    query.data.try_collect::<Vec<RecordBatch>>().await?;
 
-            let results_str =
-                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-            insta::assert_snapshot!(results_str);
+                let results_str =
+                    arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+                insta::assert_snapshot!(snapshot_name, results_str);
+            }
 
             Ok(())
         })
