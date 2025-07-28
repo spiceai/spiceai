@@ -49,9 +49,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
 
     let collection: Collection<mongodb::bson::Document> = database.collection("test");
 
-    let ts = DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z")
-        ?
-        .with_timezone(&Utc);
+    let ts = DateTime::parse_from_rfc3339("2019-01-01T00:00:00Z")?.with_timezone(&Utc);
 
     // Insert test documents
     let test_docs = vec![
