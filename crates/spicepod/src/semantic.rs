@@ -102,6 +102,9 @@ pub struct ColumnLevelEmbeddingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub row_ids: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_size: Option<usize>,
 }
 
 // Let `row_id` handle single string or arrays. All acceptable

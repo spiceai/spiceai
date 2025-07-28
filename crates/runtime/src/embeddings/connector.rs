@@ -103,6 +103,7 @@ impl EmbeddingConnector {
                     model: e.model.clone(),
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
+                    vector_size: e.vector_size,
                 })
             })
             .collect_vec();
@@ -113,13 +114,14 @@ impl EmbeddingConnector {
             return Ok(inner_table_provider);
         }
 
-        let embed_columns: HashMap<String, String, _> = embeddings
+        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
             .iter()
-            .map(|e| (e.column.clone(), e.model.clone()))
+            .map(|e| (e.column.clone(), e.clone()))
             .collect::<HashMap<_, _>>();
 
         // Early check if embedding models are available.
-        for (column, model) in &embed_columns {
+        for (column, config) in &embed_columns {
+            let model = &config.model;
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "EmbeddingConnector".to_string(),
