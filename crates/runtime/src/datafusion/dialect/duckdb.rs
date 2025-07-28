@@ -47,7 +47,7 @@ pub(crate) fn cosine_distance_to_sql(
                     named: false,
                 });
 
-                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are curently supported
+                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are currently supported
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
