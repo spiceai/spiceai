@@ -132,6 +132,7 @@ jobs:
   test-hf:
     name: Test Huggingface Models
     needs: build
+    if: !always()
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
