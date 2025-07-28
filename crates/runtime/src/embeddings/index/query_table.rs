@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
+    cmp::min,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -49,8 +50,9 @@ use search::SEARCH_SCORE_COLUMN_NAME;
 
 use tokio_stream::StreamExt;
 
+use crate::search::util::find_concrete_table_provider;
 use crate::{embedding_col, embeddings::index::VectorIndex};
-use crate::{embeddings::udtf::append_fields, search::util::find_concrete_table_provider};
+use search::generation::util::append_fields;
 
 /// An [`IndexedTableProvider`] embued with a [`VectorIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by vector similarity to a query (similarity with respect to associated embedded column in [`VectorIndex`]).
 #[derive(Debug, Clone)]
@@ -68,6 +70,7 @@ pub struct VectorQueryTableProvider {
     /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
     /// unsupported by the index (i.e. via its[`TableProvider::supports_filters_pushdown`] ), then
     ///  `< N` will be returned in the overall SQL query.
+    /// If a `limit` is provided such that `limit` < `pre_limit`, `limit` will be used.
     pub pre_limit: Option<usize>,
 }
 
@@ -203,7 +206,8 @@ impl VectorQueryTableProvider {
             vec![],
             None, // Cannot restrict, as dependent on vector query scan.
         )?);
-        let plan = if let Some(filter) = fold_binary(underlying_filters.as_slice(), Operator::And) {
+
+        let plan = if let Some(filter) = underlying_filters.into_iter().reduce(Expr::and) {
             LogicalPlan::Filter(Filter::try_new(filter, scan.into())?)
         } else {
             scan
@@ -316,13 +320,26 @@ impl VectorQueryTableProvider {
                     .collect(),
                 filters,
             ),
-            self.pre_limit.or(limit),
+            self.limit_to_use(limit),
         )?;
 
         Ok(LogicalPlan::Projection(Projection::try_new(
             query_table_projection_exprs.clone(),
             Arc::new(LogicalPlan::TableScan(query_table_scan)),
         )?))
+    }
+
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The pre-limit configured in [`VectorQueryTableProvider::pre_limit`].
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.pre_limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
+        }
     }
 
     // Returns true if the vector index table has all requested columns and can handle all filters (i.e. filters pertain to vector index column, even if they must be post-applied in DataFusion).
@@ -433,7 +450,7 @@ impl TableProvider for VectorQueryTableProvider {
         let base_logical_plan: LogicalPlan =
             if self.vector_index_table_is_sufficient(&vector_index_table, projection, filters)? {
                 // Let DataFusion handle pushing filters.
-                if let Some(filter) = fold_binary(filters, Operator::And) {
+                if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
                     LogicalPlan::Filter(Filter::try_new(filter, vector_index_table.into())?)
                 } else {
                     vector_index_table
@@ -479,7 +496,7 @@ impl TableProvider for VectorQueryTableProvider {
                         Expr::Column(Column::new_unqualified(pk.name().clone())),
                         Expr::Column(Column::new_unqualified(pk.name().clone())),
                     )],
-                    filter: fold_binary(pre_join_filters.as_slice(), Operator::And),
+                    filter: pre_join_filters.into_iter().reduce(Expr::and),
                     schema: join_schema.into(),
                     null_equals_null: false,
                 });
@@ -503,7 +520,7 @@ impl TableProvider for VectorQueryTableProvider {
                     deduped_schema.into(),
                 ));
 
-                if let Some(filter) = fold_binary(post_join_filters.as_slice(), Operator::And) {
+                if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
                     LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
                 } else {
                     proj
@@ -533,20 +550,6 @@ impl TableProvider for VectorQueryTableProvider {
 
         state.create_physical_plan(&final_proj).await
     }
-}
-
-/// For a set of binary filter [`Expr`] = {f1, f2, .., fn} and binary operation op, return expression: `(((f1 op f2) op ...) op fn)`.
-#[must_use]
-pub fn fold_binary(exprs: &[Expr], op: Operator) -> Option<Expr> {
-    let mut iter = exprs.iter();
-    let first = iter.next()?.clone();
-    Some(iter.fold(first, |acc, expr| {
-        Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
-            Box::new(acc),
-            op,
-            Box::new(expr.clone()),
-        ))
-    }))
 }
 
 /// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.
@@ -586,12 +589,10 @@ mod tests {
         prelude::{Expr, SessionConfig, SessionContext},
         sql::TableReference,
     };
+    use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::embeddings::{
-        index::{VectorIndex, VectorQueryTableProvider},
-        udtf::append_fields,
-    };
+    use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
