@@ -27,7 +27,7 @@ use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
     configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{runtime_ready_check, test_request_context},
 };
 
 enum GithubDatasetType {
@@ -115,6 +115,8 @@ async fn test_github_issues() -> Result<(), String> {
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             let mut now = std::time::Instant::now();
 
@@ -229,6 +231,8 @@ async fn test_github_commits() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
@@ -291,6 +295,8 @@ async fn test_github_stargazers() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
@@ -352,6 +358,8 @@ async fn test_github_org_members() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_org_members_auto",
@@ -409,6 +417,8 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             run_query_and_check_results(
                 &mut rt,
@@ -483,6 +493,8 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             let dataset_columns_tests = vec![
                 ("spiceai_pulls_auto", "review_comments"),
                 ("datafusion_pulls_auto", "discussion"),
@@ -545,6 +557,8 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_pull_requests_no_comments_auto",
@@ -604,6 +618,8 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             run_query_and_check_results(
                 &mut rt,
@@ -668,6 +684,8 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
                 () = cloned_rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_pull_requests_discussion_comments_auto",
@@ -727,6 +745,8 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
                 }
                 () = cloned_rt.load_components() => {}
             }
+
+            runtime_ready_check(&rt).await;
 
             run_query_and_check_results(
                 &mut rt,
