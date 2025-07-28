@@ -12072,11 +12072,13 @@ version = "1.5.0"
 dependencies = [
  "arrow",
  "arrow-json",
+ "arrow-schema",
  "async-stream",
  "async-trait",
  "datafusion",
  "futures",
  "insta",
+ "runtime-datafusion-index",
  "serde_json",
  "snafu",
  "tantivy",
