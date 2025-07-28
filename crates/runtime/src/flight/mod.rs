@@ -190,16 +190,12 @@ impl Service {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
-
-        let query = match parameters {
-            Some(parameters) => query.parameters(parameters),
-            None => query,
-        };
-
-        let query = query.build();
-
-        let query_result = query.run().await.map_err(handle_query_error)?;
+        let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
 

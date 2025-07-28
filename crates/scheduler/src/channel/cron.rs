@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::Local;
 use croner::Cron;
+use croner::parser::{CronParser, Seconds, Year};
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +28,6 @@ use crate::Result;
 use crate::task::TaskRequest;
 
 use super::TaskRequestChannel;
-
 pub struct CronRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     task_completion: Option<Arc<tokio::sync::Notify>>,
@@ -35,6 +35,13 @@ pub struct CronRequestChannel {
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     cron: Arc<Cron>,
 }
+
+static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .year(Year::Disallowed) // TODO: allow optional years in 2.0.0 - https://github.com/spiceai/spiceai/issues/6548
+        .build()
+});
 
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
@@ -49,9 +56,8 @@ impl CronRequestChannel {
             reset: None,
             tx: None,
             cron: Arc::new(
-                Cron::new(cron)
-                    .with_seconds_optional()
-                    .parse()
+                CRON_PARSER
+                    .parse(cron)
                     .context(crate::FailedToParseCronSnafu)?,
             ),
         })
@@ -124,6 +130,8 @@ impl TaskRequestChannel for CronRequestChannel {
                 let next = cron
                     .find_next_occurrence(&time, false)
                     .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
+
+                tracing::debug!("Next cron run time: {next}");
 
                 let duration_till = next.signed_duration_since(time);
                 // .to_std() errors when the duration is less than zero - the next expression time is in the past

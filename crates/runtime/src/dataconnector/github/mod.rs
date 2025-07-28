@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
 use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
 use arrow::array::{Array, RecordBatch};
@@ -351,6 +352,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .description("The Github API endpoint.")
         .default("https://api.github.com"),
+    ParameterSpec::component("include_comments")
+        .description(
+            "Specifies the types of comments to fetch: 'all', 'review', 'discussion', or 'none'.",
+        )
+        .default("none"),
+    ParameterSpec::component("max_comments_fetched")
+        .description("Maximum number of comments to fetch per discussion or review thread.")
+        .default("100"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -441,7 +450,24 @@ impl std::str::FromStr for GitHubQueryMode {
     }
 }
 
+fn warn_if_provided(
+    parameters: Vec<(&str, bool)>,
+    table_type: &str,
+    connector_component: &ConnectorComponent,
+) {
+    for (param, present) in parameters {
+        if present {
+            tracing::warn!(
+                "The parameter '{param}' is not supported for the {connector_component}, as a '{table_type}' table. For details, visit: https://spiceai.org/docs/components/data-connectors/github"
+            );
+        }
+    }
+}
+
+const MAX_COMMENTS_FETCHED: u32 = 100;
+
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self
@@ -467,13 +493,63 @@ impl DataConnector for Github {
             }
         })?;
 
+        let include_comments = dataset
+            .params
+            .get("github_include_comments")
+            .map(|value| {
+                PullRequestCommentType::try_from(value.as_str()).map_err(|e| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: e,
+                    }
+                })
+            })
+            .transpose()?;
+
+        let max_comments_fetched = dataset
+            .params
+            .get("github_max_comments_fetched")
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!("Failed to parse integer from string '{value}': {e}"),
+                    })
+            })
+            .transpose()?;
+
+        let pull_request_specific_params = vec![
+            ("github_include_comments", include_comments.is_some()),
+            (
+                "github_max_comments_fetched",
+                max_comments_fetched.is_some(),
+            ),
+        ];
+
+        let component = ConnectorComponent::from(dataset);
+
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
+                let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
+                    value if value > MAX_COMMENTS_FETCHED => {
+                        tracing::warn!(
+                            "Due to GitHub API rate limits, the number of comments fetched for {component} per pull request is limited to {MAX_COMMENTS_FETCHED}."
+                        );
+                        MAX_COMMENTS_FETCHED
+                    }
+                    value => value,
+                };
+
                 let table_args = Arc::new(PullRequestTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
-                    component: ConnectorComponent::from(dataset),
+                    component,
+                    include_comments: include_comments.unwrap_or(PullRequestCommentType::None),
+                    max_comments_fetched,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -483,10 +559,12 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("commits")) => {
+                warn_if_provided(pull_request_specific_params, "commits", &component);
+
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    component: ConnectorComponent::from(dataset),
+                    component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -496,11 +574,13 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("issues")) => {
+                warn_if_provided(pull_request_specific_params, "issues", &component);
+
                 let table_args = Arc::new(IssuesTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
-                    component: ConnectorComponent::from(dataset),
+                    component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -510,21 +590,25 @@ impl DataConnector for Github {
                 .await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("stargazers")) => {
+                warn_if_provided(pull_request_specific_params, "stargazers", &component);
+
                 let table_args = Arc::new(StargazersTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
-                    component: ConnectorComponent::from(dataset),
+                    component,
                 });
                 self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(owner, repo)).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
+                warn_if_provided(pull_request_specific_params, "files", &component);
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
             }
             (Some("github.com"), Some(org), Some("members"), None) => {
+                warn_if_provided(pull_request_specific_params, "members", &component);
                 let table_args = Arc::new(MembersTableArgs {
                     org: org.to_string(),
-                    component: ConnectorComponent::from(dataset),
+                    component,
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -537,17 +621,17 @@ impl DataConnector for Github {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
                     source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
-                    connector_component: ConnectorComponent::from(dataset),
+                    connector_component: component,
                 })
             }
             (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: component,
                 source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
             }),
             _ => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
+                connector_component: component,
                 source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
             }),
         }

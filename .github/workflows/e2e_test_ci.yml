@@ -25,7 +25,7 @@ on:
       - 'acknowledgements.md'
       - 'Dockerfile*'
 
-  pull_request:
+  pull_request_target:
     branches:
       - trunk
     paths-ignore:
@@ -51,7 +51,7 @@ on:
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 jobs:
@@ -102,6 +102,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -1253,6 +1255,36 @@ jobs:
             echo "Cache miss detected as expected"
           else
             echo "Cache miss not detected" >&2
+            exit 1
+          fi
+
+      - name: Run SQL query with custom cache key and check for miss header
+        working-directory: test_app
+        run: |
+          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          echo "$response"
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
+            echo "Cache miss detected as expected"
+          else
+            echo "Cache miss not detected" >&2
+            exit 1
+          fi
+
+      - name: Run SQL query with custom cache key and check for hit and vary header
+        working-directory: test_app
+        run: |
+          response=$(curl -i -XPOST -H"Spice-Cache-Key: e2eci" "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
+          echo "$response"
+          if echo "$response" | grep -q "results-cache-status: HIT"; then
+            echo "Cache hit detected as expected"
+          else
+            echo "Cache hit not detected" >&2
+            exit 1
+          fi
+          if echo "$response" | grep -q "vary: Spice-Cache-Key"; then
+            echo "Vary Spice-Cache-Key detected as expected"
+          else
+            echo "Vary Spice-Cache-Key not detected" >&2
             exit 1
           fi
 
