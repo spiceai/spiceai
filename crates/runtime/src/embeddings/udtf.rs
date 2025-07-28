@@ -29,12 +29,12 @@ limitations under the License.
 
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Weak},
 };
 
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -57,7 +57,7 @@ use runtime_datafusion_index::IndexedTableProvider;
 use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::SEARCH_SCORE_COLUMN_NAME;
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::{
@@ -364,23 +364,6 @@ impl VectorSearchUDTFProvider {
             ),
         )
     }
-}
-
-/// Create a new [`SchemaRef`] with the additional fields specified.
-///
-/// If a new field is already in [`SchemaRef`], it will be ignored.
-pub(super) fn append_fields(schema: &SchemaRef, new_fields: Vec<Arc<Field>>) -> SchemaRef {
-    let existing_names: HashSet<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-
-    let mut all_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-
-    for field in new_fields {
-        if !existing_names.contains(field.name().as_str()) {
-            all_fields.push(field);
-        }
-    }
-
-    Arc::new(Schema::new(all_fields))
 }
 
 #[async_trait::async_trait]
