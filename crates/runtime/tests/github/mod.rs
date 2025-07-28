@@ -42,7 +42,11 @@ enum GithubDatasetType {
     },
 }
 
-fn make_github_dataset(kind: GithubDatasetType, query_mode: &str) -> Dataset {
+fn make_github_dataset(
+    kind: GithubDatasetType,
+    query_mode: &str,
+    additional_params: Option<HashMap<String, String>>,
+) -> Dataset {
     let mut dataset = match kind {
         GithubDatasetType::RepoSpecific {
             owner,
@@ -57,18 +61,22 @@ fn make_github_dataset(kind: GithubDatasetType, query_mode: &str) -> Dataset {
             format!("{org}_{query_type}_{query_mode}"),
         ),
     };
-    let params = HashMap::from([
+    let mut params = HashMap::from([
         ("github_query_mode".to_string(), query_mode.to_string()),
         (
             "github_token".to_string(),
             "${secrets:GITHUB_TOKEN}".to_string(),
         ),
     ]);
+
+    params.extend(additional_params.unwrap_or_default());
+
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_github_issues() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -82,6 +90,7 @@ async fn test_github_issues() -> Result<(), String> {
                         query_type: "issues".to_string(),
                     },
                     "auto",
+                    None,
                 ))
                 .with_dataset(make_github_dataset(
                     GithubDatasetType::RepoSpecific {
@@ -90,6 +99,7 @@ async fn test_github_issues() -> Result<(), String> {
                         query_type: "issues".to_string(),
                     },
                     "search",
+                    None,
                 ))
                 .build();
             let mut rt = Runtime::builder()
@@ -202,6 +212,7 @@ async fn test_github_commits() -> Result<(), String> {
                         query_type: "commits".to_string(),
                     },
                     "auto",
+                    None,
                 ))
                 .build();
 
@@ -265,6 +276,7 @@ async fn test_github_stargazers() -> Result<(), String> {
                         query_type: "stargazers".to_string(),
                     },
                     "auto",
+                    None,
                 ))
                 .build();
 
@@ -327,6 +339,7 @@ async fn test_github_org_members() -> Result<(), String> {
                         query_type: "members".to_string(),
                     },
                     "auto",
+                    None,
                 ))
                 .build();
 
