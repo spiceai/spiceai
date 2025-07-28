@@ -32,7 +32,7 @@ use std::{
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
-    download::{ST_CONFIG_NAMES, download_artifacts, download_st_config},
+    download::{ST_CONFIG_NAMES, download_artifacts},
     tokenization::EncodingInput,
 };
 
