@@ -20,11 +20,8 @@ use arrow::array::UInt64Array;
 use cache::Caching;
 use data_components::delete::get_deletion_provider;
 use datafusion::{
-    catalog::TableProvider,
-    logical_expr::Operator,
-    physical_plan::collect,
-    prelude::{Expr, SessionContext},
-    sql::TableReference,
+    catalog::TableProvider, logical_expr::Operator, physical_plan::collect,
+    prelude::SessionContext, sql::TableReference,
 };
 
 use crate::{
@@ -105,15 +102,7 @@ impl super::AcceleratedTable {
                     }
                 }
 
-                // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
-                let Some(expr) = exprs.into_iter().reduce(Expr::or) else {
-                    tracing::warn!(
-                        "[retention] No valid retention filters found for dataset {dataset_name}"
-                    );
-                    continue;
-                };
-
-                tracing::trace!("[retention] Expr {expr:?}");
+                tracing::trace!("[retention] Exprs {exprs:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),
@@ -121,7 +110,7 @@ impl super::AcceleratedTable {
                 );
 
                 let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &[expr])
+                    .delete_from(&ctx.state(), &exprs)
                     .await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {

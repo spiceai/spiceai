@@ -20,15 +20,13 @@ use app::App;
 use http::{HeaderMap, header::CACHE_CONTROL};
 use spicepod::component::caching::SQLResultsCacheConfig;
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum CacheKeyType {
     /// Use the server's default logic (e.g., `LogicalPlan` hash).
     #[default]
     Default,
     /// Use the raw input (e.g., unparsed SQL string) as the cache key.
     Raw,
-    /// Use a client-supplied cache key via the Spice-Cache-Key header.
-    ClientSupplied,
 }
 
 impl CacheKeyType {
@@ -58,7 +56,7 @@ impl CacheKeyType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum CacheControl {
     Cache(CacheKeyType),
     NoCache,
@@ -74,13 +72,17 @@ impl CacheControl {
     #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
         // This will be updated later if the runtime parameter `runtime.results_cache.cache_key_type` is present.
-        let cache_key_type = match headers.get("Spice-Cache-Key") {
-            Some(header) if !header.is_empty() => CacheKeyType::ClientSupplied,
-            _ => CacheKeyType::Default,
+        let cache_key_type = CacheKeyType::Default;
+
+        let Some(cache_control) = headers.get(CACHE_CONTROL) else {
+            return Self::Cache(cache_key_type);
+        };
+        let Ok(cache_control_str) = cache_control.to_str() else {
+            return Self::Cache(cache_key_type);
         };
 
-        match headers.get(CACHE_CONTROL).and_then(|h| h.to_str().ok()) {
-            Some("no-cache") => Self::NoCache,
+        match cache_control_str {
+            "no-cache" => Self::NoCache,
             _ => Self::Cache(cache_key_type),
         }
     }

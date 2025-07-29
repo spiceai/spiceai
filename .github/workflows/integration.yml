@@ -176,7 +176,7 @@ jobs:
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
           private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
+          owner: ${{ github.repository_owner }}
           repositories: |
             spiceai
 

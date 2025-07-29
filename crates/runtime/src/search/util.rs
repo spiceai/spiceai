@@ -20,12 +20,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use datafusion::common::Column;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::Constraint, datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::CandidateGeneration;
-use search::generation::text_search::index::FullTextDatabaseIndex;
-use search::generation::util::get_primary_keys;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -34,7 +32,7 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::SearchGenerationSnafu;
-use crate::search::full_text::as_candidate_generations;
+use crate::search::full_text::index::FullTextDatabaseIndex;
 
 use super::{Error, Result};
 
@@ -101,6 +99,31 @@ pub async fn parse_explicit_primary_keys(
     })
 }
 
+pub(crate) async fn get_primary_keys(tbl: &Arc<dyn TableProvider>) -> Result<Vec<String>> {
+    let constraint_idx = tbl
+        .constraints()
+        .map(|c| c.iter())
+        .unwrap_or_default()
+        .find_map(|c| match c {
+            Constraint::PrimaryKey(columns) => Some(columns),
+            Constraint::Unique(_) => None,
+        })
+        .cloned()
+        .unwrap_or(Vec::new());
+
+    tbl.schema()
+        .project(&constraint_idx)
+        .map(|schema_projection| {
+            schema_projection
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        })
+        .boxed()
+        .map_err(|e| Error::DataFusionError { source: e })
+}
+
 pub(crate) async fn get_primary_keys_from_table(
     df: &Arc<DataFusion>,
     table: &TableReference,
@@ -112,10 +135,7 @@ pub(crate) async fn get_primary_keys_from_table(
             data_source: vec![table.clone()],
         })?;
 
-    get_primary_keys(&tbl_ref)
-        .await
-        .boxed()
-        .map_err(|e| Error::DataFusionError { source: e })
+    get_primary_keys(&tbl_ref).await
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
@@ -215,7 +235,8 @@ pub async fn full_text_search_candidates(
     };
 
     Some(
-        as_candidate_generations(&fts.with_new_base(table_provider))
+        fts.with_new_base(table_provider)
+            .as_candidate_generations()
             .await
             .context(SearchGenerationSnafu),
     )

@@ -18,7 +18,6 @@ use crate::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::client::UnnestBehavior;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
@@ -62,12 +61,7 @@ impl GitHubTableArgs for StargazersTableArgs {
             name = self.repo
         );
 
-        GitHubTableGraphQLParams::new(
-            query.into(),
-            None,
-            UnnestBehavior::Depth(1),
-            Some(gql_schema()),
-        )
+        GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))
     }
 }
 

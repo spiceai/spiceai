@@ -57,7 +57,6 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use crate::request::{AsyncMarker, RequestContext};
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -205,12 +204,13 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let query_res = QueryBuilder::new(sql, df)
-        .parameters(parameters)
-        .build()
-        .run()
-        .await?;
-
+    let builder = QueryBuilder::new(sql, df);
+    let builder = if let Some(parameters) = parameters {
+        builder.parameters(parameters)
+    } else {
+        builder
+    };
+    let query_res = builder.build().run().await?;
     Ok((
         query_res.data.try_collect::<Vec<RecordBatch>>().await?,
         query_res.cache_status,
@@ -240,27 +240,18 @@ pub async fn to_http_response(
         }
     };
 
-    let request_context = RequestContext::current(AsyncMarker::new().await);
     let mut headers = HeaderMap::new();
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
     }
 
-    attach_cache_headers(
-        &mut headers,
-        cache_status,
-        request_context.client_supplied_cache_key().is_some(),
-    );
+    attach_cache_headers(&mut headers, cache_status);
 
     (StatusCode::OK, headers, body).into_response()
 }
 
-fn attach_cache_headers(
-    headers: &mut HeaderMap,
-    results_cache_status: CacheStatus,
-    user_key_specified: bool,
-) {
+fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: CacheStatus) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
     }
@@ -270,11 +261,6 @@ fn attach_cache_headers(
         .and_then(|v| v.parse().ok())
     {
         headers.insert("Results-Cache-Status", val);
-    }
-
-    // Tell CDN entry is unique per user cache key
-    if user_key_specified {
-        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
     }
 }
 

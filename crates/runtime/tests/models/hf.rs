@@ -79,7 +79,6 @@ mod nsql {
                             model: "hf_minilm".to_string(),
                             row_ids: None,
                             chunking: None,
-                            vector_size: None,
                         }],
                         description: None,
                         full_text_search: None,
