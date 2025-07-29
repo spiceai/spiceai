@@ -50,7 +50,6 @@ pub struct Running {
     request_channels: TaskRequestChannels,
     submission_channels: TaskSubmissionChannels,
     cancellation_token: Arc<CancellationToken>,
-    notification_channels: Arc<NotificationChannels>,
     scheduler_handles: SchedulerHandles,
 }
 
@@ -127,11 +126,6 @@ impl Scheduler<NotStarted> {
     pub async fn start(self) -> Result<Scheduler<Running>> {
         let cancellation_token = Arc::new(CancellationToken::new());
 
-        let notification_channels = Arc::new(NotificationChannels {
-            completion: Arc::new(Notify::default()),
-            reset: Arc::new(Notify::default()),
-        });
-
         let scheduler = Scheduler {
             state: Arc::new(Running {
                 schedules: Arc::new(RwLock::new(Vec::new())),
@@ -139,7 +133,6 @@ impl Scheduler<NotStarted> {
                 request_handles: Arc::new(RwLock::new(HashMap::new())),
                 request_channels: Arc::new(RwLock::new(HashMap::new())),
                 submission_channels: Arc::new(RwLock::new(HashMap::new())),
-                notification_channels: Arc::clone(&notification_channels),
                 scheduler_handles: Arc::new(RwLock::new(HashMap::new())),
             }),
             name: self.name,
@@ -226,8 +219,8 @@ impl Scheduler<Running> {
         schedule_name: Arc<str>,
         request_channel: Arc<RwLock<dyn TaskRequestChannel>>,
     ) -> Result<()> {
-        self.schedules()
-            .await
+        let schedules = self.schedules().await;
+        let schedule = schedules
             .iter()
             .find(|s| s.name() == schedule_name)
             .ok_or_else(|| crate::Error::DuplicateScheduleName {
@@ -236,10 +229,10 @@ impl Scheduler<Running> {
 
         let mut channel = request_channel.write().await;
         channel.set_task_completion_notification(Arc::clone(
-            &self.state.notification_channels.completion,
+            &schedule.notification_channels.completion,
         ));
         channel.set_cancellation_token(Arc::clone(&self.state.cancellation_token));
-        channel.set_reset_notification(Arc::clone(&self.state.notification_channels.reset));
+        channel.set_reset_notification(Arc::clone(&schedule.notification_channels.reset));
 
         let submission_channels_lock = Arc::clone(&self.state.submission_channels);
         let submission_channels = submission_channels_lock.read().await;
@@ -297,13 +290,14 @@ impl Scheduler<Running> {
 
         // Start the request channels for the new schedule
         let cancellation_token = Arc::clone(&self.state.cancellation_token);
-        let notification_channels = Arc::clone(&self.state.notification_channels);
 
         for trigger_lock in schedule.triggers() {
             let mut trigger = trigger_lock.write().await;
-            trigger.set_task_completion_notification(Arc::clone(&notification_channels.completion));
+            trigger.set_task_completion_notification(Arc::clone(
+                &schedule.notification_channels.completion,
+            ));
             trigger.set_cancellation_token(Arc::clone(&cancellation_token));
-            trigger.set_reset_notification(Arc::clone(&notification_channels.reset));
+            trigger.set_reset_notification(Arc::clone(&schedule.notification_channels.reset));
 
             trigger.set_submission_channel(Arc::clone(&tx));
             let handle = trigger.start()?;
@@ -319,7 +313,6 @@ impl Scheduler<Running> {
         let mut scheduler_handles = scheduler_handles.write().await;
         let handle = schedule.start(
             Arc::clone(&self.state.request_channels),
-            Arc::clone(&self.state.notification_channels),
             Arc::clone(&cancellation_token),
         );
         scheduler_handles

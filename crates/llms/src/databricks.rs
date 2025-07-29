@@ -15,20 +15,22 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
-
 use async_openai::{
     Client,
     error::OpenAIError,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
-        CreateChatCompletionRequest, CreateChatCompletionResponse, CreateEmbeddingRequest,
-        CreateEmbeddingResponse, EmbeddingInput,
+        CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, CreateEmbeddingRequest,
+        CreateEmbeddingResponse, EmbeddingInput, PromptTokensDetails, ServiceTierResponse,
     },
 };
 use async_trait::async_trait;
+use futures::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use std::sync::Arc;
 use token_provider::TokenProvider;
 use tracing::Instrument;
 
@@ -94,6 +96,68 @@ pub fn from_token_provider(
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Serialize)]
+pub struct DatabricksCreateChatCompletionStreamResponse {
+    /// The same as [`CreateChatCompletionStreamResponse`]
+    pub id: String,
+    pub choices: Vec<ChatChoiceStream>,
+    pub created: u32,
+    pub model: String,
+    pub service_tier: Option<ServiceTierResponse>,
+    pub system_fingerprint: Option<String>,
+    pub object: String,
+
+    /// Usage is different in Databricks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<DatabricksCompletionUsage>,
+}
+
+impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletionStreamResponse {
+    fn from(val: DatabricksCreateChatCompletionStreamResponse) -> Self {
+        let DatabricksCreateChatCompletionStreamResponse {
+            id,
+            choices,
+            created,
+            model,
+            service_tier,
+            system_fingerprint,
+            object,
+            usage,
+        } = val;
+        CreateChatCompletionStreamResponse {
+            id,
+            choices,
+            created,
+            model,
+            service_tier,
+            system_fingerprint,
+            object,
+            usage: usage.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct DatabricksCompletionUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl From<DatabricksCompletionUsage> for CompletionUsage {
+    fn from(val: DatabricksCompletionUsage) -> Self {
+        CompletionUsage {
+            prompt_tokens: val.prompt_tokens.unwrap_or_default(),
+            completion_tokens: val.completion_tokens.unwrap_or_default(),
+            total_tokens: val.total_tokens.unwrap_or_default(),
+            prompt_tokens_details: val.prompt_tokens_details,
+            completion_tokens_details: val.completion_tokens_details,
+        }
+    }
+}
+
 #[async_trait]
 impl Chat for Databricks {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -141,7 +205,12 @@ impl Chat for Databricks {
         inner_req.stream_options = None; // Not supported by Databricks.
 
         // Must use `post_stream` instead of `chat().create(...` to avoid concatenation of `chat/completions`.
-        Ok(Box::pin(self.client.post_stream("", inner_req).await))
+        Ok(Box::pin(
+            self.client
+                .post_stream::<_, DatabricksCreateChatCompletionStreamResponse, _>("", inner_req)
+                .await
+                .map_ok(Into::into),
+        ))
     }
 
     async fn chat_request(
