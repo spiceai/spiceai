@@ -99,6 +99,38 @@ pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static VECTOR_INDEX_CREATION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("vector_index_creation_duration_ms")
+        .with_description("Duration of vector search index (embeddings) creation.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SEARCH_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("search_duration_ms")
+        .with_description("Total duration to process all search queries.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SEARCH_RPS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("search_rps")
+        .with_description("Search queries per second.")
+        .with_unit("rps")
+        .build()
+});
+
+pub static SEARCH_P95_RESPONSE_TIME: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("search_p95_time_ms")
+        .with_description("95th percentile response time for search queries.")
+        .with_unit("ms")
+        .build()
+});
+
 pub static PEAK_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("peak_memory_usage_mb")
