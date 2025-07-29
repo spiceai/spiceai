@@ -30,7 +30,6 @@ use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use runtime_datafusion_index::Index;
 use s3_vectors::{Client, S3Vectors};
-use search::generation::util::get_primary_keys;
 use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::{
@@ -47,6 +46,7 @@ use crate::{
     get_params_with_secrets,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
+    search::util::get_primary_keys,
     secrets::Secrets,
 };
 

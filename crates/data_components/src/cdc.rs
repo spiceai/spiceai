@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{fmt::Display, sync::Arc};
 
-use arrow::error::ArrowError;
 use arrow::{
     array::{Array, ListArray, RecordBatch, StringArray, StructArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -38,8 +37,6 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
-    Arrow { source: ArrowError },
 }
 
 #[derive(Debug)]
@@ -47,7 +44,6 @@ pub enum StreamError {
     Kafka(String),
     SerdeJsonError(String),
     Flight(String),
-    Arrow(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -58,7 +54,6 @@ impl std::fmt::Display for StreamError {
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
-            StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
         }
     }
 }
@@ -85,22 +80,6 @@ impl ChangeEnvelope {
     pub fn commit(self) -> Result<(), CommitError> {
         self.change_committer.commit()
     }
-
-    #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
-        (self.change_committer, self.change_batch)
-    }
-
-    #[must_use]
-    pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
-        change_batch: ChangeBatch,
-    ) -> Self {
-        Self {
-            change_committer,
-            change_batch,
-        }
-    }
 }
 
 /// The Arrow schema that represents a `ChangeEvent`
@@ -121,7 +100,7 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
     ])
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
     op_idx: usize,
@@ -240,24 +219,6 @@ impl ChangeBatch {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
         data_col.slice(row, 1).into()
-    }
-
-    #[must_use]
-    pub fn data_batch(&self) -> RecordBatch {
-        let data_col = self.record.column(self.data_idx);
-        let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        let DataType::Struct(fields) = data_array.data_type() else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        let Ok(record_batch) = RecordBatch::try_new(
-            Arc::new(Schema::new(fields.clone())),
-            data_array.columns().to_vec(),
-        ) else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        record_batch
     }
 
     fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {

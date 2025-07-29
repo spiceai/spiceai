@@ -24,7 +24,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     prelude::Expr as LogicalExpr,
-    sql::sqlparser::ast::{Expr, Ident},
 };
 
 use futures::StreamExt;
@@ -118,11 +117,10 @@ impl ExecutionPlan for FullTextSearchExec {
         let schema = self.schema();
         let limit = self.limit;
         let query = self.query.clone();
-
         let s = stream! {
         // TODO: Support filters.
             match idx
-                .search(query, &[], &[&Expr::Identifier(Ident::new(idx.field.clone()))], limit)
+                .search(query, &[], &[], limit)
                 .await
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {

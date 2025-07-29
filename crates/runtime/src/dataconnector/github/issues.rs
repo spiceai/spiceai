@@ -23,10 +23,7 @@ use super::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
     github::error_checker,
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{GraphQLQuery, UnnestBehavior},
-    },
+    graphql::{ErrorChecker, FilterPushdownResult, GraphQLContext, Result, client::GraphQLQuery},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -147,12 +144,7 @@ impl GitHubTableArgs for IssuesTableArgs {
             ),
         };
 
-        GitHubTableGraphQLParams::new(
-            query.into(),
-            None,
-            UnnestBehavior::Depth(2),
-            Some(gql_schema()),
-        )
+        GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
     }
 }
 

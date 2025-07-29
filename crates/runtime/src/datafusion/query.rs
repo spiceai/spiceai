@@ -509,7 +509,7 @@ mod tests {
         );
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
-            .parameters(Some(parameters.clone()))
+            .parameters(parameters.clone())
             .build()
             .run()
             .await
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
-            .parameters(Some(parameters))
+            .parameters(parameters)
             .build()
             .run()
             .await
@@ -550,7 +550,7 @@ mod tests {
         // New parameters should not be cached
         let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", df)
-            .parameters(Some(parameters))
+            .parameters(parameters)
             .build()
             .run()
             .await

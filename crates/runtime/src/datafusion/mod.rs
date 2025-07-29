@@ -1405,7 +1405,7 @@ impl DataFusion {
             {
                 Ok(view_table) => view_table,
                 Err(e) => {
-                    tracing::error!("Failed to create view {table}: {e}");
+                    tracing::error!("Failed to create view: {e}");
                     status.update_view(table, status::ComponentStatus::Error);
                     return None;
                 }
@@ -1421,7 +1421,7 @@ impl DataFusion {
                             return is_ready;
                         }
                         Err(e) => {
-                            tracing::error!("Failed to create view {table}: {e}");
+                            tracing::error!("Failed to create view: {e}");
                             status.update_view(table, status::ComponentStatus::Error);
                             return None;
                         }
@@ -1431,7 +1431,7 @@ impl DataFusion {
 
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
-                tracing::error!("Failed to create view {table}: {e}");
+                tracing::error!("Failed to create view: {e}");
                 status.update_view(table, status::ComponentStatus::Error);
                 return None;
             }

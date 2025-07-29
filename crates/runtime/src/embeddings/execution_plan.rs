@@ -204,7 +204,7 @@ fn to_sendable_stream(
     }
 }
 
-pub(crate) fn construct_record_batch(
+fn construct_record_batch(
     batch: &RecordBatch,
     projected_schema: &SchemaRef,
     embedding_cols: &HashMap<String, ArrayRef>,
@@ -364,7 +364,7 @@ pub(super) async fn get_vectors(
         vector_length,
         embedded_data.len() + nulls.len(),
     )
-    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
     // Current index into offset of the outputted [`FixedSizeList`].
     let mut output_ptr: usize = 0;

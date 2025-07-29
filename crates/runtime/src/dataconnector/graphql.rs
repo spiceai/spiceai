@@ -167,7 +167,7 @@ impl GraphQL {
             token,
             user,
             pass,
-            graphql::client::UnnestBehavior::Depth(unnest_depth),
+            unnest_depth,
             None,
             None,
         )
