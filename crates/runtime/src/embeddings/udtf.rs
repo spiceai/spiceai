@@ -464,9 +464,15 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )],
             input: Arc::new(proj),
-            fetch: limit,
+            // i.e., the top-k order limit passed down via the UDTF invocation
+            fetch: self.args.limit,
+        });
+        let limit = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: limit.map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(u64::try_from(l).ok())))),
+            input: Arc::new(sort),
         });
 
-        state.create_physical_plan(&sort).await
+        state.create_physical_plan(&limit).await
     }
 }
