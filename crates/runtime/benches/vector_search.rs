@@ -134,6 +134,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 model: EMBEDDING_MODEL_NAME.to_string(),
                 primary_keys: Some(vec!["_id".to_string()]),
                 chunking: None,
+                vector_size: None,
             }),
             None,
         )
@@ -171,6 +172,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 model: EMBEDDING_MODEL_NAME.to_string(),
                 primary_keys: Some(vec!["_id".to_string()]),
                 chunking: None,
+                vector_size: None,
             }),
             Some((
                 MTEB_COLUMN_NAME.to_string(),
@@ -195,6 +197,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 model: EMBEDDING_MODEL_NAME.to_string(),
                 primary_keys: Some(vec!["_id".to_string()]),
                 chunking: None,
+                vector_size: None,
             }),
             None,
         )
@@ -211,6 +214,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 model: EMBEDDING_MODEL_NAME.to_string(),
                 primary_keys: Some(vec!["_id".to_string()]),
                 chunking: None,
+                vector_size: None,
             }),
             Some((
                 MTEB_COLUMN_NAME.to_string(),
@@ -233,6 +237,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                 model: EMBEDDING_MODEL_NAME.to_string(),
                 primary_keys: Some(vec!["_id".to_string()]),
                 chunking: None,
+                vector_size: None,
             }),
             None,
         )
@@ -256,6 +261,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
                     overlap_size: 128,
                     trim_whitespace: false,
                 }),
+                vector_size: None,
             }),
             None,
         )

@@ -23,7 +23,10 @@ use super::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
     github::error_checker,
-    graphql::{ErrorChecker, FilterPushdownResult, GraphQLContext, client::GraphQLQuery},
+    graphql::{
+        ErrorChecker, FilterPushdownResult, GraphQLContext,
+        client::{GraphQLQuery, UnnestBehavior},
+    },
 };
 use datafusion::prelude::Expr;
 use std::sync::Arc;
@@ -100,7 +103,12 @@ impl GitHubTableArgs for CommitsTableArgs {
             owner = self.owner,
             name = self.repo
         );
-        GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))
+        GitHubTableGraphQLParams::new(
+            query.into(),
+            None,
+            UnnestBehavior::Depth(1),
+            Some(gql_schema()),
+        )
     }
 }
 

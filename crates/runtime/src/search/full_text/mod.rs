@@ -13,55 +13,53 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::DataType;
-use snafu::Snafu;
-use tantivy::TantivyError;
+use std::sync::Arc;
 
-use datafusion::error::DataFusionError;
+use datafusion::{
+    execution::runtime_env::RuntimeEnvBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+use search::generation::{
+    CandidateGeneration, post_apply::PostApplyCandidateGeneration,
+    text_search::index::FullTextDatabaseIndex,
+};
+use snafu::ResultExt;
 
-pub mod analyzer_rule;
+use crate::object_store_registry::SpiceObjectStoreRegistry;
+
 pub mod connector;
-pub mod index;
 pub mod udtf;
-mod util;
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum Error {
-    #[snafu(display("Full text search requires a primary key, and the table did not have one.",))]
-    NoPrimaryKey,
+/// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
+///
+/// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::generation::text_search::udtf::TextSearchIndexProvider`].
+pub async fn as_candidate_generations(
+    database_index: &FullTextDatabaseIndex,
+) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+    let mut generators = vec![];
+    for search_field in database_index.search_fields.as_slice() {
+        let base = database_index
+            .full_text_search_field_index(search_field.as_str())
+            .await
+            .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
-    #[snafu(display(
-        "Primary key column '{column}' used in search index has unsupported data type: '{data_type}'",
-    ))]
-    PrimaryKeyInvalidType { column: String, data_type: DataType },
+        let post_apply = PostApplyCandidateGeneration::new(
+            Arc::clone(&database_index.base_table),
+            Arc::new(base),
+            database_index.primary_key.clone(),
+        )
+        .with_ctx(Arc::new(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnvBuilder::default()
+                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+                    .build()
+                    .boxed()
+                    .map_err(|source| search::generation::Error::InternalError { source })?,
+            ),
+        )));
+        generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
+    }
 
-    #[snafu(display("Primary key column '{column}' used in search index is not allowed.",))]
-    PrimaryKeyInvalidName { column: String },
-
-    #[snafu(display("Primary key column '{column}' not found in table.",))]
-    PrimaryKeyNotFound { column: String },
-
-    #[snafu(display("Failed to create a full text search index: {source}.",))]
-    IndexCreationError { source: TantivyError },
-
-    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
-    IndexInsertionError { source: TantivyError },
-
-    #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
-    FailedToRetrieveDataFromIndex { source: TantivyError },
-
-    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
-    FailedToRetrieveDataFromSource { source: DataFusionError },
-
-    #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
-    FailedToInsertDataIntoIndex { source: TantivyError },
-
-    #[snafu(display(
-        "Failed to create the full text search index. Context: {context}. Error: {source}.",
-    ))]
-    InvalidIndexingError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-        context: String,
-    },
+    Ok(generators)
 }
