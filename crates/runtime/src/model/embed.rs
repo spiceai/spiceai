@@ -89,7 +89,7 @@ async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    use llms::bedrock::embed::BedrockRateLimitConfigBuilder;
+    use llms::bedrock::rate_limit::BedrockRateLimitConfigBuilder;
 
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
