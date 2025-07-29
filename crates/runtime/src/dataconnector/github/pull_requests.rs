@@ -123,6 +123,7 @@ impl PullRequestTableArgs {
             labels(first: 100) { labels: nodes { name } }
             commits(first: 100) { commits_count: totalCount, hashes: nodes { id } }
             assignees(first: 100) { assignees: nodes { login } }
+            comments_count_wrapper: comments { comments_count: totalCount }
         "
     }
 
@@ -376,6 +377,7 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
             true,
         ),
+        Field::new("comments_count", DataType::Int64, true),
         Field::new("commits_count", DataType::Int64, true),
         Field::new(
             "created_at",
