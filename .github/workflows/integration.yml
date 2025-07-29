@@ -180,6 +180,7 @@ jobs:
       - name: Run integration test
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+          GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
