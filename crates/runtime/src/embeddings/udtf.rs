@@ -42,11 +42,11 @@ use datafusion::{
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        expr::{Alias, ScalarFunction}, BinaryExpr, LogicalPlan, Operator, Projection, Sort, SortExpr,
-        TableScan,
+        BinaryExpr, LogicalPlan, Operator, Projection, Sort, SortExpr, TableScan,
+        expr::{Alias, ScalarFunction},
     },
     physical_plan::ExecutionPlan,
-    prelude::{lit, Expr},
+    prelude::{Expr, lit},
     scalar::ScalarValue,
     sql::TableReference,
 };
@@ -57,7 +57,7 @@ use runtime_datafusion_index::IndexedTableProvider;
 use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{generation::util::append_fields, SEARCH_SCORE_COLUMN_NAME};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::{
@@ -469,10 +469,10 @@ impl TableProvider for VectorSearchUDTFProvider {
         });
 
         /* TODO: for a query such as
-            `select count(*) from vector_search(realtime_reviews, 'disappoint', 10) limit 5;`
-             the resultant physical plan should have a GlobalLimitExec for the query limit,
-             but it gets lost
-         */
+           `select count(*) from vector_search(realtime_reviews, 'disappoint', 10) limit 5;`
+            the resultant physical plan should have a GlobalLimitExec for the query limit,
+            but it gets lost
+        */
         // let limit = LogicalPlan::Limit(Limit {
         //     skip: None,
         //     fetch: limit.map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(u64::try_from(l).ok())))),
