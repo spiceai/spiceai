@@ -23,8 +23,9 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 
-use super::index::FullTextDatabaseIndex;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 
+/// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
 pub struct FullTextConnector {
     inner_connector: Arc<dyn DataConnector>,
@@ -35,8 +36,6 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
-    /// Wrap an existing [`TableProvider`] with a [`IndexedTableProvider`] provider with a [`FullTextDatabaseIndex`]. If no full text search fields
-    /// are specified for the [`Dataset`], it is not unnecessarily nested.
     pub(crate) async fn wrap_table(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,

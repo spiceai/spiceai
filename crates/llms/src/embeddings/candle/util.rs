@@ -32,7 +32,7 @@ use std::{
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
-    download::{ST_CONFIG_NAMES, download_artifacts, download_st_config},
+    download::{ST_CONFIG_NAMES, download_artifacts},
     tokenization::EncodingInput,
 };
 
@@ -161,10 +161,6 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    tracing::trace!("Downloading sentence transformer config for {repo_url}");
-    let _ = download_st_config(&api_repo)
-        .await
-        .context(FailedWithHFApiSnafu)?;
     Ok(root_dir)
 }
 

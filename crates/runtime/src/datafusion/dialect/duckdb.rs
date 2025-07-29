@@ -16,6 +16,7 @@ limitations under the License.
 
 use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
+use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
 use itertools::Itertools;
 
@@ -46,7 +47,24 @@ pub(crate) fn cosine_distance_to_sql(
                     named: false,
                 });
 
-                // Apply required ::FLOAT[] casting. Only FLOAT emneddings are curently supported
+                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are currently supported
+                Ok(ast::Expr::Cast {
+                    expr: Box::new(array),
+                    data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+                        Box::new(ast::DataType::Float(None)),
+                        Some(num_elements),
+                    )),
+                    kind: ast::CastKind::DoubleColon,
+                    format: None,
+                })
+            }
+            Expr::Literal(ScalarValue::FixedSizeList(array)) => {
+                let num_elements = u64::try_from(array.value_length()).map_err(|e| {
+                    DataFusionError::Execution(format!("Cannot cast array length to u64 {e}"))
+                })?;
+                let array = unparser.expr_to_sql(arg)?;
+
+                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are curently supported
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
