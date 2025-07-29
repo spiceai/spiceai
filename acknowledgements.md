@@ -168,6 +168,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
+- croner 3.0.0, MIT 
+  <br/>https://github.com/hexagon/croner-rust
+
 - csv 1.3.1, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
