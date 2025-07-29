@@ -36,6 +36,7 @@ use std::{
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
+use datafusion::logical_expr::Limit;
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -471,14 +472,15 @@ impl TableProvider for VectorSearchUDTFProvider {
         /* TODO: for a query such as
            `select count(*) from vector_search(realtime_reviews, 'disappoint', 10) limit 5;`
             the resultant physical plan should have a GlobalLimitExec for the query limit,
-            but it gets lost
+            but it gets lost??
         */
-        // let limit = LogicalPlan::Limit(Limit {
-        //     skip: None,
-        //     fetch: limit.map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(u64::try_from(l).ok())))),
-        //     input: Arc::new(sort),
-        // });
+        let limit = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: limit
+                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(u64::try_from(l).ok())))),
+            input: Arc::new(sort),
+        });
 
-        state.create_physical_plan(&sort).await
+        state.create_physical_plan(&limit).await
     }
 }
