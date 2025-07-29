@@ -51,7 +51,7 @@ env:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,9 +171,9 @@ jobs:
         uses: actions/create-github-app-token@v2
         id: github-app-token
         with:
-          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
+          app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
+          private-key: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
           repositories: |
             spiceai
 

@@ -14,11 +14,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
 
 jobs:
   run-bench:
@@ -34,7 +34,7 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-      
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:

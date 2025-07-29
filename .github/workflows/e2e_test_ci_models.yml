@@ -69,7 +69,7 @@ jobs:
       matrix:
         target:
           - name: 'Linux x64'
-            builder: 'spiceai-dev-runners'
+            builder: 'spicehq-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
           - name: 'macOS aarch64 (Apple Silicon)'

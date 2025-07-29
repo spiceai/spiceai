@@ -62,7 +62,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          outputs: type=docker,name=localhost:5000/spiceai-enterprise:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -158,7 +158,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          outputs: type=docker,name=localhost:5000/spiceai-enterprise:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -250,7 +250,7 @@ jobs:
           context: .
           file: Dockerfile-cuda
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:models-cuda-amd64,dest=/tmp/images-amd64-cuda.tar
+          outputs: type=docker,name=localhost:5000/spiceai-enterprise:models-cuda-amd64,dest=/tmp/images-amd64-cuda.tar
           cache-from: type=gha,scope=build-cuda
           cache-to: type=gha,scope=build-cuda,mode=max
           build-args: |
@@ -295,13 +295,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Import images and create manifests
         env:
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -325,42 +318,56 @@ jobs:
 
             # Push images to local registry
             echo "Pushing images to local registry"
-            docker push localhost:5000/spiceai:${variant}-amd64
-            docker push localhost:5000/spiceai:${variant}-arm64
+            docker push localhost:5000/spiceai-enterprise:${variant}-amd64
+            docker push localhost:5000/spiceai-enterprise:${variant}-arm64
 
             if [[ "${PUBLISH}" == "true" ]]; then
               # Push to GitHub Container Registry
               echo "Pushing to GHCR"
               docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
-
-              # Push to DockerHub
-              echo "Pushing to DockerHub"
-              docker buildx imagetools create \
-                -t spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t spiceai/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                -t ghcr.io/spicehq/spiceai-enterprise:${REL_VERSION}${suffix} \
+                -t ghcr.io/spicehq/spiceai-enterprise:latest${suffix} \
+                localhost:5000/spiceai-enterprise:${variant}-amd64 \
+                localhost:5000/spiceai-enterprise:${variant}-arm64
 
               echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
-
-              echo "Verifying DockerHub image:"
-              docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
+              docker buildx imagetools inspect ghcr.io/spicehq/spiceai-enterprise:${REL_VERSION}${suffix}
             else
               echo "Skipping push for non-tag build"
               echo "Creating local manifest for testing:"
               docker buildx imagetools create \
-                -t localhost:5000/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+                -t localhost:5000/spiceai-enterprise:latest${suffix} \
+                localhost:5000/spiceai-enterprise:${variant}-amd64 \
+                localhost:5000/spiceai-enterprise:${variant}-arm64
 
-              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
+              docker buildx imagetools inspect localhost:5000/spiceai-enterprise:latest${suffix}
             fi
           done
+
+      - name: Get spicehq scoped GitHub access token
+        uses: actions/create-github-app-token@v2
+        id: github-app-token
+        with:
+          app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
+          private-key: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ai-platform
+
+      # triggers https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml workflow
+      - name: Trigger platform images promotion
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        env:
+          GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+        run: |
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/spicehq/ai-platform/dispatches \
+            -f 'event_type=publish-spiceai-enterprise' \
+            -F "client_payload[tag]=${{ env.REL_VERSION }}-models"
 
   publish-cuda:
     if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
@@ -392,13 +399,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to DockerHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Import images and create manifests
         env:
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -407,27 +407,22 @@ jobs:
           echo "Handling CUDA models..."
 
           docker load -i /tmp/images-amd64-cuda/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:models-cuda-amd64
+          docker push localhost:5000/spiceai-enterprise:models-cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then
-            echo "Pushing CUDA models to GHCR and DockerHub"
+            echo "Pushing CUDA models to GHCR"
             docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t spiceai/spiceai:latest-models-cuda \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t ghcr.io/spiceai/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+              -t ghcr.io/spicehq/spiceai-enterprise:${REL_VERSION}-models-cuda \
+              -t ghcr.io/spicehq/spiceai-enterprise:latest-models-cuda \
+              localhost:5000/spiceai-enterprise:models-cuda-amd64
 
             echo "Verifying CUDA GHCR image:"
-            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda
-
-            echo "Verifying CUDA DockerHub image:"
-            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
+            docker buildx imagetools inspect ghcr.io/spicehq/spiceai-enterprise:${REL_VERSION}-models-cuda
           else
             echo "Skipping push for non-tag CUDA build"
             docker buildx imagetools create \
-              -t localhost:5000/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+              -t localhost:5000/spiceai-enterprise:latest-models-cuda \
+              localhost:5000/spiceai-enterprise:models-cuda-amd64
 
-            docker buildx imagetools inspect localhost:5000/spiceai:latest-models-cuda
+            docker buildx imagetools inspect localhost:5000/spiceai-enterprise:latest-models-cuda
           fi

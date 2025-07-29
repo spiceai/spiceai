@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build:
     name: Features Check
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
 
     steps:
       - uses: actions/checkout@v4

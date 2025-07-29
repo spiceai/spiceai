@@ -55,10 +55,8 @@ on:
         default: 'spiceai-runners'
         type: choice
         options:
-          - 'spiceai-runners'
-          - 'spiceai-large-runners'
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
 
 jobs:
   run-data-consistency:
