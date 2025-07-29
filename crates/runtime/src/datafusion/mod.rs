@@ -1353,6 +1353,11 @@ impl DataFusion {
         let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
 
+        tracing::debug!(
+            "Creating view {} with dependent tables {dependent_table_names:?}",
+            view.name
+        );
+
         let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
@@ -1401,6 +1406,9 @@ impl DataFusion {
                 return None;
             }
 
+            // If view depends on other tables, wait until they are ready
+            wait_until_dependent_tables_are_ready(table, &dependent_table_names, &status).await;
+
             let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
             {
                 Ok(view_table) => view_table,
@@ -1414,7 +1422,7 @@ impl DataFusion {
             if let Some(acceleration) = &view.acceleration {
                 if acceleration.enabled {
                     match df_ref
-                        .create_accelerated_view(&view, view_table, &dependent_table_names, secrets)
+                        .create_accelerated_view(&view, view_table, secrets)
                         .await
                     {
                         Ok(is_ready) => {
@@ -1448,14 +1456,9 @@ impl DataFusion {
         self: &Arc<Self>,
         view: &View,
         view_table: ViewTable,
-        dependent_tables: &[TableReference],
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<Arc<Notify>>> {
         let table = &view.name;
-
-        tracing::debug!(
-            "Creating accelerated view {table} with dependent tables {dependent_tables:?}"
-        );
 
         let acceleration =
             view.acceleration
@@ -1463,12 +1466,6 @@ impl DataFusion {
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: table.to_string(),
                 })?;
-
-        let runtime_status = self.runtime_status();
-
-        // If accelerated view depends on other tables, wait until they are ready; this is required to complete
-        // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
-        wait_until_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
 
         let schema = view_table.schema();
         let federated_table =
@@ -1517,7 +1514,7 @@ impl DataFusion {
         }
 
         let mut builder = AcceleratedTable::builder(
-            Arc::clone(&runtime_status),
+            self.runtime_status(),
             table.clone(),
             federated_table.into(),
             "view".to_string(),
@@ -1775,6 +1772,11 @@ async fn wait_until_dependent_tables_are_ready(
     dependent_tables: &[TableReference],
     runtime_status: &Arc<status::RuntimeStatus>,
 ) {
+    tracing::debug!(
+        "Waiting for dependent tables {dependent_tables:?} to be ready for {table}",
+        table = table
+    );
+
     // Exponential retry with max duration of 10 seconds between retries
     let retry_strategy = FibonacciBackoffBuilder::new()
         .max_retries(None)

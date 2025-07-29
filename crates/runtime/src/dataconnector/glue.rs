@@ -100,12 +100,21 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    catalog_id: Option<String>,
 }
 
 impl GlueDataConnector {
     #[must_use]
     pub fn new(params: Parameters) -> Self {
-        Self { params }
+        Self {
+            params,
+            catalog_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_catalog_id(params: Parameters, catalog_id: Option<String>) -> Self {
+        Self { params, catalog_id }
     }
 }
 
@@ -202,24 +211,24 @@ impl DataConnector for GlueDataConnector {
 
         let client = Client::new(&config);
 
-        let get_table_output = client
-            .get_table()
-            .database_name(database)
-            .name(table)
-            .send()
-            .await
-            .map_err(|_| {
-                let e = Error::GetTable {
-                    database: database.to_string(),
-                    table: table.to_string(),
-                };
-                super::DataConnectorError::InvalidConfiguration {
-                    dataconnector: PREFIX.to_string(),
-                    connector_component: dataset.into(),
-                    message: e.to_string(),
-                    source: Box::new(e),
-                }
-            })?;
+        let mut glue_table_builder = client.get_table().database_name(database).name(table);
+
+        if let Some(catalog_id) = &self.catalog_id {
+            glue_table_builder = glue_table_builder.catalog_id(catalog_id);
+        }
+
+        let get_table_output = glue_table_builder.send().await.map_err(|_| {
+            let e = Error::GetTable {
+                database: database.to_string(),
+                table: table.to_string(),
+            };
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            }
+        })?;
 
         let table = get_table_output.table.ok_or_else(|| {
             let e = Error::GetTable {
@@ -389,6 +398,7 @@ async fn create_iceberg_provider(
 
     let config = GlueCatalogConfig::builder()
         .warehouse(metadata_location)
+        .catalog_id_opt(table.catalog_id.clone())
         .props(props)
         .build();
 

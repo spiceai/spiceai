@@ -1,56 +1,87 @@
 name: Generate Spiceschema OpenAPI
 
 on:
-  pull_request:
-    branches:
-      - trunk
+  push:
+    branches: [trunk]
     paths:
       - "tools/spiceschema/**"
       - "crates/**"
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
   generate_openapi:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out PR branch
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
+
+      - name: Check for existing PR
+        id: check_pr
+        run: |
+          existing_pr=$(gh pr list \
+            --base trunk \
+            --json title,headRefName \
+            --jq '.[] | select(.title=="Update openapi.json")')
+
+          if [ ! -z "$existing_pr" ]; then
+            echo "An existing PR for updating openapi.json was found. Skipping updates."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust stable
+        if: steps.check_pr.outputs.skip != 'true'
         run: rustup toolchain install stable --profile minimal
 
       - name: Build Cargo project
+        if: steps.check_pr.outputs.skip != 'true'
         run: cargo build --manifest-path tools/spiceschema/Cargo.toml
 
-      - name: Generate OpenAPI JSON
-        run: |
-          cargo run --manifest-path tools/spiceschema/Cargo.toml -- http --json > .schema/openapi.json
+      - name: Run Cargo project to generate OpenAPI
+        if: steps.check_pr.outputs.skip != 'true'
+        run: cargo run --manifest-path tools/spiceschema/Cargo.toml -- http --json > .schema/openapi.json
 
-      - name: Verify .schema/openapi.json exists
+      - name: Verify OpenAPI file
+        if: steps.check_pr.outputs.skip != 'true'
         run: |
-          if [ ! -f ".schema/openapi.json" ]; then
-            echo "ERROR: .schema/openapi.json was not generated."
+          if [ -f ".schema/openapi.json" ]; then
+            echo ".schema/openapi.json file was successfully created."
+            cat .schema/openapi.json
+          else
+            echo ".schema/openapi.json file was not created."
             exit 1
           fi
 
-      - name: Commit & push updated OpenAPI
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload OpenAPI artifact
+        if: steps.check_pr.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi.json
+          path: .schema/openapi.json
+
+      - name: Create PR if needed
+        if: steps.check_pr.outputs.skip != 'true'
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
-          
-          # see if there are any changes
-          if git diff --quiet .schema/openapi.json; then
-            echo "✅ openapi.json is up to date; nothing to commit."
+
+          git checkout -b openapi/${GITHUB_RUN_ID}
+          if git diff --exit-code -- .schema/openapi.json; then
+            echo "No changes detected"
           else
-            echo "📝 openapi.json changed; committing and pushing back to PR branch."
             git add .schema/openapi.json
-            git commit -m "chore: update openapi.json"
-            git push origin HEAD:${{ github.head_ref }}
+            git commit -m "Update openapi.json"
+            git push origin openapi/${GITHUB_RUN_ID}
+            gh pr create \
+              --title "Update openapi.json" \
+              --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
+              --label 'kind/documentation' \
+              --base trunk \
+              --head openapi/${GITHUB_RUN_ID}
           fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
