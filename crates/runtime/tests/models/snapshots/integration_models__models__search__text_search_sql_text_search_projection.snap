@@ -5,10 +5,24 @@ snapshot_kind: text
 ---
 [
   {
-    "i_item_sk": 19,
-    "i_color": "smoke",
-    "i_item_id": "AAAAAAAADBAAAAAA",
-    "i_item_desc": "Patient",
-    "trunc(text_search().score,Int64(3))": 4.285
+    "i_item_sk": 5,
+    "i_color": "pink",
+    "i_item_id": "AAAAAAAAEAAAAAAA",
+    "i_item_desc": "Passengers want etc in a walls. Important years must benefit clear by a ideas; hot children must avoid. Major, bad pounds rise on the needs. Farms may not see bright lines. Differ",
+    "trunc(text_search().score,Int64(3))": 1.288
+  },
+  {
+    "i_item_sk": 6,
+    "i_color": "moccasin",
+    "i_item_id": "AAAAAAAAEAAAAAAA",
+    "i_item_desc": "Passengers want etc in a walls. Important years must benefit clear by a ideas; hot children must avoid. Major, bad pounds rise on the needs. Farms may not see bright lines. Differ",
+    "trunc(text_search().score,Int64(3))": 1.288
+  },
+  {
+    "i_item_sk": 4,
+    "i_color": "red",
+    "i_item_id": "AAAAAAAAEAAAAAAA",
+    "i_item_desc": "Passengers want etc in a walls. Important years must benefit clear by a ideas; hot children must avoid. Major, bad pounds rise on the needs. Farms may not see bright lines. Differ",
+    "trunc(text_search().score,Int64(3))": 1.288
   }
 ]

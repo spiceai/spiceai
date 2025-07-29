@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "i_color": "pink"
+  },
+  {
+    "i_color": "moccasin"
+  },
+  {
+    "i_color": "red"
+  }
+]

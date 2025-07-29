@@ -387,7 +387,11 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
-        vec![],
+        vec![(
+            "multi_embedding_sql_no_score",
+            format!(
+            "SELECT cp_description FROM vector_search(multi_embedding_models, 'basic', cp_description) LIMIT 4").as_str(),
+        )],
     )
     .await
 }
@@ -561,6 +565,15 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                 }),
             },
             SearchTestCase {
+                name: "multi_column_hybrid_embedding_column_as_additional",
+                body: json!({
+                    "text": "patient",
+                    "limit": 2,
+                    "datasets": ["multi_column_hybrid_search"],
+                    "additional_columns": ["cp_description"],
+                }),
+            },
+            SearchTestCase {
                 name: "multi_column_hybrid_where",
                 body: json!({
                     "text": "general",
@@ -576,7 +589,6 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 
 // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
-#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     let mut ds = get_tpcds_dataset("item", Some("item"), None);
     ds.columns = vec![Column {
@@ -596,7 +608,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "text_search_basic",
                 body: json!({
-                    "text": "Patient",
+                    "text": "Passengers",
                     "limit": 2,
                     "datasets": ["item"],
                     "additional_columns": ["i_color", "i_item_id"],
@@ -605,10 +617,10 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             SearchTestCase {
                 name: "text_search_with_extra_columns_and_where",
                 body: json!({
-                    "text": "Patient",
+                    "text": "Passengers",
                     "datasets": ["item"],
                     "additional_columns": ["i_color", "i_item_id"],
-                    "where": "i_color='smoke'",
+                    "where": "i_color='pink'",
                     "limit": 1,
                 }),
             },
@@ -616,14 +628,18 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
         vec![
             (
                 "text_search_sql_text_search_basic",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Passengers') LIMIT 4"
             ), (
                 "text_search_sql_text_search_projection",
-                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Passengers') LIMIT 4"
             ), (
                 "text_search_sql_text_search_filters",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
-            )
+                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Passengers') where i_color='pink' LIMIT 4"
+            ),
+            (
+                "text_search_sql_text_search_no_score",
+                format!("SELECT i_color FROM text_search(item, 'Passengers') LIMIT 4").as_str(),
+            ),
         ]
     )
     .await
