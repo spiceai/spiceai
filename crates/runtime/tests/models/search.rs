@@ -947,10 +947,12 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
                 "vector_search_explain_basic",
                 "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic') LIMIT 4".to_string().as_str()
             ),
+            // Look for SortExec: TopK(fetch=2)
             (
                 "vector_search_explain_with_udtf_limit_and_global_limit",
                 "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) LIMIT 4".to_string().as_str()
             ),
+            // Look for SortExec: TopK(fetch=3)
             (
                 "vector_search_explain_udtf_limit_only",
                 "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 3)".to_string().as_str()
