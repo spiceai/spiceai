@@ -20,11 +20,15 @@ use super::get_app_and_start_request;
 use crate::{args::VectorSearchTestArgs, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
-    anyhow, git,
+    TestType, anyhow, git,
+    metrics::{MetricCollector, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
-    spicetest::{SpiceTest, vector_search::NotStarted},
+    spicetest::{
+        SpiceTest,
+        vector_search::{NotStarted, SearchRunMetric},
+    },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
@@ -67,24 +71,42 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search");
 
-    // Only QuoraRetrieval dataset is currently supported. no need to use `benchmark_dataset` function to determine what config to use.
+    // Only QuoraRetrieval dataset is currently supported; no need to use `benchmark_dataset` function to determine what config to use.
     let config = mteb_quora::init_search_config(&spiced_instance, Some(10)).await?;
+
+    // retrieve query relevance data
+    let qrels = mteb_quora::get_query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
     let vector_test = SpiceTest::new(
         app.name.clone(),
-        NotStarted::new().with_config(config).with_parallel_count(1),
+        NotStarted::new()
+            .with_config(config)
+            .with_parallel_count(args.common.concurrency),
     )
     .with_spiced_instance(spiced_instance)
     .start()?;
 
     let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);
-    let mut spiced_instance = test.end()?;
-
     let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
     println!("Search requests completed, calculating results...");
+
+    let p95 = test.get_p95_response_time_metric()?;
+    let rps = test.get_rps_metric()?;
+    let score = test.calculate_search_score_metric(&qrels, |results| {
+        mteb_quora::transform_search_results_for_eval(results)
+    })?;
+
+    let metrics: QueryMetrics<_, _> = test
+        .collect(TestType::VectorSearch)?
+        .with_run_metric(SearchRunMetric::new(rps, p95, score));
+
+    let mut spiced_instance = test.end()?;
+    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+
+    metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
 
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
 
@@ -97,35 +119,31 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("spiced_commit_sha", spiced_commit_sha),
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
-    ]);
-
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
-
-    let attributes = vec![
         KeyValue::new("config_name", app.name), // use app name as search configuration
         KeyValue::new(
             "benchmark_dataset",
             args.benchmark_dataset.clone().unwrap_or_default(),
         ),
-    ];
+    ]);
 
-    crate::metrics::TEST_DURATION.record(
-        u64::try_from((finished_at - started_at).as_millis())?,
-        &attributes,
-    );
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    crate::metrics::TEST_DURATION
+        .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
     crate::metrics::VECTOR_INDEX_CREATION_DURATION.record(
         u64::try_from((index_finished_at - started_at).as_millis())?,
-        &attributes,
+        &[],
     );
     crate::metrics::SEARCH_DURATION.record(
         u64::try_from((finished_at - search_started_at).as_millis())?,
-        &attributes,
+        &[],
     );
 
-    // TODO: Calculation to be added next: https://github.com/spiceai/spiceai/issues/6143
-    crate::metrics::SEARCH_RPS.record(0.0, &attributes);
-    crate::metrics::SEARCH_P95_RESPONSE_TIME.record(0.0, &attributes);
-    crate::metrics::SCORE.record(0.0, &attributes);
+    crate::metrics::SEARCH_RPS.record(rps, &[]);
+    crate::metrics::SEARCH_P95_RESPONSE_TIME.record(p95, &[]);
+    crate::metrics::SCORE.record(score, &[]);
+    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
     telemetry.emit().await?;
 

@@ -23,7 +23,7 @@ datasets:
       enabled: true
 
   - from: file:./data.parquet
-    name: test_data
+    name: relevance_data
     acceleration:
       enabled: true
 
