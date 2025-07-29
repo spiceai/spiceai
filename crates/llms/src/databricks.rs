@@ -52,6 +52,7 @@ impl Databricks {
     /// Changes to `req` to accomodate Databricks not being `OpenAI` compatible.
     fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
         req.model.clone_from(&self.model);
+        req.stream_options = None; // Not supported by Databricks.
         // Databricks should set Option::None parameters to a schema with no inputs, but doesn't.
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
