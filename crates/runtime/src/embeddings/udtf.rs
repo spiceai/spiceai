@@ -469,15 +469,13 @@ impl TableProvider for VectorSearchUDTFProvider {
             fetch: self.args.limit,
         });
 
-        /* TODO: for a query such as
-           `select count(*) from vector_search(realtime_reviews, 'disappoint', 10) limit 5;`
-            the resultant physical plan should have a GlobalLimitExec for the query limit,
-            but it gets lost??
-        */
+        // TODO: GlobalLimitExec may be missing for `select from vector_search(..) limit n`
+        // https://github.com/spiceai/spiceai/issues/6639
         let limit = LogicalPlan::Limit(Limit {
             skip: None,
             fetch: limit
-                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(u64::try_from(l).ok())))),
+                .and_then(|l| u64::try_from(l).ok())
+                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(Some(l))))),
             input: Arc::new(sort),
         });
 
