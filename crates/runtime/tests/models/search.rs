@@ -477,10 +477,10 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
             ), (
                 "hybrid_column_sql_vector_search_filters",
                 format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
-            )
+            ),
         ],
     )
-    .await
+        .await
 }
 
 #[tokio::test]
@@ -920,4 +920,41 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+#[tokio::test]
+async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
+    let ds = catalog_page_tpch_dataset_w_embeddings(
+        "basic_embedding_search",
+        "hf_minilm",
+        Some(vec!["cp_catalog_page_sk".to_string()]),
+        None,
+    );
+
+    let app = AppBuilder::new("search_app")
+        .with_dataset(ds)
+        .with_embedding(get_huggingface_embeddings(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "hf_minilm",
+        ))
+        .build();
+
+    run_search(
+        app,
+        vec![],
+        vec![
+            (
+                "vector_search_explain_basic",
+                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic') LIMIT 4".to_string().as_str()
+            ),
+            (
+                "vector_search_explain_with_udtf_limit_and_global_limit",
+                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) LIMIT 4".to_string().as_str()
+            ),
+            (
+                "vector_search_explain_udtf_limit_only",
+                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 3)".to_string().as_str()
+            ),
+        ],
+    ).await
 }
