@@ -331,7 +331,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
             }
         }
         DataFusionError::NotImplemented(message) => {
-            Status::invalid_argument(format!("Feature not implemented: {message}"))
+            Status::invalid_argument(format!("Unsupported Query. {message}"))
         }
         DataFusionError::Internal(_)
         | DataFusionError::ArrowError(..)
