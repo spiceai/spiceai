@@ -469,8 +469,6 @@ impl TableProvider for VectorSearchUDTFProvider {
             fetch: self.args.limit,
         });
 
-        // TODO: GlobalLimitExec may be missing for `select from vector_search(..) limit n`
-        // https://github.com/spiceai/spiceai/issues/6639
         let limit = LogicalPlan::Limit(Limit {
             skip: None,
             fetch: limit
