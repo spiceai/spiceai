@@ -17,11 +17,23 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
+use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
+use crate::dataconnector::DataConnectorResult;
+use crate::embeddings::execution_plan::compute_additional_embedding_columns;
+use crate::embeddings::execution_plan::construct_record_batch;
+use crate::federated_table::FederatedTable;
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
+use data_components::cdc::ChangeEnvelope;
+use data_components::cdc::ChangesStream;
+use data_components::cdc::StreamError;
+#[cfg(feature = "debezium")]
+use data_components::debezium::arrow::changes::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
+use futures::StreamExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -31,10 +43,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorResult;
-use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use super::table::EmbeddingTable;
 
@@ -237,6 +245,47 @@ impl EmbeddingConnector {
             }),
         }
     }
+
+    #[cfg(feature = "debezium")]
+    async fn embed_change_envelope(
+        maybe_envelope: Result<ChangeEnvelope, StreamError>,
+        embedding_table: Arc<EmbeddingTable>,
+    ) -> Result<ChangeEnvelope, StreamError> {
+        let envelope = maybe_envelope.map_err(|e| {
+            tracing::debug!("Error in underlying base stream: {e:?}");
+            e
+        })?;
+
+        let (change_committer, batch) = envelope.into_parts();
+        let data_batch = batch.data_batch();
+
+        let embeddings = compute_additional_embedding_columns(
+            &data_batch,
+            &embedding_table.embedded_columns,
+            Arc::clone(&embedding_table.embedding_models),
+        )
+        .await
+        .map_err(|e| {
+            tracing::debug!("Error when getting embedding columns: {e:?}");
+            StreamError::Arrow(e.to_string())
+        })?;
+
+        for (column_name, embeddings) in &embeddings {
+            tracing::trace!(
+                "Embedding column computed: {column_name}, embeddings: {:?}",
+                embeddings.len()
+            );
+        }
+
+        let embedded_batch =
+            construct_record_batch(&data_batch, &embedding_table.schema(), &embeddings)
+                .map_err(|e| StreamError::Arrow(e.to_string()))?;
+
+        let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
+            .map_err(|e| StreamError::Arrow(e.to_string()))?;
+
+        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+    }
 }
 
 #[async_trait]
@@ -287,5 +336,35 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let embedding_table = Arc::new(
+            table_provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()?
+                .clone(),
+        );
+        let underlying_table = Arc::clone(&embedding_table.base_table);
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+        #[cfg(feature = "debezium")]
+        let stream = self
+            .inner_connector
+            .changes_stream(underlying_federated_table)?
+            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
+            .boxed();
+
+        #[cfg(not(feature = "debezium"))]
+        let stream = self
+            .inner_connector
+            .changes_stream(underlying_federated_table)?;
+
+        Some(stream)
     }
 }

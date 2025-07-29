@@ -239,18 +239,18 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with accelerated datasets.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector requires an accelerated dataset.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
         let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("we just checked above that the dataset is accelerated");
+            unreachable!("Dataset acceleration already verified. This should never be None here.");
         };
         ensure!(
             acceleration.engine != Engine::Arrow,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with non-Arrow acceleration engines.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector does not support the Arrow acceleration engine. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -258,7 +258,7 @@ impl DataConnector for Debezium {
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -267,7 +267,7 @@ impl DataConnector for Debezium {
 
         if !dataset.is_file_accelerated() {
             tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated. This is not recommended as it requires replaying all changes from the beginning on restarts.",
+                "Dataset {dataset_name} is not file accelerated, which forces full change replay on restarts. It is recommended only to use file acceleration with the Debezium connector. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
             );
         }
 
