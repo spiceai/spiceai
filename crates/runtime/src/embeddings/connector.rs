@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
+#[cfg(feature = "debezium")]
 use data_components::debezium::arrow::changes::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
@@ -245,6 +246,7 @@ impl EmbeddingConnector {
         }
     }
 
+    #[cfg(feature = "debezium")]
     async fn embed_change_envelope(
         maybe_envelope: Result<ChangeEnvelope, StreamError>,
         embedding_table: Arc<EmbeddingTable>,
@@ -351,11 +353,17 @@ impl DataConnector for EmbeddingConnector {
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
 
+        #[cfg(feature = "debezium")]
         let stream = self
             .inner_connector
             .changes_stream(underlying_federated_table)?
             .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
             .boxed();
+
+        #[cfg(not(feature = "debezium"))]
+        let stream = self
+            .inner_connector
+            .changes_stream(underlying_federated_table)?;
 
         Some(stream)
     }
