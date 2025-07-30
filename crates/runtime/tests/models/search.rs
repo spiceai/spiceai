@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::DEFAULT_TRACING_MODELS;
+use crate::models::hf::get_huggingface_embeddings;
+use crate::models::openai::get_openai_embeddings;
+use crate::models::{create_api_bindings_config, http_post};
+use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
+use crate::{init_tracing, utils::init_tracing_with_task_history};
 use app::{App, AppBuilder};
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
@@ -31,13 +37,6 @@ use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfi
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-
-use crate::DEFAULT_TRACING_MODELS;
-use crate::models::hf::get_huggingface_embeddings;
-use crate::models::openai::get_openai_embeddings;
-use crate::models::{create_api_bindings_config, http_post};
-use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
-use crate::{init_tracing, utils::init_tracing_with_task_history};
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
@@ -939,24 +938,36 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
         ))
         .build();
 
-    run_search(
-        app,
-        vec![],
-        vec![
-            (
-                "vector_search_explain_basic",
-                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic') LIMIT 4".to_string().as_str()
-            ),
-            // Look for SortExec: TopK(fetch=2)
-            (
-                "vector_search_explain_with_udtf_limit_and_global_limit",
-                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) LIMIT 4".to_string().as_str()
-            ),
-            // Look for SortExec: TopK(fetch=3)
-            (
-                "vector_search_explain_udtf_limit_only",
-                "EXPLAIN SELECT cp_catalog_page_sk, trunc(score, 3) FROM vector_search(spice.public.basic_embedding_search, 'basic', 3)".to_string().as_str()
-            ),
-        ],
-    ).await
+    let queries = vec![
+        (
+            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic') order by score desc LIMIT 4".to_string(),
+            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4"]
+        ),
+        (
+            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) order by score desc LIMIT 4".to_string(),
+            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4", "SortExec: TopK(fetch=2)"]
+        ),
+        (
+            "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 3) order by score desc".to_string(),
+            vec!["SortExec: TopK(fetch=3)"]
+        )
+    ];
+
+    let api_config = start_app(app).await?;
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+    for (query, must_contain) in queries {
+        let result = http_sql(http_base_url.as_str(), &query).await?;
+        let result_str = result
+            .as_array()
+            .and_then(|o| o.last())
+            .and_then(|v| v.as_object())
+            .and_then(|v| v.get("plan"))
+            .and_then(|v| v.as_str())
+            .expect("Must read physical plan");
+
+        assert!(must_contain.iter().all(|p| result_str.contains(p)));
+    }
+
+    Ok(())
 }
