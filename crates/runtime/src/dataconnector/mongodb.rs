@@ -24,8 +24,10 @@ use datafusion_table_providers::mongodb::{
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
+use std::convert::Into;
 use std::future::Future;
 use std::pin::Pin;
+use std::string::ToString;
 use std::sync::Arc;
 
 use super::{
@@ -66,6 +68,9 @@ impl MongoDBFactory {
     }
 }
 
+const DEFAULT_MIN_POOL_SIZE: usize = 0;
+const DEFAULT_MAX_POOL_SIZE: usize = 10;
+
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string").secret(),
     ParameterSpec::component("user").secret(),
@@ -79,10 +84,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("direct_connection"),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
-        .default("0"),
+        .default(&DEFAULT_MIN_POOL_SIZE.to_string().into()),
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections to allow in the pool.")
-        .default("10"),
+        .default(DEFAULT_MAX_POOL_SIZE.to_string().into()),
 ];
 
 impl DataConnectorFactory for MongoDBFactory {
@@ -109,7 +114,7 @@ impl DataConnectorFactory for MongoDBFactory {
                     }
                     parsed_pool_min.ok()
                 })
-                .unwrap_or(10);
+                .unwrap_or(DEFAULT_MIN_POOL_SIZE);
             let mut pool_max = params
                 .parameters
                 .get("pool_max")
@@ -124,14 +129,14 @@ impl DataConnectorFactory for MongoDBFactory {
                     }
                     parsed_pool_max.ok()
                 })
-                .unwrap_or(100);
+                .unwrap_or(DEFAULT_MAX_POOL_SIZE);
 
             if pool_min > pool_max {
                 tracing::warn!(
                     "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of 10 and 100"
                 );
-                pool_min = 10;
-                pool_max = 100;
+                pool_min = DEFAULT_MIN_POOL_SIZE;
+                pool_max = DEFAULT_MAX_POOL_SIZE;
 
                 params
                     .parameters
