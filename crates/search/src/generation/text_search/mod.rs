@@ -47,8 +47,13 @@ use super::{
 pub static DEFAULT_BATCH_SIZE: usize = 100;
 
 pub mod exec;
+pub mod index;
+pub mod query;
+pub mod udtf;
+mod util;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("Error occurred during text search: {source}"))]
     TextSearchError { source: TantivyError },
@@ -81,6 +86,46 @@ pub enum Error {
 
     #[snafu(display("Full text search does not support retrieving additional columns."))]
     UnsupportedAdditionalColumnsError,
+
+    #[snafu(display("Failed to create a full text search index: {source}.",))]
+    IndexCreationError { source: TantivyError },
+
+    #[snafu(display("Failed to insert or update data into a full text search index: {source}.",))]
+    IndexInsertionError { source: TantivyError },
+
+    #[snafu(display(
+        "Failed to create the full text search index. Context: {context}. Error: {source}.",
+    ))]
+    InvalidIndexingError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        context: String,
+    },
+
+    #[snafu(display("Failed to retrieve the data from the full text search index: {source}.",))]
+    FailedToRetrieveDataFromIndex { source: TantivyError },
+
+    #[snafu(display("Failed to retrieve the data from the underlying table: {source}.",))]
+    FailedToRetrieveDataFromSource { source: DataFusionError },
+
+    #[snafu(display("Failed to insert data into the full text search index: {source}.",))]
+    FailedToInsertDataIntoIndex { source: TantivyError },
+
+    #[snafu(display("Full text search requires a primary key, and the table did not have one.",))]
+    NoPrimaryKey,
+
+    #[snafu(display(
+        "Primary key column '{column}' used in search index has unsupported data type: '{data_type}'",
+    ))]
+    PrimaryKeyInvalidType {
+        column: String,
+        data_type: arrow::datatypes::DataType,
+    },
+
+    #[snafu(display("Primary key column '{column}' used in search index is not allowed.",))]
+    PrimaryKeyInvalidName { column: String },
+
+    #[snafu(display("Primary key column '{column}' not found in table.",))]
+    PrimaryKeyNotFound { column: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -114,12 +159,12 @@ pub struct FullTextSearchFieldIndex {
     reader: tantivy::Searcher,
     tokenizer_manager: tantivy::tokenizer::TokenizerManager,
 
-    field: String,
-    primary_key: Vec<String>,
+    pub field: String,
+    pub primary_key: Vec<String>,
 
     /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
     /// This allows for the reuse of a generic `Index` in search.
-    additional_columns: Option<Vec<String>>,
+    pub additional_columns: Option<Vec<String>>,
 
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
@@ -176,6 +221,26 @@ impl FullTextSearchFieldIndex {
         }
 
         Ok(fts)
+    }
+
+    ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
+    fn schema(&self) -> Arc<Schema> {
+        let fields = self
+            .all_columns()
+            .iter()
+            .filter_map(|field_name| {
+                let (data_type, nullable) = if let Some(f) = self.get_type_hint(field_name) {
+                    (f.data_type().clone(), f.is_nullable())
+                } else {
+                    let f = self.search_schema.get_field(field_name).ok()?;
+                    let entry = self.search_schema.get_field_entry(f);
+                    (tantivy_to_arrow_type(entry.field_type())?, false)
+                };
+                Some(Field::new(field_name, data_type, nullable))
+            })
+            .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
     }
 
     /// Add type hints for all fields in [`SchemaRef`].

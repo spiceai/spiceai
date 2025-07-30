@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 
@@ -103,13 +103,21 @@ impl SearchConfig {
         self.requests.push(request);
         self
     }
+
+    #[must_use]
+    pub fn add_requests(mut self, requests: impl IntoIterator<Item = SearchRequest>) -> Self {
+        self.requests.extend(requests);
+        self
+    }
 }
 
 pub(crate) struct VectorSearchWorkerResult {
     pub(crate) search_results: BTreeMap<String, SearchResult>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct SearchResult {
+    pub(crate) response: SearchResponse,
     pub(crate) score: f64,
     pub(crate) duration: Duration,
 }
@@ -120,13 +128,23 @@ pub(crate) struct VectorSearchWorker {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct Match {
-    score: f64,
+#[allow(dead_code)]
+pub(crate) struct SearchResponse {
+    results: Vec<SearchResponseResult>,
+    duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct SearchResponse {
-    matches: Vec<Match>,
+#[allow(dead_code)]
+pub(crate) struct SearchResponseResult {
+    // `matches` is left as a generic JSON value (`serde_json::Value`) instead of a strongly typed struct.
+    // The search API can return different sets of fields here depending on dataset or configuration
+    matches: serde_json::Value,
+    score: f64,
+    dataset: String,
+    /// Primary key can be different types depending on the dataset. Default to empty map, if not present.
+    #[serde(default)]
+    primary_key: HashMap<String, serde_json::Value>,
 }
 
 impl VectorSearchWorker {
@@ -148,17 +166,19 @@ impl VectorSearchWorker {
                     .json(&request)
                     .send()
                     .await?;
-                let res: SearchResponse = res.json().await?;
+
+                let response: SearchResponse = res.json().await?;
                 let duration = start.elapsed();
                 results.insert(
                     request.id,
                     SearchResult {
-                        score: res
-                            .matches
+                        score: response
+                            .results
                             .iter()
                             .map(|m| m.score)
                             .max_by(f64::total_cmp)
                             .unwrap_or(0.0),
+                        response,
                         duration,
                     },
                 );

@@ -15,20 +15,23 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
-
 use async_openai::{
     Client,
     error::OpenAIError,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
-        CreateChatCompletionRequest, CreateChatCompletionResponse, CreateEmbeddingRequest,
-        CreateEmbeddingResponse, EmbeddingInput,
+        CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, CreateEmbeddingRequest,
+        CreateEmbeddingResponse, EmbeddingInput, PromptTokensDetails, ServiceTierResponse,
     },
 };
 use async_trait::async_trait;
+use futures::TryStreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use snafu::ResultExt;
+use std::sync::Arc;
 use token_provider::TokenProvider;
 use tracing::Instrument;
 
@@ -44,6 +47,50 @@ pub struct Databricks {
     pub model: String,
     client: Client<HostedModelConfig>,
     health_check: HealthCheck,
+}
+impl Databricks {
+    /// Changes to `req` to accomodate Databricks not being `OpenAI` compatible.
+    fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+        req.model.clone_from(&self.model);
+        // Databricks should set Option::None parameters to a schema with no inputs, but doesn't.
+        // Must be done explicitly.
+        if let Some(ref mut tools) = req.tools {
+            for t in tools.iter_mut() {
+                if t.function.parameters.is_none() {
+                    t.function.parameters.replace(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ));
+                }
+
+                // For tools that want to have Uint as inputs, they will set `minimum=0`.
+                // This is valid JSON schema, but not supported in Databricks.
+                if let Some(Some(serde_json::Value::Object(properties))) = t
+                    .function
+                    .parameters
+                    .as_mut()
+                    .map(|v| v.get_mut("properties"))
+                {
+                    for (_field, value) in properties.iter_mut() {
+                        if let Some(Value::String(value_type)) = value.get("type") {
+                            if value_type != "integer" {
+                                continue;
+                            }
+                            if let Some(value_map) = value.as_object_mut() {
+                                value_map.remove("minimum");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        req
+    }
 }
 
 #[must_use]
@@ -94,6 +141,68 @@ pub fn from_token_provider(
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Serialize)]
+pub struct DatabricksCreateChatCompletionStreamResponse {
+    /// The same as [`CreateChatCompletionStreamResponse`]
+    pub id: String,
+    pub choices: Vec<ChatChoiceStream>,
+    pub created: u32,
+    pub model: String,
+    pub service_tier: Option<ServiceTierResponse>,
+    pub system_fingerprint: Option<String>,
+    pub object: String,
+
+    /// Usage is different in Databricks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<DatabricksCompletionUsage>,
+}
+
+impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletionStreamResponse {
+    fn from(val: DatabricksCreateChatCompletionStreamResponse) -> Self {
+        let DatabricksCreateChatCompletionStreamResponse {
+            id,
+            choices,
+            created,
+            model,
+            service_tier,
+            system_fingerprint,
+            object,
+            usage,
+        } = val;
+        CreateChatCompletionStreamResponse {
+            id,
+            choices,
+            created,
+            model,
+            service_tier,
+            system_fingerprint,
+            object,
+            usage: usage.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct DatabricksCompletionUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl From<DatabricksCompletionUsage> for CompletionUsage {
+    fn from(val: DatabricksCompletionUsage) -> Self {
+        CompletionUsage {
+            prompt_tokens: val.prompt_tokens.unwrap_or_default(),
+            completion_tokens: val.completion_tokens.unwrap_or_default(),
+            total_tokens: val.total_tokens.unwrap_or_default(),
+            prompt_tokens_details: val.prompt_tokens_details,
+            completion_tokens_details: val.completion_tokens_details,
+        }
+    }
+}
+
 #[async_trait]
 impl Chat for Databricks {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -141,16 +250,22 @@ impl Chat for Databricks {
         inner_req.stream_options = None; // Not supported by Databricks.
 
         // Must use `post_stream` instead of `chat().create(...` to avoid concatenation of `chat/completions`.
-        Ok(Box::pin(self.client.post_stream("", inner_req).await))
+        Ok(Box::pin(
+            self.client
+                .post_stream::<_, DatabricksCreateChatCompletionStreamResponse, _>(
+                    "",
+                    self.alter_request(req),
+                )
+                .await
+                .map_ok(Into::into),
+        ))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
-        self.client.post("", inner_req).await
+        self.client.post("", self.alter_request(req)).await
     }
 }
 
