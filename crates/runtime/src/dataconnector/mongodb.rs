@@ -69,7 +69,9 @@ impl MongoDBFactory {
 }
 
 const DEFAULT_MIN_POOL_SIZE: usize = 0;
+const DEFAULT_MIN_POOL_SIZE_STR: &str = "0";
 const DEFAULT_MAX_POOL_SIZE: usize = 10;
+const DEFAULT_MAX_POOL_SIZE_STR: &str = "10";
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string").secret(),
@@ -84,10 +86,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("direct_connection"),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
-        .default(&DEFAULT_MIN_POOL_SIZE.to_string()),
+        .default(DEFAULT_MIN_POOL_SIZE_STR),
     ParameterSpec::component("pool_max")
         .description("The maximum number of connections to allow in the pool.")
-        .default(&DEFAULT_MAX_POOL_SIZE.to_string()),
+        .default(DEFAULT_MAX_POOL_SIZE_STR),
 ];
 
 impl DataConnectorFactory for MongoDBFactory {
