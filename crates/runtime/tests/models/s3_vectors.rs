@@ -310,6 +310,7 @@ pub fn get_package_delivery_dataset(
             model: embedding_model.to_string(),
             chunking: None,
             row_ids: Some(vec!["event.id".to_string()]),
+            vector_size: None,
         }]),
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),

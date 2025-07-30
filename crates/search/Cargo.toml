@@ -12,15 +12,17 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-json.workspace = true
+arrow-schema.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 serde_json.workspace = true
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
+tokio.workspace = true
 tracing.workspace = true
-
 [features]
 default = ["text_search"]
 text_search = ["dep:tantivy"]
