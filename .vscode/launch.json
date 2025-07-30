@@ -47,7 +47,7 @@
         "--concurrency",
         "10",
         "-p",
-        "./test/spicepods/vector_search/mteb/quora_openai-text-embedding-3-small_arrow.yaml",
+        "./test/spicepods/vector_search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
         "--benchmark-dataset",
         "quora_retrieval"
     ],
