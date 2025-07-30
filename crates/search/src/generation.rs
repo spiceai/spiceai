@@ -20,6 +20,8 @@ pub mod post_apply;
 #[cfg(feature = "text_search")]
 pub mod text_search;
 
+pub mod util;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Error occured during search: {source}"))]

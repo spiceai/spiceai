@@ -233,4 +233,7 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunking: Option<EmbeddingChunkConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_size: Option<usize>,
 }

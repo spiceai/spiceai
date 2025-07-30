@@ -12091,11 +12091,13 @@ version = "1.6.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
+ "arrow-schema",
  "async-stream",
  "async-trait",
  "datafusion",
  "futures",
  "insta",
+ "runtime-datafusion-index",
  "serde_json",
  "snafu",
  "tantivy",
@@ -13695,6 +13697,7 @@ version = "1.6.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
+ "hf-hub",
  "reqwest",
  "serde",
  "serde_json",

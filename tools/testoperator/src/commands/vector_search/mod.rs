@@ -14,77 +14,63 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod mteb_quora;
+
 use super::get_app_and_start_request;
-use crate::{args::CommonArgs, wait_test_and_memory};
-use std::time::Duration;
+use crate::{args::VectorSearchTestArgs, wait_test_and_memory};
+use std::time::{Duration, SystemTime};
 use test_framework::{
-    TestType, anyhow,
-    arrow::util::pretty::print_batches,
-    metrics::MetricCollector,
+    anyhow, git,
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
-    spicetest::{
-        SpiceTest,
-        vector_search::{NotStarted, SearchConfig, SearchRequest},
-    },
+    spicetest::{SpiceTest, vector_search::NotStarted},
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
+use tokio::time::sleep;
 
-pub(crate) async fn run(args: &CommonArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(args).await?;
+pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+
+    match args.benchmark_dataset.as_deref() {
+        Some("quora_retrieval") => {
+            mteb_quora::prepare_dataset(&start_request.get_tempdir_path()).await?;
+        }
+        Some(ds) => {
+            return Err(anyhow::anyhow!("Unsupported benchmark-dataset: {ds}"));
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "Benchmark dataset is required, please specify --benchmark-dataset"
+            ));
+        }
+    }
+
+    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
+    println!("Starting benchmark Spicepod...");
+
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    // baseline run
-    println!("Running benchmark test");
+    let index_finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
-    // TODO: build search config for vector search elsewhere
-    let config = SearchConfig::new()
-        .add_request(
-            SearchRequest::new("file_connector_recipe_no_keywords", "file connector recipe")
-                .with_additional_columns(vec!["path"]),
-        )
-        .add_request(
-            SearchRequest::new(
-                "file_connector_recipe_separate_keywords",
-                "file connector recipe",
-            )
-            .with_keywords(vec!["file", "connector"])
-            .with_additional_columns(vec!["path"]),
-        )
-        .add_request(
-            SearchRequest::new(
-                "file_connector_recipe_combined_keyword",
-                "file connector recipe",
-            )
-            .with_keywords(vec!["file connector"])
-            .with_additional_columns(vec!["path"]),
-        )
-        .add_request(
-            SearchRequest::new("file_data_connector_no_keywords", "file data connector")
-                .with_additional_columns(vec!["path"]),
-        )
-        .add_request(
-            SearchRequest::new(
-                "file_data_connector_separate_keywords",
-                "file data connector",
-            )
-            .with_keywords(vec!["file", "connector"])
-            .with_additional_columns(vec!["path"]),
-        )
-        .add_request(
-            SearchRequest::new(
-                "file_data_connector_combined_keyword",
-                "file data connector",
-            )
-            .with_keywords(vec!["file connector"])
-            .with_additional_columns(vec!["path"]),
-        );
+    // Allow Spicepod traces to be fully printed before running the test
+    sleep(Duration::from_millis(200)).await;
+
+    println!("Running search");
+
+    // Only QuoraRetrieval dataset is currently supported. no need to use `benchmark_dataset` function to determine what config to use.
+    let config = mteb_quora::init_search_config(&spiced_instance, Some(10)).await?;
+
+    let search_started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
 
     let vector_test = SpiceTest::new(
         app.name.clone(),
@@ -94,13 +80,58 @@ pub(crate) async fn run(args: &CommonArgs) -> anyhow::Result<()> {
     .start()?;
 
     let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);
-    let metrics = test.collect(TestType::VectorSearch)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
-    print_batches(&records)?;
+    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+
+    println!("Search requests completed, calculating results...");
+
+    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
+
+    // Record benchmark results
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "vector_search"),
+        KeyValue::new("name", app.name.clone()),
+        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+        KeyValue::new("branch_name", git::get_branch_name()),
+    ]);
+
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    let attributes = vec![
+        KeyValue::new("config_name", app.name), // use app name as search configuration
+        KeyValue::new(
+            "benchmark_dataset",
+            args.benchmark_dataset.clone().unwrap_or_default(),
+        ),
+    ];
+
+    crate::metrics::TEST_DURATION.record(
+        u64::try_from((finished_at - started_at).as_millis())?,
+        &attributes,
+    );
+    crate::metrics::VECTOR_INDEX_CREATION_DURATION.record(
+        u64::try_from((index_finished_at - started_at).as_millis())?,
+        &attributes,
+    );
+    crate::metrics::SEARCH_DURATION.record(
+        u64::try_from((finished_at - search_started_at).as_millis())?,
+        &attributes,
+    );
+
+    // TODO: Calculation to be added next: https://github.com/spiceai/spiceai/issues/6143
+    crate::metrics::SEARCH_RPS.record(0.0, &attributes);
+    crate::metrics::SEARCH_P95_RESPONSE_TIME.record(0.0, &attributes);
+    crate::metrics::SCORE.record(0.0, &attributes);
+
+    telemetry.emit().await?;
 
     spiced_instance.stop()?;
+
+    println!("Benchmark completed successfully!");
+
     Ok(())
 }
