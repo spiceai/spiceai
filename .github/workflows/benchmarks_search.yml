@@ -67,7 +67,9 @@ jobs:
       - setup-matrix
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Limit to a single running instance to prevent embedding creation throttling when multiple configurations use the same model provider
+      # https://github.com/spiceai/spiceai/issues/6653
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
