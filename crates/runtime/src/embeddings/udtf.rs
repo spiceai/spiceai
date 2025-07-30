@@ -30,7 +30,6 @@ limitations under the License.
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
-use datafusion::logical_expr::Limit;
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -481,14 +480,6 @@ impl TableProvider for VectorSearchUDTFProvider {
             fetch: self.limit_to_use(limit),
         });
 
-        let limit = LogicalPlan::Limit(Limit {
-            skip: None,
-            fetch: limit
-                .and_then(|l| u64::try_from(l).ok())
-                .map(|l| Box::new(Expr::Literal(ScalarValue::UInt64(Some(l))))),
-            input: Arc::new(sort),
-        });
-
-        state.create_physical_plan(&limit).await
+        state.create_physical_plan(&sort).await
     }
 }
