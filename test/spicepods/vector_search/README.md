@@ -25,3 +25,4 @@ Examples of full spicepod names:
 * `openai[text-embedding-3-small[chunking]]-duckdb[file]` - an OpenAI `text-embedding-3-small` embedding model with chunking enabled, using DuckDB file-mode acceleration.
 * `openai[text-embedding-3-small]-s3_vectors` - an OpenAI `text-embedding-3-small` embedding model with AWS S3-based vector storage.
 * `huggingface[all-minilm-l6-v2]-arrow-hybrid_limit_2000` - a HuggingFace `all-MiniLM-L6-v2` embedding model with Arrow acceleration and hybrid search (vector + full-text search) enabled, with a test corpus data limit of 2000 records.
+* `openai[text-embedding-3-small]-federated[postgres]` - an OpenAI `text-embedding-3-small` embedding model using precomputed embeddings stored in the source PostgreSQL dataset, performing direct search against the source without additional acceleration.
