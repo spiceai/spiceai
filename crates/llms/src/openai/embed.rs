@@ -16,6 +16,8 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
 use bytes::Bytes;
+use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
+use util::{retry, RetryError};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -41,6 +43,10 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
+fn default_retry_strategy() -> FibonacciBackoff {
+    FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
+}
+
 /// Embedding implementation for `OpenAI` compatible embedding models.
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
@@ -48,6 +54,8 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 pub struct OpenaiEmbed<C: Config> {
     pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
+    // Retry strategy for transient or throttling errors
+    retry_strategy: FibonacciBackoff,
 }
 
 impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
@@ -64,6 +72,7 @@ impl<C: Config> OpenaiEmbed<C> {
         Self {
             inner,
             chunk_sizer: None,
+            retry_strategy: default_retry_strategy(),
         }
     }
 
@@ -113,22 +122,28 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
             })
             .collect();
 
+        let client_ref = Arc::new(self.inner.client.clone());
+
         let embed_futures: Vec<_> = request_batches_result?
             .into_iter()
             .map(|req| {
-                let local_client = self.inner.client.clone();
+                let retry_strategy = self.retry_strategy.clone();
+                let client = Arc::clone(&client_ref);
                 async move {
-                    let embedding: Vec<Vec<f32>> = local_client
-                        .embeddings()
-                        .create_float(req)
-                        .await
-                        .boxed()
-                        .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
-                        .data
-                        .into_iter()
-                        .map(|d| d.embedding.into())
-                        .collect();
-                    Ok::<Vec<Vec<f32>>, EmbedError>(embedding)
+                    retry(retry_strategy, async || {
+                        client.embeddings().create_float(req.clone()).await
+                            .map(|resp| {
+                                resp.data.into_iter().map(|d| d.embedding.into()).collect::<Vec<_>>()
+                            })
+                            .map_err(|err| {
+                                if is_retriable_error(&err) {
+                                    return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
+                                } else {
+                                    return RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() });
+                                }
+                            })
+                    })
+                    .await
                 }
             })
             .collect();
@@ -163,6 +178,16 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
             )),
         }
     }
+}
+
+fn is_retriable_error(err: &OpenAIError) -> bool {
+
+    println!("Checking if error is retriable: {:?}", err);
+
+    matches!(
+        err,
+        OpenAIError::ApiError(_)
+    )
 }
 
 // `OpenAPI` estimator counts utf-8 bytes as 0.25 tokens so allowed string size is 1,200,000 bytes.
