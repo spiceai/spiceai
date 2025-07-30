@@ -164,9 +164,7 @@ pub(crate) async fn get_query_relevance_data(
     )
     .await?;
 
-    let qrels = extract_query_relevance_from_batches(&records)?;
-
-    Ok(qrels)
+    extract_query_relevance_from_batches(&records)
 }
 
 fn extract_query_relevance_from_batches(

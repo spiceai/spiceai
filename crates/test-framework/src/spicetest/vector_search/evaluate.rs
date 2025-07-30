@@ -16,16 +16,29 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-/// Evaluate the search results using NDCG@10 metric.
-/// Reference: `https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500`
+/// Calculates the average Normalized Discounted Cumulative Gain (NDCG@k) across all search queries.
+///
+/// NDCG@k measures the quality of ranking by considering both relevance and position,
+/// with higher-ranked relevant documents contributing more to the score. This implementation
+/// follows the MTEB (Massive Text Embedding Benchmark) methodology.
+///
+/// # Arguments
+/// * `qrels` - Query relevance judgments mapping `query_id` -> (`doc_id` -> `relevance_score`)
+/// * `results` - Search results mapping `query_id` -> (`doc_id` -> `similarity_score`)
+/// * `k` - Number of top results to consider for NDCG calculation
+///
+/// # Returns
+/// Average NDCG@k score across all queries (0.0 to 1.0, where 1.0 is perfect ranking)
+///
+/// # Reference
+/// MTEB `RetrievalEvaluator`: <https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500>
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
-pub(crate) fn evaluate_search_results<S: ::std::hash::BuildHasher>(
+pub(crate) fn calculate_ndcg<S: ::std::hash::BuildHasher>(
     qrels: &HashMap<String, HashMap<String, i32, S>, S>,
     results: &HashMap<String, HashMap<String, f64, S>, S>,
+    k: usize,
 ) -> f64 {
-    // Similar to MTEB report NDCG@10 as the main metric
-    const K: usize = 10;
     let mut ndcg_at_k_values = Vec::new();
 
     for (query_id, relevance) in qrels {
@@ -34,7 +47,7 @@ pub(crate) fn evaluate_search_results<S: ::std::hash::BuildHasher>(
                 .iter()
                 .map(|(doc_id, _score)| f64::from(*relevance.get(doc_id).unwrap_or(&0)))
                 .collect();
-            ndcg_at_k_values.push(ndcg_at_k(&relevance_scores, K));
+            ndcg_at_k_values.push(ndcg_at_k(&relevance_scores, k));
         } else {
             println!("No search results found for test query {query_id}");
         }

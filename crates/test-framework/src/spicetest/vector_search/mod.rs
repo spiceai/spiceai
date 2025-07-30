@@ -24,7 +24,7 @@ use crate::{
         Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
         StatisticsCollector, system_time_to_unix_epoch_ms,
     },
-    spicetest::vector_search::evaluate::evaluate_search_results,
+    spicetest::vector_search::evaluate::calculate_ndcg,
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -199,7 +199,8 @@ impl SpiceTest<Completed> {
         F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
     {
         let transformed_results = transform(&self.state.search_results);
-        Ok(evaluate_search_results(qrels, &transformed_results))
+        // Similar to MTEB, use NDCG@10 as the main metric for search score
+        Ok(calculate_ndcg(qrels, &transformed_results, 10))
     }
 }
 
@@ -289,7 +290,7 @@ impl ExtendedMetrics for SearchRunMetric {
         let mut builders = BTreeMap::new();
         builders.insert("rps".to_string(), Builder::Float64(Float64Builder::new()));
         builders.insert(
-            "latency_p95_ms".to_string(),
+            "p95_latency_ms".to_string(),
             Builder::Float64(Float64Builder::new()),
         );
         builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
