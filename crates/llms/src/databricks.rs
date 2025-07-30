@@ -192,7 +192,6 @@ pub struct DatabricksCompletionUsage {
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-
 impl From<DatabricksCompletionUsage> for CompletionUsage {
     fn from(val: DatabricksCompletionUsage) -> Self {
         CompletionUsage {
