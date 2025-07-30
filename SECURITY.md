@@ -8,6 +8,7 @@ In the latest major version, the last 2 minor versions are supported for securit
 
 | Version        | Supported          |
 | -------------- | ------------------ |
+| 1.5.1          | :white_check_mark: |
 | 1.5.0          | :white_check_mark: |
 | 1.4.0          | :white_check_mark: |
 | 1.3.2          | :x:                |
