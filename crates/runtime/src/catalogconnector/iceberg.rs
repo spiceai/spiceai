@@ -24,7 +24,7 @@ use crate::{
 use async_trait::async_trait;
 use data_components::{
     RefreshableCatalogProvider,
-    iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
+    iceberg::catalog::rest::{IcebergCatalogProvider, RestCatalog},
 };
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_aws_sdk::S3CredentialProvider;
