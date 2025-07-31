@@ -18,6 +18,7 @@ on:
         options:
           - 'all'
           - 'openai[text-embedding-3-small]-arrow'
+          - 'openai[text-embedding-3-small]-duckdb[file]'
           - 'openai[text-embedding-3-small[chunking]]-duckdb[file]'
           - 'openai[text-embedding-3-small]-s3_vectors'
 
@@ -27,6 +28,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Using a matrix here allows us to easily run all or a specific configuration from the dropdown.
+  # This is simpler than using testoperator dispatch for the current small set of configurations.
+  # We'll incrementally switch to testoperator dispatch as more configurations are added.
   setup-matrix:
     name: Setup matrix
     runs-on: ubuntu-latest
@@ -40,7 +44,8 @@ jobs:
         with:
           script: |
             const matrix = [
-              { name: "openai[text-embedding-3-small]-arrow"},
+              { name: "openai[text-embedding-3-small]-arrow" },
+              { name: "openai[text-embedding-3-small]-duckdb[file]" },
               { name: "openai[text-embedding-3-small[chunking]]-duckdb[file]" },
               { name: "openai[text-embedding-3-small]-s3_vectors" },
             ];
