@@ -135,7 +135,7 @@ where
 
         let response = self
             .client
-            .do_the_thing(self.config.model_id().clone(), body)
+            .do_invoke(self.config.model_id().clone(), body)
             .await
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {
