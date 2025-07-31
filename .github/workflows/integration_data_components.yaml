@@ -61,9 +61,23 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+
+      - name: Start compose
+        working-directory: ./crates/data_components/tests/hadoop_data
+        run: |
+          docker compose up -d --wait --remove-orphans
+
       - name: Run tests
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           CARGO_INCREMENTAL: 0
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo test -p data_components --test hadoop_catalog_test
+      
+      - name: Stop compose
+        if: always()
+        working-directory: ./crates/data_components/tests/hadoop_data
+        run: |
+          docker compose down --remove-orphans -v || true

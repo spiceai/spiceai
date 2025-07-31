@@ -50,6 +50,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_SECRET_ACCESS_KEY, "password")
 }
 
+#[cfg(feature = "test_hadoop_catalog_docker")]
 #[ctor]
 #[allow(clippy::expect_used)]
 fn before_all() {
@@ -65,6 +66,7 @@ fn before_all() {
     guard.replace(docker_compose);
 }
 
+#[cfg(feature = "test_hadoop_catalog_docker")]
 #[dtor]
 #[allow(clippy::expect_used)]
 fn after_all() {
