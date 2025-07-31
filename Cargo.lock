@@ -3422,6 +3422,7 @@ name = "data_components"
 version = "1.6.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-array",
  "arrow-buffer",
  "arrow-flight",
  "async-stream",
@@ -3436,6 +3437,7 @@ dependencies = [
  "charset",
  "chrono",
  "clickhouse-rs",
+ "ctor",
  "datafusion",
  "datafusion-federation",
  "datafusion-table-providers",
@@ -3452,13 +3454,16 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
+ "iceberg_test_utils",
  "imap",
  "indexmap 2.10.0",
+ "insta",
  "itertools 0.14.0",
  "logos",
  "mailparse",
  "object-store-aws-sdk",
  "object_store",
+ "opendal",
  "oracle",
  "rdkafka",
  "regex",
@@ -5757,24 +5762,6 @@ dependencies = [
  "slab",
  "tokio",
  "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "hadoop_catalog"
-version = "1.6.0-unstable"
-dependencies = [
- "arrow",
- "arrow-array",
- "async-trait",
- "ctor",
- "futures",
- "iceberg",
- "iceberg_test_utils",
- "insta",
- "opendal",
- "serde_json",
- "tokio",
  "tracing",
 ]
 

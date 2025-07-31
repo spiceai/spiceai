@@ -55,6 +55,7 @@ logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 object-store-aws-sdk = { path = "../object-store-aws-sdk" }
+opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
 rdkafka = { version = "0.38.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
@@ -120,4 +121,9 @@ sqlite = [
 ]
 
 [dev-dependencies]
+arrow = { workspace = true, features = ["prettyprint"] }
+arrow-array = { workspace = true }
+ctor = "0.2.8"
+insta = { version = "1.43" }
+iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
