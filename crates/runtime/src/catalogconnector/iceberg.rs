@@ -24,7 +24,13 @@ use crate::{
 use async_trait::async_trait;
 use data_components::{
     RefreshableCatalogProvider,
-    iceberg::catalog::rest::{IcebergCatalogProvider, RestCatalog},
+    iceberg::{
+        catalog::{
+            hadoop::{HadoopCatalogBuilder, MetadataMode},
+            rest::RestCatalog,
+        },
+        provider::IcebergCatalogProvider,
+    },
 };
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_aws_sdk::S3CredentialProvider;
@@ -58,6 +64,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
+
+    #[snafu(display("Failed to parse catalog URL"))]
+    UrlParseNoSource,
 
     #[snafu(display(
         "Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."
@@ -199,6 +208,33 @@ impl CatalogConnector for IcebergCatalog {
                 },
             );
         };
+
+        if catalog_id.starts_with("file://") || catalog_id.starts_with("s3://") {
+            // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
+            let hadoop_catalog = HadoopCatalogBuilder::default()
+                .with_warehouse_root(&catalog_id)
+                .with_metadata_mode(MetadataMode::Infer)
+                .build()
+                .await
+                .map_err(|e| super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: format!(
+                        "Failed to create Hadoop Catalog for Iceberg with base URI: {catalog_id}",
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
+
+            let catalog_provider = IcebergCatalogProvider::try_new(Arc::new(hadoop_catalog), None)
+                .await
+                .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                    connector: "iceberg".into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
+
+            return Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>);
+        }
 
         let (base_uri, mut props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
             Ok(result) => result,
@@ -542,9 +578,146 @@ fn get_warehouse(url: &Url) -> Option<String> {
     None
 }
 
+pub fn parse_hadoop_table_url(
+    url: &str,
+    warehouse_uri: Option<&str>,
+) -> Result<(String, Namespace, String)> {
+    // There's no definite position for a root namespace in Hadoop, so all we can do is validate the URL and return the base URI.
+    // If an optional root is provided, it will be used as the warehouse root.
+    let parsed = Url::parse(url).context(UrlParseSnafu)?;
+
+    match parsed.scheme() {
+        "file" | "s3" => {} // OK
+        other => {
+            return InvalidSchemeSnafu {
+                scheme: other.to_string(),
+            }
+            .fail();
+        }
+    }
+
+    let count = parsed
+        .path_segments()
+        .map(std::iter::Iterator::count)
+        .context(UrlParseNoSourceSnafu)?;
+
+    let table_name = parsed
+        .path_segments()
+        .and_then(std::iter::Iterator::last)
+        .context(UrlParseNoSourceSnafu)?;
+    let namespace_ident = parsed
+        .path_segments()
+        .and_then(|mut segments| {
+            segments
+                .nth(count - 2)
+                .map(|s| NamespaceIdent::new(s.to_string()))
+        })
+        .context(MissingNamespaceSnafu)?;
+
+    let nodes = parsed
+        .path_segments()
+        .map(|segments| segments.take(count - 2).collect::<Vec<_>>())
+        .context(UrlParseNoSourceSnafu)?;
+
+    let mut base_uri = if let Some(host) = parsed.host_str() {
+        format!("{}://{}/{}", parsed.scheme(), host, nodes.join("/"))
+    } else {
+        format!("{}://{}", parsed.scheme(), nodes.join("/"))
+    };
+
+    let mut namespace = Namespace::new(namespace_ident);
+
+    if let Some(warehouse_uri) = warehouse_uri {
+        base_uri = warehouse_uri.to_string();
+
+        let warehouse_uri = Url::parse(warehouse_uri).context(UrlParseSnafu)?;
+        if warehouse_uri.scheme() != parsed.scheme() {
+            return InvalidSchemeSnafu {
+                scheme: warehouse_uri.scheme().to_string(),
+            }
+            .fail();
+        }
+
+        // inverse union of the nodes with the warehouse URI paths gives any namespace segments
+        let warehouse_segments: Vec<_> = warehouse_uri
+            .path_segments()
+            .map(|s| s.collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let namespace_segments: Vec<_> = nodes
+            .iter()
+            .filter(|segment| !warehouse_segments.contains(segment))
+            .map(|s| s.to_string())
+            .collect();
+
+        if !namespace_segments.is_empty() {
+            let namespace_ident = NamespaceIdent::from_vec(namespace_segments)
+                .map_err(|_| Error::MissingNamespace)?;
+            namespace = Namespace::new(namespace_ident);
+        }
+    }
+
+    Ok((base_uri, namespace, table_name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_hadoop_table_url() {
+        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("s3://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        let url = "file:///my/local/path/to/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "file:///my/local/path/to/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should infer the base URI when no warehouse is provided
+        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        let url = "file://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "file://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should support nested namespaces when a warehouse URI is provided
+        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/nested/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("s3://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(
+            namespace.name().to_string().as_str(),
+            "spiceai_sandbox.nested",
+        );
+        assert_eq!(table_name, "my_table");
+
+        // should deny unknown schemes, or schemes from warehouses that don't match
+        let url = "ftp://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
+        assert!(result.is_err());
+
+        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_parse_catalog_url_no_prefix() {
