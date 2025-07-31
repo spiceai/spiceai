@@ -33,7 +33,10 @@ use datafusion::{
     sql::unparser::expr_to_sql,
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory},
+    duckdb::{
+        DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        attached_factory::AttachedDuckDBTableProviderFactory,
+    },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
@@ -102,8 +105,8 @@ pub enum Error {
     #[snafu(display("Unable to read directory: {source}"))]
     UnableToReadDirectory { source: std::io::Error },
 
-    #[snafu(display("Unable to create checkpointing pool: {source}"))]
-    FailedToCreateCheckpointingPool {
+    #[snafu(display("Unable to create pool: {source}"))]
+    FailedToCreatePool {
         source: datafusion_table_providers::duckdb::Error,
     },
 
@@ -154,7 +157,7 @@ impl PartitionedDuckDBAccelerator {
 
         get_pool(&self.duckdb_factory, &duckdb_path)
             .await
-            .context(FailedToCreateCheckpointingPoolSnafu)
+            .context(FailedToCreatePoolSnafu)
     }
 }
 
@@ -258,11 +261,9 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         } = partition_by;
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());
-        let creator = Arc::new(DuckDBPartitionCreator::new(
-            partition_dir(source),
-            cmd,
-            expressions_hash,
-        ));
+        let creator = Arc::new(
+            DuckDBPartitionCreator::new(partition_dir(source), cmd, expressions_hash).await?,
+        );
         let table_provider =
             Arc::new(PartitionTableProvider::new(creator, partition_by, schema).await?);
 
@@ -287,32 +288,35 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
 #[derive(Debug)]
 pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
-    duckdb_factory: DuckDBTableProviderFactory,
+    duckdb_factory: AttachedDuckDBTableProviderFactory,
     partition_dir: PathBuf,
     expressions_hash: u64,
 }
 
 impl DuckDBPartitionCreator {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         partition_dir: PathBuf,
         cmd: CreateExternalTable,
         expressions_hash: u64,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let duckdb_factory = create_factory();
+        let duckdb_factory = AttachedDuckDBTableProviderFactory::new(duckdb_factory)
+            .await
+            .context(FailedToCreatePoolSnafu)?;
 
-        Self {
+        Ok(Self {
             cmd,
             duckdb_factory,
             partition_dir,
             expressions_hash,
-        }
+        })
     }
 
     fn valid_file_extensions() -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
     }
 
-    fn add_open(
+    fn add_location(
         &self,
         cmd: &mut CreateExternalTable,
         partition_value: &ScalarValue,
@@ -322,7 +326,7 @@ impl DuckDBPartitionCreator {
         let duckdb_file = format!("{partition_value_str}.db");
         let duckdb_path = self.partition_dir.join(&duckdb_file);
         let duckdb_path = duckdb_path.display().to_string();
-        cmd.options.insert("open".to_string(), duckdb_path.clone());
+        cmd.location = duckdb_path.clone();
 
         Ok(duckdb_path)
     }
@@ -336,7 +340,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
     ) -> Result<Partition, creator::Error> {
         let mut cmd = self.cmd.clone();
         let duckdb_path = self
-            .add_open(&mut cmd, &partition_value)
+            .add_location(&mut cmd, &partition_value)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         tracing::debug!("creating partition at {duckdb_path}");
@@ -397,12 +401,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 };
 
                 let mut cmd = self.cmd.clone();
-                self.add_open(&mut cmd, &partition_value)
-                    .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
-
-                let duckdb_path = path.display().to_string();
-                get_pool(&self.duckdb_factory, &duckdb_path)
-                    .await
+                self.add_location(&mut cmd, &partition_value)
                     .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
                 let table_provider = create_table_provider(&self.duckdb_factory, &cmd)

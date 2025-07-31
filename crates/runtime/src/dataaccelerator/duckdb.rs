@@ -249,6 +249,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("data_dir"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
+    ParameterSpec::component("threads"),
     ParameterSpec::component("preserve_insertion_order"),
 ];
 
@@ -404,7 +405,7 @@ impl DataAccelerator for DuckDBAccelerator {
 }
 
 pub(crate) async fn create_table_provider(
-    duckdb_factory: &DuckDBTableProviderFactory,
+    duckdb_factory: &dyn TableProviderFactory,
     cmd: &CreateExternalTable,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
