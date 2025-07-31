@@ -11,6 +11,7 @@ members = [
     "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
+    "crates/hadoop_catalog",
     "crates/iceberg-aws-sdk",
     "crates/llms",
     "crates/model_components",
@@ -221,10 +222,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "edb521d24ff856e4c785dd997fcde512a8cfe794" }              # spiceai-0.5.1
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "edb521d24ff856e4c785dd997fcde512a8cfe794" } # spiceai-0.5.1
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "edb521d24ff856e4c785dd997fcde512a8cfe794" } # spiceai-0.5.1
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "edb521d24ff856e4c785dd997fcde512a8cfe794" }   # spiceai-0.5.1
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7b2e311f6ec97b16d7c22d7c0ad30c59b66f179b" }              # spiceai-0.5.1
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7b2e311f6ec97b16d7c22d7c0ad30c59b66f179b" } # spiceai-0.5.1
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7b2e311f6ec97b16d7c22d7c0ad30c59b66f179b" } # spiceai-0.5.1
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7b2e311f6ec97b16d7c22d7c0ad30c59b66f179b" }   # spiceai-0.5.1
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "7b2e311f6ec97b16d7c22d7c0ad30c59b66f179b" }   # spiceai-0.5.1
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
