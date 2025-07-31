@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 
 use arrow_array::RecordBatch;
 use ctor::{ctor, dtor};
-use data_components::hadoop::{HadoopCatalog, HadoopCatalogBuilder};
+use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuilder};
 use futures::TryStreamExt;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, NamespaceIdent};
@@ -33,6 +33,7 @@ fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
     HadoopCatalogBuilder::default().with_warehouse_root("file:///tmp/hadoop_warehouse")
 }
 
+#[allow(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     let guard = DOCKER_COMPOSE_ENV
         .read()
@@ -50,6 +51,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 }
 
 #[ctor]
+#[allow(clippy::expect_used)]
 fn before_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -64,6 +66,7 @@ fn before_all() {
 }
 
 #[dtor]
+#[allow(clippy::expect_used)]
 fn after_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -74,6 +77,7 @@ fn after_all() {
     }
 }
 
+#[allow(clippy::expect_used)]
 async fn build_catalogs() -> [(&'static str, HadoopCatalog); 2] {
     [
         (
@@ -281,6 +285,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::expect_used)]
     async fn load_table_and_check_results(
         namespace: NamespaceIdent,
         catalog: &HadoopCatalog,

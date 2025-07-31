@@ -39,7 +39,6 @@ pub mod dynamodb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
-pub mod hadoop;
 pub mod iceberg;
 #[cfg(feature = "debezium")]
 pub mod kafka;
