@@ -16,10 +16,11 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
 use bytes::Bytes;
-use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
-use util::{retry, RetryError};
+use reqwest::StatusCode;
 use std::fmt::Debug;
 use std::sync::Arc;
+use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
+use util::{RetryError, retry};
 
 use crate::chunking::{
     ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
@@ -137,8 +138,14 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
                             })
                             .map_err(|err| {
                                 if is_retriable_error(&err) {
+                                    tracing::debug!(
+                                        "OpenAI embedding model encountered a retriable server error: {err}. Backing off and retrying..."
+                                    );
                                     return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
                                 } else {
+                                     tracing::debug!(
+                                        "OpenAI embedding model encountered a non-retriable server error: {err}"
+                                    );
                                     return RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() });
                                 }
                             })
@@ -181,13 +188,34 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
 }
 
 fn is_retriable_error(err: &OpenAIError) -> bool {
-
     println!("Checking if error is retriable: {:?}", err);
 
-    matches!(
-        err,
-        OpenAIError::ApiError(_)
-    )
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            matches!(
+                api_err.code.as_deref(),
+                None | Some("429") | Some("500") | Some("503")
+            )
+        }
+        OpenAIError::JSONDeserialize(_) => true,
+        OpenAIError::Reqwest(request) => {
+            request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body()
+                || matches!(
+                    request.status(),
+                    Some(
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::INTERNAL_SERVER_ERROR
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    )
+                )
+        }
+        _ => false,
+    }
 }
 
 // `OpenAPI` estimator counts utf-8 bytes as 0.25 tokens so allowed string size is 1,200,000 bytes.
