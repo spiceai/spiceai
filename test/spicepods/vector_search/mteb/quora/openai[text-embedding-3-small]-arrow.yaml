@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mteb_quora_openai-text-embedding-3-small_arrow
+name: openai[text-embedding-3-small]-arrow
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
@@ -23,7 +23,7 @@ datasets:
       enabled: true
 
   - from: file:./data.parquet
-    name: test_data
+    name: relevance_data
     acceleration:
       enabled: true
 
