@@ -39,9 +39,21 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
         ModelSource::Anthropic => Some(anthropic::PARAMETERS),
         ModelSource::Perplexity => Some(perplexity::PARAMETERS),
         ModelSource::Xai => Some(xai::PARAMETERS),
+        ModelSource::Bedrock => Some(BEDROCK_PARAMETERS),
         ModelSource::SpiceAI => None,
     }
 }
+
+pub(crate) const BEDROCK_EXTRA: [ParameterSpec; 3] = [
+    ParameterSpec::runtime("aws_secret_access_key").description(""),
+    ParameterSpec::runtime("aws_access_key_id").description(""),
+    ParameterSpec::runtime("aws_region").description(""),
+];
+pub(crate) const BEDROCK_PARAMETERS: &[ParameterSpec] =
+    &concat_arrays::<ParameterSpec, 3, PARAM_WITH_DEPRE_LEN, { 3 + PARAM_WITH_DEPRE_LEN }>(
+        BEDROCK_EXTRA,
+        COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
+    );
 
 // Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
 const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(

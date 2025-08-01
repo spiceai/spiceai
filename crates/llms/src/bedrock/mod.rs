@@ -25,6 +25,9 @@ use aws_sdk_bedrockruntime::{
     error::SdkError,
     operation::{
         converse::{ConverseError, ConverseOutput, builders::ConverseFluentBuilder},
+        converse_stream::{
+            ConverseStreamError, ConverseStreamOutput, builders::ConverseStreamFluentBuilder,
+        },
         invoke_model::{InvokeModelError, InvokeModelOutput},
     },
     primitives::Blob,
@@ -67,6 +70,42 @@ impl BedrockClient {
         }
     }
 
+    pub async fn do_converse_stream(
+        &self,
+        converse_build: ConverseStreamFluentBuilder,
+    ) -> Result<ConverseStreamOutput, Box<dyn std::error::Error + Send + Sync>> {
+        self.do_the_thing(move |_client| {
+            let value = converse_build.clone();
+            async move {
+                match value.send().await {
+                    Ok(response) => Ok(response),
+                    Err(e) => {
+                        tracing::warn!("Got an error on bedrock send {e:#?}");
+                        let retry_error = match &e {
+                            SdkError::ServiceError(service_error) => match service_error.err() {
+                                ConverseStreamError::ThrottlingException(_) => {
+                                    tracing::debug!(
+                                        "Bedrock model throttled whilst conversing, backing off and retrying..."
+                                    );
+                                    RetryError::transient(
+                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                    )
+                                }
+                                _ => RetryError::permanent(
+                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                ),
+                            },
+                            _ => RetryError::permanent(
+                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                            ),
+                        };
+                        Err(retry_error)
+                    }
+                }
+            }
+        })
+        .await
+    }
     pub async fn do_converse(
         &self,
         converse_build: ConverseFluentBuilder,
@@ -77,6 +116,7 @@ impl BedrockClient {
                 match value.send().await {
                     Ok(response) => Ok(response),
                     Err(e) => {
+                        tracing::warn!("Got an error on bedrock send {e:#?}");
                         let retry_error = match &e {
                             SdkError::ServiceError(service_error) => match service_error.err() {
                                 ConverseError::ThrottlingException(_) => {
