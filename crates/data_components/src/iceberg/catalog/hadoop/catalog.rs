@@ -467,11 +467,23 @@ impl HadoopCatalog {
         if let Some(metadata_file) = metadata_file_path {
             self.file_io.new_input(&metadata_file)
         } else {
-            // TODO: version hint could be .txt or .text. refactor this to support both later
-            let version_hint_path = self.version_hint_path(table_identifier, "txt");
+            #[allow(clippy::similar_names)] // txt and text are indeed similar
+            let hint_txt = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "txt"))?;
+            #[allow(clippy::similar_names)] // txt and text are indeed similar
+            let hint_text = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "text"))?;
+            let hint_input = if hint_txt.exists().await? {
+                Some(hint_txt)
+            } else if hint_text.exists().await? {
+                Some(hint_text)
+            } else {
+                None
+            };
 
-            let input = self.file_io.new_input(&version_hint_path)?;
-            if input.exists().await? {
+            if let Some(input) = hint_input {
                 // Load the version hint file to get the latest metadata file
                 let metadata_version = input.read().await?;
                 let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
