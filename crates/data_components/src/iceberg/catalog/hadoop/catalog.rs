@@ -368,9 +368,6 @@ impl Catalog for HadoopCatalog {
                 .await?
             {
                 tables.push(table_ident);
-            } else {
-                // TODO: Add something like a `MetadataMissingBehavior` to choose whether to fail or not
-                tracing::warn!("Table {} does not have metadata, skipping", table_ident);
             }
         }
 
