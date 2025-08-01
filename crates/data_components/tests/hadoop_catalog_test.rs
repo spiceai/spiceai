@@ -14,19 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "test_hadoop_catalog_docker")]
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use arrow_array::RecordBatch;
+#[cfg(feature = "test_hadoop_catalog_docker")]
 use ctor::{ctor, dtor};
 use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuilder};
 use futures::TryStreamExt;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_test_utils::docker::DockerCompose;
+#[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::normalize_test_name;
 
+#[cfg(feature = "test_hadoop_catalog_docker")]
 const MINIO_PORT: u16 = 9000;
+
+#[cfg(feature = "test_hadoop_catalog_docker")]
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
 fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
@@ -35,19 +41,29 @@ fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
 
 #[allow(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
-    let guard = DOCKER_COMPOSE_ENV
-        .read()
-        .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
-    let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
-    let minio_ip = docker_compose.get_container_ip("minio");
-    let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
+    let minio_endpoint = std::env::var("MINIO_ENDPOINT")
+        .expect("Should have MINIO_ENDPOINT environment variable set");
+
+    #[cfg(feature = "test_hadoop_catalog_docker")]
+    let minio_endpoint = {
+        let guard = DOCKER_COMPOSE_ENV
+            .read()
+            .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
+        let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
+        let minio_ip = docker_compose.get_container_ip("minio");
+        let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
+        format!("http://{minio_socket_addr}")
+    };
+
+    let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
+    let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
         .set_property(S3_REGION, "us-east-1")
-        .set_property(S3_ENDPOINT, format!("http://{minio_socket_addr}"))
-        .set_property(S3_ACCESS_KEY_ID, "admin")
-        .set_property(S3_SECRET_ACCESS_KEY, "password")
+        .set_property(S3_ENDPOINT, minio_endpoint)
+        .set_property(S3_ACCESS_KEY_ID, access_key)
+        .set_property(S3_SECRET_ACCESS_KEY, secret_key)
 }
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
