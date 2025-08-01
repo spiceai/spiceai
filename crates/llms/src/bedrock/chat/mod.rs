@@ -21,18 +21,19 @@ use crate::chat::nsql::SqlGeneration;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
     ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallChunk, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
-    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionCallStream,
+    ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
+    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionCallStream, FunctionName, FunctionObject,
     PromptTokensDetails, Role, Stop,
 };
 use async_stream::stream;
@@ -43,19 +44,22 @@ use aws_sdk_bedrockruntime::operation::converse::builders::ConverseFluentBuilder
 use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamFluentBuilder;
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::builders::{
-    MessageBuilder, ToolResultBlockBuilder, ToolUseBlockBuilder,
+    AnyToolChoiceBuilder, AutoToolChoiceBuilder, MessageBuilder, ToolResultBlockBuilder,
+    ToolUseBlockBuilder,
 };
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
-    ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
-    ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    GuardrailConverseContentBlock, GuardrailConverseTextBlock, InferenceConfiguration, Message,
-    MessageStartEvent, MessageStopEvent, ReasoningContentBlock, ReasoningTextBlock, StopReason,
-    SystemContentBlock, TokenUsage, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
-    ToolUseBlock, ToolUseBlockDelta, ToolUseBlockStart,
+    AutoToolChoice, ContentBlock, ContentBlockDelta as ContentBlockDeltaType,
+    ContentBlockDeltaEvent, ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent,
+    ConversationRole, ConverseStreamMetadataEvent,
+    ConverseStreamOutput as ConverseStreamOutputPacket, GuardrailConverseContentBlock,
+    GuardrailConverseTextBlock, InferenceConfiguration, Message, MessageStartEvent,
+    MessageStopEvent, ReasoningContentBlock, ReasoningTextBlock, SpecificToolChoice, StopReason,
+    SystemContentBlock, TokenUsage, Tool, ToolChoice, ToolConfiguration, ToolInputSchema,
+    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
+    ToolUseBlockDelta, ToolUseBlockStart,
 };
-use aws_smithy_types::Document;
+use aws_smithy_types::{Document, Number};
 use itertools::Itertools;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -253,7 +257,7 @@ impl BedrockConverse {
             .build()
     }
 
-    #[allow(clippy::deprecated)]
+    #[allow(deprecated)]
     fn to_converse_stream(
         &self,
         client: Arc<BedrockClient>,
@@ -261,7 +265,11 @@ impl BedrockConverse {
     ) -> Result<ConverseStreamFluentBuilder, OpenAIError> {
         let inf_cfg = Self::inference_cfg(&req);
         let CreateChatCompletionRequest {
-            messages, metadata, ..
+            messages,
+            metadata,
+            tool_choice,
+            tools,
+            ..
         } = req;
 
         let (system, messages): (
@@ -285,7 +293,8 @@ impl BedrockConverse {
             .model_id(self.model_id.clone())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
-            .set_system(Some(system));
+            .set_system(Some(system))
+            .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(Value::Object(m)) = metadata {
             bldr = bldr.set_request_metadata(Some(
@@ -293,12 +302,10 @@ impl BedrockConverse {
             ));
         };
 
-        // pub tools: Option<Vec<ChatCompletionTool>>,
-        // pub tool_choice: Option<ChatCompletionToolChoiceOption>,
         Ok(bldr)
     }
 
-    #[allow(clippy::deprecated)]
+    #[allow(deprecated)]
     fn to_converse(
         &self,
         client: Arc<BedrockClient>,
@@ -306,7 +313,11 @@ impl BedrockConverse {
     ) -> Result<ConverseFluentBuilder, OpenAIError> {
         let inf_cfg = Self::inference_cfg(&req);
         let CreateChatCompletionRequest {
-            messages, metadata, ..
+            messages,
+            metadata,
+            tools,
+            tool_choice,
+            ..
         } = req;
 
         let (system, messages): (
@@ -330,7 +341,8 @@ impl BedrockConverse {
             .model_id(self.model_id.clone())
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
-            .set_system(Some(system));
+            .set_system(Some(system))
+            .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(Value::Object(m)) = metadata {
             bldr = bldr.set_request_metadata(Some(
@@ -338,8 +350,6 @@ impl BedrockConverse {
             ));
         };
 
-        // pub tools: Option<Vec<ChatCompletionTool>>,
-        // pub tool_choice: Option<ChatCompletionToolChoiceOption>,
         Ok(bldr)
     }
 
@@ -433,8 +443,8 @@ impl BedrockConverse {
                     .unwrap_or_default(),
                 ..StreamState::default()
             };
-            while let result = input_stream.recv().await {
-                match result {
+            loop {
+                match input_stream.recv().await {
                     Err(SdkError::ServiceError(e)) => {
                         match &e.err() {
                             &ConverseStreamOutputError::InternalServerException(e) => {
@@ -462,10 +472,9 @@ impl BedrockConverse {
                                 state.role = Some(try_convert_role(&role)?);
                             },
                             ConverseStreamOutputPacket::ContentBlockStart(ContentBlockStartEvent{
-                                start: Some(ContentBlockStartInner::ToolUse(ToolUseBlockStart{tool_use_id, name,..})), content_block_index,.. }) => {
-                                // add tools to incremenetal
-                                // emit incremental content.
-
+                                start: Some(ContentBlockStartInner::ToolUse(tool_use)), content_block_index,.. }) => {
+                                state.content_block_index_to_delta_idx.insert(content_block_index, 0);
+                                state.content_block_index_to_tool_details.insert(content_block_index, tool_use);
                             },
                             ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::Text(text)), content_block_index, ..}) => {
                                 match chat_completion_stream(
@@ -563,13 +572,15 @@ impl Chat for BedrockConverse {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        tracing::warn!("hello");
         let input = self.to_converse(self.client.clone(), req)?;
+        tracing::warn!("hello.. input={input:?}");
         let output = self
             .client
             .do_converse(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-
+        tracing::warn!("hello.. output={output:?}");
         self.from_converse_output(output)
     }
 
@@ -688,6 +699,56 @@ fn chat_completion_stream(
     })
 }
 
+fn tool_config(
+    tools: Option<Vec<ChatCompletionTool>>,
+    tool_choice: Option<ChatCompletionToolChoiceOption>,
+) -> Option<ToolConfiguration> {
+    let tool_choice = match tool_choice {
+        Some(ChatCompletionToolChoiceOption::Auto) => {
+            Some(ToolChoice::Auto(AutoToolChoiceBuilder::default().build()))
+        }
+        Some(ChatCompletionToolChoiceOption::Required) => {
+            Some(ToolChoice::Any(AnyToolChoiceBuilder::default().build()))
+        }
+        Some(ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+            function: FunctionName { name },
+            ..
+        })) => SpecificToolChoice::builder()
+            .name(name)
+            .build()
+            .ok()
+            .map(ToolChoice::Tool),
+        _ => None, // None, ChatCompletionToolChoiceOption::None, or Unknown.
+    };
+    let tools = tools?
+        .into_iter()
+        .filter_map(|t| {
+            let FunctionObject {
+                name,
+                description,
+                parameters,
+                ..
+            } = t.function;
+            Some(Tool::ToolSpec(
+                ToolSpecification::builder()
+                    .name(name)
+                    .set_description(description)
+                    .set_input_schema(
+                        parameters.map(|p| ToolInputSchema::Json(value_to_document(p))),
+                    )
+                    .build()
+                    .ok()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    ToolConfiguration::builder()
+        .set_tool_choice(tool_choice)
+        .set_tools(Some(tools))
+        .build()
+        .ok()
+}
+
 fn chat_choice_stream(
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
@@ -726,5 +787,34 @@ fn convert_usage(usage: &TokenUsage) -> CompletionUsage {
             audio_tokens: None,
         }),
         completion_tokens_details: None,
+    }
+}
+
+fn value_to_document(value: serde_json::Value) -> Document {
+    match value {
+        serde_json::Value::Object(map) => {
+            let converted: HashMap<_, _> = map
+                .into_iter()
+                .map(|(k, v)| (k, value_to_document(v)))
+                .collect();
+            Document::Object(converted)
+        }
+        serde_json::Value::Array(arr) => {
+            Document::Array(arr.into_iter().map(value_to_document).collect())
+        }
+        serde_json::Value::Number(num) => {
+            if let Some(u) = num.as_u64() {
+                Document::Number(Number::PosInt(u))
+            } else if let Some(i) = num.as_i64() {
+                Document::Number(Number::NegInt(i))
+            } else if let Some(f) = num.as_f64() {
+                Document::Number(Number::Float(f))
+            } else {
+                unreachable!("Invalid number in serde_json::Value")
+            }
+        }
+        serde_json::Value::String(s) => Document::String(s),
+        serde_json::Value::Bool(b) => Document::Bool(b),
+        serde_json::Value::Null => Document::Null,
     }
 }
