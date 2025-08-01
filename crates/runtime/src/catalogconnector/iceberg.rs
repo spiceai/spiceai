@@ -32,7 +32,7 @@ use data_components::{
         provider::IcebergCatalogProvider,
     },
 };
-use iceberg::{Namespace, NamespaceIdent};
+use iceberg::{Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
 use iceberg_aws_sdk::S3CredentialProvider;
 use iceberg_catalog_rest::RestCatalogConfig;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
@@ -44,7 +44,10 @@ use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid URL scheme '{}'. Must be http or https", scheme))]
+    #[snafu(display(
+        "Invalid URL scheme '{}'. Must be 'http', 'https', 'file', 's3', or 's3a'.",
+        scheme
+    ))]
     InvalidScheme { scheme: String },
 
     #[snafu(display("URL is missing a host"))]
@@ -93,6 +96,46 @@ impl IcebergCatalog {
         Arc::new(Self {
             params: params.parameters,
         })
+    }
+
+    async fn load_hadoop_catalog(
+        props: HashMap<String, String>,
+        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        catalog: &Catalog,
+        catalog_id: &str,
+    ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
+        // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
+        let mut catalog_builder = HadoopCatalogBuilder::default()
+            .with_warehouse_root(catalog_id)
+            .with_metadata_mode(MetadataMode::Infer)
+            .with_properties(props);
+
+        if let Some(loader) = custom_credential_loader {
+            catalog_builder = catalog_builder.with_file_io_extension(loader);
+        }
+
+        let hadoop_catalog =
+            catalog_builder
+                .build()
+                .await
+                .map_err(|e| super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: format!(
+                        "Failed to create Hadoop Catalog for Iceberg with base URI: {catalog_id}",
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
+
+        let catalog_provider = IcebergCatalogProvider::try_new(Arc::new(hadoop_catalog), None)
+            .await
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                connector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(e),
+            })?;
+
+        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 }
 
@@ -194,6 +237,7 @@ impl CatalogConnector for IcebergCatalog {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,
@@ -209,34 +253,76 @@ impl CatalogConnector for IcebergCatalog {
             );
         };
 
-        if catalog_id.starts_with("file://") || catalog_id.starts_with("s3://") {
-            // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
-            let hadoop_catalog = HadoopCatalogBuilder::default()
-                .with_warehouse_root(&catalog_id)
-                .with_metadata_mode(MetadataMode::Infer)
-                .build()
+        let mut props = HashMap::new();
+        for (key, value) in &self.params {
+            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
+                for prop in prop_vec {
+                    props.insert(prop.clone(), value.expose_secret().to_string());
+                }
+            }
+        }
+
+        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
+            verify_s3_endpoint(endpoint)
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
-                    message: format!(
-                        "Failed to create Hadoop Catalog for Iceberg with base URI: {catalog_id}",
-                    ),
+                    message: e.to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })?;
 
-            let catalog_provider = IcebergCatalogProvider::try_new(Arc::new(hadoop_catalog), None)
-                .await
-                .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                    connector: "iceberg".into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    source: Box::new(e),
-                })?;
+            let aws_sdk_config = load_config(
+                "IcebergCatalogConnector",
+                "s3_region",
+                "s3_access_key_id",
+                "s3_secret_access_key",
+                "s3_session_token",
+                &self.params,
+            )
+            .await
+            .map_err(|e| super::Error::InvalidConfiguration {
+                connector: "iceberg".into(),
+                message: e.to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(e),
+            })?;
 
-            return Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>);
+            Some(
+                S3CredentialProvider::from_config(&aws_sdk_config)
+                    .map_err(|e| super::Error::InvalidConfiguration {
+                        connector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        source: Box::new(e),
+                    })?
+                    .into_custom_loader(),
+            )
+        } else {
+            None
+        };
+
+        if catalog_id.starts_with("file://")
+            || catalog_id.starts_with("s3://")
+            || catalog_id.starts_with("s3a://")
+        {
+            let catalog_id = if catalog_id.starts_with("s3://") {
+                // s3 needs to be s3a for Hadoop Catalog: https://github.com/apache/iceberg-rust/issues/434
+                catalog_id.replace("s3://", "s3a://")
+            } else {
+                catalog_id.to_string()
+            };
+
+            return IcebergCatalog::load_hadoop_catalog(
+                props,
+                custom_credential_loader,
+                catalog,
+                &catalog_id,
+            )
+            .await;
         }
 
-        let (base_uri, mut props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
+        let (base_uri, new_props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
             Ok(result) => result,
             Err(e) => {
                 return Err(super::Error::InvalidConfiguration {
@@ -250,54 +336,12 @@ impl CatalogConnector for IcebergCatalog {
             }
         };
 
-        for (key, value) in &self.params {
-            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
-                for prop in prop_vec {
-                    props.insert(prop.clone(), value.expose_secret().to_string());
-                }
-            }
-        }
-
-        if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
-                .await
-                .map_err(|e| super::Error::InvalidConfiguration {
-                    connector: "iceberg".into(),
-                    message: e.to_string(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    source: Box::new(e),
-                })?;
-        }
-
-        let aws_sdk_config = load_config(
-            "IcebergCatalogConnector",
-            "s3_region",
-            "s3_access_key_id",
-            "s3_secret_access_key",
-            "s3_session_token",
-            &self.params,
-        )
-        .await
-        .map_err(|e| super::Error::InvalidConfiguration {
-            connector: "iceberg".into(),
-            message: e.to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-            source: Box::new(e),
-        })?;
-
-        let custom_credential_loader = S3CredentialProvider::from_config(&aws_sdk_config)
-            .map_err(|e| super::Error::InvalidConfiguration {
-                connector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?
-            .into_custom_loader();
-
+        props.extend(new_props);
         let catalog_config = get_rest_catalog_config(base_uri, props);
-
-        let catalog_client =
-            RestCatalog::new(catalog_config).with_file_io_extension(custom_credential_loader);
+        let mut catalog_client = RestCatalog::new(catalog_config);
+        if let Some(loader) = custom_credential_loader {
+            catalog_client = catalog_client.with_file_io_extension(loader);
+        }
 
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
@@ -587,7 +631,7 @@ pub fn parse_hadoop_table_url(
     let parsed = Url::parse(url).context(UrlParseSnafu)?;
 
     match parsed.scheme() {
-        "file" | "s3" => {} // OK
+        "file" | "s3a" => {} // OK
         other => {
             return InvalidSchemeSnafu {
                 scheme: other.to_string(),
@@ -641,13 +685,13 @@ pub fn parse_hadoop_table_url(
         // inverse union of the nodes with the warehouse URI paths gives any namespace segments
         let warehouse_segments: Vec<_> = warehouse_uri
             .path_segments()
-            .map(|s| s.collect::<Vec<_>>())
+            .map(Iterator::collect::<Vec<_>>)
             .unwrap_or_default();
 
         let namespace_segments: Vec<_> = nodes
             .iter()
             .filter(|segment| !warehouse_segments.contains(segment))
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
 
         if !namespace_segments.is_empty() {

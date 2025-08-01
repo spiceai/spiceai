@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use iceberg::io::{FileIO, InputFile};
+use iceberg::io::{Extensions, FileIO, InputFile};
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
@@ -46,6 +47,7 @@ pub struct HadoopCatalogBuilder {
     file_io: Option<FileIO>,
     metadata_mode: MetadataMode,
     properties: HashMap<String, String>,
+    file_io_extensions: Extensions,
 }
 
 impl HadoopCatalogBuilder {
@@ -64,6 +66,13 @@ impl HadoopCatalogBuilder {
         self
     }
 
+    /// Sets the `FileIO` extensions for the Hadoop catalog.
+    #[must_use]
+    pub fn with_file_io_extension<T: Any + Send + Sync>(mut self, extension: T) -> Self {
+        self.file_io_extensions.add(extension);
+        self
+    }
+
     /// Sets the metadata mode for the Hadoop catalog.
     #[must_use]
     pub fn with_metadata_mode(mut self, metadata_mode: MetadataMode) -> Self {
@@ -78,6 +87,13 @@ impl HadoopCatalogBuilder {
         self
     }
 
+    /// Sets properties for the `FileIO` connection.
+    #[must_use]
+    pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties.extend(properties);
+        self
+    }
+
     /// Builds the `HadoopCatalog` instance.
     ///
     /// # Errors
@@ -89,11 +105,16 @@ impl HadoopCatalogBuilder {
             Error::new(ErrorKind::DataInvalid, "Warehouse root must be specified")
         })?;
 
+        if !warehouse_root.ends_with('/') {
+            warehouse_root.push('/');
+        }
+
         let file_io = if let Some(file_io) = self.file_io {
             file_io
         } else {
             FileIO::from_path(&warehouse_root)?
                 .with_props(self.properties)
+                .with_extensions(self.file_io_extensions)
                 .build()?
         };
 
@@ -109,10 +130,6 @@ impl HadoopCatalogBuilder {
                 ErrorKind::DataInvalid,
                 "Warehouse root must be a directory",
             ));
-        }
-
-        if !warehouse_root.ends_with('/') {
-            warehouse_root.push('/');
         }
 
         Ok(HadoopCatalog {
