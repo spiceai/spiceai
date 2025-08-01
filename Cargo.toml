@@ -98,7 +98,7 @@ datafusion-datasource = "48.0.1"
 datafusion-execution = "48.0.1"
 datafusion-expr = "48.0.1"
 datafusion-federation = { version = "0.4.2", features = ["sql"] }
-datafusion-functions-json = "0.47"
+datafusion-functions-json = "0.48"
 datafusion-table-providers = "0.1"
 delta_kernel = { version = "0.12", features = ["default-engine", "arrow-55"] }
 dotenvy = "0.15"
