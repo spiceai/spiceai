@@ -16,7 +16,9 @@ limitations under the License.
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+#[cfg(feature = "test_hadoop_catalog_docker")]
+use std::sync::RwLock;
 
 use arrow_array::RecordBatch;
 #[cfg(feature = "test_hadoop_catalog_docker")]
@@ -25,6 +27,7 @@ use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuil
 use futures::TryStreamExt;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, NamespaceIdent};
+#[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::docker::DockerCompose;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::normalize_test_name;
@@ -35,6 +38,7 @@ const MINIO_PORT: u16 = 9000;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
+#[cfg(feature = "test_hadoop_catalog_docker")]
 fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
     HadoopCatalogBuilder::default().with_warehouse_root("file:///tmp/hadoop_warehouse")
 }
@@ -96,8 +100,9 @@ fn after_all() {
 }
 
 #[allow(clippy::expect_used)]
-async fn build_catalogs() -> [(&'static str, HadoopCatalog); 2] {
-    [
+async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
+    vec![
+        #[cfg(feature = "test_hadoop_catalog_docker")]
         (
             "file",
             get_file_hadoop_catalog()
