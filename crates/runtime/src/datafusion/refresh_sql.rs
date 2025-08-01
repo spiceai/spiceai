@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::error::DataFusionError;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -35,7 +36,7 @@ pub enum Error {
         "The provided Refresh SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
     ))]
     UnableToParseSql {
-        source: sqlparser::parser::ParserError,
+        source: DataFusionError,
     },
 
     #[snafu(display(

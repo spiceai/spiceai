@@ -38,7 +38,7 @@ pub enum Error {
         "The provided Retention SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
     ))]
     UnableToParseSql {
-        source: sqlparser::parser::ParserError,
+        source: DataFusionError,
     },
 
     #[snafu(display(

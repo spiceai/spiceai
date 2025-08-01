@@ -123,7 +123,7 @@ pub enum Error {
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
-        source: sqlparser::parser::ParserError,
+        source: DataFusionError,
     },
 
     #[snafu(display("{source}"))]
