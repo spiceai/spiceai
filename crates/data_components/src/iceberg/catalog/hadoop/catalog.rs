@@ -467,18 +467,16 @@ impl HadoopCatalog {
         if let Some(metadata_file) = metadata_file_path {
             self.file_io.new_input(&metadata_file)
         } else {
-            #[allow(clippy::similar_names)] // txt and text are indeed similar
-            let hint_txt = self
+            let hint_one = self
                 .file_io
                 .new_input(self.version_hint_path(table_identifier, "txt"))?;
-            #[allow(clippy::similar_names)] // txt and text are indeed similar
-            let hint_text = self
+            let hint_two = self
                 .file_io
                 .new_input(self.version_hint_path(table_identifier, "text"))?;
-            let hint_input = if hint_txt.exists().await? {
-                Some(hint_txt)
-            } else if hint_text.exists().await? {
-                Some(hint_text)
+            let hint_input = if hint_one.exists().await? {
+                Some(hint_one)
+            } else if hint_two.exists().await? {
+                Some(hint_two)
             } else {
                 None
             };
