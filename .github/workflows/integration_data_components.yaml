@@ -42,8 +42,8 @@ env:
   CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
 
 jobs:
-  build:
-    name: Build Data Components Test Binary
+  test:
+    name: Test Data Components
     runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@v4
@@ -60,77 +60,13 @@ jobs:
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
-      
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
 
-      - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Build test binary
+      - name: Run tests (hadoop)
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           CARGO_INCREMENTAL: 0
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          cargo nextest archive -p data_components --archive-file data_components_test.tar.zst
-
-      - name: Upload test archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: data-components-test-archive
-          path: ./data_components_test.tar.zst
-          retention-days: 1
-
-  test:
-    name: Data Components Integration Tests
-    needs: build
-    permissions: read-all
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
-
-      - name: Download test archive
-        uses: actions/download-artifact@v4
-        with:
-          name: data-components-test-archive
-          path: ./data_components_test
-
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Login to ACR
-        uses: docker/login-action@v3
-        if: github.repository == 'spiceai/spiceai'
-        with:
-          registry: spiceaitestimages.azurecr.io
-          username: spiceai-repo-pull
-          password: ${{ secrets.AZCR_PASSWORD }}
-
-      - name: Use public ECR for forks
-        if: github.repository != 'spiceai/spiceai'
-        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
-
-      - name: Run integration test
-        run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./data_components_test/data_components_test.tar.zst
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo test -p data_components --test hadoop_catalog_test
