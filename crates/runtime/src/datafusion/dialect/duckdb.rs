@@ -155,9 +155,9 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(
                 make_array_udf(),
                 vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0))),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0))),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0))),
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
                 ],
             )),
         ];
@@ -184,9 +184,9 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(
                 make_array_udf(),
                 vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0))),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0))),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0))),
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
                 ],
             )),
         ];
