@@ -649,6 +649,8 @@ pub fn parse_hadoop_table_url(
         .path_segments()
         .and_then(std::iter::Iterator::last)
         .context(UrlParseNoSourceSnafu)?;
+
+    // Set initial namespace - this falls through if warehouse URI is not provided
     let namespace_ident = parsed
         .path_segments()
         .and_then(|mut segments| {
@@ -660,13 +662,22 @@ pub fn parse_hadoop_table_url(
 
     let nodes = parsed
         .path_segments()
-        .map(|segments| segments.take(count - 2).collect::<Vec<_>>())
+        .map(|segments| segments.take(count - 1).collect::<Vec<_>>())
         .context(UrlParseNoSourceSnafu)?;
 
+    let warehouse_leaves = nodes
+        .clone()
+        .iter()
+        .map(ToString::to_string)
+        .take(count - 2)
+        .collect::<Vec<_>>()
+        .join("/");
+
     let mut base_uri = if let Some(host) = parsed.host_str() {
-        format!("{}://{}/{}", parsed.scheme(), host, nodes.join("/"))
+        format!("{}://{host}/{warehouse_leaves}", parsed.scheme())
     } else {
-        format!("{}://{}", parsed.scheme(), nodes.join("/"))
+        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI
+        format!("{}://{warehouse_leaves}", parsed.scheme())
     };
 
     let mut namespace = Namespace::new(namespace_ident);
