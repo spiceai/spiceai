@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::rate_limit::RateLimiter;
 use token_provider::TokenProvider;
+use tokio::sync::Semaphore;
 
 use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
@@ -647,6 +648,7 @@ pub struct GraphQLClient {
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone)]
@@ -752,6 +754,7 @@ impl GraphQLClient {
         unnest_behavior: UnnestBehavior,
         schema: Option<SchemaRef>,
         rate_limiter: Option<Arc<dyn RateLimiter>>,
+        semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
@@ -774,6 +777,7 @@ impl GraphQLClient {
             auth,
             schema,
             rate_limiter,
+            semaphore,
         })
     }
 
@@ -799,11 +803,34 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
+        let permit = if let Some(semaphore) = &self.semaphore {
+            tracing::info!("Acquiring semaphore permit for GraphQL query execution");
+            Some(
+                semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::InternalError {
+                        message: e.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let mut request = self.client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, self.auth.as_ref());
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
+
+        if let Some(_) = permit {
+            tracing::info!("Releasing permit");
+        }
+
+        permit.map(drop);
+
         let response_headers = response.headers().clone();
+
+        tracing::info!("{response_headers:?}");
 
         // Update rate limiter with response headers
         if let Some(rate_limiter) = &self.rate_limiter {

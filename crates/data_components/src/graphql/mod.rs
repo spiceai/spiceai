@@ -30,7 +30,7 @@ pub mod rate_limit;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Reqwest Internal: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
     #[snafu(display("HTTP {status}: {message}"))]
@@ -64,6 +64,10 @@ pub enum Error {
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[snafu(display(
+        "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    InternalError { message: String },
 
     #[snafu(display(
         "GraphQL Query Error:

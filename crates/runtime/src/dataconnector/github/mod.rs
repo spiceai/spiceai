@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use token_provider::{StaticTokenProvider, TokenProvider};
+use tokio::sync::Semaphore;
 use url::Url;
 
 use super::{
@@ -73,6 +74,7 @@ pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
     rate_limiter: Arc<GitHubRateLimiter>,
+    semaphore: Arc<Semaphore>,
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -135,6 +137,7 @@ impl Github {
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
+        .with_semaphore(Some(Arc::clone(&self.semaphore)))
         .build(client)
         .boxed()
     }
@@ -419,6 +422,7 @@ impl DataConnectorFactory for GithubFactory {
                 params: params.parameters,
                 token: token_provider,
                 rate_limiter: Arc::new(GitHubRateLimiter::new()),
+                semaphore: Arc::new(Semaphore::new(50)),
             }) as Arc<dyn DataConnector>)
         })
     }
