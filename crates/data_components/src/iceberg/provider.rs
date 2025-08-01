@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
+use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use tokio::sync::Semaphore;
@@ -57,11 +58,12 @@ impl IcebergCatalogProvider {
     pub async fn try_new(
         client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
+        includes: Option<&GlobSet>,
     ) -> Result<Self> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
 
-        let schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
+        let mut schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
             Ok(namespaces) => namespaces
                 .iter()
                 .flat_map(|ns| ns.as_ref().clone())
@@ -87,6 +89,15 @@ impl IcebergCatalogProvider {
             },
         };
 
+        // filter out namespaces that aren't part of the includes set
+        // this avoids fully listing all tables from namespaces we're not including anyway
+        if let Some(glob_set) = includes {
+            schema_names.retain(|name| {
+                // suffix namespace with `.` to match expected glob patterns
+                glob_set.is_match(format!("{name}."))
+            });
+        }
+
         let providers = try_join_all(
             schema_names
                 .iter()
@@ -96,6 +107,7 @@ impl IcebergCatalogProvider {
                         Arc::clone(&client),
                         NamespaceIdent::new(name.clone()),
                         semaphore_clone,
+                        includes,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -159,11 +171,23 @@ impl IcebergSchemaProvider {
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
+        include: Option<&GlobSet>,
     ) -> Result<Self> {
         let table_names: Vec<_> = client
             .list_tables(&namespace)
             .await
-            .map_err(handle_iceberg_error)?;
+            .map_err(handle_iceberg_error)?
+            .into_iter()
+            .filter(|table| {
+                // If include is None, we include all tables
+                if let Some(glob_set) = &include {
+                    // Check if the table name matches any of the glob patterns
+                    glob_set.is_match(table.to_string())
+                } else {
+                    true // Include all tables if no glob patterns are specified
+                }
+            })
+            .collect();
 
         // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
         let table_futures: Vec<_> = table_names
