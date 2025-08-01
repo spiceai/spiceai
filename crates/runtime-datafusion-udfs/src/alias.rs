@@ -17,10 +17,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use arrow_schema::FieldRef;
 use datafusion::{
     common::{ExprSchema, Result as DataFusionResult},
     logical_expr::{
-        ColumnarValue, Documentation, ReturnInfo, ReturnTypeArgs, ScalarFunctionArgs,
+        ColumnarValue, Documentation, ScalarFunctionArgs,
         ScalarUDFImpl, Signature,
         interval_arithmetic::Interval,
         simplify::{ExprSimplifyResult, SimplifyInfo},
@@ -28,6 +29,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion::logical_expr::ReturnFieldArgs;
 
 /// Aliases an existing Scalar UDF to a new name.
 #[derive(Debug)]
@@ -64,8 +66,8 @@ impl ScalarUDFImpl for ScalarUDFAlias {
         Ok(self.alias.to_string())
     }
 
-    fn return_type_from_args(&self, args: ReturnTypeArgs) -> DataFusionResult<ReturnInfo> {
-        self.scalar_udf.return_type_from_args(args)
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef> {
+        self.scalar_udf.return_field_from_args(args)
     }
 
     #[expect(deprecated)]
