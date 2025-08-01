@@ -58,7 +58,7 @@ pub(crate) fn cosine_distance_to_sql(
                     format: None,
                 })
             }
-            Expr::Literal(ScalarValue::FixedSizeList(array)) => {
+            Expr::Literal(ScalarValue::FixedSizeList(array), None) => {
                 let num_elements = u64::try_from(array.value_length()).map_err(|e| {
                     DataFusionError::Execution(format!("Cannot cast array length to u64 {e}"))
                 })?;

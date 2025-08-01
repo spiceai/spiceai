@@ -88,7 +88,7 @@ impl VectorQueryTableProvider {
         while let Some(Ok(rb)) = strm.next().await {
             if let Some(arr) = rb.column_by_name(primary_key_column.as_str()) {
                 for i in 0..arr.len() {
-                    expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?));
+                    expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?, None));
                 }
             }
         }
