@@ -710,11 +710,11 @@ mod tests {
 
     #[test]
     fn test_parse_hadoop_table_url() {
-        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let (base_uri, namespace, table_name) =
-            parse_hadoop_table_url(url, Some("s3://my-bucket/my-prefix/warehouse"))
+            parse_hadoop_table_url(url, Some("s3a://my-bucket/my-prefix/warehouse"))
                 .expect("Failed to parse Hadoop table URL");
-        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
         assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
         assert_eq!(table_name, "my_table");
 
@@ -727,10 +727,10 @@ mod tests {
         assert_eq!(table_name, "my_table");
 
         // should infer the base URI when no warehouse is provided
-        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let (base_uri, namespace, table_name) =
             parse_hadoop_table_url(url, None).expect("Failed to parse Hadoop table URL");
-        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
         assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
         assert_eq!(table_name, "my_table");
 
@@ -742,11 +742,11 @@ mod tests {
         assert_eq!(table_name, "my_table");
 
         // should support nested namespaces when a warehouse URI is provided
-        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/nested/my_table";
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/nested/my_table";
         let (base_uri, namespace, table_name) =
-            parse_hadoop_table_url(url, Some("s3://my-bucket/my-prefix/warehouse"))
+            parse_hadoop_table_url(url, Some("s3a://my-bucket/my-prefix/warehouse"))
                 .expect("Failed to parse Hadoop table URL");
-        assert_eq!(base_uri, "s3://my-bucket/my-prefix/warehouse");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
         assert_eq!(
             namespace.name().to_string().as_str(),
             "spiceai_sandbox.nested",
@@ -758,7 +758,7 @@ mod tests {
         let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
         assert!(result.is_err());
 
-        let url = "s3://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
         assert!(result.is_err());
     }
