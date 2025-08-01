@@ -435,17 +435,20 @@ mod tests {
                     .await
                     .expect("Should create provider");
 
+            // include does not prune namespaces
             assert!(
-                provider.schema_names().len() == 1,
-                "{name} - Should have exactly one schema, found: {:?}",
+                provider.schema_names().len() == 2,
+                "{name} - Should have exactly two schemas, found: {:?}",
                 provider.schema_names()
             );
 
+            let mut namespaces = provider.schema_names();
+            namespaces.sort();
+
             assert_eq!(
-                provider.schema_names()[0],
-                "test",
-                "{name} - The schema name should be 'test', found: {}",
-                provider.schema_names()[0]
+                namespaces,
+                vec!["nested", "test"],
+                "{name} - The schema names should be 'nested' and 'test', found: {namespaces:?}",
             );
 
             assert!(

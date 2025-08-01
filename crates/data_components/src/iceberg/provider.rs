@@ -63,7 +63,7 @@ impl IcebergCatalogProvider {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
 
-        let mut schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
+        let schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
             Ok(namespaces) => namespaces
                 .iter()
                 .flat_map(|ns| ns.as_ref().clone())
@@ -88,15 +88,6 @@ impl IcebergCatalogProvider {
                 _ => return Err(handle_iceberg_error(e)),
             },
         };
-
-        // filter out namespaces that aren't part of the includes set
-        // this avoids fully listing all tables from namespaces we're not including anyway
-        if let Some(glob_set) = includes {
-            schema_names.retain(|name| {
-                // suffix namespace with `.` to match expected glob patterns
-                glob_set.is_match(format!("{name}."))
-            });
-        }
 
         let providers = try_join_all(
             schema_names
