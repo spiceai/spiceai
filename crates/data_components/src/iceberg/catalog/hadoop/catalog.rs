@@ -368,9 +368,6 @@ impl Catalog for HadoopCatalog {
                 .await?
             {
                 tables.push(table_ident);
-            } else {
-                // TODO: Add something like a `MetadataMissingBehavior` to choose whether to fail or not
-                tracing::warn!("Table {} does not have metadata, skipping", table_ident);
             }
         }
 
@@ -470,11 +467,21 @@ impl HadoopCatalog {
         if let Some(metadata_file) = metadata_file_path {
             self.file_io.new_input(&metadata_file)
         } else {
-            // TODO: version hint could be .txt or .text. refactor this to support both later
-            let version_hint_path = self.version_hint_path(table_identifier, "txt");
+            let hint_one = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "txt"))?;
+            let hint_two = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "text"))?;
+            let hint_input = if hint_one.exists().await? {
+                Some(hint_one)
+            } else if hint_two.exists().await? {
+                Some(hint_two)
+            } else {
+                None
+            };
 
-            let input = self.file_io.new_input(&version_hint_path)?;
-            if input.exists().await? {
+            if let Some(input) = hint_input {
                 // Load the version hint file to get the latest metadata file
                 let metadata_version = input.read().await?;
                 let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
