@@ -4103,7 +4103,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=347a765a106c62cbdf2943da0f8b1f790e84492f#347a765a106c62cbdf2943da0f8b1f790e84492f"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=2e0bdfd5e7809ae53106f3e63bbfbebbad4aff69#2e0bdfd5e7809ae53106f3e63bbfbebbad4aff69"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4113,6 +4113,7 @@ dependencies = [
  "bb8 0.8.6",
  "bb8-postgres",
  "bigdecimal",
+ "bitflags 2.9.1",
  "byte-unit",
  "byteorder",
  "chrono",
