@@ -48,13 +48,14 @@ use graphql_parser::query::{
 use issues::IssuesTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use token_provider::{StaticTokenProvider, TokenProvider};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use super::{
@@ -68,6 +69,9 @@ mod members;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
+
+static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub struct Github {
@@ -397,32 +401,60 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
+        let max_concurrent_connections = params
+            .app
+            .and_then(|app| {
+                app.runtime
+                    .params
+                    .get("github_max_concurrent_connections")
+                    .cloned()
+            })
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+
         Box::pin(async move {
-            let token_provider: Option<Arc<dyn TokenProvider>> =
+            let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
-                        Some(Arc::new(StaticTokenProvider::new(token.clone())))
+                        let key = token.clone().expose_secret().to_string();
+                        (
+                            Some(Arc::new(StaticTokenProvider::new(token.clone()))),
+                            Some(key),
+                        )
                     }
 
                     (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                        Some(Arc::new(
+                        let key = client_id.clone();
+                        let provider = Arc::new(
                             GitHubAppTokenProvider::try_new(
                                 client_id.into(),
                                 private_key.into(),
                                 installation_id.into(),
                             )
                             .await?,
-                        ))
+                        );
+                        (Some(provider), Some(key))
                     }
 
-                    _ => None,
+                    _ => (None, None),
                 };
+
+            let semaphore = if let Some(key) = semaphore_key {
+                let mut limits = GITHUB_CONCURRENCY_LIMITS.lock().await;
+                Arc::clone(
+                    limits
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent_connections))),
+                )
+            } else {
+                Arc::new(Semaphore::new(max_concurrent_connections))
+            };
 
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
                 rate_limiter: Arc::new(GitHubRateLimiter::new()),
-                semaphore: Arc::new(Semaphore::new(50)),
+                semaphore,
             }) as Arc<dyn DataConnector>)
         })
     }

@@ -803,8 +803,10 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
+        let mut request = self.client.post(self.endpoint.clone()).body(body);
+        request = request_with_auth(request, self.auth.as_ref());
+
         let permit = if let Some(semaphore) = &self.semaphore {
-            tracing::info!("Acquiring semaphore permit for GraphQL query execution");
             Some(
                 semaphore
                     .acquire()
@@ -817,20 +819,13 @@ impl GraphQLClient {
             None
         };
 
-        let mut request = self.client.post(self.endpoint.clone()).body(body);
-        request = request_with_auth(request, self.auth.as_ref());
-
         let response = request.send().await.context(ReqwestInternalSnafu)?;
 
-        if let Some(_) = permit {
-            tracing::info!("Releasing permit");
+        if let Some(permit) = permit {
+            drop(permit);
         }
 
-        permit.map(drop);
-
         let response_headers = response.headers().clone();
-
-        tracing::info!("{response_headers:?}");
 
         // Update rate limiter with response headers
         if let Some(rate_limiter) = &self.rate_limiter {
