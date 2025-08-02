@@ -68,7 +68,7 @@ pub(super) async fn create_bedrock_client(
         .map(|rpm| rpm.expose_secret().parse::<u32>().boxed())
         .transpose()?
     {
-        rate_limit_builder.requests_per_minute(rpm);
+        let _ = rate_limit_builder.requests_per_minute(rpm);
     }
 
     if let Some(invocations) = params
@@ -76,7 +76,7 @@ pub(super) async fn create_bedrock_client(
         .map(|inv| inv.expose_secret().parse::<usize>().boxed())
         .transpose()?
     {
-        rate_limit_builder.max_concurrent_invocations(invocations);
+        let _ = rate_limit_builder.max_concurrent_invocations(invocations);
     }
 
     let config = config_builder.load().await;

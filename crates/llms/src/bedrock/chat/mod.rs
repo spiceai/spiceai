@@ -25,8 +25,7 @@ use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoice, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallChunk,
+    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
     ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
@@ -36,7 +35,8 @@ use async_openai::types::{
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolType,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FunctionCall, FunctionCallStream, Role, Stop,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FunctionCall, FunctionCallStream,
+    Role, Stop,
 };
 use async_stream::stream;
 use async_trait::async_trait;
@@ -46,15 +46,15 @@ use aws_sdk_bedrockruntime::operation::converse::builders::ConverseFluentBuilder
 use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamFluentBuilder;
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::builders::{
-    MessageBuilder, ToolResultBlockBuilder,
-    ToolUseBlockBuilder,
+    MessageBuilder, ToolResultBlockBuilder, ToolUseBlockBuilder,
 };
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
     ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
-    ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket, InferenceConfiguration, Message,
-    MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock, ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
+    ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
+    InferenceConfiguration, Message, MessageStartEvent, MessageStopEvent, SystemContentBlock,
+    ToolResultContentBlock, ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
 use itertools::Itertools;
 use serde_json::{Value, json};
@@ -103,6 +103,7 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are neither [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`Message`] format.
     ///
     /// Other enum variants will be ignored.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
     fn convert_non_system_messages(
         msgs: Vec<ChatCompletionRequestMessage>,
     ) -> Result<Vec<Message>, BuildError> {
@@ -144,7 +145,9 @@ impl BedrockConverse {
                                 ChatCompletionRequestAssistantMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
                                 ) => Some(text.clone()),
-                                _ => None,
+                                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => {
+                                    None
+                                }
                             })
                             .join("")
                             .into(),
@@ -230,13 +233,10 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
     ///
     /// Other enum variants will be ignored.
+    #[allow(clippy::cast_possible_wrap)]
     fn convert_system_messages(msgs: Vec<ChatCompletionRequestMessage>) -> Vec<SystemContentBlock> {
         msgs.into_iter()
             .flat_map(|m| match m {
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: ChatCompletionRequestSystemMessageContent::Text(s),
-                    name: _,
-                }) => vec![SystemContentBlock::Text(s.to_string())],
                 ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Array(arr),
                     name: _,
@@ -253,7 +253,11 @@ impl BedrockConverse {
                         content: ChatCompletionRequestDeveloperMessageContent::Text(s),
                         name: _,
                     },
-                ) => vec![SystemContentBlock::Text(s.to_string())],
+                )
+                | ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: ChatCompletionRequestSystemMessageContent::Text(s),
+                    name: _,
+                }) => vec![SystemContentBlock::Text(s.to_string())],
                 ChatCompletionRequestMessage::Developer(
                     ChatCompletionRequestDeveloperMessage {
                         content: ChatCompletionRequestDeveloperMessageContent::Array(arr),
@@ -271,7 +275,7 @@ impl BedrockConverse {
             .collect()
     }
 
-    #[allow(deprecated)]
+    #[allow(clippy::cast_possible_wrap, deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
             .set_max_tokens(
@@ -290,7 +294,7 @@ impl BedrockConverse {
 
     fn to_converse_stream(
         &self,
-        client: Arc<BedrockClient>,
+        client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseStreamFluentBuilder, OpenAIError> {
         let inf_cfg = Self::inference_cfg(&req);
@@ -339,7 +343,7 @@ impl BedrockConverse {
     #[allow(deprecated)]
     fn to_converse(
         &self,
-        client: Arc<BedrockClient>,
+        client: &Arc<BedrockClient>,
         req: CreateChatCompletionRequest,
     ) -> Result<ConverseFluentBuilder, OpenAIError> {
         let inf_cfg = Self::inference_cfg(&req);
@@ -385,8 +389,8 @@ impl BedrockConverse {
         Ok(bldr)
     }
 
-    #[allow(deprecated)]
-    fn from_converse_output(
+    #[allow(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
+    fn convert_converse_output(
         &self,
         output: ConverseOutput,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
@@ -447,7 +451,8 @@ impl BedrockConverse {
         })
     }
 
-    async fn process_stream(
+    #[allow(clippy::too_many_lines)]
+    fn process_stream(
         model: String,
         mut input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
     ) -> ChatCompletionResponseStream {
@@ -503,7 +508,7 @@ impl BedrockConverse {
                             },
                             ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::Text(text)), ..}) => {
                                 match chat_completion_stream(
-                                    &state.id,
+                                    state.id.as_str(),
                                     model.clone(),
                                     vec![chat_choice_stream(Some(text), None, state.role, None, None)],
                                     None,
@@ -518,7 +523,7 @@ impl BedrockConverse {
                                 if let Some(ToolUseBlockStart{tool_use_id, name,..}) = state.content_block_index_to_tool_details.get(&content_block_index) {
 
                                     match chat_completion_stream(
-                                        &state.id,
+                                        state.id.as_str(),
                                         model.clone(),
                                         vec![chat_choice_stream(None, Some(vec![ChatCompletionMessageToolCallChunk{
                                             index: *tool_delta_idx,
@@ -547,7 +552,7 @@ impl BedrockConverse {
                                     }
                                 };
                                 match chat_completion_stream(
-                                    &state.id,
+                                    state.id.as_str(),
                                     model.clone(),
                                     vec![chat_choice_stream(None, None, state.role, None, Some(finish_reason))],
                                     None,
@@ -558,7 +563,7 @@ impl BedrockConverse {
                             },
                             ConverseStreamOutputPacket::Metadata(ConverseStreamMetadataEvent{usage: Some(usage), ..}) => {
                                 match chat_completion_stream(
-                                    &state.id, model.clone(), vec![], Some(convert_usage(&usage))
+                                    state.id.as_str(), model.clone(), vec![], Some(convert_usage(&usage))
                                 ) {
                                     Ok(s) => yield Ok(s),
                                     Err(e) => {yield Err(e); break}
@@ -586,26 +591,26 @@ impl Chat for BedrockConverse {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let input = self.to_converse_stream(self.client.clone(), self.alter_request(req))?;
+        let input = self.to_converse_stream(&self.client, self.alter_request(req))?;
         let output = self
             .client
             .do_converse_stream(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-        Ok(Self::process_stream(self.model_id.clone(), output.stream).await)
+        Ok(Self::process_stream(self.model_id.clone(), output.stream))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let input = self.to_converse(self.client.clone(), self.alter_request(req))?;
+        let input = self.to_converse(&self.client, self.alter_request(req))?;
         let output = self
             .client
             .do_converse(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-        self.from_converse_output(output)
+        self.convert_converse_output(output)
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {

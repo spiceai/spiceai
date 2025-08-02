@@ -17,21 +17,18 @@ limitations under the License.
 
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
-    ChatChoiceStream, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta,
-    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage, CreateChatCompletionStreamResponse,
-    FinishReason, FunctionCall, FunctionName, FunctionObject,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionName, FunctionObject,
     PromptTokensDetails, Role,
 };
-use aws_sdk_bedrockruntime::types::builders::{
-    AnyToolChoiceBuilder, AutoToolChoiceBuilder,
-};
+use aws_sdk_bedrockruntime::types::builders::{AnyToolChoiceBuilder, AutoToolChoiceBuilder};
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole,
-    GuardrailConverseContentBlock, GuardrailConverseTextBlock, ReasoningContentBlock, ReasoningTextBlock,
-    SpecificToolChoice, StopReason, TokenUsage, Tool, ToolChoice,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock,
-    ToolSpecification, ToolUseBlock,
+    ContentBlock, ConversationRole, GuardrailConverseContentBlock, GuardrailConverseTextBlock,
+    ReasoningContentBlock, ReasoningTextBlock, SpecificToolChoice, StopReason, TokenUsage, Tool,
+    ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolSpecification,
+    ToolUseBlock,
 };
 use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
@@ -76,6 +73,7 @@ pub(super) fn to_api_error(err: impl Into<String>) -> OpenAIError {
 }
 
 /// Extract the content, refusal and tool calls from a `ContentBlock`.
+#[allow(clippy::type_complexity, clippy::cast_possible_truncation)]
 pub(super) fn extract_from_content_block(
     blck: &ContentBlock,
 ) -> Result<
@@ -119,15 +117,16 @@ pub(super) fn extract_from_content_block(
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 pub(super) fn chat_completion_stream(
-    id: &String,
+    id: &str,
     model: String,
     choices: Vec<ChatChoiceStream>,
     usage: Option<CompletionUsage>,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
     Ok(CreateChatCompletionStreamResponse {
         choices,
-        id: id.clone(),
+        id: id.to_owned(),
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
@@ -212,6 +211,7 @@ pub(super) fn chat_choice_stream(
     }
 }
 
+#[allow(clippy::cast_sign_loss)]
 pub(super) fn convert_usage(usage: &TokenUsage) -> CompletionUsage {
     let TokenUsage {
         input_tokens,
