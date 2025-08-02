@@ -16,6 +16,3 @@ limitations under the License.
 
 mod catalog;
 pub use catalog::*;
-
-mod provider;
-pub use provider::*;
