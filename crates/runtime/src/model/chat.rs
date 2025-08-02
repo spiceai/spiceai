@@ -134,7 +134,7 @@ pub async fn construct_model(
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         #[cfg(feature = "bedrock")]
-        ModelSource::Bedrock => bedrock(model_id, &params).await,
+        ModelSource::Bedrock => bedrock(model_id, params).await,
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),

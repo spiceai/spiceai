@@ -69,7 +69,7 @@ pub(super) async fn create_bedrock_client(
         .transpose()?
     {
         rate_limit_builder.requests_per_minute(rpm);
-    };
+    }
 
     if let Some(invocations) = params
         .get("max_concurrent_invocations")
@@ -77,7 +77,7 @@ pub(super) async fn create_bedrock_client(
         .transpose()?
     {
         rate_limit_builder.max_concurrent_invocations(invocations);
-    };
+    }
 
     let config = config_builder.load().await;
     Ok(BedrockClient::new(&config, rate_limit_builder.build()))

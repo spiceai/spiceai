@@ -70,6 +70,7 @@ impl BedrockClient {
         }
     }
 
+    /// Perform a [Converse Stream API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html) with appropriate rate-limiting and retry logic.
     pub async fn do_converse_stream(
         &self,
         converse_build: ConverseStreamFluentBuilder,
@@ -79,33 +80,29 @@ impl BedrockClient {
             async move {
                 match value.send().await {
                     Ok(response) => Ok(response),
-                    Err(e) => {
-                        tracing::warn!("Got an error on bedrock send {e:#?}");
-                        let retry_error = match &e {
-                            SdkError::ServiceError(service_error) => match service_error.err() {
-                                ConverseStreamError::ThrottlingException(_) => {
-                                    tracing::debug!(
-                                        "Bedrock model throttled whilst conversing, backing off and retrying..."
-                                    );
-                                    RetryError::transient(
-                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                    )
-                                }
-                                _ => RetryError::permanent(
-                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                ),
-                            },
-                            _ => RetryError::permanent(
-                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                            ),
-                        };
-                        Err(retry_error)
-                    }
+                    Err(SdkError::ServiceError(service_error)) => match service_error.into_err() {
+                        ConverseStreamError::ThrottlingException(throttle_e) => {
+                            tracing::debug!(
+                                "Bedrock model throttled whilst conversing, backing off and retrying..."
+                            );
+                            Err(RetryError::transient(
+                                Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
+                            ))
+                        }
+                        e => Err(RetryError::permanent(
+                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                        )),
+                    },
+                    Err(e) => Err(RetryError::permanent(
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    ))
                 }
             }
         })
         .await
     }
+
+    /// Perform a Converse [API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html) with appropriate rate-limiting and retry logic.
     pub async fn do_converse(
         &self,
         converse_build: ConverseFluentBuilder,
@@ -115,34 +112,29 @@ impl BedrockClient {
             async move {
                 match value.send().await {
                     Ok(response) => Ok(response),
-                    Err(e) => {
-                        tracing::warn!("Got an error on bedrock send {e:#?}");
-                        let retry_error = match &e {
-                            SdkError::ServiceError(service_error) => match service_error.err() {
-                                ConverseError::ThrottlingException(_) => {
-                                    tracing::debug!(
-                                        "Bedrock model throttled whilst conversing, backing off and retrying..."
-                                    );
-                                    RetryError::transient(
-                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                    )
-                                }
-                                _ => RetryError::permanent(
-                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                ),
-                            },
-                            _ => RetryError::permanent(
-                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                            ),
-                        };
-                        Err(retry_error)
-                    }
+                    Err(SdkError::ServiceError(service_error)) => match service_error.into_err() {
+                        ConverseError::ThrottlingException(throttle_e) => {
+                            tracing::debug!(
+                                "Bedrock model throttled whilst conversing, backing off and retrying..."
+                            );
+                            Err(RetryError::transient(
+                                Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
+                            ))
+                        }
+                        e => Err(RetryError::permanent(
+                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                        )),
+                    },
+                    Err(e) => Err(RetryError::permanent(
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    ))
                 }
             }
         })
         .await
     }
 
+    /// Perform an Invoke [API operation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html) with appropriate rate-limiting and retry logic.
     pub async fn do_invoke(
         &self,
         model_id: impl Into<String>,
@@ -163,28 +155,22 @@ impl BedrockClient {
                 .await
             {
                 Ok(response) => Ok(response),
-                Err(e) => {
-                    // Map Bedrock Throttling into RetryError::transient.
-                    let retry_error = match &e {
-                        SdkError::ServiceError(service_error) => match service_error.err() {
-                            InvokeModelError::ThrottlingException(_) => {
-                                tracing::debug!(
-                                    "Bedrock embedding model throttled, backing off and retrying..."
-                                );
-                                RetryError::transient(
-                                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                )
-                            }
-                            _ => RetryError::permanent(
-                                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                            ),
-                        },
-                        _ => RetryError::permanent(
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        ),
-                    };
-                    Err(retry_error)
-                }
+                Err(SdkError::ServiceError(service_error)) => match service_error.into_err() {
+                    InvokeModelError::ThrottlingException(throttle_e) => {
+                        tracing::debug!(
+                            "Bedrock model throttled whilst conversing, backing off and retrying..."
+                        );
+                        Err(RetryError::transient(
+                            Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
+                        ))
+                    }
+                    e => Err(RetryError::permanent(
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    )),
+                },
+                Err(e) => Err(RetryError::permanent(
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                )),
             }}
         })
         .await
