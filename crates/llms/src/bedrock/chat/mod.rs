@@ -49,9 +49,8 @@ use aws_sdk_bedrockruntime::types::builders::{
 };
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    AutoToolChoice, ContentBlock, ContentBlockDelta as ContentBlockDeltaType,
-    ContentBlockDeltaEvent, ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent,
-    ConversationRole, ConverseStreamMetadataEvent,
+    ContentBlock, ContentBlockDelta as ContentBlockDeltaType,
+    ContentBlockDeltaEvent, ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole, ConverseStreamMetadataEvent,
     ConverseStreamOutput as ConverseStreamOutputPacket, GuardrailConverseContentBlock,
     GuardrailConverseTextBlock, InferenceConfiguration, Message, MessageStartEvent,
     MessageStopEvent, ReasoningContentBlock, ReasoningTextBlock, SpecificToolChoice, StopReason,
@@ -61,21 +60,43 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Document, Number};
 use itertools::Itertools;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::Span;
 
-/// [`BedrockConverse`] provides an OpenAI compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
+/// [`BedrockConverse`] provides an `OpenAI` compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
 pub struct BedrockConverse {
     client: Arc<BedrockClient>,
     model_id: String,
 }
 
 impl BedrockConverse {
-    pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
+    #[must_use] pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
         Self { client, model_id }
+    }
+
+    fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+        req.model.clone_from(&self.model_id);
+        // Bedrock should set Option::None parameters to a schema with no inputs, but doesn't.
+        // Must be done explicitly.
+        if let Some(ref mut tools) = req.tools {
+            for t in tools.iter_mut() {
+                if t.function.parameters.is_none() {
+                    t.function.parameters.replace(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ));
+                }
+            }
+        }
+        req
     }
 
     fn convert_non_system_messages(
@@ -128,7 +149,7 @@ impl BedrockConverse {
 
                     let mut tool_content = tool_calls.as_ref().map(|tools| {
                         tools
-                            .into_iter()
+                            .iter()
                             .filter_map(|t| {
                                 let ChatCompletionMessageToolCall {
                                     id,
@@ -136,24 +157,26 @@ impl BedrockConverse {
                                     ..
                                 } = t;
 
+                                let tool_input =
+                                    serde_json::from_str(arguments).ok().map(value_to_document);
                                 Some(ContentBlock::ToolUse(
                                     ToolUseBlockBuilder::default()
                                         .set_tool_use_id(Some(id.clone()))
                                         .set_name(Some(name.clone()))
-                                        .set_input(Some(Document::String(arguments.clone())))
+                                        .set_input(tool_input)
                                         .build()
                                         .ok()?,
                                 ))
                             })
                             .collect::<Vec<_>>()
                     });
-                    if let Some(mut messages) = tool_content.as_mut() {
-                        message_content.append(&mut messages);
-                    };
+                    if let Some(messages) = tool_content.as_mut() {
+                        message_content.append(messages);
+                    }
 
                     if let Some(text) = text_content {
                         message_content.push(ContentBlock::Text(text));
-                    };
+                    }
 
                     MessageBuilder::default()
                         .set_content(Some(message_content))
@@ -241,6 +264,7 @@ impl BedrockConverse {
             .collect()
     }
 
+    #[allow(deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
             .set_max_tokens(
@@ -257,7 +281,6 @@ impl BedrockConverse {
             .build()
     }
 
-    #[allow(deprecated)]
     fn to_converse_stream(
         &self,
         client: Arc<BedrockClient>,
@@ -300,7 +323,7 @@ impl BedrockConverse {
             bldr = bldr.set_request_metadata(Some(
                 m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
             ));
-        };
+        }
 
         Ok(bldr)
     }
@@ -348,7 +371,7 @@ impl BedrockConverse {
             bldr = bldr.set_request_metadata(Some(
                 m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
             ));
-        };
+        }
 
         Ok(bldr)
     }
@@ -479,17 +502,17 @@ impl BedrockConverse {
                             ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::Text(text)), content_block_index, ..}) => {
                                 match chat_completion_stream(
                                     model.clone(),
-                                    vec![chat_choice_stream(Some(text), None, state.role.clone(), None, None)],
+                                    vec![chat_choice_stream(Some(text), None, state.role, None, None)],
                                     None,
                                 ) {
                                     Ok(s) => yield Ok(s),
                                     Err(e) => {yield Err(e); break}
-                                };
+                                }
                             },
                             ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::ToolUse(ToolUseBlockDelta{input,..})), content_block_index, ..}) => {
                                 let tool_delta_idx = state.content_block_index_to_delta_idx.get(&content_block_index).unwrap_or(&0);
 
-                                if let Some(ToolUseBlockStart{tool_use_id, name: _,..}) = state.content_block_index_to_tool_details.get(&content_block_index) {
+                                if let Some(ToolUseBlockStart{tool_use_id, name,..}) = state.content_block_index_to_tool_details.get(&content_block_index) {
 
                                     match chat_completion_stream(
                                         model.clone(),
@@ -497,18 +520,18 @@ impl BedrockConverse {
                                             index: *tool_delta_idx,
                                             id: Some(tool_use_id.clone()),
                                             r#type: Some(ChatCompletionToolType::Function),
-                                            function: None
-                                        }]), state.role.clone(), None, None)],
+                                            function: Some(FunctionCallStream { name: Some(name.clone()), arguments: Some(input) })
+                                        }]), state.role, None, None)],
                                         None,
                                     ) {
                                         Ok(s) => yield Ok(s),
                                         Err(e) => {yield Err(e); break}
-                                    };
+                                    }
 
                                 } else {
-                                    yield Err(to_api_error(format!("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet")));
+                                    yield Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string()));
                                     break;
-                                };
+                                }
                                 state.content_block_index_to_delta_idx.insert(content_block_index, tool_delta_idx + 1);
                             },
                             ConverseStreamOutputPacket::MessageStop(MessageStopEvent{ stop_reason,.. }) => {
@@ -521,12 +544,12 @@ impl BedrockConverse {
                                 };
                                 match chat_completion_stream(
                                     model.clone(),
-                                    vec![chat_choice_stream(None, None, state.role.clone(), None, Some(finish_reason))],
+                                    vec![chat_choice_stream(None, None, state.role, None, Some(finish_reason))],
                                     None,
                                 ) {
                                     Ok(s) => yield Ok(s),
                                     Err(e) => {yield Err(e); break}
-                                };
+                                }
                             },
                             ConverseStreamOutputPacket::Metadata(ConverseStreamMetadataEvent{usage: Some(usage), ..}) => {
                                 match chat_completion_stream(
@@ -534,10 +557,10 @@ impl BedrockConverse {
                                 ) {
                                     Ok(s) => yield Ok(s),
                                     Err(e) => {yield Err(e); break}
-                                };
+                                }
                             },
                             ConverseStreamOutputPacket::ContentBlockStop(_) => {
-                                // No action needed for content block stop
+
                             },
                             unknown => {
                                 yield Err(to_api_error(format!("Unknown event from Bedrock stream: {unknown:?}")));
@@ -558,13 +581,12 @@ impl Chat for BedrockConverse {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let input = self.to_converse_stream(self.client.clone(), req)?;
+        let input = self.to_converse_stream(self.client.clone(), self.alter_request(req))?;
         let output = self
             .client
             .do_converse_stream(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-
         Ok(Self::process_stream(self.model_id.clone(), output.stream).await)
     }
 
@@ -572,15 +594,12 @@ impl Chat for BedrockConverse {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        tracing::warn!("hello");
-        let input = self.to_converse(self.client.clone(), req)?;
-        tracing::warn!("hello.. input={input:?}");
+        let input = self.to_converse(self.client.clone(), self.alter_request(req))?;
         let output = self
             .client
             .do_converse(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-        tracing::warn!("hello.. output={output:?}");
         self.from_converse_output(output)
     }
 
@@ -594,9 +613,9 @@ fn try_convert_role(role: &ConversationRole) -> Result<Role, OpenAIError> {
         ConversationRole::Assistant => Ok(Role::Assistant),
         ConversationRole::User => Ok(Role::User),
         unknown_role => {
-            return Err(to_api_error(format!(
+            Err(to_api_error(format!(
                 "Unknown role returned from AWS bedrock: {unknown_role:?}"
-            )));
+            )))
         }
     }
 }
@@ -627,7 +646,7 @@ fn to_api_error(err: impl Into<String>) -> OpenAIError {
     })
 }
 
-/// Extract the content, refusal and tool calls from a ContentBlock.
+/// Extract the content, refusal and tool calls from a `ContentBlock`.
 fn extract_from_content_block(
     blck: &ContentBlock,
 ) -> Result<
@@ -667,7 +686,8 @@ fn extract_from_content_block(
                     r#type: ChatCompletionToolType::Function,
                     function: FunctionCall {
                         name: name.clone(),
-                        arguments: serde_json::to_string(input).unwrap_or_default(),
+                        arguments: serde_json::to_string(&document_to_value(input.clone()))
+                            .unwrap_or_default(),
                     },
                 }),
             ))
@@ -816,5 +836,27 @@ fn value_to_document(value: serde_json::Value) -> Document {
         serde_json::Value::String(s) => Document::String(s),
         serde_json::Value::Bool(b) => Document::Bool(b),
         serde_json::Value::Null => Document::Null,
+    }
+}
+
+fn document_to_value(doc: Document) -> serde_json::Value {
+    match doc {
+        Document::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, document_to_value(v)))
+                .collect(),
+        ),
+        Document::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(document_to_value).collect())
+        }
+        Document::Number(num) => match num {
+            Number::PosInt(u) => serde_json::Value::Number(u.into()),
+            Number::NegInt(i) => serde_json::Value::Number(i.into()),
+            Number::Float(f) => serde_json::Number::from_f64(f)
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        },
+        Document::String(s) => serde_json::Value::String(s),
+        Document::Bool(b) => serde_json::Value::Bool(b),
+        Document::Null => serde_json::Value::Null,
     }
 }

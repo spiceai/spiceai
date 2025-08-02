@@ -1,5 +1,2 @@
-[build]
-rustflags = ["--cfg", "aws_sdk_unstable"]
-
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static", "--cfg", "aws_sdk_unstable"]
