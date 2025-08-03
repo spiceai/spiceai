@@ -30,7 +30,7 @@ pub mod rate_limit;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Reqwest Internal: {source}"))]
+    #[snafu(display("{source}"))]
     ReqwestInternal { source: reqwest::Error },
 
     #[snafu(display("HTTP {status}: {message}"))]
