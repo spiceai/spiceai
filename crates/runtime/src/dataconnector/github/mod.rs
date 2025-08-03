@@ -73,6 +73,8 @@ mod stargazers;
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
+
 #[derive(Debug)]
 pub struct Github {
     params: Parameters,
@@ -410,7 +412,7 @@ impl DataConnectorFactory for GithubFactory {
                     .cloned()
             })
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(10);
+            .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
 
         Box::pin(async move {
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
