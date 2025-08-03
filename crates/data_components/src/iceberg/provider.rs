@@ -26,45 +26,10 @@ use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
-use snafu::prelude::*;
 use tokio::sync::Semaphore;
 
 use crate::RefreshableCatalogProvider;
-
-use super::catalog::RestCatalog;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "An unknown error occurred while interacting with the Iceberg catalog.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
-    ))]
-    Unknown { source: iceberg::Error },
-
-    #[snafu(display(
-        "The data in the Iceberg table is invalid. The table may be corrupted or incomplete.\n{source}"
-    ))]
-    DataInvalid { source: iceberg::Error },
-
-    #[snafu(display(
-        "This Iceberg feature is not yet supported.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
-    ))]
-    FeatureUnsupported { source: iceberg::Error },
-
-    #[snafu(display(
-        "The namespace '{namespace}' does not exist in the Iceberg catalog, verify the namespace name and try again."
-    ))]
-    NamespaceDoesNotExist { namespace: String },
-
-    #[snafu(display(
-        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."
-    ))]
-    FailedToConnect { url: String, source: iceberg::Error },
-
-    #[snafu(display(
-        "Internal error: could not acquire a semaphore permit for concurrency control: {source}"
-    ))]
-    SemaphoreError { source: tokio::sync::AcquireError },
-}
+use crate::iceberg::catalog::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -90,7 +55,7 @@ impl IcebergCatalogProvider {
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
     pub async fn try_new(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
     ) -> Result<Self> {
         // Create the semaphore first, so we can use it in the closures below
@@ -191,7 +156,7 @@ impl IcebergSchemaProvider {
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
     pub(crate) async fn try_new(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
     ) -> Result<Self> {
@@ -231,7 +196,7 @@ impl IcebergSchemaProvider {
     }
 
     async fn load_table(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {

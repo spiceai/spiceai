@@ -16,8 +16,11 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
 use bytes::Bytes;
+use reqwest::StatusCode;
 use std::fmt::Debug;
 use std::sync::Arc;
+use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
+use util::{RetryError, retry};
 
 use crate::chunking::{
     ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
@@ -41,6 +44,10 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
+fn default_retry_strategy() -> FibonacciBackoff {
+    FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
+}
+
 /// Embedding implementation for `OpenAI` compatible embedding models.
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
@@ -48,6 +55,8 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 pub struct OpenaiEmbed<C: Config> {
     pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
+    // Retry strategy for transient or throttling errors
+    retry_strategy: FibonacciBackoff,
 }
 
 impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
@@ -64,6 +73,7 @@ impl<C: Config> OpenaiEmbed<C> {
         Self {
             inner,
             chunk_sizer: None,
+            retry_strategy: default_retry_strategy(),
         }
     }
 
@@ -113,22 +123,33 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
             })
             .collect();
 
+        let client_ref = Arc::new(self.inner.client.clone());
+
         let embed_futures: Vec<_> = request_batches_result?
             .into_iter()
             .map(|req| {
-                let local_client = self.inner.client.clone();
+                let retry_strategy = self.retry_strategy.clone();
+                let client = Arc::clone(&client_ref);
                 async move {
-                    let embedding: Vec<Vec<f32>> = local_client
-                        .embeddings()
-                        .create_float(req)
-                        .await
-                        .boxed()
-                        .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
-                        .data
-                        .into_iter()
-                        .map(|d| d.embedding.into())
-                        .collect();
-                    Ok::<Vec<Vec<f32>>, EmbedError>(embedding)
+                    retry(retry_strategy, async || {
+                        client.embeddings().create_float(req.clone()).await
+                            .map(|resp| {
+                                resp.data.into_iter().map(|d| d.embedding.into()).collect::<Vec<_>>()
+                            })
+                            .map_err(|err| {
+                                if is_retriable_error(&err) {
+                                    tracing::debug!(
+                                        "OpenAI embedding model encountered a retriable server error: {err}. Backing off and retrying..."
+                                    );
+                                    return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
+                                }
+                                tracing::debug!(
+                                    "OpenAI embedding model encountered a non-retriable server error: {err}"
+                                );
+                                RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
+                            })
+                    })
+                    .await
                 }
             })
             .collect();
@@ -162,6 +183,33 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
                     .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?,
             )),
         }
+    }
+}
+
+fn is_retriable_error(err: &OpenAIError) -> bool {
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
+            matches!(api_err.code.as_deref(), None | Some("429" | "500" | "503"))
+        }
+        OpenAIError::JSONDeserialize(_) => true,
+        OpenAIError::Reqwest(request) => {
+            request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body()
+                || matches!(
+                    request.status(),
+                    Some(
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::INTERNAL_SERVER_ERROR
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    )
+                )
+        }
+        _ => false,
     }
 }
 

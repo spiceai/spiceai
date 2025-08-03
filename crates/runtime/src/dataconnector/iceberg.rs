@@ -17,11 +17,12 @@ limitations under the License.
 //! The Iceberg Data Connector is a thin layer over the Iceberg Catalog Connector.
 //! It takes the same parameters as the Catalog Connector.
 
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
+use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
-use iceberg::TableIdent;
+use iceberg::{TableIdent, io::CustomAwsCredentialLoader};
 use iceberg_aws_sdk::S3CredentialProvider;
 use iceberg_catalog_rest::RestCatalog;
 use iceberg_datafusion::IcebergTableProvider;
@@ -30,8 +31,8 @@ use secrecy::ExposeSecret;
 use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
-        get_rest_catalog_config, map_param_name_to_iceberg_prop, parse_table_url,
-        verify_s3_endpoint,
+        get_rest_catalog_config, map_param_name_to_iceberg_prop, parse_hadoop_table_url,
+        parse_table_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
@@ -94,6 +95,58 @@ impl IcebergDataConnector {
             params: params.parameters,
         })
     }
+
+    async fn load_hadoop_catalog(
+        props: HashMap<String, String>,
+        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        dataset: &Dataset,
+        source: &str,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let (base_uri, namespace, table_name) = parse_hadoop_table_url(source, None).map_err(|e| {
+                Error::InvalidConfiguration {
+                    dataconnector: "iceberg".into(),
+                    message: format!(
+                        "A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name> or s3://<bucket>/<namespace>/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                }
+            })?;
+
+        // Load the specific table
+        let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
+
+        let mut catalog_builder = HadoopCatalogBuilder::default()
+            .with_warehouse_root(base_uri)
+            .with_metadata_mode(MetadataMode::Infer)
+            .with_properties(props);
+
+        if let Some(custom_loader) = custom_credential_loader {
+            catalog_builder = catalog_builder.with_file_io_extension(custom_loader);
+        }
+
+        let catalog_client =
+            catalog_builder
+                .build()
+                .await
+                .map_err(|e| Error::UnableToGetReadProvider {
+                    dataconnector: "iceberg".into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                })?;
+
+        // Create a DataFusion TableProvider from the Iceberg table
+        let table_provider =
+            IcebergTableProvider::try_new(Arc::new(catalog_client), table_identifier)
+                .await
+                .map_err(|e| Error::UnableToGetReadProvider {
+                    dataconnector: "iceberg".into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                })?;
+
+        Ok(Arc::new(table_provider))
+    }
 }
 
 #[async_trait]
@@ -108,7 +161,76 @@ impl DataConnector for IcebergDataConnector {
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let source = dataset.path();
 
-        let (base_uri, mut props, namespace, table_name) = match parse_table_url(source) {
+        let mut props = HashMap::new();
+        for (key, value) in &self.params {
+            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
+                for prop in prop_vec {
+                    props.insert(prop.clone(), value.expose_secret().to_string());
+                }
+            }
+        }
+
+        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
+            verify_s3_endpoint(endpoint)
+                .await
+                .map_err(|e| Error::InvalidConfiguration {
+                    dataconnector: "iceberg".into(),
+                    message: e.to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                })?;
+
+            let aws_sdk_config = load_config(
+                "IcebergDataConnector",
+                "s3_region",
+                "s3_access_key_id",
+                "s3_secret_access_key",
+                "s3_session_token",
+                &self.params,
+            )
+            .await
+            .map_err(|e| Error::InvalidConfiguration {
+                dataconnector: "iceberg".into(),
+                message: e.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
+
+            Some(
+                S3CredentialProvider::from_config(&aws_sdk_config)
+                    .map_err(|e| Error::InvalidConfiguration {
+                        dataconnector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    })?
+                    .into_custom_loader(),
+            )
+        } else {
+            None
+        };
+
+        if source.starts_with("file://")
+            || source.starts_with("s3://")
+            || source.starts_with("s3a://")
+        {
+            let source = if source.starts_with("s3://") {
+                // s3 needs to be s3a for Hadoop Catalog: https://github.com/apache/iceberg-rust/issues/434
+                source.replace("s3://", "s3a://")
+            } else {
+                source.to_string()
+            };
+
+            return IcebergDataConnector::load_hadoop_catalog(
+                props,
+                custom_credential_loader,
+                dataset,
+                &source,
+            )
+            .await;
+        }
+
+        let (base_uri, new_props, namespace, table_name) = match parse_table_url(source) {
             Ok(result) => result,
             Err(e) => {
                 return Err(Error::InvalidConfiguration {
@@ -122,54 +244,15 @@ impl DataConnector for IcebergDataConnector {
             }
         };
 
-        for (key, value) in &self.params {
-            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
-                for prop in prop_vec {
-                    props.insert(prop.clone(), value.expose_secret().to_string());
-                }
-            }
-        }
-
-        if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
-                .await
-                .map_err(|e| Error::InvalidConfiguration {
-                    dataconnector: "iceberg".into(),
-                    message: e.to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                })?;
-        }
-
-        let aws_sdk_config = load_config(
-            "IcebergDataConnector",
-            "s3_region",
-            "s3_access_key_id",
-            "s3_secret_access_key",
-            "s3_session_token",
-            &self.params,
-        )
-        .await
-        .map_err(|e| Error::InvalidConfiguration {
-            dataconnector: "iceberg".into(),
-            message: e.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
-
-        let custom_credential_loader = S3CredentialProvider::from_config(&aws_sdk_config)
-            .map_err(|e| Error::InvalidConfiguration {
-                dataconnector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?
-            .into_custom_loader();
+        props.extend(new_props);
 
         let catalog_config = get_rest_catalog_config(base_uri, props);
 
-        let catalog_client =
-            RestCatalog::new(catalog_config).with_file_io_extension(custom_credential_loader);
+        let mut catalog_client = RestCatalog::new(catalog_config);
+        if let Some(custom_loader) = custom_credential_loader {
+            catalog_client = catalog_client.with_file_io_extension(custom_loader);
+        }
+
         let catalog_client = Arc::new(catalog_client);
 
         // Load the specific table

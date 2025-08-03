@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::SystemTime,
+};
 
-use crate::metrics::{
-    Builder, BuilderTarget, ExtendedMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
-    QueryStatus, system_time_to_unix_epoch_ms,
+use crate::{
+    metrics::{
+        Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
+        StatisticsCollector, system_time_to_unix_epoch_ms,
+    },
+    spicetest::vector_search::evaluate::calculate_ndcg,
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -29,7 +35,9 @@ use tokio::task::JoinHandle;
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 
+mod evaluate;
 mod worker;
+pub use worker::SearchResult;
 pub use worker::{SearchConfig, SearchRequest};
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
 
@@ -66,7 +74,7 @@ pub struct Running {
 
 pub struct Completed {
     end_time: SystemTime,
-    results: Vec<VectorSearchWorkerResult>,
+    search_results: BTreeMap<String, worker::SearchResult>,
 }
 
 impl TestState for NotStarted {}
@@ -87,9 +95,20 @@ impl SpiceTest<NotStarted> {
             .context("Spiced instance should be present")?
             .http_client()?;
 
-        let workers = (0..self.state.parallel_count)
-            .map(|_| {
-                VectorSearchWorker::new(http_client.clone(), self.state.config.clone()).start()
+        // Split the requests among workers based on the parallel_count
+        let requests = self.state.config.into_requests();
+        let chunk_size = if self.state.parallel_count > 0 {
+            requests.len().div_ceil(self.state.parallel_count)
+        } else {
+            requests.len()
+        };
+
+        let workers = requests
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(worker_id, chunk)| {
+                let worker_config = SearchConfig::new().add_requests(chunk.iter().cloned());
+                VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
             })
             .collect();
 
@@ -110,14 +129,15 @@ impl SpiceTest<NotStarted> {
 
 impl SpiceTest<Running> {
     pub async fn wait(self) -> Result<SpiceTest<Completed>> {
-        let mut results = vec![];
+        let mut search_results = BTreeMap::new();
+
         for worker in self.state.vector_workers {
-            // TODO: combine results from multiple workers?
-            results.push(
-                worker
-                    .await
-                    .context("Error waiting for vector search worker")??,
-            );
+            let worker_result = worker
+                .await
+                .context("Error waiting for vector search worker")??;
+
+            // Combine all worker results
+            search_results.extend(worker_result.search_results);
         }
 
         Ok(SpiceTest {
@@ -130,13 +150,61 @@ impl SpiceTest<Running> {
             results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 end_time: SystemTime::now(),
-                results,
+                search_results,
             },
         })
     }
 }
 
-impl MetricCollector<SearchScoreMetric, NoExtendedMetrics> for SpiceTest<Completed> {
+impl SpiceTest<Completed> {
+    #[must_use]
+    pub fn get_search_results(&self) -> &BTreeMap<String, worker::SearchResult> {
+        &self.state.search_results
+    }
+
+    pub fn get_p95_response_time_metric(&self) -> Result<f64> {
+        let durations = self
+            .state
+            .search_results
+            .values()
+            .map(|result| result.duration) // Convert to milliseconds
+            .collect::<Vec<_>>();
+
+        #[allow(clippy::cast_precision_loss)]
+        let p95 = durations.percentile(95.0)?.as_millis() as f64;
+        Ok(p95)
+    }
+
+    pub fn get_rps_metric(&self) -> Result<f64> {
+        let total_duration = self.state.end_time.duration_since(self.start_time)?;
+
+        #[allow(clippy::cast_precision_loss)]
+        let total_requests = self.state.search_results.len() as f64;
+        if total_duration.as_secs() == 0 {
+            return Ok(total_requests);
+        }
+        Ok(total_requests / total_duration.as_secs_f64())
+    }
+
+    /// Calculate overall search score metric based on the search results and query relevance data.
+    /// The `transform` function is used to convert the search results into a format suitable for
+    /// evaluation
+    pub fn calculate_search_score_metric<S, F>(
+        &self,
+        qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+        transform: F,
+    ) -> Result<f64>
+    where
+        S: ::std::hash::BuildHasher,
+        F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
+    {
+        let transformed_results = transform(&self.state.search_results);
+        // Similar to MTEB, use NDCG@10 as the main metric for search score
+        Ok(calculate_ndcg(qrels, &transformed_results, 10))
+    }
+}
+
+impl MetricCollector<SearchScoreMetric, SearchRunMetric> for SpiceTest<Completed> {
     fn start_time(&self) -> SystemTime {
         self.start_time
     }
@@ -160,9 +228,6 @@ impl MetricCollector<SearchScoreMetric, NoExtendedMetrics> for SpiceTest<Complet
 
     fn metrics(&self) -> Result<Vec<QueryMetric<SearchScoreMetric>>> {
         self.state
-            .results
-            .first()
-            .context("No results found")?
             .search_results
             .iter()
             .map(|(id, result)| {
@@ -204,5 +269,49 @@ impl SearchScoreMetric {
     #[must_use]
     pub fn new(score: f64) -> Self {
         Self { score }
+    }
+}
+
+pub struct SearchRunMetric {
+    pub rps: f64,
+    pub p95_latency_ms: f64,
+    pub score: f64,
+}
+impl ExtendedMetrics for SearchRunMetric {
+    fn fields() -> Vec<Field> {
+        vec![
+            Field::new("rps", DataType::Float64, false),
+            Field::new("p95_latency_ms", DataType::Float64, false),
+            Field::new("score", DataType::Float64, false),
+        ]
+    }
+
+    fn builders() -> BTreeMap<String, Builder> {
+        let mut builders = BTreeMap::new();
+        builders.insert("rps".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "p95_latency_ms".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
+        builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
+        builders
+    }
+
+    fn build(&self) -> Result<Vec<BuilderTarget>> {
+        Ok(vec![
+            BuilderTarget::Float64(("rps".to_string(), self.rps)),
+            BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
+            BuilderTarget::Float64(("score".to_string(), self.score)),
+        ])
+    }
+}
+impl SearchRunMetric {
+    #[must_use]
+    pub fn new(rps: f64, p95_latency_ms: f64, score: f64) -> Self {
+        Self {
+            rps,
+            p95_latency_ms,
+            score,
+        }
     }
 }

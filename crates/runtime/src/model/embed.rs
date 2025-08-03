@@ -89,7 +89,7 @@ async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    use llms::bedrock::embed::BedrockRateLimitConfigBuilder;
+    use llms::bedrock::rate_limit::BedrockRateLimitConfigBuilder;
 
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
@@ -156,10 +156,8 @@ async fn bedrock(
         })
         .transpose()?;
 
-    let rate_limit = rate_limit_builder.build();
-
     let config = config_builder.load().await;
-    let client = BedrockClient::new(&config);
+    let client = BedrockClient::new(&config, rate_limit_builder.build());
 
     if model_id.starts_with("amazon.titan-embed") {
         let normalize = params
@@ -193,9 +191,7 @@ async fn bedrock(
             });
         }
 
-        Ok(Arc::new(bedrock::embed::new_titan_v2(
-            client, normalize, dimensions, rate_limit,
-        )) as Arc<dyn Embed>)
+        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
         let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
             CohereEmbeddingTruncate::from_str(truncate_str)
@@ -225,7 +221,6 @@ async fn bedrock(
             truncate,
             input_type,
             CohereEmbeddingType::Float,
-            rate_limit,
         )) as Arc<dyn Embed>)
     } else {
         Err(EmbedError::ModelDoesNotExist {

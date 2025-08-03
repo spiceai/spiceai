@@ -15,16 +15,15 @@ proc verify_datasets_access {} {
     send "What datasets you have access to\r"
 
     expect {
-        "spice.public.taxi_trips" {
+        -re "(?i)taxi_trips|taxi trips" {
             set taxi_trips_available 1
             exp_continue
-
         }
-        "spice.public.issues" {
+        -re "(?i)github_issues|github issues" {
             set gh_issues_available 1
             exp_continue
         }
-        "spice.public.catalog_page" {
+        -re "(?i)catalog_page|catalog page" {
             set catalog_page_available 1
             exp_continue
         }
@@ -46,7 +45,7 @@ proc verify_datasets_access {} {
     if { $taxi_trips_available == 1 && $gh_issues_available == 1 && $catalog_page_available == 1 } {
         send_user "Model confirmed access to all datasets\n"
     } else {
-        send_user "Model does not returned expected response\n"
+        send_user "Model did not return expected response\n"
         exit 1
     }
 }
