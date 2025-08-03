@@ -75,6 +75,7 @@ jsonpath-rust = "0.7.3"
 paste.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+aws-credential-types.workspace = true
 
 [features]
 cuda = [

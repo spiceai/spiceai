@@ -46,6 +46,8 @@ use aws_config::SdkConfig;
 
 use rate_limit::BedrockRateLimitConfig;
 
+use crate::bedrock::rate_limit::BedrockRateLimitConfigBuilder;
+
 #[derive(Debug, Clone)]
 pub struct BedrockClient {
     pub(crate) client: Arc<aws_sdk_bedrockruntime::Client>,
@@ -56,6 +58,12 @@ pub struct BedrockClient {
     retry_strategy: FibonacciBackoff,
     // Rate limiting configuration for logging and metrics
     rate_config: BedrockRateLimitConfig,
+}
+
+impl From<&SdkConfig> for BedrockClient {
+    fn from(value: &SdkConfig) -> Self {
+        BedrockClient::new(value, BedrockRateLimitConfigBuilder::default().build())
+    }
 }
 
 impl BedrockClient {
