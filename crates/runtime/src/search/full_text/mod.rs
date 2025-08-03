@@ -25,7 +25,7 @@ use search::generation::{
 };
 use snafu::ResultExt;
 
-use crate::object_store_registry::SpiceObjectStoreRegistry;
+use object_store_extra::registry::SpiceObjectStoreRegistry;
 
 pub mod connector;
 pub mod udtf;
