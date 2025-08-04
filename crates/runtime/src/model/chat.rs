@@ -17,6 +17,7 @@ limitations under the License.
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
+    bedrock::chat::BedrockConverse,
     chat::{Chat, Error as LlmError},
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -132,6 +133,8 @@ pub async fn construct_model(
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
+        #[cfg(feature = "bedrock")]
+        ModelSource::Bedrock => bedrock(model_id, params).await,
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -162,6 +165,21 @@ pub async fn construct_model(
     }
 
     Ok(Arc::new(wrapper))
+}
+
+#[cfg(feature = "bedrock")]
+async fn bedrock(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "bedrock".to_string(),
+        });
+    };
+
+    let client = super::util::create_bedrock_client(&params.get_runtime_params(), "bedrock-chat")
+        .await
+        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+
+    Ok(Arc::new(BedrockConverse::new(client.into(), model_id)) as Arc<dyn Chat>)
 }
 
 fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {

@@ -16,6 +16,7 @@ limitations under the License.
 
 mod anthropic;
 mod azure;
+mod bedrock;
 mod databricks;
 mod file;
 mod huggingface;
@@ -39,6 +40,7 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
         ModelSource::Anthropic => Some(anthropic::PARAMETERS),
         ModelSource::Perplexity => Some(perplexity::PARAMETERS),
         ModelSource::Xai => Some(xai::PARAMETERS),
+        ModelSource::Bedrock => Some(bedrock::PARAMETERS),
         ModelSource::SpiceAI => None,
     }
 }
