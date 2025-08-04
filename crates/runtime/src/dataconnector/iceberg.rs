@@ -97,12 +97,7 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        // Concat the data connector specific parameters with the catalog parameters
-        let iceberg_params = PARAMETERS.to_vec();
-        let catalog_params = crate::catalogconnector::iceberg::PARAMETERS.to_vec();
-        let mut params = iceberg_params;
-        params.extend(catalog_params);
-        Box::leak(Box::new(params)) // Leak the memory to return a static slice
+        PARAMETERS
     }
 }
 
