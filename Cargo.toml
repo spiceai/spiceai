@@ -16,6 +16,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
+    "crates/runtime-object-store",
     "crates/object-store-aws-sdk",
     "crates/package",
     "crates/runtime",
@@ -222,8 +223,8 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }              # spiceai-0.5.1
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" } # spiceai-0.5.1
 iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" } # spiceai-0.5.1
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" } # spiceai-0.5.1
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }   # spiceai-0.5.1
 iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }   # spiceai-0.5.1
 

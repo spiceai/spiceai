@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::objectstore::github::GitHubRawObjectStore;
 use axum::{
     Json,
     http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use object_store::{ObjectStore, path::Path};
+use runtime_object_store::store::github::GitHubRawObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 

@@ -18,6 +18,7 @@ use async_openai::error::OpenAIError;
 use serde::{Deserialize, Serialize};
 
 use crate::bedrock::embed::BedrockEmbeddingConfig;
+pub const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 
 #[derive(Debug)]
 pub struct TitanConfig {
