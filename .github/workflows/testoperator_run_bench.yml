@@ -9,7 +9,7 @@ on:
         required: false
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with (appended with query set and scale factor)'
+        description: 'The spicepod file to test with'
         required: true
         type: string
       query_set:
