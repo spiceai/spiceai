@@ -218,7 +218,7 @@ impl DataConnector for IcebergDataConnector {
                 props,
                 custom_credential_loader,
                 dataset,
-                &source,
+                source,
             )
             .await;
         }
