@@ -392,8 +392,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
         ],
         vec![(
             "multi_embedding_sql_no_score",
-            format!(
-            "SELECT cp_description FROM vector_search(multi_embedding_models, 'basic', cp_description) LIMIT 4").as_str(),
+            "SELECT cp_description FROM vector_search(multi_embedding_models, 'basic', cp_description) LIMIT 4".to_string(),
         )],
     )
     .await
@@ -642,7 +641,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             ),
             (
                 "text_search_sql_text_search_no_score",
-                format!("SELECT i_color FROM text_search(item, 'Passengers') LIMIT 4").as_str(),
+                "SELECT i_color FROM text_search(item, 'Passengers') LIMIT 4".to_string(),
             ),
         ]
     )
