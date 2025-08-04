@@ -27,12 +27,6 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
-
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
@@ -52,6 +46,12 @@ use datafusion::{
 };
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use std::cmp::min;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 #[cfg(feature = "s3_vectors")]
 use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
@@ -364,6 +364,19 @@ impl VectorSearchUDTFProvider {
             ),
         )
     }
+
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The limit provided in `vector_search` args
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.args.limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -464,7 +477,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )],
             input: Arc::new(proj),
-            fetch: limit,
+            fetch: self.limit_to_use(limit),
         });
 
         state.create_physical_plan(&sort).await

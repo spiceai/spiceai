@@ -1,16 +1,16 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-arrow.yaml
+    spicepod_path: accelerated/spicecloud-arrow.yaml
     query_set: tpcds
     runner_type: spiceai-dev-runners
     ready_wait: 300
   throughput:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-arrow.yaml
+    spicepod_path: accelerated/spicecloud-arrow.yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
     ready_wait: 300
   load:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-arrow.yaml
+    spicepod_path: accelerated/spicecloud-arrow.yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
     ready_wait: 300

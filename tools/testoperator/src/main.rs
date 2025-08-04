@@ -26,6 +26,8 @@ use args::{
     HttpOverheadTestArgs, TestCommands,
 };
 
+use crate::args::VectorSearchTestArgs;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -48,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
             | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })
+            | TestCommands::VectorSearch(VectorSearchTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -85,9 +88,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::VectorSearch(args)) => {
             commands::vector_search::run(&args).await?;
-        }
-        Commands::Export(TestCommands::VectorSearch(args)) => {
-            commands::env_export(&args).await?;
         }
     }
 

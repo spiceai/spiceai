@@ -1,18 +1,18 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/mysql-duckdb[file].yaml
+    spicepod_path: accelerated/mysql-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 600
     runner_type: spiceai-dev-runners
   throughput:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/mysql-duckdb[file].yaml
+    spicepod_path: accelerated/mysql-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 600
     runner_type: spiceai-dev-runners
   load:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/mysql-duckdb[file].yaml
+    spicepod_path: accelerated/mysql-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     ready_wait: 600

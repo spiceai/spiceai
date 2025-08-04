@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/clickbench/sf1/accelerated/s3[parquet]-duckdb[file].yaml
+    spicepod_path: accelerated/s3[parquet]-duckdb[file].yaml
     query_set: clickbench
     query_overrides: duckdb
     runner_type: spiceai-dev-large-runners

@@ -1,15 +1,15 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpch/sf1/accelerated/file[parquet]-duckdb[memory].yaml
+    spicepod_path: accelerated/file[parquet]-duckdb[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true
   throughput:
-    spicepod_path: ./test/spicepods/tpch/sf1/accelerated/file[parquet]-duckdb[memory].yaml
+    spicepod_path: accelerated/file[parquet]-duckdb[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
   load:
-    spicepod_path: ./test/spicepods/tpch/sf1/accelerated/file[parquet]-duckdb[memory].yaml
+    spicepod_path: accelerated/file[parquet]-duckdb[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
