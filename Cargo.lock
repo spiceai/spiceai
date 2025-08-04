@@ -281,7 +281,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "snafu",
  "spicepod",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3239,6 +3239,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
+dependencies = [
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
 name = "ctrlc"
 version = "3.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3409,9 +3419,10 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
+ "arrow-array",
  "arrow-buffer",
  "arrow-flight",
  "async-stream",
@@ -3426,6 +3437,7 @@ dependencies = [
  "charset",
  "chrono",
  "clickhouse-rs",
+ "ctor",
  "datafusion",
  "datafusion-federation",
  "datafusion-table-providers",
@@ -3442,13 +3454,16 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
+ "iceberg_test_utils",
  "imap",
  "indexmap 2.10.0",
+ "insta",
  "itertools 0.14.0",
  "logos",
  "mailparse",
  "object-store-aws-sdk",
  "object_store",
+ "opendal",
  "oracle",
  "rdkafka",
  "regex",
@@ -3477,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4088,7 +4103,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=347a765a106c62cbdf2943da0f8b1f790e84492f#347a765a106c62cbdf2943da0f8b1f790e84492f"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=2e0bdfd5e7809ae53106f3e63bbfbebbad4aff69#2e0bdfd5e7809ae53106f3e63bbfbebbad4aff69"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4098,6 +4113,7 @@ dependencies = [
  "bb8 0.8.6",
  "bb8-postgres",
  "bigdecimal",
+ "bitflags 2.9.1",
  "byte-unit",
  "byteorder",
  "chrono",
@@ -4135,7 +4151,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -4486,7 +4502,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -4786,7 +4802,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "futures",
  "futures-util",
@@ -4967,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4983,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4996,7 +5012,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -5018,7 +5034,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6379,7 +6395,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6430,7 +6446,7 @@ dependencies = [
 
 [[package]]
 name = "iceberg-aws-sdk"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6445,7 +6461,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6462,7 +6478,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6488,7 +6504,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=edb521d24ff856e4c785dd997fcde512a8cfe794#edb521d24ff856e4c785dd997fcde512a8cfe794"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6496,6 +6512,15 @@ dependencies = [
  "futures",
  "iceberg",
  "tokio",
+]
+
+[[package]]
+name = "iceberg_test_utils"
+version = "0.5.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7441,7 +7466,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -8163,7 +8188,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -8513,7 +8538,7 @@ checksum = "5e0826a989adedc2a244799e823aece04662b66609d96af8dff7ac6df9a8925d"
 
 [[package]]
 name = "ns_lookup"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "snafu",
  "tracing",
@@ -8918,7 +8943,7 @@ dependencies = [
 
 [[package]]
 name = "object-store-aws-sdk"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -9385,7 +9410,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -9396,7 +9421,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "clap",
  "futures",
@@ -9452,7 +9477,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "bytes",
  "futures",
@@ -9576,7 +9601,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "bytes",
  "clap",
@@ -11288,7 +11313,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -11450,7 +11475,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "app",
  "axum 0.8.4",
@@ -11465,7 +11490,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -11476,7 +11501,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -11490,7 +11515,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -11829,7 +11854,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -11841,7 +11866,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -11923,7 +11948,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -12068,7 +12093,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -12692,7 +12717,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -12738,7 +12763,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "app",
  "clap",
@@ -12774,7 +12799,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "byte-unit",
@@ -12796,7 +12821,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "schemars 0.9.0",
  "serde_json",
@@ -12805,7 +12830,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "clap",
  "runtime",
@@ -13547,7 +13572,7 @@ checksum = "e502f78cdbb8ba4718f566c418c52bc729126ffd16baee5baa718cf25dd5a69a"
 
 [[package]]
 name = "telemetry"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -13630,7 +13655,7 @@ dependencies = [
 
 [[package]]
 name = "test-framework"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -13674,7 +13699,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow-json",
  "clap",
@@ -13988,7 +14013,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "reqwest",
  "secrecy",
@@ -14319,7 +14344,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -14397,7 +14422,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -15155,7 +15180,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "backoff",
  "ctrlc",
@@ -16121,7 +16146,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "arrow",
  "async-openai",

@@ -1,0 +1,6 @@
+tests:
+  bench:
+    spicepod_path: federated/iceberg[hadoop].yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+    validate_results: false # Needs some schema changes to validate, spark schema infer from data load causes numerics to cast wrong and Q6 fails validation

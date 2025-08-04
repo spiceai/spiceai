@@ -31,7 +31,7 @@ use snafu::prelude::*;
 
 use crate::{Read, RefreshableCatalogProvider};
 
-use crate::iceberg::catalog::RestCatalog;
+use crate::iceberg::catalog::rest::RestCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
