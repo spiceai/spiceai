@@ -466,7 +466,6 @@ impl BedrockConverse {
             role: Option<Role>,
             content_block_index_to_tool_details: HashMap<i32, ToolUseBlockStart>,
             content_block_index_to_delta_idx: HashMap<i32, u32>,
-            // input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
         }
 
         let state = Arc::new(RwLock::new(StreamState {
