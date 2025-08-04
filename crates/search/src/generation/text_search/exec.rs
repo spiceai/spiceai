@@ -120,7 +120,7 @@ impl ExecutionPlan for FullTextSearchExec {
         let query = self.query.clone();
 
         let s = stream! {
-        // TODO: Support filters.
+          // TODO: Support filters.
             match idx
                 .search(query, &[], &[&Expr::Identifier(Ident::new(idx.field.clone()))], limit)
                 .await
@@ -130,14 +130,14 @@ impl ExecutionPlan for FullTextSearchExec {
                         match item {
                             Err(e) => yield Err(e),
                             Ok(rb) => {
-                                // Apply projection, as per `self.schema()`, to record batch from FTS.
-                                let proj = rb.schema().fields().iter().enumerate().filter_map(|(i, f)| {
-                                    if schema.column_with_name(f.name()).is_some() {
-                                        Some(i)
-                                    } else {
-                                        None
-                                    }
+                                let data_columns: Vec<_> = rb.schema().fields().iter().map(|f| f.name().clone()).collect();
+
+                                // Apply projection. Must return in the order it exists in
+                                // `self.schema()`, not in the record batch.
+                                let proj = schema.fields().iter().filter_map(|f| {
+                                    data_columns.iter().position(|data_col| data_col == f.name())
                                 }).collect::<Vec<_>>();
+
                                 yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
                             }
                         }
