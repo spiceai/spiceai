@@ -109,6 +109,16 @@ impl SearchConfig {
         self.requests.extend(requests);
         self
     }
+
+    #[must_use]
+    pub fn requests(&self) -> &[SearchRequest] {
+        &self.requests
+    }
+
+    #[must_use]
+    pub fn into_requests(self) -> Vec<SearchRequest> {
+        self.requests
+    }
 }
 
 pub(crate) struct VectorSearchWorkerResult {
@@ -116,40 +126,42 @@ pub(crate) struct VectorSearchWorkerResult {
 }
 
 #[allow(dead_code)]
-pub(crate) struct SearchResult {
-    pub(crate) response: SearchResponse,
-    pub(crate) score: f64,
-    pub(crate) duration: Duration,
+pub struct SearchResult {
+    pub response: SearchResponse,
+    pub score: f64,
+    pub duration: Duration,
 }
 
 pub(crate) struct VectorSearchWorker {
+    worker_id: usize,
     http_client: Client,
     config: SearchConfig,
 }
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
-pub(crate) struct SearchResponse {
-    results: Vec<SearchResponseResult>,
-    duration_ms: Option<u64>,
+pub struct SearchResponse {
+    pub results: Vec<SearchResponseResult>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
-pub(crate) struct SearchResponseResult {
+pub struct SearchResponseResult {
     // `matches` is left as a generic JSON value (`serde_json::Value`) instead of a strongly typed struct.
     // The search API can return different sets of fields here depending on dataset or configuration
-    matches: serde_json::Value,
-    score: f64,
-    dataset: String,
+    pub matches: serde_json::Value,
+    pub score: f64,
+    pub dataset: String,
     /// Primary key can be different types depending on the dataset. Default to empty map, if not present.
     #[serde(default)]
-    primary_key: HashMap<String, serde_json::Value>,
+    pub primary_key: HashMap<String, serde_json::Value>,
 }
 
 impl VectorSearchWorker {
-    pub fn new(http_client: Client, config: SearchConfig) -> Self {
+    pub fn new(worker_id: usize, http_client: Client, config: SearchConfig) -> Self {
         Self {
+            worker_id,
             http_client,
             config,
         }
@@ -158,7 +170,15 @@ impl VectorSearchWorker {
     pub fn start(self) -> JoinHandle<Result<VectorSearchWorkerResult>> {
         tokio::spawn(async move {
             let mut results: BTreeMap<String, SearchResult> = BTreeMap::new();
-            for request in self.config.requests {
+            let total_requests = self.config.requests.len();
+            let mut last_progress_time = Instant::now();
+
+            println!(
+                "[SearchWorker-{:02}] STARTED, {total_requests} remaining",
+                self.worker_id
+            );
+
+            for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
                 let res = self
                     .http_client
@@ -182,7 +202,24 @@ impl VectorSearchWorker {
                         duration,
                     },
                 );
+
+                // Trace progress every 10 seconds
+                if last_progress_time.elapsed() >= Duration::from_secs(10) {
+                    let completed = index + 1;
+                    #[allow(clippy::cast_precision_loss)]
+                    let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
+                    println!(
+                        "[SearchWorker-{:02}]: {completed}/{total_requests} completed ({completed_percent:.1}%)",
+                        self.worker_id
+                    );
+                    last_progress_time = Instant::now();
+                }
             }
+
+            println!(
+                "[SearchWorker-{:02}]: DONE, {total_requests} completed",
+                self.worker_id
+            );
 
             Ok(VectorSearchWorkerResult {
                 search_results: results,

@@ -77,6 +77,10 @@ jobs:
           os: darwin
 
       - name: Build LLMs integration test binary
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test

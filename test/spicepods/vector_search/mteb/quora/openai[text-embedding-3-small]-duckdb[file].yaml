@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mteb_quora_openai-text-embedding-3-small_arrow
+name: openai[text-embedding-3-small]-duckdb[file]
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
@@ -10,6 +10,8 @@ datasets:
     name: corpus
     acceleration:
       enabled: true
+      engine: duckdb
+      mode: file
     columns:
       - name: text
         embeddings:
@@ -23,7 +25,7 @@ datasets:
       enabled: true
 
   - from: file:./data.parquet
-    name: test_data
+    name: relevance_data
     acceleration:
       enabled: true
 

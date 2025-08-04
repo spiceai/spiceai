@@ -330,8 +330,10 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 Status::internal("Several DataFusion errors occurred, but no details available")
             }
         }
+        DataFusionError::NotImplemented(message) => {
+            Status::invalid_argument(format!("Unsupported Query. {message}"))
+        }
         DataFusionError::Internal(_)
-        | DataFusionError::NotImplemented(_)
         | DataFusionError::ArrowError(..)
         | DataFusionError::IoError(_)
         | DataFusionError::ObjectStore(_)

@@ -29,4 +29,8 @@ endif
 
 .PHONY: all
 all:
+# If "metal" is not in SPICED_FEATURES, set MISTRALRS_METAL_PRECOMPILE=0
+ifneq ($(filter metal,$(subst ,, ,$(SPICED_FEATURES))),metal)
+	$(eval export MISTRALRS_METAL_PRECOMPILE=0)
+endif
 	cargo build ${OPT_LEVEL} $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)
