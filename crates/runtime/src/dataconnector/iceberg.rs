@@ -59,7 +59,7 @@ impl IcebergDataConnectorFactory {
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     // Hadoop options
-    ParameterSpec::component("metadata_path")
+    ParameterSpec::runtime("metadata_path")
         .description("The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`")
 ];
 
@@ -167,6 +167,7 @@ impl DataConnector for IcebergDataConnector {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn read_provider(
         &self,
         dataset: &Dataset,

@@ -135,7 +135,7 @@ impl HadoopCatalogBuilder {
         Ok(HadoopCatalog {
             warehouse_root,
             file_io,
-            metadata_mode: MetadataMode::Infer,
+            metadata_mode: self.metadata_mode,
         })
     }
 }
