@@ -127,13 +127,17 @@ impl IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
-        let catalog_provider = IcebergCatalogProvider::try_new(Arc::new(hadoop_catalog), None)
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?;
+        let catalog_provider = IcebergCatalogProvider::try_new(
+            Arc::new(hadoop_catalog),
+            None,
+            catalog.include.as_ref(),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
@@ -346,6 +350,7 @@ impl CatalogConnector for IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
+            catalog.include.as_ref(),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
