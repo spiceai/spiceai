@@ -17,8 +17,8 @@ limitations under the License.
 use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 3] = [
-    ParameterSpec::runtime("aws_secret_access_key")
+pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 4] = [
+    ParameterSpec::runtime("aws_access_key_id")
         .description("The AWS access key ID to use for Bedrock models")
         .secret(),
     ParameterSpec::runtime("aws_secret_access_key")
@@ -30,7 +30,7 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 3] = [
     ParameterSpec::runtime("aws_region").description("The AWS region to use for Bedrock models."),
 ];
 pub(crate) const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<ParameterSpec, 3, PARAM_WITH_DEPRE_LEN, { 3 + PARAM_WITH_DEPRE_LEN }>(
+    &concat_arrays::<ParameterSpec, 4, PARAM_WITH_DEPRE_LEN, { 4 + PARAM_WITH_DEPRE_LEN }>(
         BEDROCK_PARAMETERS,
         COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
     );

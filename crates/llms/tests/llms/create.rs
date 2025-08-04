@@ -21,7 +21,7 @@ use aws_credential_types::Credentials;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
-    bedrock::{BedrockClient, chat::BedrockConverse},
+    bedrock::chat::BedrockConverse,
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
@@ -41,8 +41,8 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
     let mut config_builder = defaults(BehaviorVersion::latest());
 
     if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
-        config_builder = config_builder.region(Region::new(region.to_owned()));
-    };
+        config_builder = config_builder.region(Region::new(region.clone()));
+    }
 
     match (
         std::env::var("SPICE_BEDROCK_ACCESS_KEY"),
@@ -52,7 +52,7 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
             config_builder = config_builder.credentials_provider(Credentials::new(
                 access_key,
                 secret_key,
-                std::env::var("SPICE_BEDROCK_SESSION_TOKEN"),
+                std::env::var("SPICE_BEDROCK_SESSION_TOKEN").ok(),
                 None,
                 "bedrock-chat",
             ));
@@ -68,10 +68,11 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
                 "SPICE_BEDROCK_ACCESS_KEY & SPICE_BEDROCK_SECRET_KEY not set"
             ));
         }
-    };
+    }
 
+    let config = config_builder.load().await;
     Ok(Arc::new(BedrockConverse::new(
-        config_builder.load().await.into::<BedrockClient>(),
+        Arc::new((&config).into()),
         model_id.to_string(),
     )) as Arc<dyn Chat>)
 }

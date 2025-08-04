@@ -23,6 +23,8 @@ use async_openai::types::{
     CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionName, FunctionObject,
     PromptTokensDetails, Role,
 };
+use aws_sdk_bedrockruntime::error::SdkError;
+use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
 use aws_sdk_bedrockruntime::types::builders::{AnyToolChoiceBuilder, AutoToolChoiceBuilder};
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ConversationRole, GuardrailConverseContentBlock, GuardrailConverseTextBlock,
@@ -30,7 +32,10 @@ use aws_sdk_bedrockruntime::types::{
     ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolSpecification,
     ToolUseBlock,
 };
+use aws_smithy_types::event_stream::RawMessage;
 use aws_smithy_types::{Document, Number};
+use futures::Stream;
+use futures::stream::unfold;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -282,4 +287,16 @@ pub(super) fn document_to_value(doc: Document) -> serde_json::Value {
         Document::Bool(b) => serde_json::Value::Bool(b),
         Document::Null => serde_json::Value::Null,
     }
+}
+
+/// Make a [`EventReceiver`] a proper [`Stream`].
+pub(super) fn into_fallible_stream<T, E>(
+    receiver: EventReceiver<T, E>,
+) -> impl Stream<Item = Result<Option<T>, SdkError<E, RawMessage>>> {
+    unfold(receiver, |mut recv| async move {
+        match recv.recv().await {
+            Ok(None) => None,
+            otherwise => Some((otherwise, recv)),
+        }
+    })
 }

@@ -19,7 +19,8 @@ pub(super) mod util;
 use crate::bedrock::BedrockClient;
 use crate::bedrock::chat::util::{
     chat_choice_stream, chat_completion_stream, convert_usage, extract_from_content_block,
-    to_api_error, tool_config, try_convert_finish_reason, try_convert_role, value_to_document,
+    into_fallible_stream, to_api_error, tool_config, try_convert_finish_reason, try_convert_role,
+    value_to_document,
 };
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
@@ -35,10 +36,9 @@ use async_openai::types::{
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolType,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FunctionCall, FunctionCallStream,
-    Role, Stop,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FunctionCall, FunctionCallStream, Role, Stop,
 };
-use async_stream::stream;
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::error::{BuildError, SdkError};
 use aws_sdk_bedrockruntime::operation::converse::ConverseOutput;
@@ -56,11 +56,13 @@ use aws_sdk_bedrockruntime::types::{
     InferenceConfiguration, Message, MessageStartEvent, MessageStopEvent, SystemContentBlock,
     ToolResultContentBlock, ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
+use futures::stream::StreamExt;
 use itertools::Itertools;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::RwLock;
 use tracing::Span;
 
 /// [`BedrockConverse`] provides an `OpenAI` compatible interface (i.e. `impl Chat` ), for models on AWS bedrock that are compatible with the [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html).
@@ -453,134 +455,187 @@ impl BedrockConverse {
 
     #[allow(clippy::too_many_lines)]
     fn process_stream(
-        model: String,
-        mut input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
+        model: &str,
+        input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
     ) -> ChatCompletionResponseStream {
         // Individual packets in the stream may need information from previous packets to be converted correctly to a  [`CreateChatCompletionStreamResponse`]. This struct track all the necessary information.
-        #[derive(Clone, Default)]
+        #[derive(Default)]
         struct StreamState {
             id: String,
+            model: String,
             role: Option<Role>,
             content_block_index_to_tool_details: HashMap<i32, ToolUseBlockStart>,
             content_block_index_to_delta_idx: HashMap<i32, u32>,
+            // input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
         }
 
-        let s = stream! {
-            let mut state = StreamState {
-                id: Span::current()
-                    .id()
-                    .map(|id| id.into_u64().to_string())
-                    .unwrap_or_default(),
-                ..StreamState::default()
-            };
-            loop {
-                match input_stream.recv().await {
+        let state = Arc::new(RwLock::new(StreamState {
+            id: Span::current()
+                .id()
+                .map(|id| id.into_u64().to_string())
+                .unwrap_or_default(),
+            // input_stream,
+            model: model.to_string(),
+
+            ..StreamState::default()
+        }));
+
+        Box::pin(into_fallible_stream(input_stream).filter_map(move |packet| {
+            let state = Arc::clone(&state);
+
+            async move {
+               let mut state_ = state.write().await;
+               let zz: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> = match packet {
                     Err(SdkError::ServiceError(e)) => {
                         match &e.err() {
                             &ConverseStreamOutputError::InternalServerException(e) => {
-                                yield Err(to_api_error(e.to_string()));
-                                break;
-                            },
+                                Some(Err(to_api_error(e.to_string())))
+                            }
                             ee => {
                                 // TODO specialise
-                                yield Err(to_api_error(ee.to_string()));
-                                break;
+                                Some(Err(to_api_error(ee.to_string())))
                             }
                         }
-                    },
+                    }
                     Err(e) => {
-                        // TODO specialise
-                        yield Err(to_api_error(e.to_string()));
-                        break;
+                        Some(Err(to_api_error(e.to_string())))
                     }
-                    Ok(None) => {
-                        break;
-                    }
+                    Ok(None) => None, // Natural end-of-stream.
                     Ok(Some(pkt)) => {
-                        match pkt {
-                            ConverseStreamOutputPacket::MessageStart(MessageStartEvent{role,..}) => {
-                                state.role = Some(try_convert_role(&role)?);
-                            },
-                            ConverseStreamOutputPacket::ContentBlockStart(ContentBlockStartEvent{
-                                start: Some(ContentBlockStartInner::ToolUse(tool_use)), content_block_index,.. }) => {
-                                state.content_block_index_to_delta_idx.insert(content_block_index, 0);
-                                state.content_block_index_to_tool_details.insert(content_block_index, tool_use);
-                            },
-                            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::Text(text)), ..}) => {
-                                match chat_completion_stream(
-                                    state.id.as_str(),
-                                    model.clone(),
-                                    vec![chat_choice_stream(Some(text), None, state.role, None, None)],
-                                    None,
-                                ) {
-                                    Ok(s) => yield Ok(s),
-                                    Err(e) => {yield Err(e); break}
+                        let value: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> =
+                            match pkt {
+                                ConverseStreamOutputPacket::MessageStart(MessageStartEvent {
+                                    role,
+                                    ..
+                                }) => match try_convert_role(&role) {
+                                    Ok(r) => {
+                                        state_.role = Some(r);
+                                        None
+                                    }
+                                    Err(e) => Some(Err(e)),
+                                },
+                                ConverseStreamOutputPacket::ContentBlockStart(
+                                    ContentBlockStartEvent {
+                                        start: Some(ContentBlockStartInner::ToolUse(tool_use)),
+                                        content_block_index,
+                                        ..
+                                    },
+                                ) => {
+                                    state_
+                                        .content_block_index_to_delta_idx
+                                        .insert(content_block_index, 0);
+                                    state_
+                                        .content_block_index_to_tool_details
+                                        .insert(content_block_index, tool_use);
+                                    None
                                 }
-                            },
-                            ConverseStreamOutputPacket::ContentBlockDelta(ContentBlockDeltaEvent{ delta: Some(ContentBlockDeltaType::ToolUse(ToolUseBlockDelta{input,..})), content_block_index, ..}) => {
-                                let tool_delta_idx = state.content_block_index_to_delta_idx.get(&content_block_index).unwrap_or(&0);
-
-                                if let Some(ToolUseBlockStart{tool_use_id, name,..}) = state.content_block_index_to_tool_details.get(&content_block_index) {
-
-                                    match chat_completion_stream(
-                                        state.id.as_str(),
-                                        model.clone(),
-                                        vec![chat_choice_stream(None, Some(vec![ChatCompletionMessageToolCallChunk{
-                                            index: *tool_delta_idx,
-                                            id: Some(tool_use_id.clone()),
-                                            r#type: Some(ChatCompletionToolType::Function),
-                                            function: Some(FunctionCallStream { name: Some(name.clone()), arguments: Some(input) })
-                                        }]), state.role, None, None)],
+                                ConverseStreamOutputPacket::ContentBlockDelta(
+                                    ContentBlockDeltaEvent {
+                                        delta: Some(ContentBlockDeltaType::Text(text)),
+                                        ..
+                                    },
+                                ) => Some(chat_completion_stream(
+                                    state_.id.as_str(),
+                                    state_.model.clone(),
+                                    vec![chat_choice_stream(
+                                        Some(text),
                                         None,
-                                    ) {
-                                        Ok(s) => yield Ok(s),
-                                        Err(e) => {yield Err(e); break}
-                                    }
-
-                                } else {
-                                    yield Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string()));
-                                    break;
-                                }
-                                state.content_block_index_to_delta_idx.insert(content_block_index, tool_delta_idx + 1);
-                            },
-                            ConverseStreamOutputPacket::MessageStop(MessageStopEvent{ stop_reason,.. }) => {
-                                let finish_reason = match try_convert_finish_reason(&stop_reason) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        yield Err(e);
-                                        break;
-                                    }
-                                };
-                                match chat_completion_stream(
-                                    state.id.as_str(),
-                                    model.clone(),
-                                    vec![chat_choice_stream(None, None, state.role, None, Some(finish_reason))],
+                                        state_.role,
+                                        None,
+                                        None,
+                                    )],
                                     None,
-                                ) {
-                                    Ok(s) => yield Ok(s),
-                                    Err(e) => {yield Err(e); break}
-                                }
-                            },
-                            ConverseStreamOutputPacket::Metadata(ConverseStreamMetadataEvent{usage: Some(usage), ..}) => {
-                                match chat_completion_stream(
-                                    state.id.as_str(), model.clone(), vec![], Some(convert_usage(&usage))
-                                ) {
-                                    Ok(s) => yield Ok(s),
-                                    Err(e) => {yield Err(e); break}
-                                }
-                            },
-                            ConverseStreamOutputPacket::ContentBlockStop(_) => {
+                                )),
+                                ConverseStreamOutputPacket::ContentBlockDelta(
+                                    ContentBlockDeltaEvent {
+                                        delta:
+                                            Some(ContentBlockDeltaType::ToolUse(ToolUseBlockDelta {
+                                                input,
+                                                ..
+                                            })),
+                                        content_block_index,
+                                        ..
+                                    },
+                                ) => {
+                                    let tool_delta_idx = *state_
+                                        .content_block_index_to_delta_idx
+                                        .get(&content_block_index)
+                                        .unwrap_or(&0);
 
-                            },
-                            unknown => {
-                                yield Err(to_api_error(format!("Unknown event from Bedrock stream: {unknown:?}")));
-                            }
-                        }
+                                    if let Some(ToolUseBlockStart {
+                                        tool_use_id, name, ..
+                                    }) = state_
+                                        .content_block_index_to_tool_details
+                                        .get(&content_block_index)
+                                    {
+                                        let z = chat_completion_stream(
+                                            state_.id.as_str(),
+                                            state_.model.clone(),
+                                            vec![chat_choice_stream(
+                                                None,
+                                                Some(vec![ChatCompletionMessageToolCallChunk {
+                                                    index: tool_delta_idx,
+                                                    id: Some(tool_use_id.clone()),
+                                                    r#type: Some(ChatCompletionToolType::Function),
+                                                    function: Some(FunctionCallStream {
+                                                        name: Some(name.clone()),
+                                                        arguments: Some(input),
+                                                    }),
+                                                }]),
+                                                state_.role,
+                                                None,
+                                                None,
+                                            )],
+                                            None,
+                                        );
+                                        state_
+                                            .content_block_index_to_delta_idx
+                                            .insert(content_block_index, tool_delta_idx + 1);
+                                        Some(z)
+                                    } else {
+                                        Some(Err(to_api_error("Invalid stream from Bedrock Converse API. Tool use delta received before starting packet".to_string())))
+                                    }
+                                }
+                                ConverseStreamOutputPacket::MessageStop(MessageStopEvent {
+                                    stop_reason,
+                                    ..
+                                }) => match try_convert_finish_reason(&stop_reason) {
+                                    Ok(finish_reason) => Some(chat_completion_stream(
+                                        state_.id.as_str(),
+                                        state_.model.clone(),
+                                        vec![chat_choice_stream(
+                                            None,
+                                            None,
+                                            state_.role,
+                                            None,
+                                            Some(finish_reason),
+                                        )],
+                                        None,
+                                    )),
+                                    Err(e) => Some(Err(e)),
+                                },
+                                ConverseStreamOutputPacket::Metadata(
+                                    ConverseStreamMetadataEvent {
+                                        usage: Some(usage), ..
+                                    },
+                                ) => Some(chat_completion_stream(
+                                    state_.id.as_str(),
+                                    state_.model.clone(),
+                                    vec![],
+                                    Some(convert_usage(&usage)),
+                                )),
+                                ConverseStreamOutputPacket::ContentBlockStop(_) => None,
+                                unknown => Some(Err(to_api_error(format!(
+                                    "Unknown event from Bedrock stream: {unknown:?}"
+                                )))),
+                            };
+                        // Need to drop [`RwLockWriteGuard`] before returning `state.
+                        value
                     }
-                }
+                };
+               zz
             }
-        };
-        Box::pin(s)
+        }))
     }
 }
 
@@ -597,7 +652,7 @@ impl Chat for BedrockConverse {
             .do_converse_stream(input)
             .await
             .map_err(|e| to_api_error(e.to_string()))?;
-        Ok(Self::process_stream(self.model_id.clone(), output.stream))
+        Ok(Self::process_stream(self.model_id.as_str(), output.stream))
     }
 
     async fn chat_request(
