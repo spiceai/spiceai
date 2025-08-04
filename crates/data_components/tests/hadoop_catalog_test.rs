@@ -123,7 +123,7 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
 
 mod tests {
     use data_components::iceberg::provider::IcebergCatalogProvider;
-    use datafusion::catalog::{CatalogProvider, SchemaProvider};
+    use datafusion::catalog::CatalogProvider;
     use globset::{Glob, GlobSet};
 
     use super::*;
