@@ -1,17 +1,17 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
     runner_type: spiceai-dev-runners
     validate_results: true
   throughput:
-    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
     runner_type: spiceai-dev-large-runners
   load:
-    spicepod_path: ./test/spicepods/tpch/sf1/federated/databricks[sql_warehouse].yaml
+    spicepod_path: federated/databricks[sql_warehouse].yaml
     query_set: tpch
     query_overrides: spark
     runner_type: spiceai-dev-large-runners

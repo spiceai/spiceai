@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/clickbench/sf1/accelerated/s3[parquet]-arrow.yaml
+    spicepod_path: accelerated/s3[parquet]-arrow.yaml
     query_set: clickbench
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800

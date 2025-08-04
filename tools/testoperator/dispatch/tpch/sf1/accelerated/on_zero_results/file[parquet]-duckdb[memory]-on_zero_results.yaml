@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpch/sf1/accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results.yaml
+    spicepod_path: accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true

@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/clickbench/sf1/accelerated/s3[parquet]-postgres.yaml
+    spicepod_path: accelerated/s3[parquet]-postgres.yaml
     query_set: clickbench
     query_overrides: postgresql
     runner_type: spiceai-dev-large-runners
