@@ -96,7 +96,7 @@ jobs:
       - name: Set spicepod path
         id: set_spicepod_path
         run: |
-          SPICEPOD_PATH="./test/spicepods/${{ github.event.inputs.query_set}}/SF${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${{ github.event.inputs.query_set}}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Install MinIO
