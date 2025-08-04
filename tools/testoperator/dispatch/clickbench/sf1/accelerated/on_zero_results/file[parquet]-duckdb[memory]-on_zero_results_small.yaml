@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/clickbench/sf1/accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results_small.yaml
+    spicepod_path: accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results_small.yaml
     query_set: clickbench
     query_overrides: duckdb
     runner_type: spiceai-dev-large-runners
