@@ -31,9 +31,9 @@ use object_store_aws_sdk::S3CredentialProvider;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
-use crate::objectstore::ftp::FTPObjectStore;
+use crate::store::ftp::FTPObjectStore;
 #[cfg(feature = "ftp")]
-use crate::objectstore::sftp::SFTPObjectStore;
+use crate::store::sftp::SFTPObjectStore;
 
 #[derive(Debug, Default)]
 pub struct SpiceObjectStoreRegistry {
@@ -470,7 +470,8 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
-pub(crate) fn default_runtime_env() -> Arc<RuntimeEnv> {
+#[must_use]
+pub fn default_runtime_env() -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
         .build_arc()

@@ -716,6 +716,7 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// TODO: Standardise logic with `llms` crate (Bedrock models): `https://github.com/spiceai/spiceai/issues/6676`.
 #[must_use]
 pub fn document_to_json_map(document: Document) -> Map<String, Value> {
     match document {
