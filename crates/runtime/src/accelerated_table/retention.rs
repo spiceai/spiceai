@@ -34,8 +34,8 @@ use crate::{
         builder::get_df_default_config, filter_converter::TimestampFilterConvert,
         is_spice_internal_dataset,
     },
-    object_store_registry::default_runtime_env,
 };
+use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
     #[allow(clippy::cast_possible_wrap)]

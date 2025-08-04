@@ -7473,7 +7473,9 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
  "bytes",
  "cudarc 0.12.2",
  "dotenvy",
@@ -7483,6 +7485,7 @@ dependencies = [
  "hf-hub",
  "indexmap 2.10.0",
  "insta",
+ "itertools 0.14.0",
  "jsonpath-rust",
  "mistralrs",
  "mistralrs-core",
@@ -11442,6 +11445,7 @@ dependencies = [
  "runtime-auth",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-object-store",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",
@@ -11458,9 +11462,7 @@ dependencies = [
  "snowflake-api",
  "spice-cloud",
  "spicepod",
- "ssh2",
  "strsim 0.11.1",
- "suppaftp",
  "tantivy",
  "telemetry",
  "tera",
@@ -11530,6 +11532,32 @@ dependencies = [
  "snafu",
  "tracing",
  "tract-core",
+]
+
+[[package]]
+name = "runtime-object-store"
+version = "1.6.0-unstable"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "fundu",
+ "futures",
+ "http 1.3.1",
+ "object-store-aws-sdk",
+ "object_store",
+ "reqwest",
+ "serde",
+ "snafu",
+ "ssh2",
+ "suppaftp",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
