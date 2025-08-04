@@ -3,7 +3,7 @@ kind: Spicepod
 name: iceberg[hadoop[catalog]]-federated
 
 catalogs:
-  - from: iceberg:iceberg:s3a://benchmarks/hadoop
+  - from: iceberg:s3a://benchmarks/hadoop
     name: ice
     include:
       - "tpcds.*"
