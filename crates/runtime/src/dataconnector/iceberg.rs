@@ -57,6 +57,12 @@ impl IcebergDataConnectorFactory {
     }
 }
 
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+    // Hadoop options
+    ParameterSpec::component("metadata_path")
+        .description("The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`")
+];
+
 impl DataConnectorFactory for IcebergDataConnectorFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -79,7 +85,12 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        crate::catalogconnector::iceberg::PARAMETERS
+        // Concat the data connector specific parameters with the catalog parameters
+        let iceberg_params = PARAMETERS.to_vec();
+        let catalog_params = crate::catalogconnector::iceberg::PARAMETERS.to_vec();
+        let mut params = iceberg_params;
+        params.extend(catalog_params);
+        Box::leak(Box::new(params)) // Leak the memory to return a static slice
     }
 }
 
@@ -101,6 +112,7 @@ impl IcebergDataConnector {
         custom_credential_loader: Option<CustomAwsCredentialLoader>,
         dataset: &Dataset,
         source: &str,
+        metadata_mode: MetadataMode,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let (base_uri, namespace, table_name) = parse_hadoop_table_url(source, None).map_err(|e| {
                 Error::InvalidConfiguration {
@@ -118,7 +130,7 @@ impl IcebergDataConnector {
 
         let mut catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(base_uri)
-            .with_metadata_mode(MetadataMode::Infer)
+            .with_metadata_mode(metadata_mode)
             .with_properties(props);
 
         if let Some(custom_loader) = custom_credential_loader {
@@ -221,13 +233,27 @@ impl DataConnector for IcebergDataConnector {
                 source.to_string()
             };
 
+            let metadata_mode = self
+                .params
+                .get("metadata_path")
+                .ok()
+                .map(|path| MetadataMode::Exact(path.expose_secret().to_string()))
+                .unwrap_or_default();
+
             return IcebergDataConnector::load_hadoop_catalog(
                 props,
                 custom_credential_loader,
                 dataset,
                 &source,
+                metadata_mode,
             )
             .await;
+        }
+
+        if self.params.get("metadata_path").ok().is_some() {
+            tracing::warn!(
+                "The `metadata_path` parameter is valid only for Hadoop Catalogs. The parameter will be ignored for REST Catalogs."
+            );
         }
 
         let (base_uri, new_props, namespace, table_name) = match parse_table_url(source) {
