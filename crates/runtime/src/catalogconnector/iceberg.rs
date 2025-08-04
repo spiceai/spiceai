@@ -311,13 +311,6 @@ impl CatalogConnector for IcebergCatalog {
             || catalog_id.starts_with("s3://")
             || catalog_id.starts_with("s3a://")
         {
-            let catalog_id = if catalog_id.starts_with("s3://") {
-                // s3 needs to be s3a for Hadoop Catalog: https://github.com/apache/iceberg-rust/issues/434
-                catalog_id.replace("s3://", "s3a://")
-            } else {
-                catalog_id.to_string()
-            };
-
             return IcebergCatalog::load_hadoop_catalog(
                 props,
                 custom_credential_loader,

@@ -234,13 +234,6 @@ impl DataConnector for IcebergDataConnector {
             || source.starts_with("s3://")
             || source.starts_with("s3a://")
         {
-            let source = if source.starts_with("s3://") {
-                // s3 needs to be s3a for Hadoop Catalog: https://github.com/apache/iceberg-rust/issues/434
-                source.replace("s3://", "s3a://")
-            } else {
-                source.to_string()
-            };
-
             let metadata_mode = self
                 .params
                 .get("metadata_path")
@@ -252,7 +245,7 @@ impl DataConnector for IcebergDataConnector {
                 props,
                 custom_credential_loader,
                 dataset,
-                &source,
+                source,
                 metadata_mode,
             )
             .await;

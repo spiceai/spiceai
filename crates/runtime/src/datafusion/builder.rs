@@ -20,10 +20,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{
-    dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA,
-    object_store_registry::SpiceObjectStoreRegistry,
-};
+use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -42,6 +39,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::sql::federation_analyzer_rule;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::status;
