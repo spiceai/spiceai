@@ -51,7 +51,7 @@ use crate::{
     execution_plan::schema_cast::EnsureSchema,
     status,
 };
-use object_store_extra::registry::default_runtime_env;
+use runtime_object_store::registry::default_runtime_env;
 
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;

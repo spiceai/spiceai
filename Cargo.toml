@@ -16,7 +16,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
-    "crates/object-store-extra",
+    "crates/runtime-object-store",
     "crates/object-store-aws-sdk",
     "crates/package",
     "crates/runtime",

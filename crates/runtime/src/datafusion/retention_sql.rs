@@ -28,7 +28,7 @@ use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
 use crate::datafusion::builder::get_df_default_config;
-use object_store_extra::registry::default_runtime_env;
+use runtime_object_store::registry::default_runtime_env;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]

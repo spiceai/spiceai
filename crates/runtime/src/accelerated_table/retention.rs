@@ -35,7 +35,7 @@ use crate::{
         is_spice_internal_dataset,
     },
 };
-use object_store_extra::registry::default_runtime_env;
+use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
     #[allow(clippy::cast_possible_wrap)]

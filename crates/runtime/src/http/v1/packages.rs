@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use object_store::{ObjectStore, path::Path};
-use object_store_extra::store::github::GitHubRawObjectStore;
+use runtime_object_store::store::github::GitHubRawObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 

@@ -39,7 +39,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::sql::federation_analyzer_rule;
-use object_store_extra::registry::SpiceObjectStoreRegistry;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::status;

@@ -49,7 +49,7 @@ use crate::dataconnector::{
 use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
-use object_store_extra::registry::default_runtime_env;
+use runtime_object_store::registry::default_runtime_env;
 
 use super::DelimitedFormat;
 

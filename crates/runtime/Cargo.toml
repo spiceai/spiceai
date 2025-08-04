@@ -92,7 +92,6 @@ mysql_async = { workspace = true, optional = true }
 notify = "8.0.0"
 ns_lookup = { path = "../ns_lookup" }
 object-store-aws-sdk = { path = "../object-store-aws-sdk" }
-object-store-extra = { path = "../object-store-extra" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
@@ -129,6 +128,7 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
@@ -226,7 +226,7 @@ duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
-ftp = ["object_store_extra/ftp"]
+ftp = ["runtime-object-store/ftp"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
 mcp = ["dep:rmcp", "tools/mcp"]
