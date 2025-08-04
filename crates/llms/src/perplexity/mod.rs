@@ -41,20 +41,30 @@ static PERPLEXITY_SONAR_API_BASE: &str = "https://api.perplexity.ai";
 static PERPLEXITY_SONAR_DEFAULT_MODEL: &str = "sonar";
 
 impl PerplexitySonar {
-    pub fn from_params(
+    pub fn from_unprefixed_params(
         model: Option<&str>,
         params: &HashMap<String, SecretString>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(auth_token) = params.get("auth_token") else {
-            return Err(Box::from(
-                "No `perplexity_auth_token` provided for Perplexity model.",
-            ));
+        Self::from_params(model, params, None)
+    }
+
+    /// Create a [`PerplexitySonar`] from unprefixed parameters (i.e. without `perplexity_`).
+    pub fn from_params(
+        model: Option<&str>,
+        params: &HashMap<String, SecretString>,
+        prefix: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let auth_token_key = format!("{}auth_token", prefix.unwrap_or_default());
+        let Some(auth_token) = params.get(auth_token_key.as_str()) else {
+            return Err(Box::from(format!(
+                "No `{auth_token_key}` provided for Perplexity model."
+            )));
         };
 
         let overrides: Vec<(String, String)> = params
             .iter()
             .filter_map(|(k, v)| {
-                if k != "auth_token" {
+                if *k != auth_token_key {
                     return Some((k.to_string(), v.expose_secret().to_string()));
                 }
                 None

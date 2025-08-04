@@ -193,7 +193,7 @@ fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, Llm
 
 fn perplexity(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
     // PerplexitySonar only requires prefixed parameters for constructing the model.
-    let model = PerplexitySonar::from_params(model_id, &params.get_component_params())
+    let model = PerplexitySonar::from_unprefixed_params(model_id, &params.get_component_params())
         .map_err(|source| LlmError::FailedToLoadModel { source })?;
 
     Ok(Arc::new(model) as Arc<dyn Chat>)
