@@ -1,0 +1,1 @@
+SELECT MAX(l_orderkey) FROM hadoop.tpch.lineitem;
