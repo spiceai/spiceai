@@ -1,4 +1,5 @@
 name: load tests
+run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:

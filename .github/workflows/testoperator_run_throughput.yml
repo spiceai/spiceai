@@ -1,4 +1,5 @@
 name: throughput tests
+run-name: throughput - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
