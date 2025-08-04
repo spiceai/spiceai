@@ -27,6 +27,7 @@ mod metrics;
 mod model_context;
 pub(crate) mod params;
 mod tool_use;
+mod util;
 mod wrapper;
 
 pub use chat::{LLMModelStore, try_to_chat_model};
