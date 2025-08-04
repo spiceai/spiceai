@@ -123,36 +123,28 @@ jobs:
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
-              echo "Error: OpenAI API key is not defined."
+              echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
-              echo "Error: Anthropic API key is not defined."
+              echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
-              echo "Error: xAI API key is not defined."
+              echo "Error: 'SPICE_XAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: Perplexity API key is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: Perplexity API key is not defined."
-              exit 1
-            fi
-            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: Perplexity API key is not defined."
+              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
               exit 1
             fi
             export SPICE_BEDROCK_REGION="us-east-2"
             if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
-              echo "Error: AWS access key (for Bedrock) is not defined."
+              echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_BEDROCK_SECRET_KEY" ]; then
-              echo "Error: AWS secret key (for Bedrock) is not defined."
+              echo "Error: 'SPICE_BEDROCK_SECRET_KEY' is not defined."
               exit 1
             fi
           fi

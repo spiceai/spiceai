@@ -232,6 +232,7 @@ pub(super) fn convert_usage(usage: &TokenUsage) -> CompletionUsage {
     }
 }
 
+// TODO: Standardise logic with `s3_vectors_metadata_filter` crate: `https://github.com/spiceai/spiceai/issues/6676`.
 pub(super) fn value_to_document(value: serde_json::Value) -> Document {
     match value {
         serde_json::Value::Object(map) => {

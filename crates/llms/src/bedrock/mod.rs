@@ -84,7 +84,7 @@ impl BedrockClient {
         &self,
         converse_build: ConverseStreamFluentBuilder,
     ) -> Result<ConverseStreamOutput, Box<dyn std::error::Error + Send + Sync>> {
-        self.do_the_thing(move |_client| {
+        self.rate_limit_request_with_retry(move |_client| {
             let value = converse_build.clone();
             async move {
                 match value.send().await {
@@ -116,7 +116,7 @@ impl BedrockClient {
         &self,
         converse_build: ConverseFluentBuilder,
     ) -> Result<ConverseOutput, Box<dyn std::error::Error + Send + Sync>> {
-        self.do_the_thing(move |_client| {
+        self.rate_limit_request_with_retry(move |_client| {
             let value = converse_build.clone();
             async move {
                 match value.send().await {
@@ -151,7 +151,7 @@ impl BedrockClient {
     ) -> Result<InvokeModelOutput, Box<dyn std::error::Error + Send + Sync>> {
         let model_id = model_id.into();
         let body = body.into();
-        self.do_the_thing(move |client| {
+        self.rate_limit_request_with_retry(move |client| {
             let b = body.clone();
             let m = model_id.clone();
             async move {
@@ -185,7 +185,7 @@ impl BedrockClient {
         .await
     }
 
-    pub(crate) async fn do_the_thing<O, Fut, F>(
+    pub(crate) async fn rate_limit_request_with_retry<O, Fut, F>(
         &self,
         make_request: F,
     ) -> Result<O, Box<dyn std::error::Error + Send + Sync>>

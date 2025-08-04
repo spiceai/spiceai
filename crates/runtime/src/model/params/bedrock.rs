@@ -24,6 +24,9 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 3] = [
     ParameterSpec::runtime("aws_secret_access_key")
         .description("The AWS secret access key to use for Bedrock models")
         .secret(),
+    ParameterSpec::runtime("aws_session_token")
+        .description("The AWS session token to use for Bedrock models.")
+        .secret(),
     ParameterSpec::runtime("aws_region").description("The AWS region to use for Bedrock models."),
 ];
 pub(crate) const PARAMETERS: &[ParameterSpec] =
