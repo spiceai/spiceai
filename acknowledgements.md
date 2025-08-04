@@ -57,6 +57,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow 55.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
+- arrow-array 55.1.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
 - arrow-buffer 55.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
@@ -204,6 +207,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - csv 1.3.1, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
+- ctor 0.2.9, Apache-2.0 OR MIT 
+  <br/>https://github.com/mmastrac/rust-ctor
+
 - ctrlc 3.4.7, Apache-2.0 OR MIT 
   <br/>https://github.com/Detegr/rust-ctrlc.git
 
@@ -327,6 +333,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - iceberg-datafusion 0.5.1, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
+- iceberg_test_utils 0.5.1, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
 - imap 3.0.0-alpha.14, Apache-2.0 OR MIT 
   <br/>https://github.com/jonhoo/rust-imap
 
@@ -413,6 +422,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - once_cell 1.21.3, Apache-2.0 OR MIT 
   <br/>https://github.com/matklad/once_cell
+
+- opendal 0.53.3, Apache-2.0 
+  <br/>https://github.com/apache/opendal
 
 - opentelemetry 0.27.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
