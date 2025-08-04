@@ -91,8 +91,8 @@ moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.0.0"
 ns_lookup = { path = "../ns_lookup" }
-object_store = { workspace = true, features = ["aws", "http", "azure"] }
 object-store-aws-sdk = { path = "../object-store-aws-sdk" }
+object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -128,6 +128,7 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
@@ -142,9 +143,7 @@ serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
-ssh2 = { workspace = true, optional = true }
 strsim = { version = "0.11.1", optional = true }
-suppaftp = { workspace = true, optional = true }
 tantivy.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
@@ -204,10 +203,7 @@ aws-secrets-manager = [
     "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
 ]
-bedrock = [
-    "dep:aws-config",
-    "dep:aws-sdk-bedrockruntime",
-]
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime"]
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
@@ -217,7 +213,12 @@ clickhouse = [
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint", "bedrock"]
+default = [
+    "keyring-secret-store",
+    "aws-secrets-manager",
+    "sharepoint",
+    "bedrock",
+]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
@@ -225,7 +226,7 @@ duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
-ftp = ["dep:suppaftp", "dep:ssh2"]
+ftp = ["runtime-object-store/ftp"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
 mcp = ["dep:rmcp", "tools/mcp"]
@@ -234,8 +235,8 @@ models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-oracle = ["data_components/oracle"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
+oracle = ["data_components/oracle"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
