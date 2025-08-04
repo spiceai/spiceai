@@ -1,0 +1,47 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_q13"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                  |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                                                                    |
+|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                                                           |
+|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                                                                 |
+|               |       SubqueryAlias: c_orders                                                                                                                                                         |
+|               |         Projection: count(hadoop.tpch.orders.o_orderkey) AS c_count                                                                                                                   |
+|               |           Aggregate: groupBy=[[hadoop.tpch.customer.c_custkey]], aggr=[[count(hadoop.tpch.orders.o_orderkey)]]                                                                        |
+|               |             Projection: hadoop.tpch.customer.c_custkey, hadoop.tpch.orders.o_orderkey                                                                                                 |
+|               |               Left Join: hadoop.tpch.customer.c_custkey = hadoop.tpch.orders.o_custkey                                                                                                |
+|               |                 BytesProcessedNode                                                                                                                                                    |
+|               |                   TableScan: hadoop.tpch.customer projection=[c_custkey]                                                                                                              |
+|               |                 Projection: hadoop.tpch.orders.o_orderkey, hadoop.tpch.orders.o_custkey                                                                                               |
+|               |                   BytesProcessedNode                                                                                                                                                  |
+|               |                     Filter: hadoop.tpch.orders.o_comment NOT LIKE Utf8("%special%requests%")                                                                                          |
+|               |                       TableScan: hadoop.tpch.orders projection=[o_orderkey, o_custkey, o_comment], partial_filters=[hadoop.tpch.orders.o_comment NOT LIKE Utf8("%special%requests%")] |
+| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                                                            |
+|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                                                                      |
+|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                                        |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                                        |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                   |
+|               |           RepartitionExec: partitioning=Hash([c_count@0], 16), input_partitions=16                                                                                                    |
+|               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                                           |
+|               |               ProjectionExec: expr=[count(hadoop.tpch.orders.o_orderkey)@1 as c_count]                                                                                                |
+|               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(hadoop.tpch.orders.o_orderkey)]                                                    |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
+|               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]                                           |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
+|               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 16), input_partitions=16                                                                                    |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                       |
+|               |                             BytesProcessedExec                                                                                                                                        |
+|               |                               IcebergTableScan projection:[c_custkey] predicate:[]                                                                                                    |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
+|               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                                                                    |
+|               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                                                                 |
+|               |                             BytesProcessedExec                                                                                                                                        |
+|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                                                                   |
+|               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                               |
+|               |                                     IcebergTableScan projection:[o_orderkey,o_custkey,o_comment] predicate:[]                                                                         |
+|               |                                                                                                                                                                                       |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
