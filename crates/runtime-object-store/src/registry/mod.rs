@@ -470,6 +470,7 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
+#[must_use]
 pub fn default_runtime_env() -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
