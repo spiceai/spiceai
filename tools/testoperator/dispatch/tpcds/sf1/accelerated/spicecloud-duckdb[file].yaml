@@ -1,18 +1,18 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-duckdb[file].yaml
+    spicepod_path: accelerated/spicecloud-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     runner_type: spiceai-dev-runners
     ready_wait: 300
   throughput:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-duckdb[file].yaml
+    spicepod_path: accelerated/spicecloud-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     runner_type: spiceai-dev-large-runners
     ready_wait: 300
   load:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/spicecloud-duckdb[file].yaml
+    spicepod_path: accelerated/spicecloud-duckdb[file].yaml
     query_set: tpcds
     query_overrides: duckdb
     runner_type: spiceai-dev-large-runners

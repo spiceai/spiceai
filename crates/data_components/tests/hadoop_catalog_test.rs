@@ -45,6 +45,7 @@ fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
 
 #[allow(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
+    #[cfg(not(feature = "test_hadoop_catalog_docker"))]
     let minio_endpoint = std::env::var("MINIO_ENDPOINT")
         .expect("Should have MINIO_ENDPOINT environment variable set");
 
@@ -121,6 +122,10 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
 }
 
 mod tests {
+    use data_components::iceberg::provider::IcebergCatalogProvider;
+    use datafusion::catalog::CatalogProvider;
+    use globset::{Glob, GlobSet};
+
     use super::*;
 
     #[tokio::test]
@@ -410,6 +415,88 @@ mod tests {
                 "my_table_3",
             )
             .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hadoop_iceberg_provider_includes_tables() {
+        let catalogs = build_catalogs().await;
+
+        for (name, catalog) in catalogs {
+            let glob_set = GlobSet::builder()
+                .add(Glob::new("test.*").expect("Should create Glob"))
+                .build()
+                .expect("Should build GlobSet");
+
+            let catalog = Arc::new(catalog) as Arc<dyn Catalog>;
+
+            let provider =
+                IcebergCatalogProvider::try_new(Arc::clone(&catalog), None, Some(&glob_set))
+                    .await
+                    .expect("Should create provider");
+
+            // include does not prune namespaces
+            assert!(
+                provider.schema_names().len() == 2,
+                "{name} - Should have exactly two schemas, found: {:?}",
+                provider.schema_names()
+            );
+
+            let mut namespaces = provider.schema_names();
+            namespaces.sort();
+
+            assert_eq!(
+                namespaces,
+                vec!["nested", "test"],
+                "{name} - The schema names should be 'nested' and 'test', found: {namespaces:?}",
+            );
+
+            assert!(
+                provider
+                    .schema("test")
+                    .expect("Should get schema")
+                    .table_names()
+                    .len()
+                    == 2,
+                "{name} - Should have exactly two tables in the 'test' schema, found: {:?}",
+                provider
+                    .schema("test")
+                    .expect("Should get schema")
+                    .table_names()
+            );
+
+            let mut table_names = provider
+                .schema("test")
+                .expect("Should get schema")
+                .table_names();
+            table_names.sort();
+
+            assert_eq!(
+                table_names,
+                vec!["my_table_1", "my_table_2"],
+                "{name} - The table names in the 'test' schema should be 'my_table_1' and 'my_table_2', found: {table_names:?}",
+            );
+
+            // recreate provider with no includes
+            let provider = IcebergCatalogProvider::try_new(catalog, None, None)
+                .await
+                .expect("Should create provider without includes");
+
+            // there should be 2 namespaces now: "nested" and "test"
+            assert!(
+                provider.schema_names().len() == 2,
+                "{name} - Should have exactly two schemas, found: {:?}",
+                provider.schema_names()
+            );
+
+            let mut namespaces = provider.schema_names();
+            namespaces.sort();
+
+            assert_eq!(
+                namespaces,
+                vec!["nested", "test"],
+                "{name} - The schema names should be 'nested' and 'test', found: {namespaces:?}",
+            );
         }
     }
 }

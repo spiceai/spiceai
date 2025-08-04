@@ -127,19 +127,24 @@ impl IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
-        let catalog_provider = IcebergCatalogProvider::try_new(Arc::new(hadoop_catalog), None)
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?;
+        let catalog_provider = IcebergCatalogProvider::try_new(
+            Arc::new(hadoop_catalog),
+            None,
+            catalog.include.as_ref(),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const ICEBERG_PARAM_LEN: usize = 16;
+pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
         .description("Bearer token value to use for Authorization header."),
@@ -346,6 +351,7 @@ impl CatalogConnector for IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
+            catalog.include.as_ref(),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {

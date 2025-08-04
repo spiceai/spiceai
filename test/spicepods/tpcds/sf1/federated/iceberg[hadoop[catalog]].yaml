@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: iceberg[hadoop[catalog]]-federated
+
+catalogs:
+  - from: iceberg:iceberg:s3a://benchmarks/hadoop
+    name: ice
+    include:
+      - "tpcds.*"
+    params:
+      iceberg_s3_endpoint: ${secrets:S3_ENDPOINT}
+      iceberg_s3_access_key_id: ${secrets:S3_KEY}
+      iceberg_s3_secret_access_key: ${secrets:S3_SECRET}
+      iceberg_s3_region: us-east-1
