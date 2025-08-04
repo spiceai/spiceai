@@ -44,7 +44,7 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
 }
 
 // Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
-const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
+pub(crate) const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     a: [T; N],
     b: [T; M],
 ) -> [T; S] {

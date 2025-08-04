@@ -138,7 +138,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             iceberg::IcebergCatalog::new_connector,
             "iceberg",
-            iceberg::PARAMETERS,
+            &iceberg::PARAMETERS,
         ),
     );
 
