@@ -31,14 +31,15 @@ use secrecy::ExposeSecret;
 use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
-        get_rest_catalog_config, map_param_name_to_iceberg_prop, parse_hadoop_table_url,
-        parse_table_url, verify_s3_endpoint,
+        ICEBERG_PARAM_LEN, get_rest_catalog_config, map_param_name_to_iceberg_prop,
+        parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::load_config,
     },
+    model::params::concat_arrays,
     parameters::{ParameterSpec, Parameters},
 };
 
@@ -57,11 +58,22 @@ impl IcebergDataConnectorFactory {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+const HADOOP_PARAM_LEN: usize = 1;
+pub(crate) const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
     // Hadoop options
     ParameterSpec::runtime("metadata_path")
         .description("The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`")
 ];
+
+pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+    ParameterSpec,
+    HADOOP_PARAM_LEN,
+    ICEBERG_PARAM_LEN,
+    { HADOOP_PARAM_LEN + ICEBERG_PARAM_LEN },
+>(
+    HADOOP_PARAMETERS,
+    crate::catalogconnector::iceberg::PARAMETERS,
+);
 
 impl DataConnectorFactory for IcebergDataConnectorFactory {
     fn as_any(&self) -> &dyn Any {
