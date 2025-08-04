@@ -4,7 +4,7 @@ name: iceberg[hadoop[catalog]]-federated
 
 catalogs:
   - from: iceberg:s3a://benchmarks/hadoop
-    name: ice
+    name: hadoop
     include:
       - "tpch.*"
     params:
