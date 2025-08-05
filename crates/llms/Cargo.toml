@@ -36,7 +36,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util" }
-
 ## For Chunking
 text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "58f9c21006e01e5e968c5de80a0398b3f5ec439a", features = [
     "markdown",
@@ -69,13 +68,13 @@ token_provider = { path = "../token_provider" }
 
 [dev-dependencies]
 anyhow = "1.0.86"
+aws-credential-types.workspace = true
 dotenvy.workspace = true
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 paste.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-aws-credential-types.workspace = true
 
 [features]
 cuda = [
