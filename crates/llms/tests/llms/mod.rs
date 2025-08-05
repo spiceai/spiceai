@@ -537,6 +537,14 @@ macro_rules! generate_model_tests {
         test_model_case!(hf_phi3, system_prompt, true);
         test_model_case!(hf_phi3, supports_basic_message_roles, true);
 
+        test_model_case!(bedrock, basic);
+        test_model_case!(bedrock, supports_basic_message_roles);
+        test_model_case!(bedrock, basic, true);
+        test_model_case!(bedrock, supports_basic_message_roles, true);
+        // Cannot comply with responding with just `pong`.
+        // test_model_case!(bedrock, system_prompt);
+        // test_model_case!(bedrock, system_prompt, true);
+
         // Beta
         test_model_case!(anthropic, tool_use);
         test_model_case!(anthropic, usage);

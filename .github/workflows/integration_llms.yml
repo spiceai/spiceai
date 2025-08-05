@@ -138,7 +138,7 @@ jobs:
               echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
               exit 1
             fi
-            export SPICE_BEDROCK_REGION="us-east-2"
+            export SPICE_BEDROCK_REGION="us-east-1"
             if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
               echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
               exit 1
