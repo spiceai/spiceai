@@ -118,8 +118,8 @@ jobs:
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
-          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.SPICE_SECRET_BEDROCK_ACCESS_KEY }}
-          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.SPICE_SECRET_BEDROCK_SECRET_KEY }}
+          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
@@ -138,7 +138,7 @@ jobs:
               echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
               exit 1
             fi
-            export SPICE_BEDROCK_REGION="us-east-2"
+            export SPICE_BEDROCK_REGION="us-east-1"
             if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
               echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
               exit 1
