@@ -17,7 +17,7 @@ limitations under the License.
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
-    bedrock::chat::BedrockConverse,
+    bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -169,8 +169,6 @@ pub async fn construct_model(
 
 #[cfg(feature = "bedrock")]
 async fn bedrock(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
-    use llms::bedrock::chat::guardrail::GuardRail;
-
     let Some(model_id) = model_id else {
         return Err(LlmError::ModelNotProvided {
             model_source: "bedrock".to_string(),
@@ -186,6 +184,7 @@ async fn bedrock(model_id: Option<String>, params: &Parameters) -> Result<Arc<dy
     let trace = params.get("trace").expose().ok();
     let mut converse = BedrockConverse::new(client.into(), model_id);
 
+    // Add Guardrail if added by user.
     if let (Some(id), Some(version)) = (id, version) {
         let g = GuardRail::try_new(id, version, trace)
             .boxed()
