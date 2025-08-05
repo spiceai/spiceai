@@ -85,7 +85,8 @@ impl BedrockConverse {
         }
     }
 
-    #[must_use] pub fn with_guardrail(mut self, g: GuardRail) -> Self {
+    #[must_use]
+    pub fn with_guardrail(mut self, g: GuardRail) -> Self {
         self.guardrail = Some(g);
         self
     }
