@@ -127,7 +127,7 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
         params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
-    let sonar = PerplexitySonar::from_params(None, &params)
+    let sonar = PerplexitySonar::from_unprefixed_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
 
     Ok(Arc::new(sonar))
