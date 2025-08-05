@@ -553,6 +553,13 @@ macro_rules! generate_model_tests {
         test_model_case!(anthropic, usage, true);
         test_model_case!(anthropic, supports_all_message_roles, true);
 
+        test_model_case!(bedrock, tool_use);
+        test_model_case!(bedrock, usage);
+        test_model_case!(bedrock, supports_all_message_roles);
+        test_model_case!(bedrock, tool_use, true);
+        test_model_case!(bedrock, usage, true);
+        test_model_case!(bedrock, supports_all_message_roles, true);
+
         test_model_case!(openai, tool_use);
         test_model_case!(openai, tool_use, true);
         test_model_case!(openai, usage);
