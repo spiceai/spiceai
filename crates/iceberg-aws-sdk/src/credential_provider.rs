@@ -139,6 +139,8 @@ impl AwsCredentialLoad for S3CredentialProvider {
         &self,
         _client: reqwest::Client,
     ) -> anyhow::Result<Option<AwsCredential>> {
+        // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
+        // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
         let wrapped_credentials = self
             .cache
             .resolve_cached_identity(

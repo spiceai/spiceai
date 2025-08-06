@@ -146,6 +146,8 @@ impl CredentialProvider for S3CredentialProvider {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
+        // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
         let wrapped_credentials = self
             .cache
             .resolve_cached_identity(
