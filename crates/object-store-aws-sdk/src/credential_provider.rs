@@ -18,18 +18,57 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, SdkConfig};
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::Credentials;
+use aws_runtime::auth::sigv4::SigV4AuthScheme;
+use aws_sdk_s3::{
+    Client,
+    config::{
+        ConfigBag, IdentityCache, ResolveCachedIdentity, SharedIdentityCache,
+        auth::{DefaultAuthSchemeResolver, ResolveAuthScheme},
+        endpoint::{DefaultResolver, ResolveEndpoint},
+    },
+};
+use aws_smithy_runtime::client::retries::strategy::StandardRetryStrategy;
+use aws_smithy_runtime_api::client::{
+    auth::AuthSchemeId,
+    runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
+};
+use aws_smithy_runtime_api::client::{auth::SharedAuthScheme, identity::SharedIdentityResolver};
 use object_store::{CredentialProvider, aws::AwsCredential};
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
-    credentials: aws_credential_types::provider::SharedCredentialsProvider,
+    runtime: RuntimeComponents,
+    cache: SharedIdentityCache,
+    identity_resolver: SharedIdentityResolver,
 }
 
 impl S3CredentialProvider {
-    #[must_use]
-    pub fn new(credentials: aws_credential_types::provider::SharedCredentialsProvider) -> Self {
-        Self { credentials }
+    /// Attempts to create a new `S3CredentialProvider` using the provided SDK configuration.
+    ///
+    /// # Errors
+    /// Returns an error if a credentials provider cannot be obtained from the SDK configuration,
+    /// or if the AWS runtime components are not built correctly.
+    pub fn try_new(config: &SdkConfig) -> object_store::Result<Self> {
+        let client = aws_sdk_s3::Client::new(config);
+        let runtime = Self::build_aws_runtime_components(config, &client).map_err(|e| {
+            object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(e),
+            }
+        })?;
+        let credentials_provider =
+            config
+                .credentials_provider()
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "S3",
+                    source: "No credentials provider found in SdkConfig".into(),
+                })?;
+        Ok(Self {
+            cache: IdentityCache::lazy().build(),
+            runtime,
+            identity_resolver: SharedIdentityResolver::new(credentials_provider),
+        })
     }
 
     /// Loads credentials from the environment.
@@ -49,17 +88,56 @@ impl S3CredentialProvider {
     ///
     /// Returns an error if the credentials provider cannot be obtained from the SDK configuration.
     pub fn from_config(sdk_config: &SdkConfig) -> object_store::Result<Self> {
-        let credentials =
+        let credentials_provider =
             sdk_config
                 .credentials_provider()
                 .ok_or_else(|| object_store::Error::Generic {
                     store: "S3",
-                    source: "Failed to get S3 credentials from the AWS SDK".into(),
+                    source: "No credentials provider found in SdkConfig".into(),
                 })?;
-
         Ok(Self {
-            credentials: credentials.clone(),
+            cache: IdentityCache::lazy().build(),
+            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))
+                .map_err(|e| object_store::Error::Generic {
+                    store: "S3",
+                    source: Box::new(e),
+                })?,
+            identity_resolver: SharedIdentityResolver::new(credentials_provider),
         })
+    }
+
+    fn build_aws_runtime_components(
+        sdk_config: &SdkConfig,
+        client: &Client,
+    ) -> object_store::Result<RuntimeComponents> {
+        let mut runtime_components = RuntimeComponentsBuilder::new("ServiceRuntimePlugin");
+        runtime_components.set_auth_scheme_option_resolver(::std::option::Option::Some({
+            DefaultAuthSchemeResolver::default().into_shared_resolver()
+        }));
+        runtime_components.set_endpoint_resolver(::std::option::Option::Some({
+            DefaultResolver::new().into_shared_resolver()
+        }));
+        runtime_components.push_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()));
+
+        runtime_components
+            .with_identity_cache(Some(IdentityCache::lazy().build()))
+            .with_identity_resolver(
+                AuthSchemeId::new("hello"),
+                SharedIdentityResolver::new(sdk_config.credentials_provider().ok_or_else(
+                    || object_store::Error::Generic {
+                        store: "S3",
+                        source: "No credentials provider found in SdkConfig".into(),
+                    },
+                )?),
+            )
+            .with_retry_strategy(Some(StandardRetryStrategy::new()))
+            .with_time_source(client.config().time_source())
+            .with_sleep_impl(client.config().sleep_impl())
+            .build()
+            .map_err(|e| object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(e),
+            })
     }
 }
 
@@ -68,16 +146,30 @@ impl CredentialProvider for S3CredentialProvider {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
-        let creds = self.credentials.provide_credentials().await.map_err(|e| {
+        let wrapped_credentials = self
+            .cache
+            .resolve_cached_identity(
+                self.identity_resolver.clone(),
+                &self.runtime,
+                &ConfigBag::base(),
+            )
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "S3",
+                source: e,
+            })?;
+
+        let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
             object_store::Error::Generic {
                 store: "S3",
-                source: Box::new(e),
+                source: "No credentials found in the resolved identity".into(),
             }
         })?;
+
         Ok(Arc::new(AwsCredential {
-            key_id: creds.access_key_id().to_string(),
-            secret_key: creds.secret_access_key().to_string(),
-            token: creds.session_token().map(ToString::to_string),
+            key_id: credentials.access_key_id().to_string(),
+            secret_key: credentials.secret_access_key().to_string(),
+            token: credentials.session_token().map(ToString::to_string),
         }))
     }
 }

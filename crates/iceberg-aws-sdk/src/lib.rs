@@ -21,6 +21,14 @@ pub use credential_provider::S3CredentialProvider;
 pub enum Error {
     #[snafu(display("Failed to get credentials from environment"))]
     FailedToGetCredentials,
+
+    #[snafu(display(
+        "Internal error: {}. Report a bug at https://github.com/spiceai/spiceai/issues.",
+        source
+    ))]
+    InternalError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

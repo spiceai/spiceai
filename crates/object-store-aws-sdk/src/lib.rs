@@ -35,6 +35,14 @@ pub enum Error {
 
     #[snafu(transparent)]
     ObjectStore { source: object_store::Error },
+
+    #[snafu(display(
+        "An internal error occurred: {}. Report a bug at https://github.com/spiceai/spiceai/issues",
+        source
+    ))]
+    Internal {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
