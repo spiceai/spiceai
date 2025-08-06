@@ -17,7 +17,7 @@ limitations under the License.
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
-    bedrock::chat::BedrockConverse,
+    bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -179,7 +179,20 @@ async fn bedrock(model_id: Option<String>, params: &Parameters) -> Result<Arc<dy
         .await
         .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
 
-    Ok(Arc::new(BedrockConverse::new(client.into(), model_id)) as Arc<dyn Chat>)
+    let id = params.get("guardrail_identifier").expose().ok();
+    let version = params.get("guardrail_version").expose().ok();
+    let trace = params.get("trace").expose().ok();
+    let mut converse = BedrockConverse::new(client.into(), model_id);
+
+    // Add Guardrail if added by user.
+    if let (Some(id), Some(version)) = (id, version) {
+        let g = GuardRail::try_new(id, version, trace)
+            .boxed()
+            .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+        converse = converse.with_guardrail(g);
+    }
+
+    Ok(Arc::new(converse) as Arc<dyn Chat>)
 }
 
 fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {

@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+pub mod guardrail;
 pub(super) mod util;
 
 use crate::bedrock::BedrockClient;
+use crate::bedrock::chat::guardrail::GuardRail;
 use crate::bedrock::chat::util::{
     chat_choice_stream, chat_completion_stream, convert_usage, extract_from_content_block,
     into_fallible_stream, to_api_error, tool_config, try_convert_finish_reason, try_convert_role,
@@ -53,8 +55,9 @@ use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
     ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
     ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    InferenceConfiguration, Message, MessageStartEvent, MessageStopEvent, SystemContentBlock,
-    ToolResultContentBlock, ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
+    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration, Message,
+    MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
+    ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
 use futures::stream::StreamExt;
 use itertools::Itertools;
@@ -69,12 +72,23 @@ use tracing::Span;
 pub struct BedrockConverse {
     client: Arc<BedrockClient>,
     model_id: String,
+    guardrail: Option<GuardRail>,
 }
 
 impl BedrockConverse {
     #[must_use]
     pub fn new(client: Arc<BedrockClient>, model_id: String) -> Self {
-        Self { client, model_id }
+        Self {
+            client,
+            model_id,
+            guardrail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_guardrail(mut self, g: GuardRail) -> Self {
+        self.guardrail = Some(g);
+        self
     }
 
     /// Alter the  [`CreateChatCompletionRequest`] in a way that Bedrock understands.
@@ -324,6 +338,13 @@ impl BedrockConverse {
         let messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
 
+        let guardrails: Option<GuardrailStreamConfiguration> = self
+            .guardrail
+            .as_ref()
+            .map(std::convert::TryInto::try_into)
+            .transpose()
+            .map_err(|e: BuildError| to_api_error(e.to_string()))?;
+
         let mut bldr = client
             .client
             .converse_stream()
@@ -331,6 +352,7 @@ impl BedrockConverse {
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
+            .set_guardrail_config(guardrails)
             .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(Value::Object(m)) = metadata {
@@ -373,6 +395,13 @@ impl BedrockConverse {
         let messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
 
+        let guardrails: Option<GuardrailConfiguration> = self
+            .guardrail
+            .as_ref()
+            .map(std::convert::TryInto::try_into)
+            .transpose()
+            .map_err(|e: BuildError| to_api_error(e.to_string()))?;
+
         let mut bldr = client
             .client
             .converse()
@@ -380,6 +409,7 @@ impl BedrockConverse {
             .set_messages(Some(messages))
             .inference_config(inf_cfg)
             .set_system(Some(system))
+            .set_guardrail_config(guardrails)
             .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(Value::Object(m)) = metadata {
