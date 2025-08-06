@@ -29,6 +29,11 @@ pub enum Error {
     FailedToGetCredentialsFromEnvironment,
 
     #[snafu(display(
+        "Failed to get credentials provider from SDK config. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToGetCredentialsProviderFromConfig,
+
+    #[snafu(display(
         "Failed to resolve credentials: {source}. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
     ))]
     FailedToResolveCredentials {

@@ -69,7 +69,7 @@ impl S3CredentialProvider {
     pub fn from_config(sdk_config: &SdkConfig) -> Result<Self> {
         let credentials_provider = sdk_config
             .credentials_provider()
-            .ok_or_else(|| Error::FailedToGetCredentialsFromEnvironment)?;
+            .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?;
         Ok(Self {
             cache: IdentityCache::lazy().build(),
             runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))?,
