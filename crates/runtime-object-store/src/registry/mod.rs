@@ -120,8 +120,14 @@ impl SpiceObjectStoreRegistry {
             if let Some(sdk_config) = object_store_aws_sdk::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
-                    s3_builder = s3_builder
-                        .with_credentials(Arc::new(S3CredentialProvider::try_new(sdk_config)?));
+                    s3_builder = s3_builder.with_credentials(Arc::new(
+                        S3CredentialProvider::from_config(sdk_config).map_err(|e| {
+                            object_store::Error::Generic {
+                                store: "S3",
+                                source: e.into(),
+                            }
+                        })?,
+                    ));
                 } else {
                     tracing::trace!(
                         "No S3 credentials provider found from AWS SDK, assuming public access"

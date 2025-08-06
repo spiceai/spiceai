@@ -36,8 +36,11 @@ use aws_smithy_runtime_api::client::{
     runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
 };
 use iceberg::io::{AwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader};
+use snafu::prelude::*;
 
-use crate::{Error, Result};
+use crate::{
+    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveCredentialsSnafu, Result,
+};
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
@@ -47,28 +50,6 @@ pub struct S3CredentialProvider {
 }
 
 impl S3CredentialProvider {
-    /// Attempts to create a new `S3CredentialProvider` using the provided SDK configuration.
-    ///
-    /// # Errors
-    /// Returns an error if a credentials provider cannot be obtained from the SDK configuration,
-    /// or if the AWS runtime components are not built correctly.
-    pub fn try_new(config: &SdkConfig) -> Result<Self> {
-        let client = aws_sdk_s3::Client::new(config);
-        let runtime = Self::build_aws_runtime_components(config, &client)
-            .map_err(|e| Error::InternalError { source: e.into() })?;
-        let credentials_provider =
-            config
-                .credentials_provider()
-                .ok_or_else(|| Error::InternalError {
-                    source: "Failed to get credentials provider".into(),
-                })?;
-        Ok(Self {
-            cache: IdentityCache::lazy().build(),
-            runtime,
-            identity_resolver: SharedIdentityResolver::new(credentials_provider),
-        })
-    }
-
     /// Loads credentials from the environment.
     ///
     /// # Errors
@@ -88,11 +69,10 @@ impl S3CredentialProvider {
     pub fn from_config(sdk_config: &SdkConfig) -> Result<Self> {
         let credentials_provider = sdk_config
             .credentials_provider()
-            .ok_or_else(|| Error::FailedToGetCredentials)?;
+            .ok_or_else(|| Error::FailedToGetCredentialsFromEnvironment)?;
         Ok(Self {
             cache: IdentityCache::lazy().build(),
-            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))
-                .map_err(|e| Error::InternalError { source: e.into() })?,
+            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))?,
             identity_resolver: SharedIdentityResolver::new(credentials_provider),
         })
     }
@@ -106,30 +86,29 @@ impl S3CredentialProvider {
         sdk_config: &SdkConfig,
         client: &Client,
     ) -> Result<RuntimeComponents> {
-        let mut runtime_components = RuntimeComponentsBuilder::new("ServiceRuntimePlugin");
-        runtime_components.set_auth_scheme_option_resolver(::std::option::Option::Some({
+        let mut runtime_components = RuntimeComponentsBuilder::new("S3CredentialProvider");
+        runtime_components.set_auth_scheme_option_resolver(Some({
             DefaultAuthSchemeResolver::default().into_shared_resolver()
         }));
-        runtime_components.set_endpoint_resolver(::std::option::Option::Some({
-            DefaultResolver::new().into_shared_resolver()
-        }));
+        runtime_components
+            .set_endpoint_resolver(Some(DefaultResolver::new().into_shared_resolver()));
         runtime_components.push_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()));
 
         runtime_components
             .with_identity_cache(Some(IdentityCache::lazy().build()))
             .with_identity_resolver(
-                AuthSchemeId::new("hello"),
-                SharedIdentityResolver::new(sdk_config.credentials_provider().ok_or_else(
-                    || Error::InternalError {
-                        source: "No credentials provider found in SdkConfig".into(),
-                    },
-                )?),
+                AuthSchemeId::new("SpiceIcebergS3CredentialProvider"),
+                SharedIdentityResolver::new(
+                    sdk_config
+                        .credentials_provider()
+                        .ok_or_else(|| Error::FailedToGetIdentityResolver)?,
+                ),
             )
             .with_retry_strategy(Some(StandardRetryStrategy::new()))
             .with_time_source(client.config().time_source())
             .with_sleep_impl(client.config().sleep_impl())
             .build()
-            .map_err(|e| Error::InternalError { source: e.into() })
+            .context(FailedToBuildAWSRuntimeComponentsSnafu)
     }
 }
 
@@ -149,11 +128,13 @@ impl AwsCredentialLoad for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .map_err(|_| Error::FailedToGetCredentials)?;
+            .context(FailedToResolveCredentialsSnafu)?;
 
-        let credentials = wrapped_credentials
-            .data::<Credentials>()
-            .ok_or_else(|| Error::FailedToGetCredentials)?;
+        let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            Error::FailedToResolveCredentials {
+                source: "No valid credentials found".into(),
+            }
+        })?;
 
         Ok(Some(AwsCredential {
             access_key_id: credentials.access_key_id().to_string(),

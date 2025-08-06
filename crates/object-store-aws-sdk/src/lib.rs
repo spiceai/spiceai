@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
+use aws_smithy_runtime_api::client::runtime_components::BuildError;
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 use tokio::sync::OnceCell;
 
@@ -27,6 +28,31 @@ use url::Url;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
+    #[snafu(display(
+        "Failed to build AWS runtime components: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToBuildAWSRuntimeComponents { source: BuildError },
+
+    #[snafu(display("Failed to get credentials from environment"))]
+    FailedToGetCredentialsFromEnvironment,
+
+    #[snafu(display(
+        "Failed to get AWS identity resolver. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToGetIdentityResolver,
+
+    #[snafu(display(
+        "Failed to get credentials provider from SDK config. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToGetCredentialsProviderFromConfig,
+
+    #[snafu(display(
+        "Failed to resolve credentials: {source}. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToResolveCredentials {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Not an S3 URL: {url}"))]
     NotAnS3Url { url: String },
 
@@ -35,14 +61,6 @@ pub enum Error {
 
     #[snafu(transparent)]
     ObjectStore { source: object_store::Error },
-
-    #[snafu(display(
-        "An internal error occurred: {}. Report a bug at https://github.com/spiceai/spiceai/issues",
-        source
-    ))]
-    Internal {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

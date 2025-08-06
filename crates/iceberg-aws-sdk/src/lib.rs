@@ -15,20 +15,30 @@ limitations under the License.
 */
 
 mod credential_provider;
+use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
+    #[snafu(display(
+        "Failed to build AWS runtime components: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToBuildAWSRuntimeComponents { source: BuildError },
+
     #[snafu(display("Failed to get credentials from environment"))]
-    FailedToGetCredentials,
+    FailedToGetCredentialsFromEnvironment,
 
     #[snafu(display(
-        "Internal error: {}. Report a bug at https://github.com/spiceai/spiceai/issues.",
-        source
+        "Failed to resolve credentials: {source}. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
     ))]
-    InternalError {
+    FailedToResolveCredentials {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to get AWS identity resolver. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    FailedToGetIdentityResolver,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::{Error, FailedToBuildAWSRuntimeComponentsSnafu, Result};
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::Credentials;
@@ -35,6 +36,7 @@ use aws_smithy_runtime_api::client::{
 };
 use aws_smithy_runtime_api::client::{auth::SharedAuthScheme, identity::SharedIdentityResolver};
 use object_store::{CredentialProvider, aws::AwsCredential};
+use snafu::ResultExt;
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
@@ -44,39 +46,12 @@ pub struct S3CredentialProvider {
 }
 
 impl S3CredentialProvider {
-    /// Attempts to create a new `S3CredentialProvider` using the provided SDK configuration.
-    ///
-    /// # Errors
-    /// Returns an error if a credentials provider cannot be obtained from the SDK configuration,
-    /// or if the AWS runtime components are not built correctly.
-    pub fn try_new(config: &SdkConfig) -> object_store::Result<Self> {
-        let client = aws_sdk_s3::Client::new(config);
-        let runtime = Self::build_aws_runtime_components(config, &client).map_err(|e| {
-            object_store::Error::Generic {
-                store: "S3",
-                source: Box::new(e),
-            }
-        })?;
-        let credentials_provider =
-            config
-                .credentials_provider()
-                .ok_or_else(|| object_store::Error::Generic {
-                    store: "S3",
-                    source: "No credentials provider found in SdkConfig".into(),
-                })?;
-        Ok(Self {
-            cache: IdentityCache::lazy().build(),
-            runtime,
-            identity_resolver: SharedIdentityResolver::new(credentials_provider),
-        })
-    }
-
     /// Loads credentials from the environment.
     ///
     /// # Errors
     ///
     /// Returns an error if the credentials cannot be loaded from the environment.
-    pub async fn from_env() -> object_store::Result<(Self, SdkConfig)> {
+    pub async fn from_env() -> Result<(Self, SdkConfig)> {
         let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
         Ok((Self::from_config(&config)?, config))
@@ -87,21 +62,13 @@ impl S3CredentialProvider {
     /// # Errors
     ///
     /// Returns an error if the credentials provider cannot be obtained from the SDK configuration.
-    pub fn from_config(sdk_config: &SdkConfig) -> object_store::Result<Self> {
-        let credentials_provider =
-            sdk_config
-                .credentials_provider()
-                .ok_or_else(|| object_store::Error::Generic {
-                    store: "S3",
-                    source: "No credentials provider found in SdkConfig".into(),
-                })?;
+    pub fn from_config(sdk_config: &SdkConfig) -> Result<Self> {
+        let credentials_provider = sdk_config
+            .credentials_provider()
+            .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?;
         Ok(Self {
             cache: IdentityCache::lazy().build(),
-            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))
-                .map_err(|e| object_store::Error::Generic {
-                    store: "S3",
-                    source: Box::new(e),
-                })?,
+            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))?,
             identity_resolver: SharedIdentityResolver::new(credentials_provider),
         })
     }
@@ -109,35 +76,30 @@ impl S3CredentialProvider {
     fn build_aws_runtime_components(
         sdk_config: &SdkConfig,
         client: &Client,
-    ) -> object_store::Result<RuntimeComponents> {
-        let mut runtime_components = RuntimeComponentsBuilder::new("ServiceRuntimePlugin");
-        runtime_components.set_auth_scheme_option_resolver(::std::option::Option::Some({
-            DefaultAuthSchemeResolver::default().into_shared_resolver()
-        }));
-        runtime_components.set_endpoint_resolver(::std::option::Option::Some({
-            DefaultResolver::new().into_shared_resolver()
-        }));
+    ) -> Result<RuntimeComponents> {
+        let mut runtime_components = RuntimeComponentsBuilder::new("S3CredentialProvider");
+        runtime_components.set_auth_scheme_option_resolver(Some(
+            DefaultAuthSchemeResolver::default().into_shared_resolver(),
+        ));
+        runtime_components
+            .set_endpoint_resolver(Some(DefaultResolver::new().into_shared_resolver()));
         runtime_components.push_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()));
 
         runtime_components
             .with_identity_cache(Some(IdentityCache::lazy().build()))
             .with_identity_resolver(
-                AuthSchemeId::new("hello"),
-                SharedIdentityResolver::new(sdk_config.credentials_provider().ok_or_else(
-                    || object_store::Error::Generic {
-                        store: "S3",
-                        source: "No credentials provider found in SdkConfig".into(),
-                    },
-                )?),
+                AuthSchemeId::new("SpiceObjectStoreS3CredentialsProvider"),
+                SharedIdentityResolver::new(
+                    sdk_config
+                        .credentials_provider()
+                        .ok_or_else(|| Error::FailedToGetIdentityResolver)?,
+                ),
             )
             .with_retry_strategy(Some(StandardRetryStrategy::new()))
             .with_time_source(client.config().time_source())
             .with_sleep_impl(client.config().sleep_impl())
             .build()
-            .map_err(|e| object_store::Error::Generic {
-                store: "S3",
-                source: Box::new(e),
-            })
+            .context(FailedToBuildAWSRuntimeComponentsSnafu)
     }
 }
 
