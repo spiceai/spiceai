@@ -178,7 +178,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     }
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
         let tls_root_certificate = std::fs::read(&tls_root_certificate_file).map_err(|e| {
-            format!("Failed to read TLS root certificate from '{}': {}. Verify the file path and permissions.", tls_root_certificate_file, e)
+            format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
         })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
@@ -200,8 +200,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     // Set up the Flight client
     let channel = channel.map_err(|e| {
         Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{}': {}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid.",
-            repl_flight_endpoint, e
+            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
         ))
     })?;
 
@@ -251,7 +250,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     continue 'outer;
                 }
                 Err(err) => {
-                    println!("{} Input read error: {}", Colour::Red.paint("Error:"), err);
+                    println!("{} Input read error: {err}", Colour::Red.paint("Error:"));
                     continue 'outer;
                 }
             };
@@ -316,9 +315,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 .await
                 {
                     println!(
-                        "{} NQL processing failed: {}. Use '.error' if applicable.",
-                        Colour::Red.paint("Error:"),
-                        e
+                        "{} NQL processing failed: {e}. Use '.error' if applicable.",
+                        Colour::Red.paint("Error:")
                     );
                 }
                 continue;
@@ -350,9 +348,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
             Err(e) => {
                 println!(
-                    "{} Unexpected Flight error: {}. Check connection or query syntax.",
-                    Colour::Red.paint("Error:"),
-                    e
+                    "{} Unexpected Flight error: {e}. Check connection or query syntax.",
+                    Colour::Red.paint("Error:")
                 );
             }
         }
@@ -384,14 +381,14 @@ pub async fn get_records(
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
-        return Err(FlightError::Tonic(Box::new(Status::internal(
+        return Err(FlightError::Tonic(Status::internal(
             "No endpoint returned from server. Verify server configuration.",
-        ))));
+        )));
     };
     let Some(ticket) = endpoint.ticket else {
-        return Err(FlightError::Tonic(Box::new(Status::internal(
+        return Err(FlightError::Tonic(Status::internal(
             "No ticket in endpoint. Server may be misconfigured.",
-        ))));
+        )));
     };
     let mut request = ticket.into_request();
     request = add_api_key(request, api_key)?;
@@ -482,9 +479,8 @@ fn display_records(
         Ok(pretty) => pretty,
         Err(e) => {
             println!(
-                "{} Failed to format results: {}",
-                Colour::Red.paint("Display Error:"),
-                e
+                "{} Failed to format results: {e}",
+                Colour::Red.paint("Display Error:")
             );
             return Err(Box::new(e));
         }
@@ -527,30 +523,27 @@ async fn get_and_display_nql_records(
     .await
     .map_err(|e| {
         format!(
-            "Network error during NQL request: {}. Check HTTP endpoint and network.",
-            e
+            "Network error during NQL request: {e}. Check HTTP endpoint and network."
         )
     })?;
 
     let jsonl_resp = json_array_to_jsonl(&resp).map_err(|e| {
         format!(
-            "Failed to convert NQL response to JSONL: {}. Response may be malformed.",
-            e
+            "Failed to convert NQL response to JSONL: {e}. Response may be malformed."
         )
     })?;
 
     let (schema, _) =
         arrow_json::reader::infer_json_schema(jsonl_resp.as_bytes(), None).map_err(|e| {
             format!(
-                "Schema inference failed for NQL results: {}. Ensure response is valid JSON.",
-                e
+                "Schema inference failed for NQL results: {e}. Ensure response is valid JSON."
             )
         })?;
 
     let records: Vec<RecordBatch> = arrow_json::ReaderBuilder::new(Arc::new(schema))
         .build(jsonl_resp.as_bytes())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to read NQL records into Arrow format: {}.", e))?;
+        .map_err(|e| format!("Failed to read NQL records into Arrow format: {e}."))?;
 
     let total_rows = records
         .iter()
@@ -566,13 +559,13 @@ async fn get_and_display_nql_records(
 /// Convert a JSON array string to a JSONL string.
 fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::error::Error>> {
     let json_array: Vec<serde_json::Value> = serde_json::from_str(json_array_str)
-        .map_err(|e| format!("Invalid JSON array in response: {}", e))?;
+        .map_err(|e| format!("Invalid JSON array in response: {e}"))?;
 
     let jsonl_strings: Vec<String> = json_array
         .into_iter()
         .map(|item| serde_json::to_string(&item))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to serialize JSON item: {}", e))?;
+        .map_err(|e| format!("Failed to serialize JSON item: {e}"))?;
 
     let jsonl_str = jsonl_strings.join("\n");
 
@@ -651,9 +644,8 @@ fn display_grpc_error(err: &Status) {
     };
 
     println!(
-        "{} {}",
-        Colour::Red.paint(format!("{error_type}:")),
-        user_err_msg
+        "{} {user_err_msg}",
+        Colour::Red.paint(format!("{error_type}:"))
     );
 }
 
