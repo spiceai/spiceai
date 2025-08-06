@@ -384,14 +384,14 @@ pub async fn get_records(
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
-        return Err(FlightError::Tonic(Status::internal(
+        return Err(FlightError::Tonic(Box::new(Status::internal(
             "No endpoint returned from server. Verify server configuration.",
-        )));
+        ))));
     };
     let Some(ticket) = endpoint.ticket else {
-        return Err(FlightError::Tonic(Status::internal(
+        return Err(FlightError::Tonic(Box::new(Status::internal(
             "No ticket in endpoint. Server may be misconfigured.",
-        )));
+        ))));
     };
     let mut request = ticket.into_request();
     request = add_api_key(request, api_key)?;
