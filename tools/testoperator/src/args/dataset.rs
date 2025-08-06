@@ -80,8 +80,8 @@ pub enum QueryOverridesArg {
     Oracle,
     #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
-    #[serde(rename = "hadoop-catalog")]
-    HadoopCatalog,
+    #[serde(rename = "iceberg-hadoop")]
+    IcebergHadoop,
     #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
     #[serde(rename = "glue-catalog")]
@@ -123,7 +123,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             }
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
-            QueryOverridesArg::HadoopCatalog => QueryOverrides::HadoopCatalog,
+            QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
         }
     }
 }
