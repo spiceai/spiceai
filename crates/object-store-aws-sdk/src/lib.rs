@@ -33,9 +33,6 @@ pub enum Error {
     ))]
     FailedToBuildAWSRuntimeComponents { source: BuildError },
 
-    #[snafu(display("Failed to get credentials from environment"))]
-    FailedToGetCredentialsFromEnvironment,
-
     #[snafu(display(
         "Failed to get AWS identity resolver. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
     ))]
@@ -45,13 +42,6 @@ pub enum Error {
         "Failed to get credentials provider from SDK config. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
     ))]
     FailedToGetCredentialsProviderFromConfig,
-
-    #[snafu(display(
-        "Failed to resolve credentials: {source}. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
-    ))]
-    FailedToResolveCredentials {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 
     #[snafu(display("Not an S3 URL: {url}"))]
     NotAnS3Url { url: String },

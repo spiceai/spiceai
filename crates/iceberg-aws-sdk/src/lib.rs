@@ -25,9 +25,6 @@ pub enum Error {
     ))]
     FailedToBuildAWSRuntimeComponents { source: BuildError },
 
-    #[snafu(display("Failed to get credentials from environment"))]
-    FailedToGetCredentialsFromEnvironment,
-
     #[snafu(display(
         "Failed to get credentials provider from SDK config. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
     ))]
