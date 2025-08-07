@@ -208,13 +208,6 @@ jobs:
           ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
           ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
-          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
-          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
-          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
-          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
-          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
