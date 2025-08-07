@@ -1108,6 +1108,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cognitoidentity"
+version = "1.80.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "606ea1307a8caf6ecddf1d8bbe55b7d1d967c7b6c217d13d5e81c2c8e24e0cf8"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-cognitoidentityprovider"
+version = "1.92.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b241646fc324545dfad23330a756067373ff457e7f32102ea192f04fe10a2e9"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-dynamodb"
 version = "1.84.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6616,12 +6660,16 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-runtime",
+ "aws-sdk-cognitoidentity",
+ "aws-sdk-cognitoidentityprovider",
  "aws-sdk-s3",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "iceberg",
  "reqwest",
  "snafu",
+ "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -9138,11 +9186,14 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-runtime",
+ "aws-sdk-cognitoidentity",
+ "aws-sdk-cognitoidentityprovider",
  "aws-sdk-s3",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "object_store",
  "snafu",
+ "tempfile",
  "tokio",
  "url",
 ]

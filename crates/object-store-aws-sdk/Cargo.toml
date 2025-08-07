@@ -20,3 +20,8 @@ object_store.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+aws-sdk-cognitoidentity = "1.80.0"
+aws-sdk-cognitoidentityprovider = "1.92.0"
+tempfile.workspace = true
