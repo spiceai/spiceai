@@ -42,7 +42,7 @@ env:
   CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
 
 jobs:
-  test:
+  build:
     name: Test Data Components
     runs-on: spiceai-dev-runners
     steps:
@@ -61,12 +61,50 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - name: Run tests (hadoop)
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Build test binary
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           CARGO_INCREMENTAL: 0
+        run: |
+          cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file test.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-archive
+          path: ./test.tar.zst
+          retention-days: 1
+  
+  test:
+    name: Data Components Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: test-archive
+          path: ./test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run integration tests
+        env:
           MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo test -p data_components --test hadoop_catalog_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./test/test.tar.zst
