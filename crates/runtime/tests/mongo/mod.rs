@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::utils::{test_request_context};
 
 pub mod common;
 
