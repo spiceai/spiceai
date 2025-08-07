@@ -101,7 +101,7 @@ impl S3CredentialProvider {
                 SharedIdentityResolver::new(
                     sdk_config
                         .credentials_provider()
-                        .ok_or_else(|| Error::FailedToGetIdentityResolver)?,
+                        .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?,
                 ),
             )
             .with_retry_strategy(Some(StandardRetryStrategy::new()))

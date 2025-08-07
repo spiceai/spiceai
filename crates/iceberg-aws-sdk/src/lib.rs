@@ -36,11 +36,6 @@ pub enum Error {
     FailedToResolveCredentials {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display(
-        "Failed to get AWS identity resolver. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
-    ))]
-    FailedToGetIdentityResolver,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

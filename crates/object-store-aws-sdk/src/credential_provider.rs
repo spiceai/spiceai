@@ -92,7 +92,7 @@ impl S3CredentialProvider {
                 SharedIdentityResolver::new(
                     sdk_config
                         .credentials_provider()
-                        .ok_or_else(|| Error::FailedToGetIdentityResolver)?,
+                        .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?,
                 ),
             )
             .with_retry_strategy(Some(StandardRetryStrategy::new()))
@@ -118,15 +118,15 @@ impl CredentialProvider for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .map_err(|e| object_store::Error::Generic {
+            .map_err(|_| object_store::Error::Generic {
                 store: "S3",
-                source: e,
+                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
             object_store::Error::Generic {
                 store: "S3",
-                source: "No credentials found in the resolved identity".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 
