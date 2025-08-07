@@ -84,6 +84,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sslrootcert"),
     ParameterSpec::component("auth_source"),
     ParameterSpec::component("direct_connection"),
+    ParameterSpec::component("time_zone"),
+    ParameterSpec::component("unnest_depth"),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
         .default(DEFAULT_MIN_POOL_SIZE_STR),
