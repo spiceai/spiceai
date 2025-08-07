@@ -29,12 +29,12 @@ use url::Url;
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an Iceberg S3 dataset: {source}."
+        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an S3 dataset: {source}."
     ))]
     FailedToBuildAWSRuntimeComponents { source: BuildError },
 
     #[snafu(display(
-        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+        "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
     ))]
     FailedToGetCredentialsProviderFromConfig,
 

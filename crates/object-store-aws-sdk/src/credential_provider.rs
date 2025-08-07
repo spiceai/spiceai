@@ -77,15 +77,12 @@ impl S3CredentialProvider {
         sdk_config: &SdkConfig,
         client: &Client,
     ) -> Result<RuntimeComponents> {
-        let mut runtime_components = RuntimeComponentsBuilder::new("S3CredentialProvider");
-        runtime_components.set_auth_scheme_option_resolver(Some(
-            DefaultAuthSchemeResolver::default().into_shared_resolver(),
-        ));
-        runtime_components
-            .set_endpoint_resolver(Some(DefaultResolver::new().into_shared_resolver()));
-        runtime_components.push_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()));
-
-        runtime_components
+        RuntimeComponentsBuilder::new("S3CredentialProvider")
+            .with_auth_scheme_option_resolver(Some(
+                DefaultAuthSchemeResolver::default().into_shared_resolver(),
+            ))
+            .with_endpoint_resolver(Some(DefaultResolver::new().into_shared_resolver()))
+            .with_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()))
             .with_identity_cache(Some(IdentityCache::lazy().build()))
             .with_identity_resolver(
                 AuthSchemeId::new("SpiceObjectStoreS3CredentialsProvider"),
