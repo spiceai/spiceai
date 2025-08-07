@@ -21,17 +21,17 @@ pub use credential_provider::S3CredentialProvider;
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to build AWS runtime components: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
+        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an Iceberg S3 dataset: {source}."
     ))]
     FailedToBuildAWSRuntimeComponents { source: BuildError },
 
     #[snafu(display(
-        "Failed to get credentials provider from SDK config. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
     ))]
     FailedToGetCredentialsProviderFromConfig,
 
     #[snafu(display(
-        "Failed to resolve credentials: {source}. Check that the provided AWS credentials are valid, and have been configured correctly in the Spicepod.\nReport a bug at https://github.com/spiceai/spiceai/issues."
+        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. {source} Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
     ))]
     FailedToResolveCredentials {
         source: Box<dyn std::error::Error + Send + Sync>,
