@@ -467,6 +467,7 @@ pub mod tests {
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
     #[allow(clippy::missing_panics_doc)]
+    #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema
             .fields()
