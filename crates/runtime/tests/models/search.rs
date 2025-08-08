@@ -98,13 +98,43 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
+        // To avoid inconsistent snapshots when scores are equal (common when using RRF),
+        // we also order based on primary key.
+        matches.sort_by(|a, b| {
+            let Some(Value::Number(num_a)) = a.get("score") else {
+                return Ordering::Greater;
+            };
+            let Some(score_a) = num_a.as_f64() else {
+                return Ordering::Greater;
+            };
+            let Some(Value::Number(num_b)) = b.get("score") else {
+                return Ordering::Less;
+            };
+            let Some(score_b) = num_b.as_f64() else {
+                return Ordering::Less;
+            };
+
+            if score_a > score_b {
+                return Ordering::Less;
+            } else if score_a < score_b {
+                return Ordering::Greater;
+            }
+
+            let Some(Value::Object(a_pks)) = a.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            let Some(Value::Object(b_pks)) = b.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            format!("{a_pks:?}").cmp(&format!("{b_pks:?}"))
+        });
         for m in matches {
             if let Some(obj) = m.as_object_mut() {
                 if let Some(Value::Number(n)) = obj.get("score") {
                     if let Some(score) = n.as_f64() {
                         if let Some(truncated_score) =
-                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                        // Keep 2 decimals
+                            serde_json::Number::from_f64((10000.0 * score).trunc() / 10000.0)
+                        // Keep 4 decimals
                         {
                             obj.insert("score".to_string(), Value::Number(truncated_score));
                         }
@@ -359,7 +389,10 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 }),
             },
         ],
-        vec![],
+        vec![(
+            "multi_embedding_sql_no_score",
+            "SELECT cp_description FROM vector_search(multi_embedding_models, 'basic', cp_description) LIMIT 4",
+        )],
     )
     .await
 }
@@ -541,6 +574,15 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     "where": "cp_catalog_page_sk % 2 = 1"
                 }),
             },
+            SearchTestCase {
+                name: "multi_column_hybrid_embedding_column_as_additional",
+                body: json!({
+                    "text": "patient",
+                    "limit": 2,
+                    "datasets": ["multi_column_hybrid_search"],
+                    "additional_columns": ["cp_description"],
+                }),
+            },
         ],
         vec![],
     )
@@ -596,7 +638,10 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
             ), (
                 "text_search_sql_text_search_filters",
                 "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
-            )
+            ), (
+                "text_search_sql_text_search_no_score",
+                "SELECT i_color FROM text_search(item, 'Passengers') LIMIT 4",
+            ),
         ]
     )
     .await
@@ -834,7 +879,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -843,7 +888,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let duration = start.elapsed();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -897,7 +942,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let mut bypass_headers = HeaderMap::new();
             bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_bypass_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -906,7 +951,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let duration = start.elapsed().as_secs_f64();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_bypass_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
