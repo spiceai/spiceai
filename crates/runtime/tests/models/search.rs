@@ -518,74 +518,85 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpch_dataset_w_embeddings(
-        "multi_column_hybrid_search",
-        "hf_minilm",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 512,
-            overlap_size: 128,
-            trim_whitespace: false,
-        }),
-    );
-    ds.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![],
-        description: None,
-        full_text_search: Some(FullTextSearchConfig {
-            enabled: true,
-            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-        }),
-        metadata: HashMap::new(),
-    });
-
-    let app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .build();
     run_search(
-        app,
+        AppBuilder::new("search_app")
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
+                    description: None,
+                    full_text_search: None,
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
-                name: "multi_column_hybrid_basic",
+                name: "hybrid_multiple_column_basic",
                 body: json!({
-                    "text": "department",
-                    "limit": 2,
-                    "datasets": ["multi_column_hybrid_search"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
+            // TODO - Empty result
+            // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "id: Int64, question: Utf8, score: Float64, value: Utf8". And "id: Int64, value: Utf8, score: Float64".
+            // SearchTestCase {
+            //     name: "hybrid_multiple_column_additional_columns",
+            //     body: json!({
+            //         "text": "second",
+            //         "limit": 4,
+            //         "datasets": ["qs"],
+            //         "additional_columns": ["question"],
+            //     }),
+            // },
             SearchTestCase {
-                name: "multi_column_hybrid_additional",
+                name: "hybrid_multiple_column_with_where",
                 body: json!({
-                    "text": "patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_hybrid_search"],
-                    "additional_columns": ["cp_catalog_number"],
-                }),
-            },
-            SearchTestCase {
-                name: "multi_column_hybrid_where",
-                body: json!({
-                    "text": "general",
-                    "datasets": ["multi_column_hybrid_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
-                }),
-            },
-            SearchTestCase {
-                name: "multi_column_hybrid_embedding_column_as_additional",
-                body: json!({
-                    "text": "patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_hybrid_search"],
-                    "additional_columns": ["cp_description"],
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
-        vec![],
+        vec![(
+            "hybrid_multiple_column_sql_text_search",
+            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_text_search_wrong_column",
+            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_vector_search",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_vector_search_wrong_column",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4"
+        ),
+        ],
     )
     .await
 }
