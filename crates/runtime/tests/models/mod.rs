@@ -201,8 +201,9 @@ pub fn get_mega_science_dataset(
     answer_column: Option<spicepod::semantic::Column>,
 ) -> Dataset {
     let mut dataset = Dataset::new(
-        "file:../../data/mega-science-small.jsonl",
-        // "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+        // Can use this to run efficiently, locally:
+        // "file:../../data/mega-science-small.jsonl"
+        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
         spice_name.unwrap_or("mega-science"),
     );
     dataset.params = Some(Params::from_string_map(
