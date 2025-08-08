@@ -13,10 +13,10 @@ anyhow = "1"
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
-aws-runtime = "1.5.10"
-aws-sdk-s3 = "1.101.0"
-aws-smithy-runtime = "1.8.6"
-aws-smithy-runtime-api = "1.8.7"
+aws-runtime.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-runtime.workspace = true
+aws-smithy-runtime-api.workspace = true
 iceberg.workspace = true
 reqwest.workspace = true
 snafu.workspace = true
@@ -24,6 +24,6 @@ tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-aws-sdk-cognitoidentity = "1.80.0"
-aws-sdk-cognitoidentityprovider = "1.92.0"
+aws-sdk-cognitoidentity.workspace = true
+aws-sdk-cognitoidentityprovider.workspace = true
 tempfile.workspace = true
