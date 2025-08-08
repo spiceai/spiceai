@@ -195,6 +195,9 @@ fn get_small_clickbench_dataset(name: &str) -> Dataset {
     dataset
 }
 
+// This dataset is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
 pub fn get_mega_science_dataset(
     spice_name: Option<&str>,
     question_column: Option<spicepod::semantic::Column>,
