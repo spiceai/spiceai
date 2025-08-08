@@ -17,7 +17,7 @@ limitations under the License.
 use crate::DEFAULT_TRACING_MODELS;
 use crate::models::hf::get_huggingface_embeddings;
 use crate::models::openai::get_openai_embeddings;
-use crate::models::{create_api_bindings_config, http_post};
+use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use app::{App, AppBuilder};
@@ -34,6 +34,7 @@ use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -115,9 +116,9 @@ fn normalize_search_response(mut json: Value) -> String {
             };
 
             if score_a > score_b {
-                return Ordering::Less;
-            } else if score_a < score_b {
                 return Ordering::Greater;
+            } else if score_a < score_b {
+                return Ordering::Less;
             }
 
             let Some(Value::Object(a_pks)) = a.get("primary_key") else {
@@ -591,149 +592,163 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 
 // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
-#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
-    let mut ds = get_tpcds_dataset("item", Some("item"), None);
-    ds.columns = vec![Column {
-        name: "i_item_desc".to_string(),
-        embeddings: vec![],
-        description: None,
-        full_text_search: Some(FullTextSearchConfig {
-            enabled: true,
-            row_ids: Some(vec!["i_item_sk".to_string()]),
-        }),
-        metadata: HashMap::new(),
-    }];
-
     run_search(
-        AppBuilder::new("search_app").with_dataset(ds).build(),
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                None,
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
                 name: "text_search_basic",
                 body: json!({
-                    "text": "Patient",
-                    "limit": 2,
-                    "datasets": ["item"],
-                    "additional_columns": ["i_color", "i_item_id"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                }),
+            },
+            // TODO - Empty result
+            SearchTestCase {
+                name: "text_search_additional_columns",
+                body: json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 }),
             },
             SearchTestCase {
-                name: "text_search_with_extra_columns_and_where",
+                name: "text_search_with_where",
                 body: json!({
-                    "text": "Patient",
-                    "datasets": ["item"],
-                    "additional_columns": ["i_color", "i_item_id"],
-                    "where": "i_color='smoke'",
-                    "limit": 1,
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
         vec![
             (
                 "text_search_sql_text_search_basic",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ), (
                 "text_search_sql_text_search_projection",
-                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ), (
                 "text_search_sql_text_search_filters",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
+                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
             ), (
                 "text_search_sql_text_search_no_score",
-                "SELECT i_color FROM text_search(item, 'Passengers') LIMIT 4",
+                "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ),
-        ]
+            (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+                "text_search_sql_text_search_random",
+                "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4"
+            ),
+        ],
     )
     .await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
-#[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
-    let mut ds = get_tpcds_dataset(
-            "catalog_page",
-            Some("catalog_page"),
-            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20".to_string().as_str()),
-        );
-    ds.columns = vec![
-        Column {
-            name: "cp_description".to_string(),
-            embeddings: vec![],
-            description: None,
-            full_text_search: Some(FullTextSearchConfig {
-                enabled: true,
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            }),
-            metadata: HashMap::new(),
-        },
-        Column {
-            name: "cp_department".to_string(),
-            embeddings: vec![],
-            description: None,
-            full_text_search: Some(FullTextSearchConfig {
-                enabled: true,
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            }),
-            metadata: HashMap::new(),
-        },
-    ];
     run_search(
-        AppBuilder::new("search_app").with_dataset(ds).build(),
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
                 name: "multi_text_column_basic",
                 body: json!({
-                    "text": "In general basic",
-                    "limit": 2,
-                    "datasets": ["catalog_page"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
+            // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "question: Utf8, value: Utf8, id: Int64, score: Float64". And "value: Utf8, id: Int64, score: Float64".
+            // SearchTestCase {
+            //     name: "multi_text_column_additional_columns",
+            //     body: json!({
+            //         "text": "second",
+            //         "limit": 4,
+            //         "datasets": ["qs"],
+            //         "additional_columns": ["question"],
+            //     }),
+            // },
             SearchTestCase {
-                name: "multi_text_column_fused",
+                name: "multi_text_column_with_where",
                 body: json!({
-                    "text": "In general basic department",
-                    "limit": 2,
-                    "datasets": ["catalog_page"],
-                    "additional_columns": ["cp_department", "cp_description"]
-                }),
-            },
-            SearchTestCase {
-                name: "multi_text_column_additional",
-                body: json!({
-                    "text": "In general basic",
-                    "limit": 2,
-                    "datasets": ["catalog_page"],
-                    "additional_columns": ["cp_catalog_number"],
-                }),
-            },
-            SearchTestCase {
-                name: "multi_text_column_where",
-                body: json!({
-                    "text": "In general basic",
-                    "datasets": ["catalog_page"],
-                    "where": "cp_department='DEPARTMENT'"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
         vec![
             (
-                "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
-            ),
-            // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
-            (
-                "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
+                "multi_text_column_sql_text_search_basic_answer",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ), (
+                "multi_text_column_sql_text_search_basic_question",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
             ),
             (
-                "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
+                // When there are multiple columns, `text_search` needs column explicitly as input.
+                "multi_text_column_sql_text_search_error_without_column",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
+            ),
+            (
+                "multi_text_column_sql_text_search_projection",
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
-            )
-        ]
+                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"
+            ), (
+                "multi_text_column_sql_text_search_no_score",
+                "SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ),
+            (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+                "multi_text_column_sql_text_search_random",
+                "SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ),
+        ],
     )
     .await
 }

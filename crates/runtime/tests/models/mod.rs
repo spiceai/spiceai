@@ -195,6 +195,34 @@ fn get_small_clickbench_dataset(name: &str) -> Dataset {
     dataset
 }
 
+pub fn get_mega_science_dataset(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> Dataset {
+    let mut dataset = Dataset::new(
+        "file:../../data/mega-science-small.jsonl",
+        // "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+        spice_name.unwrap_or("mega-science"),
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![("client_timeout".to_string(), "120s".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+
+    dataset.columns = [question_column, answer_column]
+        .into_iter()
+        .filter_map(|x| x)
+        .collect();
+
+    dataset
+}
+
 pub fn get_tpcds_dataset(
     ds_name: &str,
     spice_name: Option<&str>,

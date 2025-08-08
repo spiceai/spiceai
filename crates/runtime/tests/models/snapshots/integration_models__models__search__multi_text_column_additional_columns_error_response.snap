@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: e.to_string()
+snapshot_kind: text
+---
+HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "question: Utf8, id: Int64, value: Utf8, score: Float64". And "value: Utf8, id: Int64, score: Float64".
