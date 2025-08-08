@@ -78,7 +78,7 @@ impl AppendableSource for FileAppendableSource {
                 for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
                     sql += &format!(
-                        "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                          COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
                 }
 
@@ -121,6 +121,7 @@ impl AppendableSource for FileAppendableSource {
 
                 dest_conn.execute_batch(setup_sql)?;
             }
+            QuerySet::ParameterizedTpch => todo!(),
         }
 
         drop(dest_conn);
@@ -168,7 +169,7 @@ impl AppendableSource for FileAppendableSource {
                                      LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
                                      OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
                                      COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                    load_steps = config.load_steps);
+                            load_steps = config.load_steps);
                 }
 
                 sql += "COMMIT;";
@@ -183,10 +184,11 @@ impl AppendableSource for FileAppendableSource {
                                    OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
                                    COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
                                    COMMIT;",
-                                        load_steps = config.load_steps);
+                                                load_steps = config.load_steps);
 
                 dest_conn.execute_batch(&sql)?;
             }
+            QuerySet::ParameterizedTpch => todo!(),
         }
 
         Ok(())
