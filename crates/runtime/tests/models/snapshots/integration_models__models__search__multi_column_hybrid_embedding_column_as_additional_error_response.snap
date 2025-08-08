@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: e.to_string()
+snapshot_kind: text
+---
+HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred retrieving candidate search results: Error occured during search: Failed to execute query: Error during planning: Projections require unique expression names but the expression "multi_column_hybrid_search.cp_description" at position 1 and "multi_column_hybrid_search.cp_description" at position 2 have the same name. Consider aliasing ("AS") one of them.
