@@ -338,9 +338,7 @@ mod tests {
     use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::embeddings::index::{
-        VectorIndex, VectorQueryTableProvider, VectorScanTableProvider,
-    };
+    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
