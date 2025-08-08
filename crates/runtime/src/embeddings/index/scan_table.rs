@@ -360,7 +360,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "basic",
+            "scan_table_basic",
         )
         .await?;
 
@@ -368,7 +368,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "join_for_projection",
+            "scan_table_join_for_projection",
         )
         .await?;
 
@@ -376,7 +376,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' ORDER BY pk desc LIMIT 5",
-            "join_for_filter",
+            "scan_table_join_for_filter",
         )
         .await?;
 
@@ -425,7 +425,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "basic",
+            "scan_table_basic",
         )
         .await?;
 
@@ -433,7 +433,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "join_for_projection",
+            "scan_table_join_for_projection",
         )
         .await?;
 
@@ -441,7 +441,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "join_for_projection_use_metadata",
+            "scan_table_join_for_projection_use_metadata",
         )
         .await?;
 
@@ -449,7 +449,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY pk desc LIMIT 5",
-            "join_for_filter_use_metadata",
+            "scan_table_join_for_filter_use_metadata",
         )
         .await?;
 
@@ -457,7 +457,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "no_join_for_metadata_projection",
+            "scan_table_no_join_for_metadata_projection",
         )
         .await?;
 
@@ -465,7 +465,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
-            "no_join_for_metadata_filter",
+            "scan_table_no_join_for_metadata_filter",
         )
         .await?;
 

@@ -614,7 +614,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "basic",
+            "query_table_basic",
         )
         .await?;
 
@@ -622,7 +622,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "join_for_projection",
+            "query_table_join_for_projection",
         )
         .await?;
 
@@ -630,7 +630,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table WHERE another_column != 'something' ORDER BY score desc LIMIT 5",
-            "join_for_filter",
+            "query_table_join_for_filter",
         )
         .await?;
 
@@ -681,7 +681,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "basic",
+            "query_table_basic",
         )
         .await?;
 
@@ -689,7 +689,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "join_for_projection",
+            "query_table_join_for_projection",
         )
         .await?;
 
@@ -697,7 +697,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "join_for_projection_use_metadata",
+            "query_table_join_for_projection_use_metadata",
         )
         .await?;
 
@@ -705,7 +705,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY score desc LIMIT 5",
-            "join_for_filter_use_metadata",
+            "query_table_join_for_filter_use_metadata",
         )
         .await?;
 
@@ -713,7 +713,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "no_join_for_metadata_projection",
+            "query_table_no_join_for_metadata_projection",
         )
         .await?;
 
@@ -721,7 +721,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table WHERE a_number > 0 ORDER BY score desc LIMIT 5",
-            "no_join_for_metadata_filter",
+            "query_table_no_join_for_metadata_filter",
         )
         .await?;
 
