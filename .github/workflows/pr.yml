@@ -206,6 +206,13 @@ jobs:
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
+          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
+          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
+          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
+          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
