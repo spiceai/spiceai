@@ -1,4 +1,5 @@
 name: benchmark e2e tests
+run-name: benchmark - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -92,12 +93,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract spicepod filename path
-        id: extract_spicepod_filename
+      - name: Set spicepod path
+        id: set_spicepod_path
         run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
-          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+          SPICEPOD_PATH="./test/spicepods/${{ github.event.inputs.query_set}}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -111,7 +111,7 @@ jobs:
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
-          with_odbc: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
@@ -134,11 +134,11 @@ jobs:
           fi
 
       - name: Setup ODBC
-        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
         uses: ./.github/actions/setup-odbc
 
       - name: Install Oracle ODPI-C
-        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'oracle') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libaio1
@@ -149,13 +149,13 @@ jobs:
           IC_DIR=$PWD/$(ls -d linux/instantclient*)
           echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
 
-      - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
@@ -207,13 +207,13 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
-      - name: Run the benchmark test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \

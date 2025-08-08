@@ -190,16 +190,12 @@ impl Service {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
-
-        let query = match parameters {
-            Some(parameters) => query.parameters(parameters),
-            None => query,
-        };
-
-        let query = query.build();
-
-        let query_result = query.run().await.map_err(handle_query_error)?;
+        let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
 
@@ -334,8 +330,10 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 Status::internal("Several DataFusion errors occurred, but no details available")
             }
         }
+        DataFusionError::NotImplemented(message) => {
+            Status::invalid_argument(format!("Unsupported Query. {message}"))
+        }
         DataFusionError::Internal(_)
-        | DataFusionError::NotImplemented(_)
         | DataFusionError::ArrowError(..)
         | DataFusionError::IoError(_)
         | DataFusionError::ObjectStore(_)

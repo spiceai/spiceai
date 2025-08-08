@@ -21,7 +21,7 @@ use super::request::SearchRequest;
 use super::util::user_tables_with_embeddings;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::request::CacheControl;
+use crate::request::{CacheControl, CacheKeyType, RequestContext};
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -169,12 +169,22 @@ impl VectorSearch {
         &self,
         req: &SearchRequest,
         cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
-        cache_control: CacheControl,
+        request_context: Arc<RequestContext>,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
             let search_key = SearchKey::from(req.clone());
-            let cache_key = CacheKey::Search(&search_key);
+            let cache_control = request_context.cache_control();
+
+            let cache_key = match request_context.client_supplied_cache_key() {
+                Some(cache_key)
+                    if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
+                {
+                    CacheKey::ClientSupplied(cache_key)
+                }
+                _ => CacheKey::Search(&search_key),
+            };
+
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
 
             match (

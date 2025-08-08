@@ -27,14 +27,8 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
-    sync::{Arc, Weak},
-};
-
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -52,12 +46,18 @@ use datafusion::{
 };
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use std::cmp::min;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 #[cfg(feature = "s3_vectors")]
 use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::SEARCH_SCORE_COLUMN_NAME;
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::{
@@ -364,23 +364,19 @@ impl VectorSearchUDTFProvider {
             ),
         )
     }
-}
 
-/// Create a new [`SchemaRef`] with the additional fields specified.
-///
-/// If a new field is already in [`SchemaRef`], it will be ignored.
-pub(super) fn append_fields(schema: &SchemaRef, new_fields: Vec<Arc<Field>>) -> SchemaRef {
-    let existing_names: HashSet<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The limit provided in `vector_search` args
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.args.limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
 
-    let mut all_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-
-    for field in new_fields {
-        if !existing_names.contains(field.name().as_str()) {
-            all_fields.push(field);
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
         }
     }
-
-    Arc::new(Schema::new(all_fields))
 }
 
 #[async_trait::async_trait]
@@ -481,7 +477,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )],
             input: Arc::new(proj),
-            fetch: limit,
+            fetch: self.limit_to_use(limit),
         });
 
         state.create_physical_plan(&sort).await

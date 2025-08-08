@@ -20,11 +20,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{
-    dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA,
-    object_store_registry::SpiceObjectStoreRegistry,
-    search::full_text::analyzer_rule::FullTextUDTFAnalyzerRule,
-};
+use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -43,6 +39,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::sql::federation_analyzer_rule;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
 use crate::status;
@@ -249,7 +246,6 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(federation_analyzer_rule()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
-        Arc::new(FullTextUDTFAnalyzerRule {}),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
     ]

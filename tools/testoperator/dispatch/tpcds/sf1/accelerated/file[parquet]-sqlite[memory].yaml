@@ -1,18 +1,18 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-sqlite[memory].yaml
+    spicepod_path: accelerated/file[parquet]-sqlite[memory].yaml
     query_set: tpcds
     query_overrides: sqlite
     runner_type: spiceai-dev-runners
     ready_wait: 600
   throughput:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-sqlite[memory].yaml
+    spicepod_path: accelerated/file[parquet]-sqlite[memory].yaml
     query_set: tpcds
     query_overrides: sqlite
     runner_type: spiceai-dev-runners
     ready_wait: 600
   load:
-    spicepod_path: ./test/spicepods/tpcds/sf1/accelerated/file[parquet]-sqlite[memory].yaml
+    spicepod_path: accelerated/file[parquet]-sqlite[memory].yaml
     query_set: tpcds
     query_overrides: sqlite
     runner_type: spiceai-dev-runners

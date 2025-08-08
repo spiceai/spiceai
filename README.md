@@ -54,7 +54,9 @@ Spice is built-on industry leading technologies including [Apache DataFusion](ht
 </div>
 
 🎥 [Watch the CMU Databases Accelerating Data and AI with Spice.ai Open-Source](https://www.youtube.com/watch?v=tyM-ec1lKfU)
+
 🎥 [Watch How to Query Data using Spice, OpenAI, and MCP](https://www.youtube.com/watch?v=TFAu4qxjTPk&list=PLesJrUXEx3U-dQul0PqLV3TGTdUmr3B6e&index=8)
+
 🎥 [Watch How to search with Amazon S3 Vectors](https://www.youtube.com/watch?v=QPbqPf5W36g)
 
 ## Why Spice?

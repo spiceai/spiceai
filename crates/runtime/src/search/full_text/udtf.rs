@@ -27,38 +27,24 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::sync::{Arc, Weak};
 
-use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
+    catalog::{TableFunctionImpl, TableProvider},
     common::Column,
-    datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
-    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
 use runtime_datafusion_index::IndexedTableProvider;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME,
-    generation::text_search::{
-        DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec,
-        tantivy_to_arrow_type,
-    },
+use search::generation::text_search::{
+    index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
 };
 
 use crate::{
     datafusion::DataFusion,
-    search::{
-        full_text::index::FullTextDatabaseIndex,
-        util::{find_concrete_table_provider, table_ref_from_column_expr},
-    },
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
@@ -71,6 +57,41 @@ pub struct TextSearchTableFuncArgs {
     pub column: Option<String>,
     pub limit: Option<usize>,
     pub include_score: Option<bool>,
+}
+
+impl TextSearchTableFuncArgs {
+    // Find column to perform full text search upon. Use either column specified in
+    // [`TextSearchTableFuncArgs`] or if there is only one column in `search_fields`.
+    fn column(&self, search_fields: &[String]) -> datafusion::error::Result<String> {
+        let TextSearchTableFuncArgs { column, tbl, .. } = &self;
+        let col: String = if let Some(col) = column {
+            if !search_fields.contains(col) {
+                return Err(DataFusionError::Internal(format!(
+                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
+                    search_fields.join(", ")
+                )));
+            }
+            col.clone()
+        } else {
+            let mut fields = search_fields.iter();
+
+            match (fields.next(), fields.next()) {
+                (Some(field), None) => field.clone(),
+                (Some(_), Some(_)) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
+                        search_fields.len()
+                    )));
+                }
+                _ => {
+                    return Err(DataFusionError::Internal(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
+                    )));
+                }
+            }
+        };
+        Ok(col)
+    }
 }
 
 #[derive(Debug)]
@@ -193,202 +214,13 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        Ok(Arc::new(TextSearchUDTFProvider {
-            args,
+        let column = args.column(&fts_index.search_fields)?;
+        Ok(Arc::new(TextSearchIndexProvider {
+            query: args.query.clone(),
+            column,
+            pre_limit: args.limit,
             index: fts_index.clone(),
             underlying: table_provider,
         }))
-    }
-}
-
-/// The [`TableProvider`] produced from the [`TEXT_SEARCH_UDTF_NAME`] UDTF.
-///
-/// Importantly, [`TextSearchUDTFProvider`] relies on [`FullTextUDTFAnalyzerRule`] because, by itself, [`TextSearchUDTFProvider`] does not have all the fields it claims to in its schema (see [`TextSearchUDTFProvider::schema`]).
-#[derive(Debug, Clone)]
-pub(super) struct TextSearchUDTFProvider {
-    pub args: TextSearchTableFuncArgs,
-    pub index: FullTextDatabaseIndex,
-    pub underlying: Arc<dyn TableProvider>,
-}
-
-impl TextSearchUDTFProvider {
-    // Find column to perform full text search upon. Use either column specified in
-    // [`TextSearchTableFuncArgs`] or if index has one column.
-    fn column(&self) -> datafusion::error::Result<String> {
-        let TextSearchTableFuncArgs { column, tbl, .. } = &self.args;
-        let col: String = if let Some(col) = column {
-            if !self.index.search_fields.contains(col) {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
-                    self.index.search_fields.join(", ")
-                )));
-            }
-            col.clone()
-        } else {
-            let mut fields = self.index.search_fields.iter();
-
-            match (fields.next(), fields.next()) {
-                (Some(field), None) => field.clone(),
-                (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
-                        self.index.search_fields.len()
-                    )));
-                }
-                _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
-                    )));
-                }
-            }
-        };
-        Ok(col)
-    }
-
-    // Convert projection relative to [`TextSearchUDTFProvider`] (i.e. base schema + 'score'), to the schema of the underlying full text search index.
-    fn convert_projection(
-        &self,
-        projection: Option<&Vec<usize>>,
-        search_index_schema: &SchemaRef,
-    ) -> Result<Vec<usize>, DataFusionError> {
-        let proj = match projection {
-            Some(proj) => {
-                let fields: Vec<_> = self
-                    .schema()
-                    .project(proj)
-                    .map_err(DataFusionError::from)?
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect();
-
-                // Need to preserve order of projection.
-                // Map name of fields above, in order, to the indices within the search index.
-                let index_fields: HashMap<String, usize> = search_index_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.name().clone(), i))
-                    .collect();
-
-                fields
-                    .iter()
-                    .filter_map(|f| index_fields.get(f).copied())
-                    .collect::<Vec<usize>>()
-            }
-            None => (0..search_index_schema.fields().len()).collect(),
-        };
-        Ok(proj)
-    }
-
-    /// Return the indices of the primary key in the schema.
-    pub fn primary_key_projection(&self) -> Vec<usize> {
-        let schema = self.schema();
-
-        self.index
-            .primary_key
-            .iter()
-            .filter_map(|pk| {
-                let (idx, _) = schema.column_with_name(pk)?;
-                Some(idx)
-            })
-            .collect()
-    }
-
-    fn search_field_index_schema(field_index: &FullTextSearchFieldIndex) -> SchemaRef {
-        let tantivy_schema = &field_index.search_schema;
-
-        let fields = field_index
-            .all_columns()
-            .iter()
-            .filter_map(|field_name| {
-                let (data_type, nullable) = if let Some(f) = field_index.get_type_hint(field_name) {
-                    (f.data_type().clone(), f.is_nullable())
-                } else {
-                    let f = tantivy_schema.get_field(field_name).ok()?;
-                    let entry = tantivy_schema.get_field_entry(f);
-                    (tantivy_to_arrow_type(entry.field_type())?, false)
-                };
-                Some(Field::new(field_name, data_type, nullable))
-            })
-            .chain([Field::new(
-                SEARCH_SCORE_COLUMN_NAME,
-                arrow::datatypes::DataType::Float64,
-                false,
-            )])
-            .collect::<Vec<_>>();
-
-        Arc::new(Schema::new(fields))
-    }
-}
-
-#[async_trait::async_trait]
-impl TableProvider for TextSearchUDTFProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    // The schema of [`TextSearchUDTFProvider`] is the underlying [`TableProvider`] (see `self.index.underlying`) augmented with the additional column [`SEARCH_SCORE_COLUMN_NAME`].
-    //
-    // **Note**: [`TextSearchUDTFProvider`] may not have all fields it claims to have in the schema because the underlying [`FullTextDatabaseIndex`] (in reality the [`search::generation::text_search::FullTextSearchIndex`]) will not have all fields.
-    //
-    // When used via [`TextSearchTableFunc`], [`TextSearchUDTFProvider`] relies on [`FullTextUDTFAnalyzerRule`] to resolve queries correctly (joining on the underlying table (see `self.args.tbl`)).
-    fn schema(&self) -> SchemaRef {
-        let mut fields: Vec<_> = self.underlying.schema().fields().iter().cloned().collect();
-        fields.push(Arc::new(Field::new(
-            SEARCH_SCORE_COLUMN_NAME.to_string(),
-            arrow_schema::DataType::Float64,
-            false,
-        )));
-        Arc::new(Schema::new(fields))
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Temporary
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let TextSearchTableFuncArgs {
-            tbl,
-            query,
-            limit: args_limit,
-            ..
-        } = &self.args;
-
-        let col = self.column()?;
-
-        let Some(field_index) = self
-            .index
-            .full_text_search_field_index(col.as_str())
-            .await
-            .ok()
-        else {
-            // This shouldn't be reachable as we checked `col` above. Instead of `unreachable!`, provide user friendly error.
-            return Err(DataFusionError::Internal(format!(
-                "User function 'text_search' is called on table '{tbl}'. Unexpectedly, text search cannot be performed on '{col}' column. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues."
-            )));
-        };
-
-        let search_field_index_schema = Self::search_field_index_schema(&field_index);
-        let underlying_projection =
-            self.convert_projection(projection, &search_field_index_schema)?;
-
-        Ok(Arc::new(
-            FullTextSearchExec::try_new(
-                field_index,
-                query.clone(),
-                search_field_index_schema,
-                Some(&underlying_projection),
-                filters.to_vec(),
-                limit.or(*args_limit).unwrap_or(DEFAULT_BATCH_SIZE),
-            )
-            .map_err(|e| DataFusionError::ArrowError(e, None))?,
-        ))
     }
 }

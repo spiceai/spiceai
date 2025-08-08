@@ -6,109 +6,112 @@ on:
     - cron: '0 10 * * 6' # Runs at 10 AM UTC (2AM PT) on Saturdays.
   workflow_dispatch:
     inputs:
-      run_all:
-        description: 'Run all benchmarks'
+      spiced_commit:
+        description: 'spiced build commit'
         required: false
-        default: 'true'
+        type: string
+      configuration:
+        description: 'Configuration to run'
+        required: false
+        default: 'all'
         type: choice
         options:
-          - 'true'
-          - 'false'
-      selected_configuration:
-        description: 'Individual configuration to run'
-        required: false
-        default: 'quora_minilm-l6-v2_arrow'
-        type: choice
-        options:
-          - 'quora_minilm-l6-v2_arrow'
-          - 'quora_minilm-l6-v2_hybrid_arrow'
-          - 'quora_text_arrow'
-          - 'quora_openai-text-embedding-3-small_arrow'
-          - 'quora_openai-text-embedding-3-small_hybrid_arrow'
-          - 'quora_openai-text-embedding-3-small_duckdb'
-          - 'quora_openai-text-embedding-3-small_duckdb_chunking'
+          - 'all'
+          - 'openai[text-embedding-3-small]-arrow'
+          - 'openai[text-embedding-3-small]-duckdb[file]'
+          - 'openai[text-embedding-3-small[chunking]]-duckdb[file]'
+          - 'openai[text-embedding-3-small]-s3_vectors'
 
-env:
-  FEATURES: 'models,duckdb,postgres-write'
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
 
 jobs:
-  build-bench-binary:
-    name: Build benchmark binary
-    timeout-minutes: 30
-    runs-on: spiceai-runners
+  # Using a matrix here allows us to easily run all or a specific configuration from the dropdown.
+  # This is simpler than using testoperator dispatch for the current small set of configurations.
+  # We'll incrementally switch to testoperator dispatch as more configurations are added.
+  setup-matrix:
+    name: Setup matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
         with:
-          os: 'linux'
+          script: |
+            const matrix = [
+              { name: "openai[text-embedding-3-small]-arrow" },
+              { name: "openai[text-embedding-3-small]-duckdb[file]" },
+              { name: "openai[text-embedding-3-small[chunking]]-duckdb[file]" },
+              { name: "openai[text-embedding-3-small]-s3_vectors" },
+            ];
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+            const configuration = context.payload.inputs?.configuration || 'all';
+            let filtered = matrix;
 
-      - name: Install the cc tool chain for building benchmark binary
-        uses: ./.github/actions/setup-cc
+            if (configuration !== 'all') {
+              filtered = filtered.filter(m => m.name === configuration);
+            }
 
-      - name: Build benchmark binary
-        run: cargo bench -p runtime --bench vector_search --features ${{ env.FEATURES }} --profile release --no-run
+            // include the spicepod path for each matrix item
+            filtered = filtered.map((m) => {
+                m.spicepod = "./test/spicepods/vector_search/mteb/quora/" + m.name + ".yaml";
+                return m;
+            });
 
-      - name: Find, move, and rename benchmark binary
-        run: find target/release/deps -type f -name "vector_search-*" ! -name "*.d" -exec mv {} ./spice_bench \;
-
-      - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: spice_bench
-          path: ./spice_bench
-
+            return filtered;
   run-bench:
-    name: Run ${{ matrix.name }}
+    name: Run ${{ matrix.target.name }}
     timeout-minutes: 60
-    runs-on: spiceai-runners
-    needs: build-bench-binary
-
+    runs-on: spiceai-dev-runners
+    needs:
+      - setup-matrix
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Limit to a single running instance to prevent embedding creation throttling when multiple configurations use the same model provider
+      # https://github.com/spiceai/spiceai/issues/6653
+      max-parallel: 1
       matrix:
-        include:
-          - cmd: '--configuration quora_minilm-l6-v2_arrow'
-            name: 'quora_minilm-l6-v2_arrow'
-          - cmd: '--configuration quora_text_arrow'
-            name: 'quora_text_arrow'
-          - cmd: '--configuration quora_minilm-l6-v2_hybrid_arrow'
-            name: 'quora_minilm-l6-v2_hybrid_arrow'
-          - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'
-            name: 'quora_openai-text-embedding-3-small_arrow'
-          - cmd: '--configuration quora_openai-text-embedding-3-small_hybrid_arrow'
-            name: 'quora_openai-text-embedding-3-small_hybrid_arrow'
-          - cmd: '--configuration quora_openai-text-embedding-3-small_duckdb'
-            name: 'quora_openai-text-embedding-3-small_duckdb'
-          - cmd: '--configuration quora_openai-text-embedding-3-small_duckdb_chunking'
-            name: 'quora_openai-text-embedding-3-small_duckdb_chunking'
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up API Keys
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-
-      - name: Download benchmark binary
-        uses: actions/download-artifact@v4
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
         with:
-          name: spice_bench
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
-      - name: Make benchmark binary executable
-        run: chmod +x ./spice_bench
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
-      - name: Benchmark ${{ matrix.name }}
-        env:
-          SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SPICEAI_BENCHMARK_API_KEY }}
-        if: github.event.inputs.selected_configuration == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: ./spice_bench ${{ matrix.cmd }}
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
-      - name: Remove spice_bench file
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+
+      - name: Run ${{ matrix.target.name }}
         run: |
-          rm -f spice_bench
+          rm -rf .spice/data
+          testoperator run vector-search \
+          --ready-wait 1800 \
+          --concurrency 10 \
+          --benchmark-dataset quora_retrieval \
+          --metrics \
+          -p "${{ matrix.target.spicepod }}"
+        env:
+          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

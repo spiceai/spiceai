@@ -28,7 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::{
-    Read, RefreshableCatalogProvider, iceberg::catalog::RestCatalog,
+    Read, RefreshableCatalogProvider, iceberg::catalog::rest::RestCatalog,
     spice_cloud::provider::SpiceCloudPlatformCatalogProvider,
 };
 use iceberg::NamespaceIdent;

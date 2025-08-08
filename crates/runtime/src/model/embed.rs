@@ -22,7 +22,7 @@ use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
-    self, BedrockClient,
+    self,
     embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
 };
 
@@ -84,7 +84,6 @@ pub async fn try_to_embedding(
 }
 
 #[cfg(feature = "bedrock")]
-#[allow(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -95,55 +94,9 @@ async fn bedrock(
         });
     };
 
-    // Build AWS config
-    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
-
-    // Set region if provided
-    if let Some(region) = extract_secret!(params, "aws_region") {
-        config_builder = config_builder.region(aws_config::Region::new(region.to_owned()));
-    }
-
-    // Set profile if provided
-    if let Some(profile) = extract_secret!(params, "aws_profile") {
-        config_builder = config_builder.profile_name(profile);
-    }
-
-    // Set access key and secret key if provided
-    if let (Some(access_key), Some(secret_key)) = (
-        extract_secret!(params, "aws_access_key_id"),
-        extract_secret!(params, "aws_secret_access_key"),
-    ) {
-        let session_token = extract_secret!(params, "aws_session_token");
-
-        let credentials = aws_credential_types::Credentials::new(
-            access_key,
-            secret_key,
-            session_token.map(std::string::ToString::to_string),
-            None,
-            "bedrock-embed",
-        );
-
-        config_builder = config_builder.credentials_provider(credentials);
-    }
-
-    let rate_limit = if let Some(rpm) = params.get("requests_per_min_limit") {
-        match rpm.expose_secret().parse::<u32>() {
-            Ok(limit) => {
-                Some(bedrock::embed::BedrockRateLimitConfig::with_requests_per_minute(limit))
-            }
-            Err(e) => {
-                return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}")
-                        .into(),
-                });
-            }
-        }
-    } else {
-        None
-    };
-
-    let config = config_builder.load().await;
-    let client = BedrockClient::new(&config);
+    let client = super::util::create_bedrock_client(params, "bedrock-embed")
+        .await
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 
     if model_id.starts_with("amazon.titan-embed") {
         let normalize = params
@@ -177,9 +130,7 @@ async fn bedrock(
             });
         }
 
-        Ok(Arc::new(bedrock::embed::new_titan_v2(
-            client, normalize, dimensions, rate_limit,
-        )) as Arc<dyn Embed>)
+        Ok(Arc::new(bedrock::embed::new_titan_v2(client, normalize, dimensions)) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
         let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
             CohereEmbeddingTruncate::from_str(truncate_str)
@@ -209,7 +160,6 @@ async fn bedrock(
             truncate,
             input_type,
             CohereEmbeddingType::Float,
-            rate_limit,
         )) as Arc<dyn Embed>)
     } else {
         Err(EmbedError::ModelDoesNotExist {
