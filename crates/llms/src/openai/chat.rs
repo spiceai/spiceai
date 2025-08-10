@@ -31,6 +31,15 @@ use tracing_futures::Instrument;
 
 use super::Openai;
 
+/// These models do not support [`stream_options.include_usage`](https://platform.openai.com/docs/api-reference/chat/create#chat_create-stream_options)
+pub static STREAM_OPTIONS_INCOMPATIBLE_MODELS: [&str; 2] = ["gpt-5", "gpt-5-mini"];
+
+impl<C: Config + Send + Sync> Openai<C> {
+    fn cannot_handle_stream_options(&self) -> bool {
+        STREAM_OPTIONS_INCOMPATIBLE_MODELS.contains(&self.model.as_str())
+    }
+}
+
 #[async_trait]
 impl<C: Config + Send + Sync> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -49,6 +58,12 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
+
+        if self.cannot_handle_stream_options() {
+            // Only field in `stream_options` is `include_usage`.
+            inner_req.stream_options = None;
+        };
+
         let stream = self.client.chat().create_stream(inner_req).await?;
 
         Ok(Box::pin(stream.map_ok(move |mut s| {
