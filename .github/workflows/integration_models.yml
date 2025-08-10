@@ -13,29 +13,29 @@ on:
       - release/*
       - feature-*
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "README.md"
-      - "Makefile"
-      - "CONTRIBUTING.md"
-      - "SECURITY.md"
-      - "LICENSE"
-      - ".github/**"
-      - "version.txt"
-      - ".schema/**"
-      - ".vscode/**"
-      - "deploy/**"
-      - "install/**"
-      - "media/**"
-      - "monitoring/**"
-      - "acknowledgements.md"
-      - "Dockerfile*"
-      - "bin/spice/**"
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
+      - 'bin/spice/**'
 
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Run all tests"
+        description: 'Run all tests'
         type: boolean
         required: false
         default: false
@@ -48,7 +48,7 @@ concurrency:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,7 +57,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "darwin"
+          os: 'darwin'
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -90,7 +90,7 @@ jobs:
     name: Test OpenAI Models
     needs: build
     permissions: read-all
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v4
 
