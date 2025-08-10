@@ -27,8 +27,6 @@ use schemars::JsonSchema;
 use search::pipeline::valid_keywords;
 use serde::{Deserialize, Serialize};
 
-use crate::tools::builtin::sql;
-
 use super::{Error, Result};
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
