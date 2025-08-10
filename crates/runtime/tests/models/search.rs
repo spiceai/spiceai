@@ -434,7 +434,6 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     .await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "cp_catalog_page_sk: Int32, cp_catalog_number: Int32, score: Float64, value: LargeUtf8". And "cp_catalog_page_sk: Int32, value: Utf8, score: Float64".
 #[tokio::test]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     run_search(
@@ -472,16 +471,15 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                     "datasets": ["qs"],
                 }),
             },
-            // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "id: Int64, question: Utf8, score: Float64, value: Utf8". And "id: Int64, value: Utf8, score: Float64".
-            // SearchTestCase {
-            //     name: "hybrid_single_column_additional_columns",
-            //     body: json!({
-            //         "text": "second",
-            //         "limit": 4,
-            //         "datasets": ["qs"],
-            //         "additional_columns": ["question"],
-            //     }),
-            // },
+            SearchTestCase {
+                name: "hybrid_single_column_additional_columns",
+                body: json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                }),
+            },
             SearchTestCase {
                 name: "hybrid_single_column_with_where",
                 body: json!({
@@ -548,16 +546,15 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     "datasets": ["qs"],
                 }),
             },
-            // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "id: Int64, question: Utf8, score: Float64, value: Utf8". And "id: Int64, value: Utf8, score: Float64".
-            // SearchTestCase {
-            //     name: "hybrid_multiple_column_additional_columns",
-            //     body: json!({
-            //         "text": "second",
-            //         "limit": 4,
-            //         "datasets": ["qs"],
-            //         "additional_columns": ["question"],
-            //     }),
-            // },
+            SearchTestCase {
+                name: "hybrid_multiple_column_additional_columns",
+                body: json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                }),
+            },
             SearchTestCase {
                 name: "hybrid_multiple_column_with_where",
                 body: json!({
@@ -700,7 +697,6 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                     "datasets": ["qs"],
                 }),
             },
-            // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "question: Utf8, value: Utf8, id: Int64, score: Float64". And "value: Utf8, id: Int64, score: Float64".
             SearchTestCase {
                 name: "multi_text_column_additional_columns",
                 body: json!({
