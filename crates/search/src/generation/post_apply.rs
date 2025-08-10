@@ -176,6 +176,7 @@ impl PostApplyCandidateGeneration {
 
                 cols.append(&mut remaining_projection.iter().filter_map(|s| {
                     match s {
+                        // Intentionally ignore `quote_style`. `DataFrame::select` will reapply.
                         Expr::Identifier(Ident{value,..}) => Some(SelectExpr::Expression(LogicalExpr::Column(Column::new(Some(TABLE_PROVIDER_TABLE_NAME), value)))),
                         _ => None
                     }
