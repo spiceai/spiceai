@@ -306,3 +306,169 @@ impl TableProvider for VectorScanTableProvider {
         state.create_physical_plan(&limit).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
+    use datafusion::{
+        catalog::{MemTable, TableProvider},
+        sql::TableReference,
+    };
+
+    use crate::embeddings::index::VectorScanTableProvider;
+    use crate::embeddings::index::tests::{
+        PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
+    };
+
+    #[tokio::test]
+    pub async fn test_vector_scan_basic() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+        ]));
+
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
+                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new(
+                        S3_VECTOR_EMBEDDING_NAME,
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                ]),
+            )),
+        };
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_basic",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_vector_scan_index_metadata() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
+                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new(
+                        S3_VECTOR_EMBEDDING_NAME,
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_basic",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_filter_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_no_join_for_metadata_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
+            "scan_table_no_join_for_metadata_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+}
