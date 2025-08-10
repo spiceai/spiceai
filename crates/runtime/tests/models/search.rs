@@ -618,7 +618,6 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "datasets": ["qs"],
                 }),
             },
-            // TODO - Empty result
             SearchTestCase {
                 name: "text_search_additional_columns",
                 body: json!({
@@ -649,13 +648,15 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 "text_search_sql_text_search_filters",
                 "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
             ), (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+
                 "text_search_sql_text_search_no_score",
                 "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ),
             (
                 // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
                 "text_search_sql_text_search_random",
-                "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4"
+                "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
             ),
         ],
     )
@@ -700,15 +701,15 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 }),
             },
             // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "question: Utf8, value: Utf8, id: Int64, score: Float64". And "value: Utf8, id: Int64, score: Float64".
-            // SearchTestCase {
-            //     name: "multi_text_column_additional_columns",
-            //     body: json!({
-            //         "text": "second",
-            //         "limit": 4,
-            //         "datasets": ["qs"],
-            //         "additional_columns": ["question"],
-            //     }),
-            // },
+            SearchTestCase {
+                name: "multi_text_column_additional_columns",
+                body: json!({
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                }),
+            },
             SearchTestCase {
                 name: "multi_text_column_with_where",
                 body: json!({
