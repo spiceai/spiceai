@@ -286,8 +286,6 @@ async fn query_vector_stream(
 ) -> DataFusionResult<()> {
     let start = std::time::Instant::now();
 
-    tracing::debug!("QueryVector expected schema: {schema:?}");
-
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
     let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
 
@@ -342,10 +340,7 @@ async fn query_vector_stream(
 
     let num_vectors = vectors.len();
 
-    tracing::debug!("OutputVectors from S3Vectors: {vectors:?}");
-
     let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
-    tracing::debug!("S3VectorsQueryTable: prepared rows: {rows:?}");
     decoder.serialize(rows.as_slice()).map_err(|e| {
         DataFusionError::ArrowError(
             e,
@@ -409,10 +404,6 @@ fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
             );
         }
     }
-
-    tracing::debug!(
-        "S3VectorsQueryTable: converted QueryOutputVector to flat JSON value: {result:?}"
-    );
 
     serde_json::Value::Object(result)
 }
