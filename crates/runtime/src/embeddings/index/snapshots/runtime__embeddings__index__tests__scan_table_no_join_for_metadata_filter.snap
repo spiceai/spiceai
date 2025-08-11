@@ -2,23 +2,24 @@
 source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                           |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                           |
-|               |   Projection: my_vectored_table.pk, my_vectored_table.body_embedding                                                           |
-|               |     Filter: my_vectored_table.a_number > Int64(0)                                                                              |
-|               |       TableScan: my_vectored_table projection=[pk, a_number, body_embedding]                                                   |
-| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                  |
-|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                      |
-|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                |
-|               |       FilterExec: a_number@1 > 0, projection=[pk@0, body_embedding@2]                                                          |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                                            |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                          |
-|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@1)], projection=[pk@0, a_number@1, body_embedding@2] |
-|               |               DataSourceExec: partitions=1, partition_sizes=[1]                                                                |
-|               |               ProjectionExec: expr=[data@0 as body_embedding, CAST(key@1 AS Int64) as pk]                                      |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                           |
-|               |                   ExplainExecutionPlan: projection=["data", "key"] filter=[] limit=None                                        |
-|               |                                                                                                                                |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                             |
++---------------+----------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                             |
+|               |   Projection: my_vectored_table.pk, my_vectored_table.body_embedding                                                             |
+|               |     Filter: my_vectored_table.a_number > Int64(0)                                                                                |
+|               |       TableScan: my_vectored_table projection=[pk, a_number, body_embedding]                                                     |
+| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                    |
+|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                        |
+|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                  |
+|               |       FilterExec: a_number@1 > 0, projection=[pk@0, body_embedding@2]                                                            |
+|               |         ProjectionExec: expr=[pk@2 as pk, a_number@0 as a_number, body_embedding@1 as body_embedding]                            |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                            |
+|               |             CoalesceBatchesExec: target_batch_size=8192                                                                          |
+|               |               HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@1)], projection=[a_number@1, body_embedding@2, pk@3] |
+|               |                 DataSourceExec: partitions=1, partition_sizes=[1]                                                                |
+|               |                 ProjectionExec: expr=[data@0 as body_embedding, CAST(key@1 AS Int64) as pk]                                      |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                           |
+|               |                     ExplainExecutionPlan: projection=["data", "key"] filter=[] limit=None                                        |
+|               |                                                                                                                                  |
++---------------+----------------------------------------------------------------------------------------------------------------------------------+

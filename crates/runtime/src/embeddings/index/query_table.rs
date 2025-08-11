@@ -631,7 +631,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "query_table_basic",
+            "query_table_basic_metadata",
         )
         .await?;
 
@@ -639,7 +639,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "query_table_join_for_projection",
+            "query_table_join_for_projection_metadata",
         )
         .await?;
 

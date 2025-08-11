@@ -278,6 +278,11 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         };
 
+        let primary_key_fields = self.index.primary_fields();
+        let Some(pk) = primary_key_fields.first() else {
+            return Err(DataFusionError::Execution("Vector search index was successfully created without a primary key available during physical planning.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues".to_string()));
+        };
+
         let output_plan = if vector_index_table_is_sufficient(
             self.schema(),
             &vector_table_scan,
@@ -291,25 +296,68 @@ impl TableProvider for VectorScanTableProvider {
                 vector_table_scan
             }
         } else {
-            let underlying_table_scan = self.underlying_table_scan(projection, filters)?;
+            let underlying_table_scan =
+                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
+
+            let join_schema = vector_table_scan
+                .schema()
+                .join(underlying_table_scan.schema())?;
+
+            // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
+            let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
+                filters.iter().cloned().partition(|f| {
+                    f.column_refs()
+                        .contains(&Column::new_unqualified(pk.name().clone()))
+                });
 
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
-            LogicalPlan::Join(Join {
+            let join = LogicalPlan::Join(Join {
                 left: Arc::new(vector_table_scan),
-                right: Arc::new(LogicalPlan::TableScan(underlying_table_scan)),
+                right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,
                 on: self.join_on_expr()?,
-                filter: filters.iter().cloned().reduce(Expr::and),
-                schema: self.qualified_schema(projection),
+                filter: pre_join_filters.into_iter().reduce(Expr::and),
+                schema: join_schema.into(),
                 null_equals_null: false,
-            })
+            });
+
+            // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
+            // case, we will remove first.
+            let deduped_schema = DFSchema::new_with_metadata(
+                join.schema()
+                    .iter()
+                    .filter(|(tbl, f)| {
+                        !(f.name() == pk.name()
+                            && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+                    })
+                    .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
+                    .collect(),
+                HashMap::default(),
+            )?;
+
+            let proj = LogicalPlan::Projection(Projection::new_from_schema(
+                join.into(),
+                deduped_schema.into(),
+            ));
+
+            if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+            } else {
+                proj
+            }
         };
 
         let output_proj = LogicalPlan::Projection(Projection::new_from_schema(
             Arc::new(output_plan),
-            self.qualified_schema(projection),
+            Arc::new(DFSchema::from_unqualified_fields(
+                self.qualified_schema(projection)
+                    .as_arrow()
+                    .fields()
+                    .clone(),
+                HashMap::default(),
+            )?),
         ));
 
         let limit = LogicalPlan::Limit(Limit {
@@ -442,7 +490,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "scan_table_basic",
+            "scan_table_basic_metadata",
         )
         .await?;
 
@@ -450,7 +498,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
-            "scan_table_join_for_projection",
+            "scan_table_join_for_projection_metadata",
         )
         .await?;
 
