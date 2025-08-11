@@ -170,6 +170,7 @@ impl GraphQL {
             graphql::client::UnnestBehavior::Depth(unnest_depth),
             None,
             None,
+            None,
         )
         .boxed()
         .context(super::InternalWithSourceSnafu {

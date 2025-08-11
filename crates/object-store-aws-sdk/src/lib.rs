@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
+use aws_smithy_runtime_api::client::runtime_components::BuildError;
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 use tokio::sync::OnceCell;
 
@@ -27,6 +28,16 @@ use url::Url;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
+    #[snafu(display(
+        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an S3 dataset: {source}."
+    ))]
+    FailedToBuildAWSRuntimeComponents { source: BuildError },
+
+    #[snafu(display(
+        "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+    ))]
+    FailedToGetCredentialsProviderFromConfig,
+
     #[snafu(display("Not an S3 URL: {url}"))]
     NotAnS3Url { url: String },
 
