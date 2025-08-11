@@ -403,7 +403,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             resp.pop().map(|s| s.to_string()),
-            Some("column".to_string())
+            Some("\"column\"".to_string())
         );
     }
 
@@ -430,7 +430,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             resp.pop().map(|s| s.to_string()),
-            Some("qualified.column".to_string())
+            Some("\"qualified.column\"".to_string())
         );
     }
 
