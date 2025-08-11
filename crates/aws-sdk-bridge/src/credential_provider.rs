@@ -42,7 +42,7 @@ use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCrede
 use snafu::prelude::*;
 
 use crate::{
-    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveCredentialsSnafu, Result,
+    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveIcebergCredentialsSnafu, Result,
 };
 
 #[derive(Debug)]
@@ -128,10 +128,10 @@ impl AwsCredentialLoad for S3CredentialProvider {
                 &ConfigBag::base(),
             )
             .await
-            .context(FailedToResolveCredentialsSnafu)?;
+            .context(FailedToResolveIcebergCredentialsSnafu)?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
-            Error::FailedToResolveCredentials {
+            Error::FailedToResolveIcebergCredentials {
                 source: "No valid credentials found".into(),
             }
         })?;
