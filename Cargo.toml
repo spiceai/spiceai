@@ -210,11 +210,11 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "821f8a7565956e2e66fdfef49f53b45d9f223df5" }            # kczimm/spiceai-47-parquet-offset-patch
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "821f8a7565956e2e66fdfef49f53b45d9f223df5" }     # kczimm/spiceai-47-parquet-offset-patch
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "821f8a7565956e2e66fdfef49f53b45d9f223df5" } # kczimm/spiceai-47-parquet-offset-patch
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "821f8a7565956e2e66fdfef49f53b45d9f223df5" }  # kczimm/spiceai-47-parquet-offset-patch
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "821f8a7565956e2e66fdfef49f53b45d9f223df5" }       # kczimm/spiceai-47-parquet-offset-patch
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "e568d4b3fec0b5c80d427a426107a5f171f9cde5" }            # spiceai-47
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e568d4b3fec0b5c80d427a426107a5f171f9cde5" }     # spiceai-47
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "e568d4b3fec0b5c80d427a426107a5f171f9cde5" } # spiceai-47
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "e568d4b3fec0b5c80d427a426107a5f171f9cde5" }  # spiceai-47
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e568d4b3fec0b5c80d427a426107a5f171f9cde5" }       # spiceai-47
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "9db74a4b360df6be1bb554c59a474a2fd4bfb7e9" }                      # spiceai-47
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "2e0bdfd5e7809ae53106f3e63bbfbebbad4aff69" } # spiceai
@@ -240,7 +240,6 @@ candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f32312
 candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" } # spiceai-0.8.4-cudarc-0.12
 
 # Use patched arrow-rs 55.2 until next release
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }      # spiceai-55.2
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }        # spiceai-55.2
 arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }  # spiceai-55.2
 arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }  # spiceai-55.2
@@ -256,3 +255,4 @@ arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30f
 arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }      # spiceai-55.2
