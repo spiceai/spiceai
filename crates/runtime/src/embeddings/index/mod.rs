@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::Field;
+use arrow_schema::{ArrowError, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
@@ -28,7 +28,9 @@ use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 
 use crate::model::EmbeddingModelStore;
-use datafusion::catalog::TableProvider;
+use datafusion::{
+    catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,
+};
 use tokio::sync::RwLock;
 
 pub(crate) mod query_table;
@@ -152,6 +154,69 @@ impl Index for S3Vector {
             self.write(&rb).await;
         }
     }
+}
+
+// Returns true if the vector index table has all requested columns and can handle all filters (i.e. filters pertain to vector index column, even if they must be post-applied in DataFusion).
+pub(super) fn vector_index_table_is_sufficient(
+    source_table_schema: SchemaRef,
+    vector_index_table: &LogicalPlan,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> Result<bool, DataFusionError> {
+    let vector_index_columns: HashSet<String> = vector_index_table
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+
+    let full_projection =
+        vector_index_has_full_projection(source_table_schema, &vector_index_columns, projection)?;
+    let vector_index_filters = vector_index_filters(&vector_index_columns, filters);
+
+    Ok(full_projection && vector_index_filters.len() == filters.len())
+}
+
+/// Returns true if the projection (relative to [`VectorQueryTableProvider`]) can be handled by the given vector index schema.
+pub(super) fn vector_index_has_full_projection(
+    source_table_schema: SchemaRef,
+    vector_index_columns: &HashSet<String>,
+    projection: Option<&Vec<usize>>,
+) -> Result<bool, ArrowError> {
+    let source_table_schema = match projection {
+        None => source_table_schema,
+        Some(indices) => Arc::new(source_table_schema.project(indices)?),
+    };
+    let columns_requested: HashSet<String> = source_table_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    Ok(vector_index_columns.is_superset(&columns_requested))
+}
+
+/// Returns all filters that can be handled by the given vector index columns.
+///
+/// This does not require that associated [`TableProvider::supports_filters_pushdown`] is
+/// [`TableProviderFilterPushDown::Unsupported`] for all filters, only that the columns
+/// referenced in the filters, are those available in the `vector_index_table`.
+pub(super) fn vector_index_filters(
+    vector_index_columns: &HashSet<String>,
+    filters: &[Expr],
+) -> Vec<Expr> {
+    filters
+        .iter()
+        .filter(|f| {
+            let filter_columns = f
+                .column_refs()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect::<HashSet<_>>();
+            vector_index_columns.is_superset(&filter_columns)
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

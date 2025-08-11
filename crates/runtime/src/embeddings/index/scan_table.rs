@@ -28,15 +28,18 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        Cast, Expr, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan,
-        expr::Alias,
+        Cast, Expr, Filter, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown,
+        TableScan, expr::Alias,
     },
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
     sql::TableReference,
 };
 
-use crate::{embedding_col, embeddings::index::VectorIndex};
+use crate::{
+    embedding_col,
+    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+};
 use search::generation::util::append_fields;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
@@ -275,23 +278,37 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         };
 
-        let underlying_table_scan = self.underlying_table_scan(projection, filters)?;
+        let output_plan = if vector_index_table_is_sufficient(
+            self.schema(),
+            &vector_table_scan,
+            projection,
+            filters,
+        )? {
+            // Let DataFusion handle pushing filters.
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, vector_table_scan.into())?)
+            } else {
+                vector_table_scan
+            }
+        } else {
+            let underlying_table_scan = self.underlying_table_scan(projection, filters)?;
 
-        // Right Join so that all rows in the underlying table are returned.
-        // Rows may not have associated vectors periodically due to indexing delays.
-        let join = LogicalPlan::Join(Join {
-            left: Arc::new(vector_table_scan),
-            right: Arc::new(LogicalPlan::TableScan(underlying_table_scan)),
-            join_type: JoinType::Right,
-            join_constraint: JoinConstraint::On,
-            on: self.join_on_expr()?,
-            filter: filters.iter().cloned().reduce(Expr::and),
-            schema: self.qualified_schema(projection),
-            null_equals_null: false,
-        });
+            // Right Join so that all rows in the underlying table are returned.
+            // Rows may not have associated vectors periodically due to indexing delays.
+            LogicalPlan::Join(Join {
+                left: Arc::new(vector_table_scan),
+                right: Arc::new(LogicalPlan::TableScan(underlying_table_scan)),
+                join_type: JoinType::Right,
+                join_constraint: JoinConstraint::On,
+                on: self.join_on_expr()?,
+                filter: filters.iter().cloned().reduce(Expr::and),
+                schema: self.qualified_schema(projection),
+                null_equals_null: false,
+            })
+        };
 
         let output_proj = LogicalPlan::Projection(Projection::new_from_schema(
-            Arc::new(join),
+            Arc::new(output_plan),
             self.qualified_schema(projection),
         ));
 
