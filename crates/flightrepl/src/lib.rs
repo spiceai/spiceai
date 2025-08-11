@@ -381,14 +381,14 @@ pub async fn get_records(
 
     let mut flight_info = client.get_flight_info(request).await?.into_inner();
     let Some(endpoint) = flight_info.endpoint.pop() else {
-        return Err(FlightError::Tonic(Status::internal(
+        return Err(FlightError::Tonic(Box::new(Status::internal(
             "No endpoint returned from server. Verify server configuration.",
-        )));
+        ))));
     };
     let Some(ticket) = endpoint.ticket else {
-        return Err(FlightError::Tonic(Status::internal(
+        return Err(FlightError::Tonic(Box::new(Status::internal(
             "No ticket in endpoint. Server may be misconfigured.",
-        )));
+        ))));
     };
     let mut request = ticket.into_request();
     request = add_api_key(request, api_key)?;
@@ -522,22 +522,16 @@ async fn get_and_display_nql_records(
     )
     .await
     .map_err(|e| {
-        format!(
-            "Network error during NQL request: {e}. Check HTTP endpoint and network."
-        )
+        format!("Network error during NQL request: {e}. Check HTTP endpoint and network.")
     })?;
 
     let jsonl_resp = json_array_to_jsonl(&resp).map_err(|e| {
-        format!(
-            "Failed to convert NQL response to JSONL: {e}. Response may be malformed."
-        )
+        format!("Failed to convert NQL response to JSONL: {e}. Response may be malformed.")
     })?;
 
     let (schema, _) =
         arrow_json::reader::infer_json_schema(jsonl_resp.as_bytes(), None).map_err(|e| {
-            format!(
-                "Schema inference failed for NQL results: {e}. Ensure response is valid JSON."
-            )
+            format!("Schema inference failed for NQL results: {e}. Ensure response is valid JSON.")
         })?;
 
     let records: Vec<RecordBatch> = arrow_json::ReaderBuilder::new(Arc::new(schema))
