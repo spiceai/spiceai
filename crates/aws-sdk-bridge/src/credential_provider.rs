@@ -97,7 +97,7 @@ impl S3CredentialProvider {
             .with_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()))
             .with_identity_cache(Some(IdentityCache::lazy().build()))
             .with_identity_resolver(
-                AuthSchemeId::new("SpiceObjectStoreS3CredentialsProvider"),
+                AuthSchemeId::new("SpiceS3CredentialProvider"),
                 SharedIdentityResolver::new(
                     sdk_config
                         .credentials_provider()
@@ -162,13 +162,13 @@ impl CredentialProvider for S3CredentialProvider {
             .await
             .map_err(|_| object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
             object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 
