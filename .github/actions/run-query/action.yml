@@ -51,7 +51,7 @@ runs:
 
         echo "query-output=$(echo "$sql_output" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
-        if [[ $sql_output != *"No error to display"* ]]; then
+        if [[ $sql_output != *"No previous error recorded"* ]]; then
           echo "Query failed to execute."
           fail_on_error="${{ inputs.fail-on-error }}"
           if [[ "$fail_on_error" == "true" || "$fail_on_error" == "1" ]]; then
