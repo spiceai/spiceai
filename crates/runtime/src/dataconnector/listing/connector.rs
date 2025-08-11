@@ -946,7 +946,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
     let runtime_app = runtime.app();
     let app = runtime_app.read().await;
     let parquet_page_index_param =
-        app::App::get_runtime_param(&*app, "parquet_page_index", "required".to_string());
+        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
         "auto" => ParquetPageIndexOptions {
