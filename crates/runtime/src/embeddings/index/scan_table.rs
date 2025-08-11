@@ -191,7 +191,7 @@ impl VectorScanTableProvider {
     fn join_on_expr(&self) -> DataFusionResult<Vec<(Expr, Expr)>> {
         let primary_key_columns = self.index.primary_fields();
         let Some(pk) = primary_key_columns.first() else {
-            return Err(DataFusionError::Execution("Vector search index was successfully created without a primary key available during physical planning.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues".to_string()));
+            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         };
         Ok(vec![(
             Expr::Column(Column::new_unqualified(pk.name().clone())),
