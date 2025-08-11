@@ -568,7 +568,7 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 
 /// Returns a boolean indicating if a message needs truncation, from a given input of lines.
 fn lines_need_truncation(lines: &[&str]) -> bool {
-    lines.iter().any(|line| line.len() > 200)
+    lines.iter().any(|line| line.len() > 120)
 }
 
 fn display_grpc_error(err: &Status) {
