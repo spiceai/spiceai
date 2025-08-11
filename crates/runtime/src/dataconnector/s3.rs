@@ -166,7 +166,7 @@ impl DataConnectorFactory for S3Factory {
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public") => (),
                 _ => {
-                    let _ = object_store_aws_sdk::initialize_sdk_config().await;
+                    let _ = aws_sdk_bridge::initialize_sdk_config().await;
                 }
             }
 
