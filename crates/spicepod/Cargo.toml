@@ -9,7 +9,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-aws-sdk-bridge = { path = "../aws-sdk-bridge" }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 byte-unit.workspace = true
 fundu.workspace = true
 futures.workspace = true

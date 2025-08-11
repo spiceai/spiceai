@@ -78,7 +78,7 @@ pub enum Error {
 
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
-        source: aws_sdk_bridge::Error,
+        source: aws_sdk_credential_bridge::Error,
         path: String,
     },
 
@@ -172,11 +172,11 @@ impl Spicepod {
     pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
         let (store, path) = match (url.scheme(), url.path()) {
             ("s3", path) => {
-                let store = aws_sdk_bridge::from_s3_url(&url, None).await.context(
-                    UnableToParseS3UrlSnafu {
+                let store = aws_sdk_credential_bridge::from_s3_url(&url, None)
+                    .await
+                    .context(UnableToParseS3UrlSnafu {
                         path: url.to_string(),
-                    },
-                )?;
+                    })?;
                 let path = object_store::path::Path::from(path);
                 (store, path)
             }

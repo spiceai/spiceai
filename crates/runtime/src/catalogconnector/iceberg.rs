@@ -22,7 +22,7 @@ use crate::{
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
-use aws_sdk_bridge::S3CredentialProvider;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::{
     RefreshableCatalogProvider,
     iceberg::{

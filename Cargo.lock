@@ -1108,29 +1108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-bridge"
-version = "1.6.0-unstable"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-runtime",
- "aws-sdk-cognitoidentity",
- "aws-sdk-cognitoidentityprovider",
- "aws-sdk-s3",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "iceberg",
- "object_store",
- "reqwest",
- "snafu",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "aws-sdk-cognitoidentity"
 version = "1.80.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1172,6 +1149,29 @@ dependencies = [
  "http 0.2.12",
  "regex-lite",
  "tracing",
+]
+
+[[package]]
+name = "aws-sdk-credential-bridge"
+version = "1.6.0-unstable"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sdk-cognitoidentity",
+ "aws-sdk-cognitoidentityprovider",
+ "aws-sdk-s3",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "iceberg",
+ "object_store",
+ "reqwest",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -3595,7 +3595,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
- "aws-sdk-bridge",
+ "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "base64 0.22.1",
  "bb8 0.9.0",
@@ -11591,7 +11591,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-bedrockruntime",
- "aws-sdk-bridge",
+ "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "aws-sdk-glue",
  "aws-sdk-secretsmanager",
@@ -11776,7 +11776,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
- "aws-sdk-bridge",
+ "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
  "datafusion",
@@ -13107,7 +13107,7 @@ name = "spicepod"
 version = "1.6.0-unstable"
 dependencies = [
  "async-trait",
- "aws-sdk-bridge",
+ "aws-sdk-credential-bridge",
  "byte-unit",
  "fundu",
  "futures",

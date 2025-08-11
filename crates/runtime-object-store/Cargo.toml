@@ -13,7 +13,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
-aws-sdk-bridge = { path = "../aws-sdk-bridge" }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono = { version = "0.4.38" }
 datafusion.workspace = true

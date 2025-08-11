@@ -25,7 +25,7 @@ async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-bedrockruntime = { version = "1.55.0", optional = true }
-aws-sdk-bridge = { path = "../aws-sdk-bridge" }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-glue = "1"
 aws-sdk-secretsmanager = { version = "1", optional = true }

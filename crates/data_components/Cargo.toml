@@ -17,7 +17,7 @@ arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
-aws-sdk-bridge = { path = "../aws-sdk-bridge" }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { version = "1.84.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }

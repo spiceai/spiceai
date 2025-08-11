@@ -20,7 +20,7 @@ limitations under the License.
 use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use aws_sdk_bridge::S3CredentialProvider;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
 use iceberg::{TableIdent, io::CustomAwsCredentialLoader};
