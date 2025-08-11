@@ -588,19 +588,18 @@ fn display_grpc_error(err: &Status) {
             let truncate = lines_need_truncation(&lines);
 
             let first_line = lines.first().unwrap_or(&message);
-            match (truncate, lines.len() > 1) {
-                (true, true) => (
-                    "Query Error",
-                    format!(
-                        "{first_line}\nMessage truncated due to length. Run '.error' for full details."
-                    ),
+            let user_err_msg = match (truncate, lines.len() > 1) {
+                // truncating due to length, and multiple error lines
+                (true, true) => format!(
+                    "{first_line}\nMessage truncated due to length. Run '.error' for full details."
                 ),
-                (true, false) => (
-                    "Query Error",
-                    "Query failed. Message truncated; run '.error' for full details.".to_string(),
-                ),
-                _ => ("Query Error", message.to_string()),
-            }
+                // truncating due to length, but only one line
+                (true, false) => {
+                    "Query failed. Message truncated; run '.error' for full details.".to_string()
+                }
+                _ => message.to_string(),
+            };
+            ("Query Error", user_err_msg)
         }
         Code::Cancelled => (
             "Operation Cancelled",
