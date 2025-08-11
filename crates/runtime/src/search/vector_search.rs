@@ -40,10 +40,7 @@ use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{CacheProvider, Sizeable};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::ast::Expr,
-};
+use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use llms::embeddings::Embed;

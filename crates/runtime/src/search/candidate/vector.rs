@@ -314,7 +314,8 @@ impl VectorGeneration {
     }
 
     // Return all unique columns from the primary key, the embedded column and the columns of `additional_columns` (i.e. `additional_columns` that are `Expr::Identifier`).
-    #[must_use] pub fn full_projection(
+    #[must_use]
+    pub fn full_projection(
         &self,
         additional_columns: &[&Expr],
         include_embedding_column: bool,
