@@ -98,7 +98,6 @@ impl VectorGeneration {
     ) -> String {
         let (pks, distances_cte, proj_table) =
             self.score_cte_sql(additional_columns, embedding, opt_filters);
-
         let projection: Vec<Expr> = self.full_projection(additional_columns);
         let final_projection_str = if projection.is_empty() {
             String::new()
