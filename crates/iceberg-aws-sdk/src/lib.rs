@@ -15,12 +15,27 @@ limitations under the License.
 */
 
 mod credential_provider;
+use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get credentials from environment"))]
-    FailedToGetCredentials,
+    #[snafu(display(
+        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an Iceberg S3 dataset: {source}."
+    ))]
+    FailedToBuildAWSRuntimeComponents { source: BuildError },
+
+    #[snafu(display(
+        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+    ))]
+    FailedToGetCredentialsProviderFromConfig,
+
+    #[snafu(display(
+        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. {source} Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+    ))]
+    FailedToResolveCredentials {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
