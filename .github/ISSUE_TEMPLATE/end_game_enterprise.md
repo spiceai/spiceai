@@ -1,3 +1,11 @@
+---
+name: Enterprise Milestone Endgame
+about: Ship a milestone release for Spice.ai Enterprise!
+title: 'v1.x.x Endgame'
+labels: 'kind/endgame'
+assignees: ''
+---
+
 ## DRIs
 
 | Role    | DRI |
