@@ -214,7 +214,8 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
-      - run: cargo build -p testoperator --all-features
+      - if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: cargo build -p testoperator --all-features
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}

@@ -98,8 +98,8 @@ impl VectorGeneration {
     ) -> String {
         let (pks, distances_cte, proj_table) =
             self.score_cte_sql(additional_columns, embedding, opt_filters);
-        let projection: Vec<Expr> = self.full_projection(additional_columns);
 
+        let projection: Vec<Expr> = self.full_projection(additional_columns, false);
         let final_projection_str = if projection.is_empty() {
             String::new()
         } else {
@@ -158,7 +158,7 @@ impl VectorGeneration {
         if self.primary_keys.is_empty() {
             self.score_cte_sql_without_pks(additional_columns, embedding, opt_filters)
         } else {
-            let projection: Vec<Expr> = self.full_projection(additional_columns);
+            let projection: Vec<Expr> = self.full_projection(additional_columns, true);
 
             let cte = format!(
                 "WITH scores as (
@@ -314,15 +314,30 @@ impl VectorGeneration {
     }
 
     // Return all unique columns from the primary key, the embedded column and the columns of `additional_columns` (i.e. `additional_columns` that are `Expr::Identifier`).
-    pub fn full_projection(&self, additional_columns: &[&Expr]) -> Vec<Expr> {
-        self.primary_keys
+    #[must_use]
+    pub fn full_projection(
+        &self,
+        additional_columns: &[&Expr],
+        include_embedding_column: bool,
+    ) -> Vec<Expr> {
+        let mut keys: Vec<_> = self
+            .primary_keys
             .iter()
             .cloned()
-            .chain(Some(self.embedding_column.to_string()))
             .chain(additional_columns.iter().filter_map(|&c| match c {
                 Expr::Identifier(Ident { value, .. }) => Some(value.clone()),
                 _ => None,
             }))
+            .collect();
+
+        if include_embedding_column {
+            keys = keys
+                .into_iter()
+                .chain(Some(self.embedding_column.to_string()))
+                .collect();
+        }
+
+        keys.into_iter()
             .unique()
             .map(|s| Expr::Identifier(Ident::with_quote('"', s)))
             .collect()

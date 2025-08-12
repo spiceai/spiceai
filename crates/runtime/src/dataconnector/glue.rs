@@ -478,7 +478,10 @@ async fn create_s3_provider(
 
     // Add required file_format parameter for S3
     params.insert("file_format".into(), input_format.file_format().into());
-    let s3 = S3 { params };
+    let s3 = S3 {
+        params,
+        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+    };
 
     dataset.from = from;
 
