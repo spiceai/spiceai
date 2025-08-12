@@ -61,3 +61,7 @@ jobs:
         env:
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          TEST_S3_VECTORS_REGION: us-west-2
+          TEST_S3_VECTORS_BUCKET: ${{ secrets.TEST_S3_VECTORS_BUCKET }}
