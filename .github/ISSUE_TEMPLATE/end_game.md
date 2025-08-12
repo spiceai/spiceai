@@ -115,6 +115,7 @@ assignees: ''
      - [ ] [Spice.ai Cloud Platform Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/spiceai/README.md)
      - [ ] [Unity Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/unity_catalog/README.md)
      - [ ] [Iceberg Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/iceberg/README.md)
+       - [ ] [Hadoop Catalog](https://github.com/spiceai/cookbook/tree/trunk/catalogs/iceberg-hadoop/README.md)
 
    - **AI/ML Models**
 

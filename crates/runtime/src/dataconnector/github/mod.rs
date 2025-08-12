@@ -426,7 +426,8 @@ impl DataConnectorFactory for GithubFactory {
                     }
 
                     (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                        let key = client_id.clone();
+                        // GitHub rate limits are per installation, so use the installation ID as the key
+                        let key = installation_id.clone();
                         let provider = Arc::new(
                             GitHubAppTokenProvider::try_new(
                                 client_id.into(),

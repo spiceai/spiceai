@@ -45,6 +45,7 @@ on:
           - 'glue-catalog'
           - 'databricks-catalog'
           - 'spicecloud'
+          - 'iceberg-hadoop'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

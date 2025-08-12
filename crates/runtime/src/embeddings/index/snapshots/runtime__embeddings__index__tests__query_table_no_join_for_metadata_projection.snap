@@ -1,7 +1,6 @@
 ---
-source: crates/runtime/src/embeddings/index/query_table.rs
+source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
-snapshot_kind: text
 ---
 +---------------+----------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                     |

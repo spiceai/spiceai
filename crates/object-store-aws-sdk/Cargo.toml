@@ -12,7 +12,16 @@ version.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
+aws-runtime.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-runtime.workspace = true
+aws-smithy-runtime-api.workspace = true
 object_store.workspace = true
 snafu.workspace = true
-url.workspace = true
 tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+aws-sdk-cognitoidentity.workspace = true
+aws-sdk-cognitoidentityprovider.workspace = true
+tempfile.workspace = true

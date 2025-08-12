@@ -40,6 +40,7 @@ use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
 
+use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{
@@ -114,7 +115,11 @@ pub trait ListingTableConnector: DataConnector {
             })
     }
 
-    fn construct_metadata_provider(
+    fn get_runtime(&self) -> Option<Runtime> {
+        None
+    }
+
+    async fn construct_metadata_provider(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
@@ -123,7 +128,7 @@ pub trait ListingTableConnector: DataConnector {
     {
         let store_url: Url = self.get_object_store_url(dataset, None)?;
         let store = self.get_object_store(dataset)?;
-        let (_, extension) = self.get_file_format_and_extension(dataset)?;
+        let (_, extension) = self.get_file_format_and_extension(dataset).await?;
 
         let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
             .context(crate::dataconnector::InvalidConfigurationSnafu {
@@ -149,7 +154,7 @@ pub trait ListingTableConnector: DataConnector {
     ///
     /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
     /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
-    fn get_file_format_and_extension(
+    async fn get_file_format_and_extension(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
@@ -186,7 +191,7 @@ pub trait ListingTableConnector: DataConnector {
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
-                    ParquetFormat::default().with_options(self.get_table_parquet_options(dataset)?),
+                    ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
                 )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
@@ -371,7 +376,7 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    fn get_table_parquet_options(
+    async fn get_table_parquet_options(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<TableParquetOptions>
@@ -388,6 +393,37 @@ pub trait ListingTableConnector: DataConnector {
                     source: Box::new(e),
                 },
             )?;
+
+        if let Some(runtime) = self.get_runtime() {
+            let page_index_options = parquet_page_index_options(&runtime).await;
+
+            table_parquet_options
+                .set(
+                    "enable_page_index",
+                    &page_index_options.enable_page_index.to_string(),
+                )
+                .map_err(
+                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    },
+                )?;
+
+            table_parquet_options
+                .set(
+                    "tolerate_missing_page_index",
+                    &page_index_options.tolerate_missing_page_index.to_string(),
+                )
+                .map_err(
+                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    },
+                )?;
+        }
+
         Ok(table_parquet_options)
     }
 
@@ -608,7 +644,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             return None;
         }
 
-        Some(self.construct_metadata_provider(dataset))
+        Some(self.construct_metadata_provider(dataset).await)
     }
 
     async fn read_provider(
@@ -617,7 +653,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
 
-        let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
+        let (file_format_opt, extension) = self.get_file_format_and_extension(dataset).await?;
         match file_format_opt {
             None => {
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
@@ -883,6 +919,55 @@ impl SensitiveListingTableUrl {
     }
 }
 
+struct ParquetPageIndexOptions {
+    enable_page_index: bool,
+    tolerate_missing_page_index: bool,
+}
+
+impl Default for ParquetPageIndexOptions {
+    fn default() -> Self {
+        Self {
+            enable_page_index: true,
+            tolerate_missing_page_index: false,
+        }
+    }
+}
+
+/// Returns the parquet page index options to use when reading Parquet files
+///
+/// Expects the user to configure the spicepod runtime params:
+///
+/// ```yaml
+/// runtime:
+///   params:
+///     parquet_page_index: required # skip, auto
+/// ```
+async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOptions {
+    let runtime_app = runtime.app();
+    let app = runtime_app.read().await;
+    let parquet_page_index_param =
+        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
+
+    match parquet_page_index_param.as_str() {
+        "auto" => ParquetPageIndexOptions {
+            enable_page_index: true,
+            tolerate_missing_page_index: true,
+        },
+        "skip" => ParquetPageIndexOptions {
+            enable_page_index: false,
+            tolerate_missing_page_index: false,
+        },
+        "required" => ParquetPageIndexOptions::default(),
+        _ => {
+            tracing::warn!(
+                "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
+                parquet_page_index_param
+            );
+            ParquetPageIndexOptions::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -993,7 +1078,7 @@ mod tests {
     async fn test_get_file_format_and_extension_require_file_format() {
         let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new()).await;
 
-        match connector.get_file_format_and_extension(&dataset) {
+        match connector.get_file_format_and_extension(&dataset).await {
             Ok(_) => panic!("Unexpected success"),
             Err(e) => assert_eq!(
                 e.to_string(),
@@ -1008,7 +1093,7 @@ mod tests {
             setup_connector("test:test.csv".to_string(), HashMap::new()).await;
 
         if let Ok((Some(_file_format), extension)) =
-            connector.get_file_format_and_extension(&dataset)
+            connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".csv");
         } else {
@@ -1022,7 +1107,7 @@ mod tests {
             setup_connector("test:test.parquet".to_string(), HashMap::new()).await;
 
         if let Ok((Some(_file_format), extension)) =
-            connector.get_file_format_and_extension(&dataset)
+            connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".parquet");
         } else {
@@ -1037,7 +1122,7 @@ mod tests {
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
-            connector.get_file_format_and_extension(&dataset)
+            connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".csv");
         } else {
@@ -1052,7 +1137,7 @@ mod tests {
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
-            connector.get_file_format_and_extension(&dataset)
+            connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".tsv");
         } else {
@@ -1067,7 +1152,7 @@ mod tests {
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
-            connector.get_file_format_and_extension(&dataset)
+            connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".parquet");
         } else {
@@ -1394,5 +1479,87 @@ mod tests {
     fn test_get_url_prefix_without_host() {
         let url = Url::parse("file:///absolute/path").expect("to parse url");
         assert_eq!(get_url_prefix(&url), "file:///");
+    }
+
+    #[tokio::test]
+    async fn test_parquet_page_index_options_default() {
+        let app = app::AppBuilder::new("test").build();
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::new(app)))
+            .build()
+            .await;
+
+        let options = parquet_page_index_options(&runtime).await;
+        assert!(options.enable_page_index);
+        assert!(!options.tolerate_missing_page_index);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_page_index_options_auto() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("parquet_page_index".to_string(), "auto".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_runtime_params(params)
+            .build();
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::new(app)))
+            .build()
+            .await;
+
+        let options = parquet_page_index_options(&runtime).await;
+        assert!(options.enable_page_index);
+        assert!(options.tolerate_missing_page_index);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_page_index_options_skip() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("parquet_page_index".to_string(), "skip".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_runtime_params(params)
+            .build();
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::new(app)))
+            .build()
+            .await;
+
+        let options = parquet_page_index_options(&runtime).await;
+        assert!(!options.enable_page_index);
+        assert!(!options.tolerate_missing_page_index);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_page_index_options_required() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("parquet_page_index".to_string(), "required".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_runtime_params(params)
+            .build();
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::new(app)))
+            .build()
+            .await;
+
+        let options = parquet_page_index_options(&runtime).await;
+        assert!(options.enable_page_index);
+        assert!(!options.tolerate_missing_page_index);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_page_index_options_invalid() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("parquet_page_index".to_string(), "invalid".to_string());
+        let app = app::AppBuilder::new("test")
+            .with_runtime_params(params)
+            .build();
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::new(app)))
+            .build()
+            .await;
+
+        let options = parquet_page_index_options(&runtime).await;
+        // Should fall back to default
+        assert!(options.enable_page_index);
+        assert!(!options.tolerate_missing_page_index);
     }
 }
