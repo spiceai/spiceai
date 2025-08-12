@@ -20,7 +20,6 @@ datasets:
         s3_vectors_aws_access_key_id: ${ secrets:AWS_ACCESS_KEY_ID }
         s3_vectors_aws_secret_access_key: ${ secrets:AWS_SECRET_ACCESS_KEY }
         s3_vectors_aws_region: ${ secrets:TEST_S3_VECTORS_REGION }
-        s3_vectors_aws_session_token: ${ secrets:AWS_SESSION_TOKEN }
     columns:
       - name: text
         embeddings:
