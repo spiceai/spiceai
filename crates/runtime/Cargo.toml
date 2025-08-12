@@ -70,7 +70,6 @@ http-body-util = "0.1.3"
 hyper = "1.6.0"
 hyper-util = { version = "0.1.15", features = ["service"] }
 iceberg.workspace = true
-iceberg-aws-sdk = { path = "../iceberg-aws-sdk" }
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
@@ -91,7 +90,6 @@ moka.workspace = true
 mysql_async = { workspace = true, optional = true }
 notify = "8.0.0"
 ns_lookup = { path = "../ns_lookup" }
-object-store-aws-sdk = { path = "../object-store-aws-sdk" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
