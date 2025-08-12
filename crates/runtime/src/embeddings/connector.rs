@@ -222,6 +222,8 @@ impl EmbeddingConnector {
                         }
                     })?;
 
+                    // augment the previous underlying table provider with the vector index
+                    // this will result in recursive augmentation of the underlying table for N embedding columns
                     provider.underlying = (Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>)
                         .augment_table(provider.underlying);
                     provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);

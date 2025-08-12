@@ -17,6 +17,7 @@ arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { version = "1.84.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
@@ -54,7 +55,6 @@ itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
-object-store-aws-sdk = { path = "../object-store-aws-sdk" }
 opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
 rdkafka = { version = "0.38.0", features = ["ssl-vendored"], optional = true }
@@ -126,6 +126,6 @@ test_hadoop_catalog_docker = []
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
 ctor = "0.2.8"
-insta = { version = "1.43" }
 iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
+insta = { version = "1.43" }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
