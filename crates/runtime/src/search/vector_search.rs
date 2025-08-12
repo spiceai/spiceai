@@ -40,10 +40,7 @@ use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{CacheProvider, Sizeable};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::ast::{Expr, Ident},
-};
+use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use llms::embeddings::Embed;
@@ -292,7 +289,7 @@ impl VectorSearch {
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
                         query.clone(),
                         where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                        additional_columns.iter().map(|s| Expr::Identifier(Ident::with_quote('"', s))).collect(),
+                        additional_columns.iter().map(|i| Expr::Identifier(i.clone())).collect(),
                         primary_keys.to_vec(),
                         keywords,
                         *limit

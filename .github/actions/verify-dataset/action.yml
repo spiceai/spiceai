@@ -69,7 +69,7 @@ runs:
 
         echo "$sql_output"
         
-        if [[ $sql_output != *"No error to display"* ]]; then
+        if [[ $sql_output != *"No previous error recorded"* ]]; then
           echo "Unexpected response from spice sql, failed to perform test query"
           exit 1
         fi
