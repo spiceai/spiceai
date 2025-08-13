@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
+use async_openai::error::OpenAIError;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use std::fmt::Debug;
@@ -28,7 +29,6 @@ use crate::chunking::{
 };
 
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
-use async_openai::error::OpenAIError;
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
@@ -98,11 +98,17 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.inner.model);
-        let mut resp = self.inner.client.embeddings().create(inner_req).await?;
+        let mut resp = self
+            .inner
+            .client
+            .embeddings()
+            .create(inner_req)
+            .await
+            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e.into() })?;
 
         resp.model = outer_model;
         Ok(resp)
