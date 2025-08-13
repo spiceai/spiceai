@@ -6637,7 +6637,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cf7cb5d19f37#cf7cb5d19f37011222cc6bc22c68d7774280065c"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bb5ef115e6c2d9a218a6bca819974bc329f5a069#bb5ef115e6c2d9a218a6bca819974bc329f5a069"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6689,7 +6689,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cf7cb5d19f37#cf7cb5d19f37011222cc6bc22c68d7774280065c"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bb5ef115e6c2d9a218a6bca819974bc329f5a069#bb5ef115e6c2d9a218a6bca819974bc329f5a069"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6706,7 +6706,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cf7cb5d19f37#cf7cb5d19f37011222cc6bc22c68d7774280065c"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bb5ef115e6c2d9a218a6bca819974bc329f5a069#bb5ef115e6c2d9a218a6bca819974bc329f5a069"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6732,7 +6732,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cf7cb5d19f37#cf7cb5d19f37011222cc6bc22c68d7774280065c"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bb5ef115e6c2d9a218a6bca819974bc329f5a069#bb5ef115e6c2d9a218a6bca819974bc329f5a069"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6745,7 +6745,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.5.1"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=cf7cb5d19f37#cf7cb5d19f37011222cc6bc22c68d7774280065c"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bb5ef115e6c2d9a218a6bca819974bc329f5a069#bb5ef115e6c2d9a218a6bca819974bc329f5a069"
 dependencies = [
  "tracing",
  "tracing-subscriber",
