@@ -215,6 +215,7 @@ impl TeiEmbed {
         inputs: Vec<EncodingInput>,
     ) -> std::result::Result<Vec<PooledEmbeddingsInferResponse>, TextEmbeddingsError> {
         let batch_size = inputs.len();
+        tracing::trace!("Embedding {batch_size} batches");
 
         let mut futures = Vec::with_capacity(batch_size);
         for input in inputs {
