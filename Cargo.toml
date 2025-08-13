@@ -73,14 +73,22 @@ arrow-schema = "55.1"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "21373192d0c3fa94c4438b8e677a9cc2350c7fca", features = [
     "byot",
 ] }
+
+
 async-stream = "0.3.5"
 async-trait = "0.1.86"
-aws-config = "1.8.2"
+aws-config = "1.8.5"
 aws-credential-types = "1.2"
 aws-runtime = "1.5.10"
+aws-sdk-bedrockruntime = "1.55.0"
 aws-sdk-cognitoidentity = "1.80.0"
 aws-sdk-cognitoidentityprovider = "1.92.0"
+aws-sdk-dynamodb = "1.84.0"
+aws-sdk-glue = "1.90.0"
 aws-sdk-s3 = "1.101.0"
+aws-sdk-s3vectors = "1.3"
+aws-sdk-secretsmanager = "1.76.0"
+aws-sdk-sts = "1.78.0"
 aws-smithy-runtime = "1.8.6"
 aws-smithy-runtime-api = "1.8.7"
 aws-smithy-types = "1.3"
@@ -225,12 +233,11 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }              # spiceai-0.5.1
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" } # spiceai-0.5.1
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" } # spiceai-0.5.1
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }   # spiceai-0.5.1
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bf04370c1b7b1557982e586aa120f3e50df7a93b" }   # spiceai-0.5.1
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bb5ef115e6c2d9a218a6bca819974bc329f5a069" }              # spiceai-0.5.1
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bb5ef115e6c2d9a218a6bca819974bc329f5a069" } # spiceai-0.5.1
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bb5ef115e6c2d9a218a6bca819974bc329f5a069" } # spiceai-0.5.1
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bb5ef115e6c2d9a218a6bca819974bc329f5a069" }   # spiceai-0.5.1
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "bb5ef115e6c2d9a218a6bca819974bc329f5a069" }   # spiceai-0.5.1
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
@@ -255,3 +262,19 @@ arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" } # spiceai-55.2
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "53162ed30fe6a2ed219b0af4dbbcd5d14745d7c2" }      # spiceai-55.2
+
+aws-config = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-config" }                                           #"1.8.2"
+aws-credential-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-credential-types" }                       #"1.2"
+aws-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-runtime" }                                         #"1.5.10"
+aws-sdk-bedrockruntime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-bedrockruntime" }                   #"1.55.0"
+aws-sdk-cognitoidentity = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-cognitoidentity" }                 #"1.80.0"
+aws-sdk-cognitoidentityprovider = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-cognitoidentityprovider" } #"1.92.0"
+aws-sdk-dynamodb = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-dynamodb" }                               #"1.84.0"
+aws-sdk-glue = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-glue" }                                       #"1.90.0"
+aws-sdk-s3 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-s3" }                                           # "1.101.0"
+aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-s3vectors" }                             # "1.3"
+aws-sdk-secretsmanager = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-secretsmanager" }                   #"1.76.0"
+aws-sdk-sts = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-sdk-sts" }                                         #"1.78.0"
+aws-smithy-runtime = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime" }                           #"1.8.6"
+aws-smithy-runtime-api = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-runtime-api" }                   #"1.8.7"
+aws-smithy-types = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "aabf319462411aa07c3fdcde99e3f1213464c7bf", package = "aws-smithy-types" }                               # "1.3"

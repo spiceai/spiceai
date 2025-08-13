@@ -19,6 +19,7 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Instant;
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
@@ -110,6 +111,10 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
     async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         // Batch requests to match OpenAI API limits: max_tokens_per_request and max array size.
         let embed_batches: Vec<EmbeddingInput> = chunk_embedding_input(&input);
+        tracing::trace!(
+            "OpenAI embedding input split into {} batches",
+            embed_batches.len()
+        );
 
         let request_batches_result: EmbedResult<Vec<CreateEmbeddingRequest>> = embed_batches
             .into_iter()
@@ -132,8 +137,11 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
                 let client = Arc::clone(&client_ref);
                 async move {
                     retry(retry_strategy, async || {
+                        let start = Instant::now();
                         client.embeddings().create_float(req.clone()).await
                             .map(|resp| {
+                                let end = Instant::now();
+                                tracing::trace!("OpenAI embedding request completed in {:?}", end - start);
                                 resp.data.into_iter().map(|d| d.embedding.into()).collect::<Vec<_>>()
                             })
                             .map_err(|err| {
