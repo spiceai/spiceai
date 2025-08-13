@@ -140,6 +140,7 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 ## Post-Release Validation and Housekeeping
 
 - [ ] Notify the team to verify [customer fixes](https://github.com/orgs/spicehq/projects/53)(if any):
+
   ```md
   :rocket: **Enterprise release complete!** Please confirm enterprise customer fixes have been merged and resolved.
 
