@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
+use async_openai::error::OpenAIError;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use std::fmt::Debug;

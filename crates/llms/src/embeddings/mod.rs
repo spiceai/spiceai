@@ -25,6 +25,7 @@ use std::{fmt::Debug, sync::Arc};
 pub mod candle;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display(
         "Embedding health check failed. {source}. Verify the embedding configuration."
@@ -97,6 +98,12 @@ pub enum Error {
         "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
     ))]
     ModelNotProvided { model_source: String },
+
+    #[snafu(display("Failed to extract embeddings from AWS Bedrock: {message}"))]
+    FailedToExtractEmbeddings { message: String },
+
+    #[snafu(display("Failed to construct request blobs: {message}"))]
+    FailedToConstructRequestBlobs { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
