@@ -12,5 +12,6 @@ version.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 itertools.workspace = true

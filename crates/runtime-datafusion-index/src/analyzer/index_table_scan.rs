@@ -30,7 +30,7 @@ use datafusion::{
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::DefaultTableSource,
-    error::Result,
+    error::{DataFusionError, Result},
     execution::{SendableRecordBatchStream, SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
@@ -43,8 +43,11 @@ use datafusion::{
 };
 use futures::StreamExt;
 use itertools::Itertools;
+use tokio::sync::Semaphore;
 
 use crate::{Index, IndexedTableProvider};
+
+const DEFAULT_MAX_CONCURRENT_COMPUTE_INDEX: u32 = 16;
 
 /// [`OptimizerRule`] that looks for [`IndexedTableProvider`] nodes and adds an [`IndexTableScanNode`].
 #[derive(Debug, Default)]
@@ -299,6 +302,7 @@ impl ExtensionPlanner for IndexTableScanExtensionPlanner {
 pub(crate) struct IndexerExec {
     input_exec: Arc<dyn ExecutionPlan>,
     indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl IndexerExec {
@@ -306,9 +310,14 @@ impl IndexerExec {
         input_exec: Arc<dyn ExecutionPlan>,
         indexes: Vec<Arc<dyn Index + Send + Sync>>,
     ) -> Self {
+        let semaphore = Arc::new(Semaphore::new(
+            DEFAULT_MAX_CONCURRENT_COMPUTE_INDEX as usize, // should this be parameterized?
+        ));
+
         Self {
             input_exec,
             indexes,
+            semaphore,
         }
     }
 }
@@ -366,6 +375,7 @@ impl ExecutionPlan for IndexerExec {
         Ok(Arc::new(Self {
             input_exec: input,
             indexes: self.indexes.clone(),
+            semaphore: Arc::clone(&self.semaphore),
         }))
     }
 
@@ -384,19 +394,28 @@ impl ExecutionPlan for IndexerExec {
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.input_exec.schema();
         let indexes = self.indexes.clone();
+        let semaphore = Arc::clone(&self.semaphore); // use semaphore to control max concurrent index computations
         let stream = self
             .input_exec
             .execute(partition, Arc::clone(&context))?
             .then(move |batch| {
                 let indexes = indexes.clone();
+                let semaphore = Arc::clone(&semaphore);
                 async move {
                     if let Ok(batch) = batch.as_ref() {
-                        futures::future::join_all(
-                            indexes
-                                .iter()
-                                .map(|index| index.compute_index(vec![batch.clone()])),
-                        )
-                        .await;
+                        futures::future::try_join_all(indexes.iter().map(|index| async {
+                            let permit = semaphore.acquire().await.map_err(|e| {
+                                datafusion::error::DataFusionError::Execution(format!(
+                                    "Failed to acquire semaphore for index computation.\n{e}"
+                                ))
+                            })?;
+
+                            index.compute_index(vec![batch.clone()]).await;
+                            drop(permit);
+
+                            Ok::<(), DataFusionError>(())
+                        }))
+                        .await?;
                     }
                     batch
                 }
