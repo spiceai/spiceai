@@ -75,7 +75,7 @@ pub enum Error {
     #[snafu(display("Failed to parse SQL expression '{expression}': {source}"))]
     ExpressionParsing {
         expression: String,
-        source: DataFusionError,
+        source: Box<DataFusionError>,
     },
 }
 
@@ -186,6 +186,7 @@ fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let expr_string = format!("{sql_expr}");
     ctx.state()
         .create_logical_expr(&expr_string, &df_schema)
+        .map_err(Box::new)
         .context(ExpressionParsingSnafu {
             expression: expr_string,
         })
