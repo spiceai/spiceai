@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.6.0-unstable"
+version = "1.6.0-enterprise-beta"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6674,23 +6674,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "iceberg-aws-sdk"
-version = "1.6.0-enterprise-beta"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "iceberg",
- "reqwest",
- "snafu",
- "url",
-]
-
-[[package]]
-=======
->>>>>>> trunk
 name = "iceberg-catalog-glue"
 version = "0.5.1"
 source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b1557982e586aa120f3e50df7a93b#bf04370c1b7b1557982e586aa120f3e50df7a93b"
@@ -9196,22 +9179,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "object-store-aws-sdk"
-version = "1.6.0-enterprise-beta"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "object_store",
- "snafu",
- "tokio",
- "url",
-]
-
-[[package]]
-=======
->>>>>>> trunk
 name = "object_store"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11801,7 +11768,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.6.0-unstable"
+version = "1.6.0-enterprise-beta"
 dependencies = [
  "async-stream",
  "async-trait",
