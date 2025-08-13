@@ -223,7 +223,7 @@ fn is_retriable_error(err: &OpenAIError) -> bool {
 
 // `OpenAPI` estimator counts utf-8 bytes as 0.25 tokens so allowed string size is 1,200,000 bytes.
 const MAX_BATCH_STR_BYTES: usize = 300_000 * 4;
-const MAX_BATCH_SIZE: usize = 500;
+const MAX_BATCH_SIZE: usize = 2048;
 
 /// Chunks embedding input to batches to be `OpenAI` API compliant: `<https://platform.openai.com/docs/api-reference/embeddings/create>`
 ///  - "any array must be 2048 dimensions or less"
