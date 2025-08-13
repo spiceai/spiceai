@@ -31,7 +31,7 @@ jobs:
     name: Build testoperator
     runs-on: "spiceai-macos"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -57,7 +57,7 @@ jobs:
     name: Build spiced
     runs-on: "spiceai-macos"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -130,7 +130,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download testoperator
         uses: actions/download-artifact@v4

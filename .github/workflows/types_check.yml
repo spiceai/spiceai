@@ -23,7 +23,7 @@ jobs:
             target_arch_go: "amd64"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -120,7 +120,7 @@ jobs:
             target_arch: "x86_64"
             target_arch_go: "amd64"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -53,7 +53,7 @@ jobs:
     name: Build Test Binary
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -121,7 +121,7 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
