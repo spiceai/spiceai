@@ -115,7 +115,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             // Initialize the AWS SDK and make it available.
-            let _ = object_store_aws_sdk::initialize_sdk_config().await;
+            let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
             let delta = DeltaLake::new(params.parameters);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })

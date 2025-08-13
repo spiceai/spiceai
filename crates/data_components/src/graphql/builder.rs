@@ -20,6 +20,7 @@ use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 use token_provider::TokenProvider;
+use tokio::sync::Semaphore;
 
 use url::Url;
 
@@ -32,6 +33,7 @@ pub struct GraphQLClientBuilder {
     pass: Option<String>,
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl GraphQLClientBuilder {
@@ -46,6 +48,7 @@ impl GraphQLClientBuilder {
             pass: None,
             schema: None,
             rate_limiter: None,
+            semaphore: None,
         }
     }
 
@@ -85,6 +88,12 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Option<Arc<Semaphore>>) -> Self {
+        self.semaphore = semaphore;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
         GraphQLClient::new(
             client,
@@ -96,6 +105,7 @@ impl GraphQLClientBuilder {
             self.unnest_behavior,
             self.schema,
             self.rate_limiter,
+            self.semaphore,
         )
     }
 }

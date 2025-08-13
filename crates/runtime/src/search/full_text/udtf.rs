@@ -37,6 +37,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use futures::FutureExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::{
     index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
@@ -44,6 +45,7 @@ use search::generation::text_search::{
 
 use crate::{
     datafusion::DataFusion,
+    request::{AsyncMarker, RequestContext},
     search::util::{find_concrete_table_provider, table_ref_from_column_expr},
 };
 
@@ -184,6 +186,12 @@ impl TextSearchTableFunc {
 
 impl TableFunctionImpl for TextSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        async {
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            telemetry::track_text_search(&request_context.to_dimensions());
+        }
+        .now_or_never();
+
         let args = Self::parse_args(args)?;
 
         let df = self.df.upgrade().ok_or_else(|| {

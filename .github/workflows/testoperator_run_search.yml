@@ -37,8 +37,12 @@ jobs:
       
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
+        id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -53,11 +57,14 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
-          testoperator run vector_search \
-            -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
-            -d /opt/spiced/data \
-            --disable-progress-bars
+          testoperator run vector-search \
+            --ready-wait 1800 \
+            --concurrency 10 \
+            --benchmark-dataset quora_retrieval \
+            -p "${{ github.event.inputs.spicepod_path }}"
         env:
-          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

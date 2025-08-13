@@ -69,11 +69,21 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
     || {
         vec![
             (
+                "bedrock",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_bedrock("us.amazon.nova-lite-v1:0")
+                            .await
+                            .map_err(|e| anyhow::anyhow!("failed to create bedrock model: {e}"))
+                    })
+                }),
+            ),
+            (
                 "anthropic",
                 Box::new(|| {
                     Box::pin(async {
                         create::create_anthropic(None)
-                            .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {}", e))
+                            .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
                     })
                 }),
             ),
@@ -85,9 +95,8 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 "xai",
                 Box::new(|| {
                     Box::pin(async {
-                        create::create_xai("grok-3").map_err(|e| {
-                            anyhow::anyhow!("failed to create 'grok-3' from xAI: {}", e)
-                        })
+                        create::create_xai("grok-3")
+                            .map_err(|e| anyhow::anyhow!("failed to create 'grok-3' from xAI: {e}"))
                     })
                 }),
             ),
@@ -97,7 +106,7 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                     Box::pin(async {
                         create::create_hf("microsoft/Phi-3-mini-4k-instruct")
                     .await
-                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF: {}", e))
+                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF: {e}"))
                     })
                 }),
             ),
@@ -107,7 +116,7 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                     Box::pin(async {
                         create::create_local("microsoft/Phi-3-mini-4k-instruct")
                     .await
-                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system: {}", e))
+                    .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system: {e}"))
                     })
                 }),
             ),
@@ -115,9 +124,8 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 "perplexity",
                 Box::new(|| {
                     Box::pin(async {
-                        create::create_perplexity().map_err(|e| {
-                            anyhow::anyhow!("failed to create perplexity model: {}", e)
-                        })
+                        create::create_perplexity()
+                            .map_err(|e| anyhow::anyhow!("failed to create perplexity model: {e}"))
                     })
                 }),
             ),
@@ -529,6 +537,14 @@ macro_rules! generate_model_tests {
         test_model_case!(hf_phi3, system_prompt, true);
         test_model_case!(hf_phi3, supports_basic_message_roles, true);
 
+        test_model_case!(bedrock, basic);
+        test_model_case!(bedrock, supports_basic_message_roles);
+        test_model_case!(bedrock, basic, true);
+        test_model_case!(bedrock, supports_basic_message_roles, true);
+        // Cannot comply with responding with just `pong`.
+        // test_model_case!(bedrock, system_prompt);
+        // test_model_case!(bedrock, system_prompt, true);
+
         // Beta
         test_model_case!(anthropic, tool_use);
         test_model_case!(anthropic, usage);
@@ -536,6 +552,13 @@ macro_rules! generate_model_tests {
         test_model_case!(anthropic, tool_use, true);
         test_model_case!(anthropic, usage, true);
         test_model_case!(anthropic, supports_all_message_roles, true);
+
+        test_model_case!(bedrock, tool_use);
+        test_model_case!(bedrock, usage);
+        test_model_case!(bedrock, supports_all_message_roles);
+        test_model_case!(bedrock, tool_use, true);
+        test_model_case!(bedrock, usage, true);
+        test_model_case!(bedrock, supports_all_message_roles, true);
 
         test_model_case!(openai, tool_use);
         test_model_case!(openai, tool_use, true);

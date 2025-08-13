@@ -49,9 +49,9 @@ use crate::{
     datafusion::{filter_converter::TimestampFilterConvert, schema},
     dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
-    object_store_registry::default_runtime_env,
     status,
 };
+use runtime_object_store::registry::default_runtime_env;
 
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;

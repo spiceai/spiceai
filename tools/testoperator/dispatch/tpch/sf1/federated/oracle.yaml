@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpch/sf1/federated/oracle.yaml
+    spicepod_path: federated/oracle.yaml
     query_set: tpch
     query_overrides: oracle
     runner_type: spiceai-dev-runners

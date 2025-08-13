@@ -30,6 +30,9 @@ use dispatch::DispatchArgs;
 mod evals;
 pub use evals::EvalsTestArgs;
 
+mod search;
+pub use search::VectorSearchTestArgs;
+
 #[derive(Subcommand)]
 pub enum Commands {
     // Run a test
@@ -53,7 +56,7 @@ pub enum TestCommands {
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(DatasetTestArgs),
-    VectorSearch(CommonArgs),
+    VectorSearch(VectorSearchTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

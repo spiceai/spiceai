@@ -204,7 +204,7 @@ fn to_sendable_stream(
     }
 }
 
-fn construct_record_batch(
+pub(crate) fn construct_record_batch(
     batch: &RecordBatch,
     projected_schema: &SchemaRef,
     embedding_cols: &HashMap<String, ArrayRef>,
@@ -355,7 +355,9 @@ pub(super) async fn get_vectors(
         .filter_map(|(_, s)| s.map(ToString::to_string))
         .collect();
 
+    tracing::trace!("Sending request to upstream embedding model");
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    tracing::trace!("Received response from upstream embedding model");
 
     let mut builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(
@@ -364,7 +366,7 @@ pub(super) async fn get_vectors(
         vector_length,
         embedded_data.len() + nulls.len(),
     )
-    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
     // Current index into offset of the outputted [`FixedSizeList`].
     let mut output_ptr: usize = 0;

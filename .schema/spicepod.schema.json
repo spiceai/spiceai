@@ -570,6 +570,14 @@
         "use": {
           "type": "string",
           "default": ""
+        },
+        "vector_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       },
       "required": [
@@ -602,6 +610,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "vector_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       }
     },

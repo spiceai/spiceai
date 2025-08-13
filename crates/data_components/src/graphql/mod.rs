@@ -64,6 +64,10 @@ pub enum Error {
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[snafu(display(
+        "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    InternalError { message: String },
 
     #[snafu(display(
         "GraphQL Query Error:
