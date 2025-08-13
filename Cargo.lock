@@ -11761,7 +11761,6 @@ dependencies = [
  "datafusion",
  "futures",
  "itertools 0.14.0",
- "tokio",
  "tracing",
 ]
 
