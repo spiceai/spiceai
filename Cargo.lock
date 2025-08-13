@@ -997,18 +997,47 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebd9b83179adf8998576317ce47785948bcff399ec5b15f4dfbdedd44ddf5b92"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-sdk-sso",
- "aws-sdk-ssooidc",
- "aws-sdk-sts",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-runtime 1.5.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-sdk-sso 1.76.0",
+ "aws-sdk-ssooidc 1.77.0",
+ "aws-sdk-sts 1.78.0",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-json 0.61.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "fastrand 2.3.0",
+ "hex",
+ "http 1.3.1",
+ "ring",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-config"
+version = "1.8.5"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-sdk-sso 1.80.0",
+ "aws-sdk-ssooidc 1.81.0",
+ "aws-sdk-sts 1.82.0",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "hex",
@@ -1027,9 +1056,20 @@ version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1541072f81945fa1251f8795ef6c92c4282d74d59f88498ae7d4bf00f0ebdad9"
 dependencies = [
- "aws-smithy-async",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-credential-types"
+version = "1.2.5"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "zeroize",
 ]
 
@@ -1062,15 +1102,38 @@ version = "1.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c034a1bc1d70e16e7f4e4caf7e9f7693e4c9c24cd91cf17c2a0b21abaebc7c8b"
 dependencies = [
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-async",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-sigv4 1.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "http-body 0.4.6",
+ "percent-encoding",
+ "pin-project-lite",
+ "tracing",
+ "uuid 1.17.0",
+]
+
+[[package]]
+name = "aws-runtime"
+version = "1.5.10"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-sigv4 1.3.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-smithy-eventstream",
- "aws-smithy-http",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1083,21 +1146,20 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.92.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed30254a3861895dc2c9437f6acbbb0e64c98637628c46748ecf463c4ff0fb32"
+version = "1.101.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-sigv4",
- "aws-smithy-async",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-sigv4 1.3.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-smithy-eventstream",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1108,19 +1170,18 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentity"
-version = "1.80.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "606ea1307a8caf6ecddf1d8bbe55b7d1d967c7b6c217d13d5e81c2c8e24e0cf8"
+version = "1.81.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1130,19 +1191,18 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentityprovider"
-version = "1.92.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b241646fc324545dfad23330a756067373ff457e7f32102ea192f04fe10a2e9"
+version = "1.94.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1156,14 +1216,14 @@ version = "1.6.0-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-runtime",
+ "aws-config 1.8.5",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-sdk-cognitoidentity",
  "aws-sdk-cognitoidentityprovider",
  "aws-sdk-s3",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "iceberg",
  "object_store",
  "reqwest",
@@ -1175,19 +1235,18 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.84.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "741f09fde8129e2f71492b36612215a81dcafdaec1d288a4df8f7418473bd268"
+version = "1.88.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1201,15 +1260,15 @@ version = "1.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "443dae52f548499507d65f08c7cd8a7b59acf9308157b9c71ec457950842937f"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-runtime 1.5.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-json 0.61.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1219,24 +1278,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-s3"
-version = "1.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b16efa59a199f5271bf21ab3e570c5297d819ce4f240e6cf0096d1dc0049c44"
+name = "aws-sdk-glue"
+version = "1.114.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-sigv4",
- "aws-smithy-async",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-s3"
+version = "1.102.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-sigv4 1.3.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-smithy-checksums",
  "aws-smithy-eventstream",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-xml 0.60.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "hex",
@@ -1254,19 +1333,18 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3vectors"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64c36be12e38415d01bffd0e881dd1ba3eb1cd2811d2e2795c5b1373aed9c4b4"
+version = "1.6.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1276,19 +1354,18 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-secretsmanager"
-version = "1.76.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb99bf4d3be2b4598ad26eed5da8d0c930b8d47d76b279a03e47d160151eb0fb"
+version = "1.84.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1302,15 +1379,36 @@ version = "1.76.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64bf26698dd6d238ef1486bdda46f22a589dc813368ba868dc3d94c8d27b56ba"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-runtime 1.5.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-json 0.61.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sso"
+version = "1.80.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1324,15 +1422,36 @@ version = "1.77.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cd07ed1edd939fae854a22054299ae3576500f4e0fadc560ca44f9c6ea1664"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-runtime 1.5.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-json 0.61.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-ssooidc"
+version = "1.81.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1346,17 +1465,39 @@ version = "1.78.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37f7766d2344f56d10d12f3c32993da36d78217f32594fe4fb8e57a538c1cdea"
 dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-query",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-runtime 1.5.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-json 0.61.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-query 0.60.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime 1.8.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-xml 0.60.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-types 1.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sts"
+version = "1.82.0"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-runtime 1.5.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-json 0.61.4 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-query 0.60.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime 1.8.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-xml 0.60.10 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-types 1.3.8 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "fastrand 2.3.0",
  "http 0.2.12",
  "regex-lite",
@@ -1369,11 +1510,32 @@ version = "1.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "084c34162187d39e3740cb635acd73c4e3a551a36146ad6fe8883c929c9f876c"
 dependencies = [
- "aws-credential-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "form_urlencoded",
+ "hex",
+ "hmac",
+ "http 0.2.12",
+ "http 1.3.1",
+ "percent-encoding",
+ "sha2",
+ "time",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sigv4"
+version = "1.3.4"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-smithy-eventstream",
- "aws-smithy-http",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "crypto-bigint 0.5.5",
  "form_urlencoded",
@@ -1403,13 +1565,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-async"
+version = "1.2.5"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "futures-util",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "aws-smithy-checksums"
 version = "0.63.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9054b4cc5eda331cde3096b1576dec45365c5cbbca61d1fffa5f236e251dfce7"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-smithy-http",
- "aws-smithy-types",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "crc-fast",
  "hex",
@@ -1425,10 +1596,9 @@ dependencies = [
 [[package]]
 name = "aws-smithy-eventstream"
 version = "0.60.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "604c7aec361252b8f1c871a7641d5e0ba3a7f5a586e51b66bc9510a5519594d9"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "crc32fast",
 ]
@@ -1439,9 +1609,28 @@ version = "0.62.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c4dacf2d38996cf729f55e7a762b30918229917eca115de45dfa8dfb97796c9"
 dependencies = [
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "bytes-utils",
+ "futures-core",
+ "http 0.2.12",
+ "http 1.3.1",
+ "http-body 0.4.6",
+ "percent-encoding",
+ "pin-project-lite",
+ "pin-utils",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-http"
+version = "0.62.3"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
  "aws-smithy-eventstream",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "bytes-utils",
  "futures-core",
@@ -1460,9 +1649,37 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f108f1ca850f3feef3009bdcc977be201bca9a91058864d9de0684e64514bee0"
 dependencies = [
- "aws-smithy-async",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h2 0.3.26",
+ "h2 0.4.10",
+ "http 0.2.12",
+ "http 1.3.1",
+ "http-body 0.4.6",
+ "hyper 0.14.32",
+ "hyper 1.6.0",
+ "hyper-rustls 0.24.2",
+ "hyper-rustls 0.27.6",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls 0.21.12",
+ "rustls 0.23.27",
+ "rustls-native-certs 0.8.1",
+ "rustls-pki-types",
+ "tokio",
+ "tower 0.5.2",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-http-client"
+version = "1.0.6"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "h2 0.3.26",
  "h2 0.4.10",
  "http 0.2.12",
@@ -1489,7 +1706,15 @@ version = "0.61.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a16e040799d29c17412943bdbf488fd75db04112d0c0d4b9290bacf5ae0014b9"
 dependencies = [
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "aws-smithy-json"
+version = "0.61.4"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
 ]
 
 [[package]]
@@ -1498,7 +1723,15 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9364d5989ac4dd918e5cc4c4bdcc61c9be17dcd2586ea7f69e348fc7c6cab393"
 dependencies = [
- "aws-smithy-runtime-api",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "aws-smithy-observability"
+version = "0.1.3"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
 ]
 
 [[package]]
@@ -1507,7 +1740,16 @@ version = "0.60.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2fbd61ceb3fe8a1cb7352e42689cec5335833cd9f94103a61e98f9bb61c64bb"
 dependencies = [
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "urlencoding",
+]
+
+[[package]]
+name = "aws-smithy-query"
+version = "0.60.7"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "urlencoding",
 ]
 
@@ -1517,12 +1759,35 @@ version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e107ce0783019dbff59b3a244aa0c114e4a8c9d93498af9162608cd5474e796"
 dependencies = [
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-http-client",
- "aws-smithy-observability",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http 0.62.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-http-client 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-observability 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "http 1.3.1",
+ "http-body 0.4.6",
+ "http-body 1.0.1",
+ "pin-project-lite",
+ "pin-utils",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-runtime"
+version = "1.8.6"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http 0.62.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-http-client 1.0.6 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-observability 0.1.3 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "fastrand 2.3.0",
  "http 0.2.12",
@@ -1541,8 +1806,24 @@ version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75d52251ed4b9776a3e8487b2a01ac915f73b2da3af8fc1e77e0fce697a550d4"
 dependencies = [
- "aws-smithy-async",
- "aws-smithy-types",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes",
+ "http 0.2.12",
+ "http 1.3.1",
+ "pin-project-lite",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-smithy-runtime-api"
+version = "1.8.7"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "http 0.2.12",
  "http 1.3.1",
@@ -1579,10 +1860,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-types"
+version = "1.3.2"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "base64-simd",
+ "bytes",
+ "bytes-utils",
+ "futures-core",
+ "http 0.2.12",
+ "http 1.3.1",
+ "http-body 0.4.6",
+ "http-body 1.0.1",
+ "http-body-util",
+ "itoa",
+ "num-integer",
+ "pin-project-lite",
+ "pin-utils",
+ "ryu",
+ "serde",
+ "time",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "aws-smithy-xml"
 version = "0.60.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3db87b96cb1b16c024980f133968d52882ca0daaee3a086c6decc500f6c99728"
+dependencies = [
+ "xmlparser",
+]
+
+[[package]]
+name = "aws-smithy-xml"
+version = "0.60.10"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
 dependencies = [
  "xmlparser",
 ]
@@ -1593,10 +1907,23 @@ version = "1.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b069d19bf01e46298eaedd7c6f283fe565a59263e53eebec945f3e6398f42390"
 dependencies = [
- "aws-credential-types",
- "aws-smithy-async",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-async 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-runtime-api 1.8.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-smithy-types 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rustc_version",
+ "tracing",
+]
+
+[[package]]
+name = "aws-types"
+version = "1.3.8"
+source = "git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf#aabf319462411aa07c3fdcde99e3f1213464c7bf"
+dependencies = [
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-async 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-runtime-api 1.8.7 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "rustc_version",
  "tracing",
 ]
@@ -3593,7 +3920,7 @@ dependencies = [
  "arrow-flight",
  "async-stream",
  "async-trait",
- "aws-config",
+ "aws-config 1.8.5",
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "base64 0.22.1",
@@ -6680,8 +7007,8 @@ source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b155798
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "aws-sdk-glue",
+ "aws-config 1.8.2",
+ "aws-sdk-glue 1.90.0",
  "iceberg",
  "serde_json",
  "tokio",
@@ -6697,10 +7024,10 @@ source = "git+https://github.com/spiceai/iceberg-rust.git?rev=bf04370c1b7b155798
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-sts",
- "aws-sigv4",
+ "aws-config 1.8.2",
+ "aws-credential-types 1.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "aws-sdk-sts 1.78.0",
+ "aws-sigv4 1.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "chrono",
  "http 1.3.1",
  "iceberg",
@@ -7687,10 +8014,10 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "aws-config",
- "aws-credential-types",
+ "aws-config 1.8.5",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-sdk-bedrockruntime",
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "bytes",
  "cudarc 0.12.2",
  "dotenvy",
@@ -11586,14 +11913,13 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-bedrockruntime",
+ "aws-config 1.8.5",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
- "aws-sdk-glue",
+ "aws-sdk-glue 1.114.0",
  "aws-sdk-secretsmanager",
- "aws-sdk-sts",
+ "aws-sdk-sts 1.82.0",
  "axum 0.8.4",
  "axum-extra",
  "azure_core 0.26.0",
@@ -11772,8 +12098,8 @@ version = "1.6.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
- "aws-config",
- "aws-credential-types",
+ "aws-config 1.8.5",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
@@ -12136,10 +12462,10 @@ name = "s3_vectors"
 version = "1.6.0-unstable"
 dependencies = [
  "async-trait",
- "aws-config",
- "aws-credential-types",
+ "aws-config 1.8.5",
+ "aws-credential-types 1.2.5 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "aws-sdk-s3vectors",
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "tokio",
 ]
 
@@ -12147,7 +12473,7 @@ dependencies = [
 name = "s3_vectors_metadata_filter"
 version = "1.6.0-unstable"
 dependencies = [
- "aws-smithy-types",
+ "aws-smithy-types 1.3.2 (git+https://github.com/spiceai/aws-sdk-rust?rev=aabf319462411aa07c3fdcde99e3f1213464c7bf)",
  "datafusion",
  "serde",
  "serde_json",
