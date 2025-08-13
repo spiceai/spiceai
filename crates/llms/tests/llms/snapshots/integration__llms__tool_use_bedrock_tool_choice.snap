@@ -1,0 +1,8 @@
+---
+source: crates/llms/tests/llms/mod.rs
+expression: "serde_json::to_string_pretty(&resp_ptr).expect(\"Failed to serialize snapshot\")"
+snapshot_kind: text
+---
+[
+  "get_current_weather"
+]

@@ -24,7 +24,9 @@ use super::{
     },
 };
 
-use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
+use crate::{
+    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+};
 
 use snafu::prelude::*;
 use std::any::Any;
@@ -97,9 +99,15 @@ pub enum Error {
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
-#[derive(Debug)]
 pub struct S3 {
     pub(crate) params: Parameters,
+    pub(crate) runtime: Option<Runtime>,
+}
+
+impl std::fmt::Debug for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S3(params: {:?})", self.params)
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -166,12 +174,13 @@ impl DataConnectorFactory for S3Factory {
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public") => (),
                 _ => {
-                    let _ = object_store_aws_sdk::initialize_sdk_config().await;
+                    let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
                 }
             }
 
             let s3 = S3 {
                 params: params.parameters,
+                runtime: params.runtime.map(Arc::unwrap_or_clone),
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
@@ -231,6 +240,10 @@ impl ListingTableConnector for S3 {
         )));
 
         Ok(s3_url)
+    }
+
+    fn get_runtime(&self) -> Option<Runtime> {
+        self.runtime.clone()
     }
 
     fn handle_object_store_error(

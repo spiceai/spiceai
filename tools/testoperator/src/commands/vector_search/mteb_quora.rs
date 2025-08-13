@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
 use test_framework::{
@@ -22,7 +25,7 @@ use test_framework::{
     arrow::{self, array::RecordBatch},
     futures::TryStreamExt,
     spiced::SpicedInstance,
-    spicetest::vector_search::{SearchConfig, SearchRequest},
+    spicetest::vector_search::{SearchConfig, SearchRequest, SearchResult},
 };
 
 /// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.
@@ -148,6 +151,99 @@ fn to_search_requests(
         .collect::<Vec<SearchRequest>>();
 
     Ok(queries)
+}
+
+pub(crate) async fn get_query_relevance_data(
+    spiced_instance: &SpicedInstance,
+) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
+    let mut spice_client = spiced_instance.spice_client(None, false).await?;
+
+    let records = execute_sql(
+        &mut spice_client,
+        r#"SELECT "query-id", "corpus-id", score FROM relevance_data"#,
+    )
+    .await?;
+
+    extract_query_relevance_from_batches(&records)
+}
+
+fn extract_query_relevance_from_batches(
+    records: &[RecordBatch],
+) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
+    let mut query_relevance = HashMap::new();
+
+    for batch in records {
+        let query_id_column = batch
+            .column_by_name("query-id")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query-id' column"))?
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Failed to downcast 'query-id' column to LargeStringArray")
+            })?;
+
+        let corpus_id_column = batch
+            .column_by_name("corpus-id")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'corpus-id' column"))?
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Failed to downcast 'corpus-id' column to LargeStringArray")
+            })?;
+
+        let score_column = batch
+            .column_by_name("score")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'score' column"))?
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("Failed to downcast 'score' column to Int64Array"))?;
+
+        for i in 0..batch.num_rows() {
+            let query_id = query_id_column.value(i).to_string();
+            let corpus_id = corpus_id_column.value(i).to_string();
+            let score = i32::try_from(score_column.value(i))
+                .map_err(|e| anyhow::anyhow!("Failed to convert score to i32: {e}"))?;
+
+            query_relevance
+                .entry(query_id)
+                .or_insert_with(HashMap::new)
+                .insert(corpus_id, score);
+        }
+    }
+
+    Ok(query_relevance)
+}
+
+/// Converts raw vector search results into a structure suitable for evaluation.
+/// The key is the search query ID, and the value is a map of matched corpus IDs and their scores.
+/// Using query relevance data from the same dataset, this allows for evaluation of the search results.
+pub(crate) fn transform_search_results_for_eval(
+    search: &BTreeMap<String, SearchResult>,
+) -> HashMap<String, HashMap<String, f64>> {
+    let mut eval_results = HashMap::new();
+
+    for (query_id, search_result) in search {
+        let mut corpus_scores = HashMap::new();
+
+        // Extract corpus IDs and scores from search response results
+        for result in &search_result.response.results {
+            // Try to extract corpus ID from primary key (looking for "_id" field)
+            if let Some(corpus_id_value) = result.primary_key.get("_id") {
+                let corpus_id = match corpus_id_value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => {
+                        continue;
+                    }
+                };
+                corpus_scores.insert(corpus_id, result.score);
+            }
+        }
+
+        eval_results.insert(query_id.clone(), corpus_scores);
+    }
+
+    eval_results
 }
 
 async fn execute_sql(

@@ -27,12 +27,6 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
-
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
@@ -50,8 +44,15 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use futures::FutureExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use std::cmp::min;
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 #[cfg(feature = "s3_vectors")]
 use crate::embeddings::index::{VectorIndex, VectorQueryTableProvider};
@@ -65,6 +66,7 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
+    request::{AsyncMarker, RequestContext},
     search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use tokio::sync::RwLock;
@@ -272,6 +274,12 @@ impl VectorSearchTableFunc {
 
 impl TableFunctionImpl for VectorSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        async {
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            telemetry::track_vector_search(&request_context.to_dimensions());
+        }
+        .now_or_never();
+
         let args = Self::parse_args(args)?;
         let df = self.df.upgrade().ok_or_else(|| {
             DataFusionError::Plan(format!(
@@ -363,6 +371,19 @@ impl VectorSearchUDTFProvider {
                 size,
             ),
         )
+    }
+
+    /// Determine whether and how to pick between
+    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
+    ///   2. The limit provided in `vector_search` args
+    fn limit_to_use(&self, limit: Option<usize>) -> Option<usize> {
+        match (self.args.limit, limit) {
+            (Some(l), None) | (None, Some(l)) => Some(l),
+            (None, None) => None,
+
+            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
+            (Some(a), Some(b)) => Some(min(a, b)),
+        }
     }
 }
 
@@ -464,7 +485,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )],
             input: Arc::new(proj),
-            fetch: limit,
+            fetch: self.limit_to_use(limit),
         });
 
         state.create_physical_plan(&sort).await

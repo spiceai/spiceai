@@ -15,23 +15,18 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{
-    args::DatasetTestArgs,
-    commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
-    wait_test_and_memory,
-};
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType,
     anyhow::{self, Context},
     app::App,
     arrow::{self, array::AsArray, util::pretty::print_batches},
-    flight::put_batches,
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet, TableWithRowCount},
     spiced::SpicedInstance,
-    spicepod::component::dataset::acceleration::RefreshMode,
+    spicepod::acceleration::RefreshMode,
     spicetest::{SpiceTest, append::NotStarted},
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
@@ -41,7 +36,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
 
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
     check_app_is_appendable(&app)?;
 
@@ -56,11 +51,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_tempdir_path(start_request.get_tempdir_path()),
     )
     .with_progress_bars(false)
-    .with_api_key(if args.common.upload_results_dataset.is_some() {
-        Some(TEST_RESULTS_API_KEY.to_string())
-    } else {
-        None
-    })
     .start_appending()
     .await?;
 
@@ -91,14 +81,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
-    if args.common.upload_results_dataset.is_some() {
-        println!("Uploading test results...");
-        let mut flight_client = spiced_instance
-            .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
-            .await?;
-        put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
-    }
-
     spiced_instance.stop()?;
     Ok(())
 }
@@ -109,7 +91,7 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
         if dataset
             .acceleration
             .as_ref()
-            .map_or(true, |a| a.refresh_mode != Some(RefreshMode::Append))
+            .is_none_or(|a| a.refresh_mode != Some(RefreshMode::Append))
         {
             return Err(anyhow::anyhow!(
                 "Dataset {} does not have an append-mode accelerator",
@@ -134,7 +116,7 @@ async fn check_table_counts(
     query_set: QuerySet,
     scale_factor: f64,
 ) -> anyhow::Result<()> {
-    let flight = spiced.flight_client(None).await?;
+    let spice_client = spiced.spice_client(None, false).await?;
 
     let mut any_count_mismatch = false;
     for TableWithRowCount {
@@ -144,7 +126,11 @@ async fn check_table_counts(
     {
         let expected_count = f64::from(expected_count) * scale_factor;
         let sql = format!("SELECT COUNT(*) FROM {name}");
-        let batches = flight.query(&sql).await?.try_collect::<Vec<_>>().await?;
+        let batches = spice_client
+            .query(&sql)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
         if batches.len() != 1 {
             return Err(anyhow::anyhow!(
                 "Expected 1 batch, got {} batches",
