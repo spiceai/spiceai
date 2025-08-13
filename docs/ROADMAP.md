@@ -17,37 +17,61 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ### v1.6 (August 2025)
 
-**Focus:** Advanced Ingestion & CDC - Expanded write capabilities for modern data lakehouse architectures.
+**Focus:** Indexing & Acceleration - Improved performance and reliability for indexing and alignment with data accelerators.
 
-- **DuckDB**: Upgrade to v1.4.x.
+- **Indexing**:
+  - Improved performance and reliability of vectorizing and full-text indexes.
+  - Alignment of indexes to data accelerators for optimized query execution.
+- **DataFusion**: Upgrade to v48.
 - **Hash Partitioning**: Improved query distribution and performance.
-- **CDC**: Expanded CDC/Debezium support.
-- **Ingestion**:
-  - Support write operations to Spice Cloud.
-  - Apache Iceberg write support for scalable table formats.
-  - PostgreSQL write support for relational database integration.
+- **Embedding Models**: Model2Vec static embedding models
+- **Data Connectors**:
+  - MongoDB Data Connector
 
 ### v1.7 (September 2025)
 
+**Focus:** Real-Time Write-Through Caching - Streamlined data and embedding caching with real-time ingestion.
+
+- **Caching**:
+  - Real-time write-through caching for data and embeddings.
 - **Ingestion**:
-  - Delta Lake write support for transactional data lakes.
+  - Real-time data consumption via Apache Kafka.
+  - Improved Change Data Capture (CDC) mechanisms.
+  - Write-through support to Parquet and Apache Iceberg.
+- **DuckDB**: Upgrade to v1.4.
+- **DataFusion**: Upgrade to v49.
 
 ### v1.8 (October 2025)
 
-- **S3 Tables**: Direct querying of S3-Table based datasets.
+**Focus:** Resource Management & Expanded Write Support - Fine-grained resource control and broader database compatibility.
+
+- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
+- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
+- **Write Support**:
+  - MySQL write support.
+  - PostgreSQL write support (expanded).
+  - Spice Cloud write support (expanded).
+- **DataFusion**: Upgrade to v50.
 
 ### v1.9 (November 2025)
 
-TBD.
+**Focus:** Hybrid Search Enhancements - Advanced search capabilities for improved relevance and performance.
+
+- **Hybrid Search**:
+  - Boosting and re-ranking for enhanced search results.
+- **Delta Lake**: Write support for transactional data lakes.
+- **DataFusion**: Upgrade to v51.
 
 ### v1.10 (December 2025)
 
+**Focus:** Extensibility - Flexible middleware for custom integrations.
+
 - **Extensible Middleware**:
-  - Pluggable extensions.
+  - Pluggable extensions for dynamic customization.
 
 ### v2.0 (H1 2026)
 
-**Focus:** Enterprise Policy & Governance
+**Focus:** Enterprise Policy & Governance - Robust security and compliance features.
 
 - **Policy Engine**:
   - Role-based security for fine-grained access control.
@@ -64,21 +88,17 @@ These are prioritized based on community demand and strategic alignment. Share y
 - **Elasticsearch**: Integration for search and analytics workloads.
 - **MotherDuck**: Hybrid cloud DuckDB connector.
 - **BigQuery**: Support for Google Cloud's data warehouse.
-- **Kafka**: Real-time streaming data ingestion.
 - **Google Docs**: Experimental connector for collaborative data sources.
 
 ### APIs
 
-- **GraphQL API**: Flexible, query-driven data access.
 - **Key/Value API**:
   - SlateDB data accelerator for low-latency storage.
-  - RocksDB data accelerator for embedded key-value performance.
 - **PostgreSQL API**: Native compatibility with PostgreSQL clients.
 
 ### AI & Analytics
 
 - **Vision Processing**: Support for image and video.
-- **Advanced Embeddings**: Enhanced support for vector-based AI models.
 - **Custom Model Integration**: Framework for user-defined ML models.
 
 ### Platform Enhancements

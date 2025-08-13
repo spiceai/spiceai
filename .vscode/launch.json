@@ -35,6 +35,28 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator (Search)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "vector-search",
+        "--ready-wait",
+        "1800",
+        "--concurrency",
+        "10",
+        "-p",
+        "./test/spicepods/vector_search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
+        "--benchmark-dataset",
+        "quora_retrieval"
+    ],
+      "env": {
+      },
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
       "name": "spice version",
       "type": "go",
       "request": "launch",

@@ -17,12 +17,13 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
     metrics::QueryStatus,
-    queries::{QueryOverrides, QuerySet},
+    queries::{self, QueryOverrides, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -43,7 +44,7 @@ use sources::FileAppendableSource;
 #[derive(Default)]
 pub struct NotStarted {
     query_set: QuerySet,
-    queries: Vec<(&'static str, &'static str)>,
+    queries: Vec<queries::Query>,
     query_count: usize,
     parallel_count: usize,
     end_duration: Duration,
@@ -94,7 +95,7 @@ impl NotStarted {
 }
 
 pub struct AppendStarted {
-    queries: Vec<(&'static str, &'static str)>,
+    queries: Vec<queries::Query>,
     append_worker: JoinHandle<Result<()>>,
     query_count: usize,
     parallel_count: usize,
@@ -169,9 +170,9 @@ impl SpiceTest<AppendStarted> {
             None
         };
 
-        let flight_client = self
+        let spice_client = self
             .get_spiced()?
-            .flight_client(self.api_key.clone())
+            .spice_client(self.api_key.clone(), false)
             .await?;
 
         let query_workers = (0..self.state.parallel_count)
@@ -180,7 +181,7 @@ impl SpiceTest<AppendStarted> {
                     id,
                     self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
-                    flight_client.clone(),
+                    spice_client.clone(),
                     self.name.clone(),
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
@@ -221,7 +222,7 @@ impl SpiceTest<Running> {
         let mut query_durations = BTreeMap::new();
         let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
-        let mut query_statuses = BTreeMap::new();
+        let mut query_statuses: BTreeMap<Arc<str>, QueryStatus> = BTreeMap::new();
         match self.state.append_worker.await {
             Err(e) => {
                 self.state.query_workers.iter().for_each(|worker| {
@@ -269,15 +270,16 @@ impl SpiceTest<Running> {
             }
 
             for (query, worker_status) in worker_result.query_statuses {
+                let worker_status_clone = worker_status.clone();
                 query_statuses
                     .entry(query)
                     .and_modify(|existing_status| {
                         // If the worker reports failure, update the status to Failed
-                        if worker_status == QueryStatus::Failed {
-                            *existing_status = QueryStatus::Failed;
+                        if let QueryStatus::Failed(msg) = worker_status {
+                            *existing_status = QueryStatus::Failed(msg);
                         }
                     })
-                    .or_insert(worker_status);
+                    .or_insert(worker_status_clone);
             }
         }
 

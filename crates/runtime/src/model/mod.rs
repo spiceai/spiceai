@@ -25,8 +25,9 @@ mod embed;
 pub(crate) mod eval;
 mod metrics;
 mod model_context;
-mod params;
+pub(crate) mod params;
 mod tool_use;
+mod util;
 mod wrapper;
 
 pub use chat::{LLMModelStore, try_to_chat_model};

@@ -1,0 +1,13 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q5"
+---
++-----------+-------------------+
+| n_name    | revenue           |
++-----------+-------------------+
+| INDONESIA | 55502041.16969999 |
+| VIETNAM   | 55295086.99669993 |
+| CHINA     | 53724494.25659998 |
+| INDIA     | 52035512.0002     |
+| JAPAN     | 45410175.69540003 |
++-----------+-------------------+

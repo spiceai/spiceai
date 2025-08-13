@@ -92,8 +92,6 @@ mod management;
 mod metrics;
 mod metrics_server;
 pub mod model;
-pub mod object_store_registry;
-pub mod objectstore;
 mod opentelemetry;
 pub mod parameters;
 pub mod podswatcher;
