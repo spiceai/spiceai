@@ -18,7 +18,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { version = "1.84.0", optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
