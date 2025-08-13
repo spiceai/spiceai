@@ -1658,7 +1658,12 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        spicepod: [duckdb_append_with_pk_and_indexes.yaml, duckdb_append_with_pk.yaml, duckdb_append_with_indexes.yaml]
+        spicepod:
+          [
+            duckdb_append_with_pk_and_indexes.yaml,
+            duckdb_append_with_pk.yaml,
+            duckdb_append_with_indexes.yaml,
+          ]
         # run only on "Linux x64"
         exclude:
           - target:
@@ -1813,7 +1818,12 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        spicepod: [duckdb_full_with_pk_and_indexes.yaml, duckdb_full_with_pk.yaml, duckdb_full_with_indexes.yaml]
+        spicepod:
+          [
+            duckdb_full_with_pk_and_indexes.yaml,
+            duckdb_full_with_pk.yaml,
+            duckdb_full_with_indexes.yaml,
+          ]
         # run only on "Linux x64"
         exclude:
           - target:
