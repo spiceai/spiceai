@@ -16,9 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Error, FailedToBuildAWSRuntimeComponentsSnafu, Result};
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, SdkConfig};
+
 use aws_credential_types::Credentials;
 use aws_runtime::auth::sigv4::SigV4AuthScheme;
 use aws_sdk_s3::{
@@ -31,12 +31,19 @@ use aws_sdk_s3::{
 };
 use aws_smithy_runtime::client::retries::strategy::StandardRetryStrategy;
 use aws_smithy_runtime_api::client::{
-    auth::AuthSchemeId,
+    auth::{AuthSchemeId, SharedAuthScheme},
+    identity::SharedIdentityResolver,
     runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
 };
-use aws_smithy_runtime_api::client::{auth::SharedAuthScheme, identity::SharedIdentityResolver};
-use object_store::{CredentialProvider, aws::AwsCredential};
-use snafu::ResultExt;
+use iceberg::io::{
+    AwsCredential as IcebergAwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader,
+};
+use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCredential};
+use snafu::prelude::*;
+
+use crate::{
+    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveIcebergCredentialsSnafu, Result,
+};
 
 #[derive(Debug)]
 pub struct S3CredentialProvider {
@@ -57,11 +64,11 @@ impl S3CredentialProvider {
         Ok((Self::from_config(&config)?, config))
     }
 
-    /// Creates a new `S3CredentialProvider` from the given SDK configuration.
+    /// Loads credentials from a given SDK configuration.
     ///
     /// # Errors
     ///
-    /// Returns an error if the credentials provider cannot be obtained from the SDK configuration.
+    /// Returns an error if the credentials cannot be loaded from the provided config.
     pub fn from_config(sdk_config: &SdkConfig) -> Result<Self> {
         let credentials_provider = sdk_config
             .credentials_provider()
@@ -71,6 +78,11 @@ impl S3CredentialProvider {
             runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))?,
             identity_resolver: SharedIdentityResolver::new(credentials_provider),
         })
+    }
+
+    #[must_use]
+    pub fn into_custom_loader(self) -> CustomAwsCredentialLoader {
+        CustomAwsCredentialLoader::new(Arc::new(self))
     }
 
     fn build_aws_runtime_components(
@@ -85,7 +97,7 @@ impl S3CredentialProvider {
             .with_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()))
             .with_identity_cache(Some(IdentityCache::lazy().build()))
             .with_identity_resolver(
-                AuthSchemeId::new("SpiceObjectStoreS3CredentialsProvider"),
+                AuthSchemeId::new("SpiceS3CredentialProvider"),
                 SharedIdentityResolver::new(
                     sdk_config
                         .credentials_provider()
@@ -101,8 +113,41 @@ impl S3CredentialProvider {
 }
 
 #[async_trait]
+impl AwsCredentialLoad for S3CredentialProvider {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<IcebergAwsCredential>> {
+        // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
+        // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
+        let wrapped_credentials = self
+            .cache
+            .resolve_cached_identity(
+                self.identity_resolver.clone(),
+                &self.runtime,
+                &ConfigBag::base(),
+            )
+            .await
+            .context(FailedToResolveIcebergCredentialsSnafu)?;
+
+        let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            Error::FailedToResolveIcebergCredentials {
+                source: "No valid credentials found".into(),
+            }
+        })?;
+
+        Ok(Some(IcebergAwsCredential {
+            access_key_id: credentials.access_key_id().to_string(),
+            secret_access_key: credentials.secret_access_key().to_string(),
+            session_token: credentials.session_token().map(ToString::to_string),
+            expires_in: credentials.expiry().map(Into::into),
+        }))
+    }
+}
+
+#[async_trait]
 impl CredentialProvider for S3CredentialProvider {
-    type Credential = AwsCredential;
+    type Credential = ObjectStoreAwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
         // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
@@ -117,17 +162,17 @@ impl CredentialProvider for S3CredentialProvider {
             .await
             .map_err(|_| object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             })?;
 
         let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
             object_store::Error::Generic {
                 store: "S3",
-                source: "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
             }
         })?;
 
-        Ok(Arc::new(AwsCredential {
+        Ok(Arc::new(ObjectStoreAwsCredential {
             key_id: credentials.access_key_id().to_string(),
             secret_key: credentials.secret_access_key().to_string(),
             token: credentials.session_token().map(ToString::to_string),
@@ -212,7 +257,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_credential_provider_caches_calls() {
+    async fn s3_credential_provider_caches_calls_for_iceberg() {
+        let mut file = NamedTempFile::new().expect("To create temp file");
+        setup(&mut file).await.expect("To setup properly");
+
+        let (credential_provider, _) = S3CredentialProvider::from_env()
+            .await
+            .expect("To Create S3CredentialProvider");
+
+        let client = reqwest::Client::new();
+
+        let first_credentials = credential_provider
+            .load_credential(client.clone())
+            .await
+            .expect("To Fetch Credentials")
+            .expect("To Find Valid Credentials");
+
+        let second_credentials = credential_provider
+            .load_credential(client)
+            .await
+            .expect("To Fetch Credentials")
+            .expect("To Find Valid Credentials");
+
+        assert_eq!(
+            first_credentials.access_key_id,
+            second_credentials.access_key_id
+        );
+        assert_eq!(
+            first_credentials.secret_access_key,
+            second_credentials.secret_access_key
+        );
+        assert_eq!(
+            first_credentials.session_token,
+            second_credentials.session_token
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_credential_provider_caches_calls_for_object_store() {
         let mut tempfile = NamedTempFile::new().expect("To create temp file");
 
         setup(&mut tempfile).await.expect("To setup properly");
