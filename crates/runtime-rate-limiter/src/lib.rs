@@ -401,11 +401,9 @@ mod tests {
         // rate limiter with multiple quotas should apply jitter only once
         let rate_limiter = RateLimiterBuilder::new()
             .add_quota(Quota::per_second(
-                // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
             .add_quota(Quota::per_minute(
-                // should result in per minute quota being hit
                 NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
             ))
             .with_jitter(JitterConfig {
