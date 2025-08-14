@@ -259,7 +259,7 @@ impl RuntimeBuilder {
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
             status: self.runtime_status,
-            runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),

@@ -22,7 +22,7 @@ jobs:
     runs-on: spiceai-dev-runners
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
