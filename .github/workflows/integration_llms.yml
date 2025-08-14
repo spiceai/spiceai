@@ -69,7 +69,7 @@ jobs:
     name: Build Test Binary
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -101,7 +101,7 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download test binary
         uses: actions/download-artifact@v4
         with:

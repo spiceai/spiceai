@@ -32,7 +32,7 @@ jobs:
       ARTIFACT_DIR: ./release
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set REL_VERSION to ${{ inputs.target_version }}
         run: |

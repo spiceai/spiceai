@@ -32,7 +32,7 @@ jobs:
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Check new commits since latest nightly build
@@ -62,7 +62,7 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
       - name: Add REL_VERSION to output
@@ -82,7 +82,7 @@ jobs:
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Add nightly postfix to version in Cargo.toml
         env:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
@@ -196,7 +196,7 @@ jobs:
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Add nightly postfix to version in Cargo.toml
         env:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
@@ -362,7 +362,7 @@ jobs:
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.event_name == 'schedule' || inputs.publish
         with:
           fetch-depth: 0
