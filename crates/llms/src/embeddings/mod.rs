@@ -103,6 +103,11 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire a rate controller permit. {source}"))]
     FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
+
+    #[snafu(display(
+        "Invalid OpenAI usage tier '{tier}'. Specify a valid tier of 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'."
+    ))]
+    InvalidOpenAITier { tier: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

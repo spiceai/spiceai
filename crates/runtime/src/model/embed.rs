@@ -30,8 +30,8 @@ use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
 };
-use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -381,6 +381,14 @@ async fn openai(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     // If parameter is from secret store, it will have `openai_` prefix
+    let openai_usage_tier = params
+        .get("usage_tier")
+        .or(params.get("openai_usage_tier"))
+        .map(secrecy::ExposeSecret::expose_secret)
+        .map(UsageTier::from_str)
+        .transpose()?
+        .unwrap_or_default();
+
     let mut embed = OpenaiEmbed::new(
         llms::openai::new_openai_client(
             model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
@@ -398,7 +406,7 @@ async fn openai(
                 .or(params.get("openai_project_id"))
                 .map(secrecy::ExposeSecret::expose_secret),
         ),
-        None,
+        Some(openai_usage_tier.into()),
     );
 
     // For OpenAI compatible embedding models, we allow users to
