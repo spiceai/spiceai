@@ -177,6 +177,10 @@ impl ExecutionPlan for S3VectorsListExec {
         vec![]
     }
 
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,

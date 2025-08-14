@@ -29,14 +29,16 @@ use datafusion::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
+    config::ConfigOptions,
     datasource::DefaultTableSource,
     error::{DataFusionError, Result},
     execution::{SendableRecordBatchStream, SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, execution_plan::CardinalityEffect,
-        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+        coalesce_batches::CoalesceBatchesExec, coalesce_partitions::CoalescePartitionsExec,
+        displayable, execution_plan::CardinalityEffect, stream::RecordBatchStreamAdapter,
     },
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
@@ -47,7 +49,7 @@ use tokio::sync::Semaphore;
 
 use crate::{Index, IndexedTableProvider};
 
-const DEFAULT_MAX_CONCURRENT_COMPUTE_INDEX: u32 = 16;
+const DEFAULT_MAX_CONCURRENT_COMPUTE_INDEX: u32 = 512;
 
 /// [`OptimizerRule`] that looks for [`IndexedTableProvider`] nodes and adds an [`IndexTableScanNode`].
 #[derive(Debug, Default)]
@@ -290,11 +292,40 @@ impl ExtensionPlanner for IndexTableScanExtensionPlanner {
         }
 
         let physical_input = &physical_inputs[0];
+        // tracing::trace!(
+        //     "IndexerExec partition count: {}",
+        //     physical_input.output_partitioning().partition_count()
+        // );
+
+        // let plan = physical_input
+        //     .repartitioned(1, &ConfigOptions::default())?
+        //     .unwrap_or_else(|| {
+        //         tracing::trace!("Repartitioning returned Ok(None)");
+        //         Arc::clone(physical_input)
+        //     });
+        // tracing::trace!(
+        //     "IndexerExec partition count: {}",
+        //     plan.output_partitioning().partition_count()
+        // );
+
+        tracing::trace!(
+            "Inner physical input: {}",
+            displayable(physical_input.as_ref()).tree_render()
+        );
+
         let exec_plan = Arc::new(IndexerExec::new(
             Arc::clone(physical_input),
             index_table_scan_node.indexes.clone(),
         ));
-        Ok(Some(exec_plan))
+
+        let coalesced_plan = Arc::new(CoalescePartitionsExec::new(exec_plan));
+
+        tracing::trace!(
+            "Coalesced plan: {}",
+            displayable(coalesced_plan.as_ref()).tree_render()
+        );
+
+        Ok(Some(coalesced_plan))
     }
 }
 
@@ -355,9 +386,18 @@ impl ExecutionPlan for IndexerExec {
         vec![&self.input_exec]
     }
 
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
