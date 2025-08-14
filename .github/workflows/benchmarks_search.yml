@@ -79,7 +79,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio

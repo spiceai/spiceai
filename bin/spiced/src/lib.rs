@@ -51,13 +51,13 @@ mod tls;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to construct spice app: {source}"))]
-    UnableToConstructSpiceApp { source: app::Error },
+    UnableToConstructSpiceApp { source: Box<app::Error> },
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
-    UnableToStartServers { source: runtime::Error },
+    UnableToStartServers { source: Box<runtime::Error> },
 
     #[snafu(display("Failed to load dataset: {source}"))]
-    UnableToLoadDataset { source: runtime::Error },
+    UnableToLoadDataset { source: Box<runtime::Error> },
 
     #[snafu(display(
         "A required parameter ({parameter}) is missing for data connector: {data_connector}",
@@ -68,7 +68,9 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create data backend: {source}"))]
-    UnableToCreateBackend { source: runtime::datafusion::Error },
+    UnableToCreateBackend {
+        source: Box<runtime::datafusion::Error>,
+    },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: runtime::NotifyError },
@@ -275,7 +277,9 @@ pub async fn run(args: Args) -> Result<()> {
     let result = match server_thread.await {
         // Don't treat force terminated as an error
         Ok(Err(runtime::Error::ForceTerminated)) => Ok(()),
-        Ok(ok) => ok.context(UnableToStartServersSnafu),
+        Ok(ok) => ok.map_err(|e| Error::UnableToStartServers {
+            source: Box::new(e),
+        }),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),

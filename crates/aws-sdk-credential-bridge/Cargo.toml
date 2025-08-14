@@ -3,12 +3,13 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
-name = "object-store-aws-sdk"
+name = "aws-sdk-credential-bridge"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+anyhow = "1"
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
@@ -16,7 +17,9 @@ aws-runtime.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-runtime.workspace = true
 aws-smithy-runtime-api.workspace = true
+iceberg.workspace = true
 object_store.workspace = true
+reqwest.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true

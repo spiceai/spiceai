@@ -22,7 +22,7 @@ use std::{
 };
 
 use arrow::datatypes::SchemaRef;
-use arrow_schema::{ArrowError, Field, Schema};
+use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 
 use data_components::s3_vectors::{
@@ -50,8 +50,11 @@ use search::SEARCH_SCORE_COLUMN_NAME;
 
 use tokio_stream::StreamExt;
 
-use crate::search::util::find_concrete_table_provider;
-use crate::{embedding_col, embeddings::index::VectorIndex};
+use crate::{
+    embedding_col,
+    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+};
+use crate::{embeddings::index::vector_index_filters, search::util::find_concrete_table_provider};
 use search::generation::util::append_fields;
 
 /// An [`IndexedTableProvider`] embued with a [`VectorIndex`] that can order results in the underlying [`IndexedTableProvider::get_underlying`] by vector similarity to a query (similarity with respect to associated embedded column in [`VectorIndex`]).
@@ -97,42 +100,6 @@ impl VectorQueryTableProvider {
             expr,
             false,
         )))
-    }
-
-    /// Returns all filters that can be handled by the given vector index columns.
-    ///
-    /// This does not require that associated [`TableProvider::supports_filters_pushdown`] is
-    /// [`TableProviderFilterPushDown::Unsupported`] for all filters, only that the columns
-    /// referenced in the filters, are those available in the `vector_index_table`.
-    fn vector_index_filters(vector_index_columns: &HashSet<String>, filters: &[Expr]) -> Vec<Expr> {
-        filters
-            .iter()
-            .filter(|f| {
-                let filter_columns = f
-                    .column_refs()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect::<HashSet<_>>();
-                vector_index_columns.is_superset(&filter_columns)
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Returns true if the projection (relative to [`VectorQueryTableProvider`]) can be handled by the given vector index schema.
-    fn vector_index_has_full_projection(
-        &self,
-        vector_index_columns: &HashSet<String>,
-        projection: Option<&Vec<usize>>,
-    ) -> Result<bool, ArrowError> {
-        let schema = match projection {
-            None => self.schema(),
-            Some(indices) => Arc::new(self.schema().project(indices)?),
-        };
-        let columns_requested: HashSet<String> =
-            schema.fields().iter().map(|f| f.name().clone()).collect();
-
-        Ok(vector_index_columns.is_superset(&columns_requested))
     }
 
     fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
@@ -310,7 +277,7 @@ impl VectorQueryTableProvider {
             query_table_ref.clone(),
             Arc::new(DefaultTableSource::new(query_table)),
             None,
-            Self::vector_index_filters(
+            vector_index_filters(
                 &self
                     .vector_index
                     .metadata_columns()
@@ -340,27 +307,6 @@ impl VectorQueryTableProvider {
             // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
             (Some(a), Some(b)) => Some(min(a, b)),
         }
-    }
-
-    // Returns true if the vector index table has all requested columns and can handle all filters (i.e. filters pertain to vector index column, even if they must be post-applied in DataFusion).
-    fn vector_index_table_is_sufficient(
-        &self,
-        vector_index_table: &LogicalPlan,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-    ) -> Result<bool, DataFusionError> {
-        let vector_index_columns: HashSet<String> = vector_index_table
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
-
-        let full_projection =
-            self.vector_index_has_full_projection(&vector_index_columns, projection)?;
-        let vector_index_filters = Self::vector_index_filters(&vector_index_columns, filters);
-
-        Ok(full_projection && vector_index_filters.len() == filters.len())
     }
 }
 
@@ -442,90 +388,94 @@ impl TableProvider for VectorQueryTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let primary_key_fields = self.vector_index.primary_fields();
         let Some(pk) = primary_key_fields.first() else {
-            return Err(DataFusionError::Execution("Vector search index was successfully created without a primary key available during physical planning.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues".to_string()));
+            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         };
         let vector_index_table = self.vector_index_table(pk, filters, limit).await?;
 
         // Only join on base table if required.
-        let base_logical_plan: LogicalPlan =
-            if self.vector_index_table_is_sufficient(&vector_index_table, projection, filters)? {
-                // Let DataFusion handle pushing filters.
-                if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                    LogicalPlan::Filter(Filter::try_new(filter, vector_index_table.into())?)
-                } else {
-                    vector_index_table
-                }
+        let base_logical_plan: LogicalPlan = if vector_index_table_is_sufficient(
+            self.schema(),
+            &vector_index_table,
+            projection,
+            filters,
+        )? {
+            // Let DataFusion handle pushing filters.
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, vector_index_table.into())?)
             } else {
-                // DataFusion does not support equi-JOIN predicate pushdown, so by default the full underlying table will be scanned.
-                // To improve performance, pre-call the vector index to find the relevant primary keys.
-                // Add these primary keys as a filter to the underlying table.
-                // Add primary_key as filter `WHERE primary_key_column in ('a_pk', 'another one',...)`.
-                let mut underlying_filters = filters.to_vec();
-                underlying_filters.push(
-                    self.base_table_query_filter(
-                        state,
-                        state.create_physical_plan(&vector_index_table).await?,
-                        pk.name().to_string(),
-                    )
-                    .await?,
-                );
+                vector_index_table
+            }
+        } else {
+            // DataFusion does not support equi-JOIN predicate pushdown, so by default the full underlying table will be scanned.
+            // To improve performance, pre-call the vector index to find the relevant primary keys.
+            // Add these primary keys as a filter to the underlying table.
+            // Add primary_key as filter `WHERE primary_key_column in ('a_pk', 'another one',...)`.
+            let mut underlying_filters = filters.to_vec();
+            underlying_filters.push(
+                self.base_table_query_filter(
+                    state,
+                    state.create_physical_plan(&vector_index_table).await?,
+                    pk.name().to_string(),
+                )
+                .await?,
+            );
 
-                let underlying_table_scan = self.underlying_table_scan(
-                    underlying_filters.as_slice(),
-                    embedding_col!(self.vector_index.embedded_column()).as_str(),
-                    self.vector_index.metadata_columns().all_names().as_slice(),
-                )?;
+            let underlying_table_scan = self.underlying_table_scan(
+                underlying_filters.as_slice(),
+                embedding_col!(self.vector_index.embedded_column()).as_str(),
+                self.vector_index.metadata_columns().all_names().as_slice(),
+            )?;
 
-                let join_schema = vector_index_table
-                    .schema()
-                    .join(underlying_table_scan.schema())?;
+            let join_schema = vector_index_table
+                .schema()
+                .join(underlying_table_scan.schema())?;
 
-                // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
-                let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
-                    filters.iter().cloned().partition(|f| {
-                        f.column_refs()
-                            .contains(&Column::new_unqualified(pk.name().clone()))
-                    });
-
-                let join = LogicalPlan::Join(Join {
-                    left: Arc::new(vector_index_table),
-                    right: Arc::new(underlying_table_scan),
-                    join_type: JoinType::Left,
-                    join_constraint: JoinConstraint::On,
-                    on: vec![(
-                        Expr::Column(Column::new_unqualified(pk.name().clone())),
-                        Expr::Column(Column::new_unqualified(pk.name().clone())),
-                    )],
-                    filter: pre_join_filters.into_iter().reduce(Expr::and),
-                    schema: join_schema.into(),
-                    null_equals_null: false,
+            // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
+            let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
+                filters.iter().cloned().partition(|f| {
+                    f.column_refs()
+                        .contains(&Column::new_unqualified(pk.name().clone()))
                 });
 
-                // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
-                // case, we will remove first.
-                let deduped_schema = DFSchema::new_with_metadata(
-                    join.schema()
-                        .iter()
-                        .filter(|(tbl, f)| {
-                            !(f.name() == pk.name()
-                                && tbl.is_some_and(|t| *t == TableReference::parse_str("tbl")))
-                        })
-                        .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
-                        .collect(),
-                    HashMap::default(),
-                )?;
+            let join = LogicalPlan::Join(Join {
+                left: Arc::new(vector_index_table),
+                right: Arc::new(underlying_table_scan),
+                join_type: JoinType::Left,
+                join_constraint: JoinConstraint::On,
+                on: vec![(
+                    Expr::Column(Column::new_unqualified(pk.name().clone())),
+                    Expr::Column(Column::new_unqualified(pk.name().clone())),
+                )],
+                filter: pre_join_filters.into_iter().reduce(Expr::and),
+                schema: join_schema.into(),
+                null_equals_null: false,
+            });
 
-                let proj = LogicalPlan::Projection(Projection::new_from_schema(
-                    join.into(),
-                    deduped_schema.into(),
-                ));
+            // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
+            // case, we will remove first.
+            let deduped_schema = DFSchema::new_with_metadata(
+                join.schema()
+                    .iter()
+                    .filter(|(tbl, f)| {
+                        !(f.name() == pk.name()
+                            && tbl.is_some_and(|t| *t == TableReference::parse_str("tbl")))
+                    })
+                    .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
+                    .collect(),
+                HashMap::default(),
+            )?;
 
-                if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
-                    LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
-                } else {
-                    proj
-                }
-            };
+            let proj = LogicalPlan::Projection(Projection::new_from_schema(
+                join.into(),
+                deduped_schema.into(),
+            ));
+
+            if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+            } else {
+                proj
+            }
+        };
 
         let sort = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr {
@@ -681,7 +631,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "query_table_basic",
+            "query_table_basic_metadata",
         )
         .await?;
 
@@ -689,7 +639,7 @@ mod tests {
             Arc::clone(&provider),
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
-            "query_table_join_for_projection",
+            "query_table_join_for_projection_metadata",
         )
         .await?;
 

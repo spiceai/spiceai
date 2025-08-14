@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use datafusion::{
     error::DataFusionError,
     execution::{
@@ -27,7 +28,6 @@ use object_store::{
     ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
     http::HttpBuilder,
 };
-use object_store_aws_sdk::S3CredentialProvider;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
@@ -117,7 +117,7 @@ impl SpiceObjectStoreRegistry {
 
         if load_credentials_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
-            if let Some(sdk_config) = object_store_aws_sdk::get_sdk_config() {
+            if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(

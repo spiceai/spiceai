@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-rate-control"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+futures.workspace = true
+governor = { workspace = true, features = ["std"] }
+rand.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true

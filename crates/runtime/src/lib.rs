@@ -436,7 +436,7 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
-    runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 
@@ -914,7 +914,7 @@ impl Runtime {
         let start_time = Instant::now();
 
         // shutdown all running components except the HTTP and Metrics servers
-        let mut runtime_tasks = self.runtime_tasks.write().await;
+        let mut runtime_tasks = self.tasks.write().await;
 
         // HTTP and METRICS servers must be shutdown last
         let mut first_shutdown_group = Vec::new();
@@ -981,7 +981,7 @@ impl Runtime {
     {
         let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        self.runtime_tasks
+        self.tasks
             .write()
             .await
             .insert(component_name.to_string(), handle);
@@ -1070,6 +1070,7 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)

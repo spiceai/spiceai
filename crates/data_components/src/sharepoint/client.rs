@@ -31,6 +31,9 @@ use super::{
     error::Error,
 };
 
+type DriveItemResponseResult =
+    Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>;
+
 /// Represents all the ways a Sharepoint [Drive](https://learn.microsoft.com/en-us/graph/api/resources/drive?view=graph-rest-1.0) can be identified.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub enum PublicDrivePtr {
@@ -160,9 +163,11 @@ async fn resolve_drive_ptr(
         PublicDrivePtr::SiteId(id) => Ok(DrivePtr::SiteId(id.to_string())),
         PublicDrivePtr::Me => Ok(DrivePtr::Me),
         PublicDrivePtr::DriveName(name) => {
-            let drives = get_drive_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let drives = get_drive_items(Arc::clone(&client)).await.map_err(|e| {
+                Error::MicrosoftGraphFailure {
+                    source: Box::new(e),
+                }
+            })?;
             let Some(drive_id) = drives.get(name) else {
                 tracing::warn!(
                     "Drive with name '{}' is not found. Available drives: {}.",
@@ -180,9 +185,11 @@ async fn resolve_drive_ptr(
             Ok(DrivePtr::DriveId(drive_id.to_string()))
         }
         PublicDrivePtr::GroupName(name) => {
-            let groups = get_group_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let groups = get_group_items(Arc::clone(&client)).await.map_err(|e| {
+                Error::MicrosoftGraphFailure {
+                    source: Box::new(e),
+                }
+            })?;
             let Some(group_id) = groups.get(name) else {
                 tracing::warn!(
                     "Group with name '{}' is not found. Available groups: {}.",
@@ -224,9 +231,11 @@ async fn resolve_drive_ptr(
             Ok(DrivePtr::GroupId(group_id.to_string()))
         }
         PublicDrivePtr::SiteName(name) => {
-            let sites = get_site_items(Arc::clone(&client))
-                .await
-                .map_err(|e| Error::MicrosoftGraphFailure { source: e })?;
+            let sites = get_site_items(Arc::clone(&client)).await.map_err(|e| {
+                Error::MicrosoftGraphFailure {
+                    source: Box::new(e),
+                }
+            })?;
             let Some(site_id) = sites.get(name) else {
                 tracing::warn!(
                     "Site '{}' is not found. Available sites: {}.",
@@ -311,10 +320,7 @@ impl SharepointClient {
     pub(crate) fn stream_drive_items(
         self: Arc<Self>,
         limit: Option<usize>,
-    ) -> Result<
-        impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,
-        GraphFailure,
-    > {
+    ) -> Result<impl Stream<Item = DriveItemResponseResult>, Box<GraphFailure>> {
         // Request docs: `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
         let mut req = match self.drive_client() {
             DriveApi::Id(client) => match &self.drive_item {
@@ -345,7 +351,7 @@ impl SharepointClient {
         // req.order_by() // `ORDER BY <expr>`
         // req.expand() // To include file content
 
-        req.paging().stream::<DriveItemResponse>()
+        req.paging().stream::<DriveItemResponse>().map_err(Box::new)
     }
 
     /// Returns the underlying content of a drive item.
@@ -373,7 +379,9 @@ impl SharepointClient {
             let raw = self
                 .get_drive_item_content(&item.id)
                 .await
-                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
+                .map_err(|source| Error::MicrosoftGraphFailure {
+                    source: Box::new(source),
+                })?;
 
             if let Some(formatter) = &formatter {
                 let doc = formatter
@@ -460,6 +468,7 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
 ///    "name2": "id2",
 /// })
 /// ```
+#[allow(clippy::result_large_err)]
 fn process_list_objs(
     resp: &serde_json::Value,
     name_key: &str,

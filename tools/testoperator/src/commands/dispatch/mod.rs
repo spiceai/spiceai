@@ -115,23 +115,35 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                 })
             }
             (TestType::Benchmark, _) => {
-                println!("Test file {path:#?} does not contain a benchmark test");
+                println!(
+                    "Test file {} does not contain a benchmark test",
+                    path.display()
+                );
                 continue;
             }
             (TestType::Throughput, _) => {
-                println!("Test file {path:#?} does not contain a throughput test");
+                println!(
+                    "Test file {} does not contain a throughput test",
+                    path.display()
+                );
                 continue;
             }
             (TestType::Load, _) => {
-                println!("Test file {path:#?} does not contain a load test");
+                println!("Test file {} does not contain a load test", path.display());
                 continue;
             }
             (TestType::HttpConsistency, _) => {
-                println!("Test file {path:#?} does not contain an HTTP consistency test");
+                println!(
+                    "Test file {} does not contain an HTTP consistency test",
+                    path.display()
+                );
                 continue;
             }
             (TestType::HttpOverhead, _) => {
-                println!("Test file {path:#?} does not contain an HTTP overhead test");
+                println!(
+                    "Test file {} does not contain an HTTP overhead test",
+                    path.display()
+                );
                 continue;
             }
             _ => {
@@ -144,8 +156,9 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         payload = map_numbers_to_strings(payload);
 
         println!(
-            "{index}/{total_tests} - Dispatching {test_type} test from {path:#?}",
-            index = index + 1
+            "{index}/{total_tests} - Dispatching {test_type} test from {}",
+            path.display(),
+            index = index + 1,
         );
         GitHubWorkflow::new(
             "spiceai",
