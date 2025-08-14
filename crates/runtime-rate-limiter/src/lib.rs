@@ -29,7 +29,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to acquire semaphore permit.\n{source}"))]
+    #[snafu(display("Failed to acquire semaphore permit. {source}"))]
     SemaphoreAcquireError { source: tokio::sync::AcquireError },
 }
 
@@ -67,8 +67,14 @@ impl RateLimiterBuilder {
     }
 
     #[must_use]
-    pub fn with_quota(mut self, quota: Quota) -> Self {
+    pub fn add_quota(mut self, quota: Quota) -> Self {
         self.quotas.push(quota);
+        self
+    }
+
+    #[must_use]
+    pub fn with_quotas(mut self, quotas: Vec<Quota>) -> Self {
+        self.quotas = quotas;
         self
     }
 
@@ -100,6 +106,11 @@ pub struct RateLimiter {
 pub struct Permit<'a>(Option<SemaphorePermit<'a>>);
 
 impl RateLimiter {
+    #[must_use]
+    pub fn builder() -> RateLimiterBuilder {
+        RateLimiterBuilder::new()
+    }
+
     fn new(
         jitter: Option<JitterConfig>,
         governors: Vec<Arc<Governor<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
@@ -167,7 +178,7 @@ mod tests {
                 max: Duration::from_millis(200),
             })
             .with_max_concurrent_requests(5)
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
             ))
             .build();
@@ -221,12 +232,12 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_per_second() {
         let rate_limiter = RateLimiterBuilder::new()
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 NonZeroU32::new(2).expect("NonZeroU32 should be non-zero"),
             ))
             .build();
 
-        // acquire all 10 permits at once, which should exhaust the rate limit
+        // acquire all 2 permits at once, which should exhaust the rate limit
         futures::future::try_join_all((0..2).map(|_| rate_limiter.acquire()))
             .await
             .expect("Should acquire all permits");
@@ -255,11 +266,11 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_with_multiple_quotas() {
         let rate_limiter = RateLimiterBuilder::new()
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
-            .with_quota(Quota::per_minute(
+            .add_quota(Quota::per_minute(
                 // should result in per minute quota being hit
                 NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
             ))
@@ -295,11 +306,11 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_hits_multiple_quotas() {
         let rate_limiter = RateLimiterBuilder::new()
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 // per-second will get hit first
                 NonZeroU32::new(4).expect("NonZeroU32 should be non-zero"),
             ))
-            .with_quota(Quota::per_minute(
+            .add_quota(Quota::per_minute(
                 // then per-minute will get hit
                 NonZeroU32::new(6).expect("NonZeroU32 should be non-zero"),
             ))
@@ -356,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limiter_jitter() {
         let rate_limiter = RateLimiterBuilder::new()
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
@@ -380,7 +391,7 @@ mod tests {
 
         // a rate limit without jitter should complete near immediately
         let rate_limiter = RateLimiterBuilder::new()
-            .with_quota(Quota::per_second(
+            .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
