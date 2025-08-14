@@ -16,15 +16,6 @@ struct StringValue {
     pub lower: Arc<str>,
 }
 
-impl StringValue {
-    fn new(val: &str) -> Self {
-        Self {
-            original: Arc::from(val),
-            lower: Arc::from(val.to_lowercase()),
-        }
-    }
-}
-
 impl From<String> for StringValue {
     fn from(s: String) -> Self {
         let original: Arc<str> = Arc::from(s.into_boxed_str());
