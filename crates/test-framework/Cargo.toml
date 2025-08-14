@@ -41,7 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
-sysinfo = "0.35.2"
+sysinfo = "0.37.0"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true
