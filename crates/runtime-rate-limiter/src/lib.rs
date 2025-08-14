@@ -134,7 +134,7 @@ impl RateLimiter {
             None
         };
 
-        // check all of the rate limiters async and wait to re-check
+        // check all of the rate limiters async
         futures::future::join_all(
             self.governors
                 .iter()
