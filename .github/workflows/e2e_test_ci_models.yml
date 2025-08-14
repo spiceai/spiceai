@@ -59,7 +59,7 @@ concurrency:
 jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
-    timeout-minutes: 30
+    timeout-minutes: 90
     runs-on: ${{ matrix.target.builder }}
     env:
       GOVER: 1.24.2
