@@ -12,8 +12,7 @@ use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
 struct StringValue {
-    #[allow(dead_code)]
-    original: Arc<str>,
+    _original: Arc<str>,
     pub lower: Arc<str>,
 }
 
@@ -21,7 +20,7 @@ impl From<String> for StringValue {
     fn from(s: String) -> Self {
         let original: Arc<str> = Arc::from(s.into_boxed_str());
         let lower: Arc<str> = Arc::from(original.to_lowercase());
-        Self { original, lower }
+        Self { _original: original, lower }
     }
 }
 
