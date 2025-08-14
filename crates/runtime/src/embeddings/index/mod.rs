@@ -71,7 +71,9 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     /// columns and the associated embedding vectors of the [`VectorIndex::embedded_column`].
     ///
     /// The associated embedding vector column will be [`VectorIndex::embedded_column`] with `_embedding` appended (e.g. `body_embedding`).
-    fn list_table_provider(&self) -> Arc<dyn TableProvider>;
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The additional columns available in the [`VectorIndex`].
     fn metadata_columns(&self) -> &MetadataColumns;
@@ -156,14 +158,18 @@ impl VectorIndex for S3Vector {
     /// Use a [`S3VectorsListTable`] and then:
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
-    fn list_table_provider(&self) -> Arc<dyn TableProvider> {
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let Some((pk_name, pk_data_type)) = self
             .primary_fields()
-            .iter()
-            .next()
+            .first()
             .map(|f| (f.name().clone(), f.data_type().clone()))
         else {
-            panic!("mahhhhh")
+            return Err(Box::from(
+                "Vector indexes defined without a primary key cannot be used for retrieving vectors"
+                    .to_string(),
+            ));
         };
 
         let mut projection = metadata_columns_to_exprs(self.metadata_columns());
@@ -191,7 +197,7 @@ impl VectorIndex for S3Vector {
             Arc::new(S3VectorsListTable::from(self.index.table.clone())),
             projection,
         )
-        .expect("blame jeadie")
+        .boxed()
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
@@ -208,8 +214,7 @@ impl VectorIndex for S3Vector {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let Some((pk_name, pk_data_type)) = self
             .primary_fields()
-            .iter()
-            .next()
+            .first()
             .map(|f| (f.name().clone(), f.data_type().clone()))
         else {
             return Err(Box::from(
@@ -551,16 +556,17 @@ pub mod tests {
             self.primary_columns.clone()
         }
 
-        fn list_table_provider(&self) -> Arc<dyn TableProvider> {
-            Arc::new(ExplainMemTable(
-                MemTable::try_new(
-                    Arc::new(self.schema.clone()),
-                    vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
-                        self.schema.clone(),
-                    ))]],
-                )
-                .expect("Could not build PretendVectorIndex::list_table_provider"),
-            ))
+        fn list_table_provider(
+            &self,
+        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+            let mem_table = MemTable::try_new(
+                Arc::new(self.schema.clone()),
+                vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
+                    self.schema.clone(),
+                ))]],
+            )
+            .boxed()?;
+            Ok(Arc::new(ExplainMemTable(mem_table)))
         }
 
         fn metadata_columns(&self) -> &MetadataColumns {

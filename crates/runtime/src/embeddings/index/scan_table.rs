@@ -92,30 +92,6 @@ impl VectorScanTableProvider {
         )
     }
 
-    /// Construct [`TableScan`] for associated vector search index table for `projection` & `filters` relative to [`VectorScanTableProvider`].
-    ///
-    /// Ok(None), if no columns from table scan are required and no filters are needed.
-    fn vector_table_scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-    ) -> DataFusionResult<Option<LogicalPlan>> {
-        // Filter pushdown not supported for S3 vector listVectors. If vector is not needed in projection, do not need this table.
-        let need_vector_column = self.need_vector_column(projection);
-        if !need_vector_column {
-            return Ok(None);
-        }
-
-        TableScan::try_new(
-            TableReference::parse_str("vector_index"),
-            Arc::new(DefaultTableSource::new(self.index.list_table_provider())),
-            None,
-            vec![],
-            None,
-        )
-        .map(|ts| Some(LogicalPlan::TableScan(ts)))
-    }
-
     /// For a projection relative to [`VectorScanTableProvider`], check if the embedding column is being requested.
     fn need_vector_column(&self, projection: Option<&Vec<usize>>) -> bool {
         let Some(proj) = projection else {
