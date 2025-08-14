@@ -107,8 +107,7 @@ impl Completer for EditorHelper {
         let mut matches = Vec::new();
 
         let cache = self.schema_cache.try_read().map_err(|_| {
-            rustyline::error::ReadlineError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            rustyline::error::ReadlineError::Io(std::io::Error::other(
                 "Cache lock error",
             ))
         })?;
@@ -144,7 +143,7 @@ impl Completer for EditorHelper {
                 if table.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
                         display: table.to_string(),
-                        replacement: format!("{} ", table),
+                        replacement: format!("{table} "),
                     });
                 }
             }
@@ -172,7 +171,7 @@ impl Completer for EditorHelper {
                 if table.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
                         display: table.to_lowercase(),
-                        replacement: format!("{} ", table),
+                        replacement: format!("{table} "),
                     });
                 }
             }
@@ -181,7 +180,7 @@ impl Completer for EditorHelper {
                 if column.to_lowercase().starts_with(&word_lower) {
                     matches.push(Pair {
                         display: column.to_lowercase(),
-                        replacement: format!("{} ", column),
+                        replacement: format!("{column} "),
                     });
                 }
             }
@@ -192,7 +191,7 @@ impl Completer for EditorHelper {
 }
 
 async fn refresh_schema(
-    mut client: FlightServiceClient<Channel>,
+    client: FlightServiceClient<Channel>,
     schema_cache: &Arc<RwLock<SchemaCache>>,
     api_key: Option<&String>,
     user_agent: &str,
@@ -261,7 +260,7 @@ async fn get_columns(
 
     let records = crate::get_records(
         client.clone(),
-        &query,
+        query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -291,7 +290,7 @@ async fn get_udfs(
 
     let records = crate::get_records(
         client.clone(),
-        &query,
+        query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -550,8 +549,7 @@ mod tests {
             let completions = get_completions(&helper, sql, sql.len());
             assert!(
                 completions.contains(&"age ".to_string()),
-                "Failed for: {}",
-                sql
+                "Failed for: {sql}"
             );
         }
     }

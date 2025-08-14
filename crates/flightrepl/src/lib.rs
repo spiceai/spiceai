@@ -40,11 +40,10 @@ use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
-use rustyline::history::FileHistory;
 use rustyline::{
-    Completer, CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
+    CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
 };
-use rustyline::{Editor, EventHandler, Modifiers};
+use rustyline::{Editor, EventHandler};
 use serde_json::json;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
