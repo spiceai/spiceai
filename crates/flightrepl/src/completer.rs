@@ -11,10 +11,33 @@ use tokio::time::interval;
 use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
+struct StringValue {
+    original: Arc<str>,
+    pub lower: Arc<str>,
+}
+
+impl StringValue {
+    fn new(val: &str) -> Self {
+        Self {
+            original: Arc::from(val),
+            lower: Arc::from(val.to_lowercase()),
+        }
+    }
+}
+
+impl From<String> for StringValue {
+    fn from(s: String) -> Self {
+        let original: Arc<str> = Arc::from(s.into_boxed_str());
+        let lower: Arc<str> = Arc::from(original.to_lowercase());
+        Self { original, lower }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SchemaCache {
     udfs: Vec<String>,
-    tables: Vec<String>,
-    columns: Vec<String>,
+    tables: Vec<StringValue>,
+    columns: Vec<StringValue>,
 
     keywords: Vec<String>,
 }
@@ -30,11 +53,11 @@ impl SchemaCache {
     }
 
     fn update_tables(&mut self, tables: Vec<String>) {
-        self.tables = tables;
+        self.tables = tables.into_iter().map(StringValue::from).collect();
     }
 
     fn update_columns(&mut self, columns: Vec<String>) {
-        self.columns = columns;
+        self.columns = columns.into_iter().map(StringValue::from).collect();
     }
 
     fn update_udfs(&mut self, udfs: Vec<String>) {
@@ -107,9 +130,7 @@ impl Completer for EditorHelper {
         let mut matches = Vec::new();
 
         let cache = self.schema_cache.try_read().map_err(|_| {
-            rustyline::error::ReadlineError::Io(std::io::Error::other(
-                "Cache lock error",
-            ))
+            rustyline::error::ReadlineError::Io(std::io::Error::other("Cache lock error"))
         })?;
 
         let before_cursor = &line[..pos].to_lowercase();
@@ -140,10 +161,10 @@ impl Completer for EditorHelper {
         if should_suggest_only_tables {
             // Only suggest tables
             for table in &cache.tables {
-                if table.to_lowercase().starts_with(&word_lower) {
+                if table.lower.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: table.to_string(),
-                        replacement: format!("{table} "),
+                        display: table.lower.to_string(),
+                        replacement: format!("{} ", table.lower.as_ref()),
                     });
                 }
             }
@@ -168,19 +189,19 @@ impl Completer for EditorHelper {
             }
 
             for table in &cache.tables {
-                if table.to_lowercase().starts_with(&word_lower) {
+                if table.lower.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: table.to_lowercase(),
-                        replacement: format!("{table} "),
+                        display: table.lower.to_string(),
+                        replacement: format!("{} ", table.lower.as_ref()),
                     });
                 }
             }
 
             for column in &cache.columns {
-                if column.to_lowercase().starts_with(&word_lower) {
+                if column.lower.starts_with(&word_lower) {
                     matches.push(Pair {
-                        display: column.to_lowercase(),
-                        replacement: format!("{column} "),
+                        display: column.lower.to_string(),
+                        replacement: format!("{} ", column.lower.as_ref()),
                     });
                 }
             }
@@ -368,7 +389,10 @@ mod tests {
                 "products".to_string(),
                 "orders".to_string(),
                 "user_profiles".to_string(),
-            ],
+            ]
+            .into_iter()
+            .map(StringValue::from)
+            .collect(),
             columns: vec![
                 "id".to_string(),
                 "name".to_string(),
@@ -379,7 +403,10 @@ mod tests {
                 "user_id".to_string(),
                 "order_date".to_string(),
                 "profile_picture".to_string(),
-            ],
+            ]
+            .into_iter()
+            .map(StringValue::from)
+            .collect(),
             keywords: ALL_KEYWORDS.iter().map(|k| k.to_lowercase()).collect(),
         }));
 
