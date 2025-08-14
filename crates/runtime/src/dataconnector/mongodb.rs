@@ -123,7 +123,6 @@ impl DataConnectorFactory for MongoDBFactory {
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-
             // If a full connection_string is provided, warn about ignored connection details.
             if params.parameters.get("connection_string").ok().is_some() {
                 let ignored: Vec<&str> = IGNORED_IF_URI
@@ -134,10 +133,10 @@ impl DataConnectorFactory for MongoDBFactory {
 
                 if !ignored.is_empty() {
                     tracing::warn!(
-                    "Both 'connection_string' and individual connection parameters ({}) were provided. \
+                        "Both 'connection_string' and individual connection parameters ({}) were provided. \
                      The 'connection_string' will be used and the listed parameters will be ignored.",
-                    ignored.join(", ")
-                );
+                        ignored.join(", ")
+                    );
                 }
             }
 
