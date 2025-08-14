@@ -445,7 +445,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: /tmp
           pattern: images-*
@@ -537,7 +537,7 @@ jobs:
     runs-on: "ubuntu-gpu-t4-4-core"
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: /tmp
           pattern: images-amd64-cuda

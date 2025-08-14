@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: llms-integration-test-binary
           path: ./integration_test
