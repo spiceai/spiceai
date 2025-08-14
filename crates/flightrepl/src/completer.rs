@@ -61,7 +61,7 @@ impl SchemaCache {
 
 impl EditorHelper {
     /// Start the background refresh task
-    /// refresh_interval: How often to refresh schema (in seconds)
+    /// `refresh_interval`: How often to refresh schema (in seconds)
     pub fn start_refreshing(&mut self, refresh_interval: u64) {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         self.shutdown_sender = Some(shutdown_tx);
@@ -69,7 +69,7 @@ impl EditorHelper {
         let Some(client) = self.flight_client.clone() else {
             return;
         };
-        let schema_cache = self.schema_cache.clone();
+        let schema_cache = Arc::clone(&self.schema_cache);
         let api_key = self.api_key.clone();
         let user_agent = self.user_agent.clone();
 
