@@ -11805,6 +11805,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-rate-limiter"
+version = "1.6.0-unstable"
+dependencies = [
+ "futures",
+ "governor",
+ "rand 0.9.2",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "runtime-table-partition"
 version = "1.6.0-unstable"
 dependencies = [
