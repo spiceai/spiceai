@@ -49,7 +49,6 @@ impl KeyringSecretStore {
 
 #[async_trait]
 impl SecretStore for KeyringSecretStore {
-    #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         // Try with prefixed key first
         let prefixed_key = format!("{KEYRING_SECRET_PREFIX}{key}");

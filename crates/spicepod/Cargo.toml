@@ -9,10 +9,10 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 byte-unit.workspace = true
 fundu.workspace = true
 futures.workspace = true
-object-store-aws-sdk = { path = "../object-store-aws-sdk" }
 object_store.workspace = true
 regex.workspace = true
 schemars = { workspace = true, optional = true }

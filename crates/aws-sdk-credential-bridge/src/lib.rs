@@ -14,22 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod credential_provider;
 use std::sync::Arc;
-
-use aws_config::{BehaviorVersion, SdkConfig};
-use aws_credential_types::provider::ProvideCredentials;
-use aws_smithy_runtime_api::client::runtime_components::BuildError;
-use object_store::{ObjectStore, aws::AmazonS3Builder};
 use tokio::sync::OnceCell;
 
-mod credential_provider;
+use aws_config::{BehaviorVersion, SdkConfig};
+use aws_sdk_s3::config::ProvideCredentials;
+use aws_smithy_runtime_api::client::runtime_components::BuildError;
 pub use credential_provider::S3CredentialProvider;
+use object_store::{ObjectStore, aws::AmazonS3Builder};
 use url::Url;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an S3 dataset: {source}."
+        "An unexpected error occurred when initializing the AWS SDK for retrieval of AWS credentials for an Iceberg S3 dataset: {source}."
     ))]
     FailedToBuildAWSRuntimeComponents { source: BuildError },
 
@@ -37,6 +36,13 @@ pub enum Error {
         "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
     ))]
     FailedToGetCredentialsProviderFromConfig,
+
+    #[snafu(display(
+        "Failed to find valid credentials from the AWS credential provider chain for the Iceberg S3 connection. {source} Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain"
+    ))]
+    FailedToResolveIcebergCredentials {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Not an S3 URL: {url}"))]
     NotAnS3Url { url: String },

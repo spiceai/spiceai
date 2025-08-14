@@ -355,7 +355,9 @@ pub(super) async fn get_vectors(
         .filter_map(|(_, s)| s.map(ToString::to_string))
         .collect();
 
+    tracing::trace!("Sending request to upstream embedding model");
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
+    tracing::trace!("Received response from upstream embedding model");
 
     let mut builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(

@@ -41,7 +41,7 @@ jobs:
     name: Check Rust Licenses
     runs-on: spiceai-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -61,7 +61,7 @@ jobs:
       GOVER: 1.24.2
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
         uses: actions/setup-go@v5
