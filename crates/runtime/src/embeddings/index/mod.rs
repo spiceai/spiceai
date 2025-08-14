@@ -40,24 +40,52 @@ pub(crate) mod scan_table;
 pub use query_table::VectorQueryTableProvider;
 pub use scan_table::VectorScanTableProvider;
 
-#[derive(Debug, Clone)]
-pub struct IndexEmbeddingConfig {
-    pub model_name: String,
-    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-}
-
+/// A [`VectorIndex`] is a table index that can provide vector similarity results for arbitrary queries (see [`VectorIndex::query_table_provider`]).
+///
+/// A [`VectorIndex`] can have additional metadata columns to improve the filter capabilities of
+/// [`VectorIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
+///  of the vector index and underlying table.
 #[async_trait]
 pub trait VectorIndex: std::fmt::Debug + Send + Sync {
+    /// The name of the column, in the underlying table, of the column for which vector similarity is performed against.
     fn embedded_column(&self) -> String;
+
+    /// All [`Field`]s that define a primary key between the underlying table and the [`VectorIndex`].
+    ///
+    /// TODO: This PR is changing it so that this [`VectorIndex`] is responsible for converting the
+    ///  internal unique key, to the jointly understood PK.
     fn primary_fields(&self) -> Vec<Field>;
+
+    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
+    /// columns and the associated embedding vectors of the [`VectorIndex::embedded_column`].
+    ///
+    /// TODO: need to convert s3vector to
+    ///   1. Return primary key as per [`VectorIndex::primary_fields`].
     fn list_table_provider(&self) -> Arc<dyn TableProvider>;
+
+    /// The additional columns available in the [`VectorIndex`].
     fn metadata_columns(&self) -> &MetadataColumns;
-    fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider>;
+
+    /// Update the index based on a [`RecordBatch`] from the underlying table.
     async fn write(&self, record: &RecordBatch);
+
+    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
+    /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
+    ///  similarity score between `query` and the [`VectorIndex::embedded_column`].
+    ///
+    /// TODO: need to convert s3vector to
+    ///   1. Return score, not distance.
+    ///   2. Return primary key as per [`VectorIndex::primary_fields`].
     async fn query_table_provider(
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexEmbeddingConfig {
+    pub model_name: String,
+    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 /// Implementations of indexes that can produce embedding vectors for a column in the associated [`IndexedTableProvider`], and some, provide efficient search mechanism for it.
@@ -98,10 +126,6 @@ impl VectorIndex for S3Vector {
         &self.index.metadata_columns
     }
 
-    fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-        Arc::new(VectorScanTableProvider::new(table, self))
-    }
-
     async fn write(&self, record: &RecordBatch) {
         s3::write(&self.index, &self.cfg, record).await;
     }
@@ -128,6 +152,8 @@ impl VectorIndex for S3Vector {
             )));
         };
 
+        // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
+        // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
         Ok(Arc::new(S3VectorsQueryTable::new(
             self.index.table.clone(),
             query_vector,
@@ -425,10 +451,6 @@ pub mod tests {
 
         fn metadata_columns(&self) -> &MetadataColumns {
             &self.metadata
-        }
-
-        fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-            table
         }
 
         async fn write(&self, _record: &RecordBatch) {}
