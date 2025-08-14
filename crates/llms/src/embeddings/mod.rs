@@ -100,6 +100,9 @@ pub enum Error {
         "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
     ))]
     ModelNotProvided { model_source: String },
+
+    #[snafu(display("Failed to acquire a rate controller permit. {source}"))]
+    FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

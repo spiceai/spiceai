@@ -22,7 +22,6 @@ use governor::{
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
-use rand::prelude::*;
 use snafu::ResultExt;
 use snafu::prelude::*;
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -35,10 +34,26 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+// tokio::task_local! {
+//     static THREAD_RNG: LazyLock<Arc<Mutex<ThreadRng>>>
+// }
+
 #[derive(Debug, Default)]
 pub struct JitterConfig {
     min: Duration,
     max: Duration,
+}
+
+impl JitterConfig {
+    #[must_use]
+    pub fn new(min: Duration, max: Duration) -> Self {
+        Self { min, max }
+    }
+
+    #[must_use]
+    pub fn zero() -> Self {
+        Self::new(Duration::ZERO, Duration::ZERO)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -150,8 +165,7 @@ impl RateController {
         .await;
 
         // add jitter
-        let mut rng = rand::rng();
-        let jitter_wait = rng.random_range(self.jitter_config.min..=self.jitter_config.max);
+        let jitter_wait = rand::random_range(self.jitter_config.min..=self.jitter_config.max);
         tokio::time::sleep(jitter_wait).await;
 
         Ok(Permit(semaphore))

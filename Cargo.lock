@@ -7723,6 +7723,7 @@ dependencies = [
  "regex",
  "reqwest",
  "reqwest-eventsource",
+ "runtime-rate-control",
  "schemars 0.9.0",
  "secrecy",
  "serde",
