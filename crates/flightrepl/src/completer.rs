@@ -20,7 +20,10 @@ impl From<String> for StringValue {
     fn from(s: String) -> Self {
         let original: Arc<str> = Arc::from(s.into_boxed_str());
         let lower: Arc<str> = Arc::from(original.to_lowercase());
-        Self { _original: original, lower }
+        Self {
+            _original: original,
+            lower,
+        }
     }
 }
 
