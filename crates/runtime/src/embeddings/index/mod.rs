@@ -21,15 +21,26 @@ use arrow_schema::{ArrowError, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
-    MetadataColumns, list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
 
-use crate::model::EmbeddingModelStore;
+use crate::{
+    embedding_col, embeddings::index::query_table::metadata_columns_to_exprs,
+    model::EmbeddingModelStore,
+};
 use datafusion::{
-    catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,
+    catalog::TableProvider,
+    common::Column,
+    datasource::{DefaultTableSource, ViewTable},
+    error::DataFusionError,
+    logical_expr::{BinaryExpr, Cast, LogicalPlan, Operator, Projection, TableScan, expr::Alias},
+    prelude::{Expr, lit},
+    sql::TableReference,
 };
 use tokio::sync::RwLock;
 
@@ -59,8 +70,7 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
     /// columns and the associated embedding vectors of the [`VectorIndex::embedded_column`].
     ///
-    /// TODO: need to convert s3vector to
-    ///   1. Return primary key as per [`VectorIndex::primary_fields`].
+    /// The associated embedding vector column will be [`VectorIndex::embedded_column`] with `_embedding` appended (e.g. `body_embedding`).
     fn list_table_provider(&self) -> Arc<dyn TableProvider>;
 
     /// The additional columns available in the [`VectorIndex`].
@@ -106,34 +116,11 @@ impl S3Vector {
         let model = model_lock.get(&self.cfg.model_name)?;
         Some(Arc::clone(model))
     }
-}
 
-#[async_trait]
-impl VectorIndex for S3Vector {
-    fn embedded_column(&self) -> String {
-        self.index.embedded_column.clone()
-    }
-
-    fn primary_fields(&self) -> Vec<Field> {
-        self.index.primary_key.clone()
-    }
-
-    fn list_table_provider(&self) -> Arc<dyn TableProvider> {
-        Arc::new(S3VectorsListTable::from(self.index.table.clone()))
-    }
-
-    fn metadata_columns(&self) -> &MetadataColumns {
-        &self.index.metadata_columns
-    }
-
-    async fn write(&self, record: &RecordBatch) {
-        s3::write(&self.index, &self.cfg, record).await;
-    }
-
-    async fn query_table_provider(
+    pub async fn query_vector(
         &self,
         query: &str,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
         let models = self.cfg.embedding_models.read().await;
         let Some(embedding_model) = models.get(&self.cfg.model_name) else {
             return Err(Box::from(format!(
@@ -152,12 +139,119 @@ impl VectorIndex for S3Vector {
             )));
         };
 
+        Ok(query_vector)
+    }
+}
+
+#[async_trait]
+impl VectorIndex for S3Vector {
+    fn embedded_column(&self) -> String {
+        self.index.embedded_column.clone()
+    }
+
+    fn primary_fields(&self) -> Vec<Field> {
+        self.index.primary_key.clone()
+    }
+
+    /// Use a [`S3VectorsListTable`] and then:
+    ///   1. Convert the primary key to its appropriate name and data type
+    ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
+    fn list_table_provider(&self) -> Arc<dyn TableProvider> {
+        let Some((pk_name, pk_data_type)) = self
+            .primary_fields()
+            .iter()
+            .next()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+        else {
+            panic!("mahhhhh")
+        };
+
+        let mut projection = metadata_columns_to_exprs(self.metadata_columns());
+        projection.extend(vec![
+            Expr::Alias(Alias::new(
+                Expr::Cast(Cast::new(
+                    Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                        S3_VECTOR_PRIMARY_KEY_NAME,
+                    ))),
+                    pk_data_type,
+                )),
+                None::<TableReference>,
+                pk_name,
+            )),
+            Expr::Alias(Alias::new(
+                Expr::Column(datafusion::common::Column::new_unqualified(
+                    S3_VECTOR_EMBEDDING_NAME,
+                )),
+                None::<TableReference>,
+                embedding_col!(self.embedded_column()),
+            )),
+        ]);
+
+        table_with_projection(
+            Arc::new(S3VectorsListTable::from(self.index.table.clone())),
+            projection,
+        )
+        .expect("blame jeadie")
+    }
+
+    fn metadata_columns(&self) -> &MetadataColumns {
+        &self.index.metadata_columns
+    }
+
+    async fn write(&self, record: &RecordBatch) {
+        s3::write(&self.index, &self.cfg, record).await;
+    }
+
+    async fn query_table_provider(
+        &self,
+        query: &str,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((pk_name, pk_data_type)) = self
+            .primary_fields()
+            .iter()
+            .next()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+        else {
+            return Err(Box::from(
+                "Vector indexes defined without a primary key cannot be used for querying vectors"
+                    .to_string(),
+            ));
+        };
+
+        let mut projection = vec![
+            Expr::Alias(Alias::new(
+                Expr::Cast(Cast::new(
+                    Box::new(Expr::Column(Column::new_unqualified(
+                        S3_VECTOR_PRIMARY_KEY_NAME,
+                    ))),
+                    pk_data_type.clone(),
+                )),
+                None::<TableReference>,
+                pk_name,
+            )),
+            Expr::Alias(Alias::new(
+                Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
+                None::<TableReference>,
+                embedding_col!(self.embedded_column()),
+            )),
+            Expr::Alias(Alias::new(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(lit(1.0)),
+                    Operator::Minus,
+                    Box::new(Expr::Column(Column::new_unqualified("distance"))),
+                )),
+                None::<TableReference>,
+                SEARCH_SCORE_COLUMN_NAME,
+            )),
+        ];
+        projection.extend(metadata_columns_to_exprs(self.metadata_columns()));
+
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
-        Ok(Arc::new(S3VectorsQueryTable::new(
-            self.index.table.clone(),
-            query_vector,
-        )))
+        let vector = self.query_vector(query).await?;
+        let tp = Arc::new(S3VectorsQueryTable::new(self.index.table.clone(), vector));
+
+        table_with_projection(tp, projection).boxed()
     }
 }
 
@@ -243,6 +337,26 @@ pub(super) fn vector_index_filters(
         })
         .cloned()
         .collect()
+}
+
+fn table_with_projection(
+    tbl: Arc<dyn TableProvider>,
+    projection: Vec<Expr>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let scan = TableScan::try_new(
+        "",
+        Arc::new(DefaultTableSource::new(tbl)),
+        None,
+        vec![],
+        None,
+    )?;
+    Ok(Arc::new(ViewTable::new(
+        LogicalPlan::Projection(Projection::try_new(
+            projection,
+            Arc::new(LogicalPlan::TableScan(scan)),
+        )?),
+        None,
+    )) as Arc<dyn TableProvider>)
 }
 
 #[cfg(test)]

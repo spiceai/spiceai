@@ -20,16 +20,13 @@ use arrow::datatypes::SchemaRef;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 
-use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
-
 use datafusion::{
     catalog::Session,
     common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        Cast, Expr, Filter, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown,
-        TableScan, expr::Alias,
+        Expr, Filter, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan,
     },
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
@@ -109,66 +106,14 @@ impl VectorScanTableProvider {
             return Ok(None);
         }
 
-        let list_scan = self.index.list_table_provider();
-        let list_scan_schema = list_scan.schema();
-        let proj = [
-            index_of_column(&list_scan_schema, S3_VECTOR_EMBEDDING_NAME),
-            index_of_column(&list_scan_schema, S3_VECTOR_PRIMARY_KEY_NAME),
-        ]
-        .iter()
-        .filter_map(|p| *p)
-        .collect();
-
-        let scan = TableScan::try_new(
+        TableScan::try_new(
             TableReference::parse_str("vector_index"),
-            Arc::new(DefaultTableSource::new(list_scan)),
-            Some(proj),
+            Arc::new(DefaultTableSource::new(self.index.list_table_provider())),
+            None,
             vec![],
             None,
-        )?;
-
-        // Add expected column aliases.
-        let primary_key = self
-            .index
-            .primary_fields()
-            .first()
-            .map_or(S3_VECTOR_PRIMARY_KEY_NAME.to_string(), |f| f.name().clone());
-
-        let primary_key_datatype = self
-            .index
-            .primary_fields()
-            .iter()
-            .find_map(|f| {
-                if *f.name() == primary_key {
-                    Some(f.data_type().clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(DataType::Utf8);
-
-        let aliased = LogicalPlan::Projection(Projection::try_new(
-            vec![
-                Expr::Alias(Alias::new(
-                    Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
-                    Some(TableReference::parse_str("vector_index")),
-                    embedding_col!(self.index.embedded_column()),
-                )),
-                Expr::Alias(Alias::new(
-                    Expr::Cast(Cast::new(
-                        Box::new(Expr::Column(Column::new_unqualified(
-                            S3_VECTOR_PRIMARY_KEY_NAME,
-                        ))),
-                        primary_key_datatype,
-                    )),
-                    Some(TableReference::parse_str("vector_index")),
-                    primary_key,
-                )),
-            ],
-            Arc::new(LogicalPlan::TableScan(scan)),
-        )?);
-
-        Ok(Some(aliased))
+        )
+        .map(|ts| Some(LogicalPlan::TableScan(ts)))
     }
 
     /// For a projection relative to [`VectorScanTableProvider`], check if the embedding column is being requested.
@@ -270,13 +215,21 @@ impl TableProvider for VectorScanTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // If vector table isn't needed (in either filters or projection)
-        let Some(vector_table_scan) = self.vector_table_scan(projection, filters)? else {
+        // Filter pushdown not supported for S3 vector listVectors. If vector is not needed in projection, do not need to join on this table.
+        if !self.need_vector_column(projection) {
             return self
                 .table_provider
                 .scan(state, projection, filters, limit)
                 .await;
-        };
+        }
+
+        let vector_table_scan = LogicalPlan::TableScan(TableScan::try_new(
+            TableReference::parse_str("vector_index"),
+            Arc::new(DefaultTableSource::new(self.index.list_table_provider())),
+            None,
+            vec![],
+            None,
+        )?);
 
         let primary_key_fields = self.index.primary_fields();
         let Some(pk) = primary_key_fields.first() else {

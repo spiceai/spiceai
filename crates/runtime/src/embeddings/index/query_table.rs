@@ -25,9 +25,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 
-use data_components::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-};
+use data_components::s3_vectors::MetadataColumns;
 
 use datafusion::{
     catalog::Session,
@@ -35,12 +33,10 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        BinaryExpr, Cast, Expr, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
-        TableProviderFilterPushDown, TableScan,
-        expr::{Alias, InList},
+        Expr, Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableProviderFilterPushDown,
+        TableScan, expr::InList,
     },
     physical_plan::ExecutionPlan,
-    prelude::lit,
     scalar::ScalarValue,
     sql::TableReference,
 };
@@ -232,7 +228,6 @@ impl VectorQueryTableProvider {
 
     async fn vector_index_table(
         &self,
-        pk: &Field,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<LogicalPlan, DataFusionError> {
@@ -240,41 +235,9 @@ impl VectorQueryTableProvider {
             .vector_index
             .query_table_provider(self.query.as_str())
             .await?;
-        let query_table_ref = TableReference::parse_str("vector_index");
-
-        let mut query_table_projection_exprs = vec![
-            Expr::Alias(Alias::new(
-                Expr::Cast(Cast::new(
-                    Box::new(Expr::Column(Column::new_unqualified(
-                        S3_VECTOR_PRIMARY_KEY_NAME,
-                    ))),
-                    pk.data_type().clone(),
-                )),
-                Some(query_table_ref.clone()),
-                pk.name().to_string(),
-            )),
-            Expr::Alias(Alias::new(
-                Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
-                None::<TableReference>,
-                embedding_col!(self.vector_index.embedded_column()),
-            )),
-            Expr::Alias(Alias::new(
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(lit(1.0)),
-                    Operator::Minus,
-                    Box::new(Expr::Column(Column::new_unqualified("distance"))),
-                )),
-                Some(query_table_ref.clone()),
-                SEARCH_SCORE_COLUMN_NAME,
-            )),
-        ];
-
-        query_table_projection_exprs.extend(metadata_columns_to_exprs(
-            self.vector_index.metadata_columns(),
-        ));
 
         let query_table_scan = TableScan::try_new(
-            query_table_ref.clone(),
+            TableReference::parse_str("vector_index"),
             Arc::new(DefaultTableSource::new(query_table)),
             None,
             vector_index_filters(
@@ -290,10 +253,7 @@ impl VectorQueryTableProvider {
             self.limit_to_use(limit),
         )?;
 
-        Ok(LogicalPlan::Projection(Projection::try_new(
-            query_table_projection_exprs.clone(),
-            Arc::new(LogicalPlan::TableScan(query_table_scan)),
-        )?))
+        Ok(LogicalPlan::TableScan(query_table_scan))
     }
 
     /// Determine whether and how to pick between
@@ -390,7 +350,7 @@ impl TableProvider for VectorQueryTableProvider {
         let Some(pk) = primary_key_fields.first() else {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
         };
-        let vector_index_table = self.vector_index_table(pk, filters, limit).await?;
+        let vector_index_table = self.vector_index_table(filters, limit).await?;
 
         // Only join on base table if required.
         let base_logical_plan: LogicalPlan = if vector_index_table_is_sufficient(
@@ -504,7 +464,7 @@ impl TableProvider for VectorQueryTableProvider {
 
 /// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.
 #[must_use]
-fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
+pub(super) fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
     metadata_columns
         .iter()
         .map(|c| Expr::Column(Column::new_unqualified(c.name())))
