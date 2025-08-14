@@ -133,9 +133,9 @@ impl DataConnectorFactory for MongoDBFactory {
 
                 if !ignored.is_empty() {
                     tracing::warn!(
-                        "Both 'connection_string' and individual connection parameters ({}) were provided. \
-                     The 'connection_string' will be used and the listed parameters will be ignored.",
-                        ignored.join(", ")
+                        "Both 'connection_string' and individual connection parameters ({parameters}) were provided for the {component}. The 'connection_string' will be used and the listed parameters will be ignored.",
+                        parameters = ignored.join(", "),
+                        component = params.component
                     );
                 }
             }
