@@ -42,6 +42,7 @@ use tower::{Layer, Service};
 /// # Errors
 ///
 /// Returns an error if the authorization header is missing, the header is not a valid bearer token, or the credentials are invalid.
+#[allow(clippy::result_large_err)]
 pub fn validate_basic_auth_handshake(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -67,6 +68,7 @@ pub fn validate_basic_auth_handshake(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn get_authorization_value<'a>(
     metadata: &'a MetadataMap,
     prefix: &'static str,
