@@ -352,4 +352,49 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_rate_limiter_jitter() {
+        let rate_limiter = RateLimiterBuilder::new()
+            .with_quota(Quota::per_second(
+                // purposely set a high per-second limit which should not be hit
+                NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
+            ))
+            .with_jitter(JitterConfig {
+                min: Duration::from_millis(1000),
+                max: Duration::from_millis(2000),
+            })
+            .build();
+
+        // acquiring a permit should wait at least for the jitter minimum duration
+        tokio::select! {
+            permit = rate_limiter.acquire() => {
+                assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
+                let permit = permit.expect("should be Ok");
+                assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
+            },
+            () = tokio::time::sleep(Duration::from_millis(1000)) => {
+                panic!("Expected to wait for at least 1000ms, but timed out.");
+            }
+        }
+
+        // a rate limit without jitter should complete near immediately
+        let rate_limiter = RateLimiterBuilder::new()
+            .with_quota(Quota::per_second(
+                // purposely set a high per-second limit which should not be hit
+                NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
+            ))
+            .build();
+
+        tokio::select! {
+            permit = rate_limiter.acquire() => {
+                assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
+                let permit = permit.expect("should be Ok");
+                assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
+            },
+            () = tokio::time::sleep(Duration::from_nanos(100)) => {
+                panic!("Expected to acquire a permit immediately, but timed out.");
+            }
+        }
+    }
 }
