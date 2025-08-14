@@ -34,6 +34,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+// tokio::task_local! {
+//     static THREAD_RNG: LazyLock<Arc<Mutex<ThreadRng>>>
+// }
+
 #[derive(Debug, Default)]
 pub struct JitterConfig {
     min: Duration,
