@@ -160,7 +160,7 @@ impl RateController {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, time::Instant};
 
     use super::*;
 
@@ -374,14 +374,18 @@ mod tests {
             .build();
 
         // acquiring a permit should wait at least for the jitter minimum duration
+        let start = Instant::now();
         tokio::select! {
             permit = rate_controller.acquire() => {
+                let end = Instant::now();
+                let elapsed = end.duration_since(start);
+                assert!(elapsed >= Duration::from_millis(1000), "Expected at least 1000ms of jitter, but got {elapsed:?}");
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
-            () = tokio::time::sleep(Duration::from_millis(1000)) => {
-                panic!("Expected to wait for at least 1000ms, but timed out.");
+            () = tokio::time::sleep(Duration::from_millis(2000)) => {
+                panic!("Expected to wait for up to 2000ms, but timed out.");
             }
         }
 
@@ -418,14 +422,18 @@ mod tests {
             })
             .build();
 
+        let start = Instant::now();
         tokio::select! {
             permit = rate_controller.acquire() => {
+                let end = Instant::now();
+                let elapsed = end.duration_since(start);
+                assert!(elapsed >= Duration::from_millis(1000), "Expected at least 1000ms of jitter, but got {elapsed:?}");
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
-            () = tokio::time::sleep(Duration::from_millis(1000)) => {
-                panic!("Expected to wait for at least 1000ms, but timed out.");
+            () = tokio::time::sleep(Duration::from_millis(2000)) => {
+                panic!("Expected to wait for up to 2000ms, but timed out.");
             }
         }
     }
