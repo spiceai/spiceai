@@ -624,6 +624,12 @@ impl Chat for MistralLlama {
     }
 }
 
+impl crate::model::Model for MistralLlama {
+    fn as_chat(&self) -> Option<&dyn Chat> {
+        Some(self)
+    }
+}
+
 fn stream_from_response(
     mut rcv: Receiver<MistralResponse>,
 ) -> Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>> {

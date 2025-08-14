@@ -80,6 +80,12 @@ impl Chat for Anthropic {
     }
 }
 
+impl crate::model::Model for Anthropic {
+    fn as_chat(&self) -> Option<&dyn Chat> {
+        Some(self)
+    }
+}
+
 impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
     type Error = OpenAIError;
 
