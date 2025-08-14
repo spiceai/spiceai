@@ -699,7 +699,7 @@ pub enum DataRetentionFilter {
         time_partition_format: Option<TimeFormat>,
     },
     Expression {
-        delete_expr: Expr,
+        delete_expr: Box<Expr>,
     },
 }
 
@@ -809,7 +809,9 @@ impl RetentionBuilder {
 
         // Add expression-based filter
         if let Some(delete_expr) = self.delete_expr {
-            filters.push(DataRetentionFilter::Expression { delete_expr });
+            filters.push(DataRetentionFilter::Expression {
+                delete_expr: Box::new(delete_expr),
+            });
         }
 
         if filters.is_empty() {

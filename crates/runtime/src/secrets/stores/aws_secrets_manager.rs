@@ -92,7 +92,6 @@ impl AwsSecretsManager {
 
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
-    #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         tracing::trace!(
             "Getting secret {} from AWS Secrets Manager",
@@ -146,6 +145,7 @@ impl SecretStore for AwsSecretsManager {
 ///
 /// This function will return an error if:
 /// - The input string cannot be parsed as a valid JSON object.
+#[allow(clippy::result_large_err)]
 pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> {
     let parsed: serde_json::Value =
         serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
