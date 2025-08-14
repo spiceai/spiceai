@@ -270,6 +270,12 @@ impl Chat for Databricks {
     }
 }
 
+impl super::model::Model for Databricks {
+    fn as_chat(&self) -> Option<&dyn Chat> {
+        Some(self)
+    }
+}
+
 #[async_trait]
 impl Embed for Databricks {
     async fn health(&self) -> super::embeddings::Result<()> {

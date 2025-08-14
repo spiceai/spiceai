@@ -14,22 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod accumulate;
-pub mod anthropic;
-pub mod bedrock;
-pub mod chat;
-pub mod chunking;
-pub mod config;
-pub mod databricks;
-pub mod embeddings;
-pub mod model;
-pub mod openai;
-pub mod perplexity;
-pub mod progress;
-pub mod responses;
-pub mod xai;
+use crate::{chat::Chat, responses::Responses};
 
-pub enum HealthCheck {
-    Required,
-    Skip,
+pub trait Model {
+    fn as_chat(&self) -> Option<&dyn Chat> {
+        None
+    }
+
+    fn as_responses(&self) -> Option<&dyn Responses> {
+        None
+    }
 }

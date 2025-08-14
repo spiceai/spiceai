@@ -430,6 +430,7 @@ mod tests {
             })))
         }
     }
+
     async fn run_post(progress_header: Option<&'static str>) -> Vec<String> {
         let mut store = LLMModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));

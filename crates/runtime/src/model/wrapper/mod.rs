@@ -374,6 +374,12 @@ impl Chat for ChatWrapper {
     }
 }
 
+impl llms::model::Model for ChatWrapper {
+    fn as_chat(&self) -> Option<&dyn Chat> {
+        Some(self)
+    }
+}
+
 /// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and `task_history` tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
 struct TracedChatCompletionStream<S> {
     inner: S,

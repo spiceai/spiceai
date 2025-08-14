@@ -14,22 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod accumulate;
-pub mod anthropic;
-pub mod bedrock;
-pub mod chat;
-pub mod chunking;
-pub mod config;
-pub mod databricks;
-pub mod embeddings;
-pub mod model;
-pub mod openai;
-pub mod perplexity;
-pub mod progress;
-pub mod responses;
-pub mod xai;
+use async_trait::async_trait;
 
-pub enum HealthCheck {
-    Required,
-    Skip,
-}
+#[async_trait]
+pub trait Responses: Sync + Send {}
