@@ -12,6 +12,7 @@ use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
 struct StringValue {
+    #[allow(dead_code)]
     original: Arc<str>,
     pub lower: Arc<str>,
 }
@@ -252,10 +253,8 @@ async fn get_tables(
     let mut tables = Vec::new();
     for batch in records.0 {
         if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
-            for value in array.iter() {
-                if let Some(table_name) = value {
-                    tables.push(table_name.to_string());
-                }
+            for table_name in array.iter().flatten() {
+                tables.push(table_name.to_string());
             }
         }
     }
@@ -282,10 +281,8 @@ async fn get_columns(
     let mut columns = Vec::new();
     for batch in records.0 {
         if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
-            for value in array.iter() {
-                if let Some(column_name) = value {
-                    columns.push(column_name.to_string());
-                }
+            for column_name in array.iter().flatten() {
+                columns.push(column_name.to_string());
             }
         }
     }
@@ -312,10 +309,8 @@ async fn get_udfs(
     let mut udfs = Vec::new();
     for batch in records.0 {
         if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
-            for value in array.iter() {
-                if let Some(column_name) = value {
-                    udfs.push(column_name.to_string());
-                }
+            for column_name in array.iter().flatten() {
+                udfs.push(column_name.to_string());
             }
         }
     }
@@ -358,6 +353,7 @@ fn extract_word(line: &str, pos: usize) -> (usize, &str) {
 }
 
 fn is_word_boundary(ch: char) -> bool {
+    #[allow(clippy::match_like_matches_macro)]
     match ch {
         ' ' | '\t' | '\n' | '\r' => true,
         '(' | ')' | ',' | ';' | '=' | '<' | '>' | '!' | '+' | '-' | '*' | '/' | '%' => true,
