@@ -319,8 +319,10 @@ fn extract_word(line: &str, pos: usize) -> (usize, &str) {
     // Find start of current word
     let mut start = pos;
     while start > 0 {
-        let ch = chars[start - 1];
-        if is_word_boundary(ch) {
+        let Some(ch) = chars.get(start - 1) else {
+            unreachable!("Start position should always be equal to the length of the characters");
+        };
+        if is_word_boundary(*ch) {
             break;
         }
         start -= 1;
@@ -329,8 +331,10 @@ fn extract_word(line: &str, pos: usize) -> (usize, &str) {
     // Find end of current word
     let mut end = pos;
     while end < chars.len() {
-        let ch = chars[end];
-        if is_word_boundary(ch) {
+        let Some(ch) = chars.get(end) else {
+            unreachable!("Start position should always be equal to the length of the characters");
+        };
+        if is_word_boundary(*ch) {
             break;
         }
         end += 1;
@@ -393,7 +397,9 @@ mod tests {
     fn get_completions(helper: &EditorHelper, line: &str, pos: usize) -> Vec<String> {
         let history = MemHistory::new();
         let ctx = Context::new(&history);
-        let result = helper.complete(line, pos, &ctx).unwrap();
+        let result = helper
+            .complete(line, pos, &ctx)
+            .expect("Should complete suggestion");
         result.1.into_iter().map(|pair| pair.replacement).collect()
     }
 
