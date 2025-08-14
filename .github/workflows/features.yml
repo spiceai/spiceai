@@ -198,7 +198,7 @@ jobs:
           CARGO_INCREMENTAL: 0
           CARGO_NET_GIT_FETCH_WITH_CLI: true
 
-      - name: Build with only mongodb`
+      - name: Build with only mongodb
         run: cargo check --no-default-features --features mongodb
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}

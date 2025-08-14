@@ -35,14 +35,6 @@ use super::{
     ParameterSpec,
 };
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to create MongoDB connection pool: {source}"))]
-    UnableToCreateMongoDBSQLConnectionPool { source: MongoDBError },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
 }
@@ -74,24 +66,51 @@ const DEFAULT_MAX_POOL_SIZE: usize = 10;
 const DEFAULT_MAX_POOL_SIZE_STR: &str = "10";
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
-    ParameterSpec::component("user").secret(),
-    ParameterSpec::component("pass").secret(),
-    ParameterSpec::component("host"),
-    ParameterSpec::component("port"),
-    ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode"),
-    ParameterSpec::component("sslrootcert"),
-    ParameterSpec::component("auth_source"),
-    ParameterSpec::component("direct_connection"),
-    ParameterSpec::component("time_zone"),
-    ParameterSpec::component("unnest_depth"),
+    ParameterSpec::component("connection_string")
+        .description("Full MongoDB connection URI in standard format (e.g., mongodb://user:pass@host:port/dbname). If provided, this overrides individual host, port, user, pass, and db parameters. See: https://www.mongodb.com/docs/manual/reference/connection-string/#connection-string-formats")
+        .secret(),
+    ParameterSpec::component("user")
+        .description("Username for MongoDB authentication. Must be used together with 'pass' unless 'connection_string' is provided.")
+        .secret(),
+    ParameterSpec::component("pass")
+        .description("Password for MongoDB authentication. Must be used together with 'user' unless 'connection_string' is provided.")
+        .secret(),
+    ParameterSpec::component("host")
+        .description("Hostname or IP address of the MongoDB server. Defaults to 'localhost' if not specified."),
+    ParameterSpec::component("port")
+        .description("Port number the MongoDB server is listening on. Defaults to '27017'."),
+    ParameterSpec::component("db")
+        .description("Database name to connect to. Defaults to 'default' if not specified."),
+    ParameterSpec::component("sslmode")
+        .description("TLS/SSL mode for the connection. Supported values: 'disabled', 'required', 'preferred'. Defaults to 'required'. 'preferred' allows invalid certificates/hostnames."),
+    ParameterSpec::component("sslrootcert")
+        .description("Path to a CA root certificate file to use for TLS verification. Optional; if not provided, system defaults are used."),
+    ParameterSpec::component("auth_source")
+        .description("Authentication source database. Overrides the default auth source in the connection string."),
+    ParameterSpec::component("direct_connection")
+        .description("Whether to connect directly to a single MongoDB host instead of discovering the topology. Accepts 'true' or 'false'."),
+    ParameterSpec::component("time_zone")
+        .description("Time zone to use for interpreting and returning timestamp values (e.g., 'UTC', 'America/Los_Angeles')."),
+    ParameterSpec::component("unnest_depth")
+        .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
+    ParameterSpec::component("num_docs_to_infer_schema")
+        .description("Number of documents to use to infer the schema. Defaults to 400."),
     ParameterSpec::component("pool_min")
-        .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
+        .description("Minimum number of connections to keep open in the pool, created lazily when first needed. Defaults to 10.")
         .default(DEFAULT_MIN_POOL_SIZE_STR),
     ParameterSpec::component("pool_max")
-        .description("The maximum number of connections to allow in the pool.")
+        .description("Maximum number of connections allowed in the pool. Defaults to 100.")
         .default(DEFAULT_MAX_POOL_SIZE_STR),
+];
+
+const IGNORED_IF_URI: &[&str] = &[
+    "host",
+    "port",
+    "db",
+    "user",
+    "pass",
+    "auth_source",
+    "direct_connection",
 ];
 
 impl DataConnectorFactory for MongoDBFactory {
@@ -104,6 +123,24 @@ impl DataConnectorFactory for MongoDBFactory {
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+
+            // If a full connection_string is provided, warn about ignored connection details.
+            if params.parameters.get("connection_string").ok().is_some() {
+                let ignored: Vec<&str> = IGNORED_IF_URI
+                    .iter()
+                    .copied()
+                    .filter(|k| params.parameters.get(k).ok().is_some())
+                    .collect();
+
+                if !ignored.is_empty() {
+                    tracing::warn!(
+                    "Both 'connection_string' and individual connection parameters ({}) were provided. \
+                     The 'connection_string' will be used and the listed parameters will be ignored.",
+                    ignored.join(", ")
+                );
+                }
+            }
+
             let mut pool_min = params
                 .parameters
                 .get("pool_min")
@@ -113,7 +150,7 @@ impl DataConnectorFactory for MongoDBFactory {
                     let parsed_pool_min = pool_min_str.parse::<usize>();
                     if parsed_pool_min.is_err() {
                         tracing::warn!(
-                            "Invalid pool_min value: {pool_min_str}, using default of 10"
+                            "Invalid pool_min value: {pool_min_str}, using default of {DEFAULT_MIN_POOL_SIZE_STR}"
                         );
                     }
                     parsed_pool_min.ok()
@@ -128,7 +165,7 @@ impl DataConnectorFactory for MongoDBFactory {
                     let parsed_pool_max = pool_max_str.parse::<usize>();
                     if parsed_pool_max.is_err() {
                         tracing::warn!(
-                            "Invalid pool_max value: {pool_max_str}, using default of 100"
+                            "Invalid pool_max value: {pool_max_str}, using default of {DEFAULT_MAX_POOL_SIZE_STR}"
                         );
                     }
                     parsed_pool_max.ok()
@@ -137,7 +174,7 @@ impl DataConnectorFactory for MongoDBFactory {
 
             if pool_min > pool_max {
                 tracing::warn!(
-                    "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of 10 and 100"
+                    "pool_min value: {pool_min} is greater than pool_max value: {pool_max}, using default values of {DEFAULT_MIN_POOL_SIZE_STR} and {DEFAULT_MAX_POOL_SIZE_STR}"
                 );
                 pool_min = DEFAULT_MIN_POOL_SIZE;
                 pool_max = DEFAULT_MAX_POOL_SIZE;
@@ -199,7 +236,7 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
+        Read::table_provider(
             &self.mongodb_factory,
             dataset.path().into(),
             dataset.schema(),
@@ -208,6 +245,6 @@ impl DataConnector for MongoDB {
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "mongodb",
             connector_component: ConnectorComponent::from(dataset),
-        })?)
+        })
     }
 }
