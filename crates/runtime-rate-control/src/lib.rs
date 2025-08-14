@@ -17,7 +17,7 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use governor::{
-    Quota, RateLimiter as Governor,
+    Quota, RateLimiter,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
@@ -42,13 +42,13 @@ pub struct JitterConfig {
 }
 
 #[derive(Debug, Default)]
-pub struct RateLimiterBuilder {
+pub struct RateControllerBuilder {
     jitter: Option<JitterConfig>,
     max_concurrent_requests: Option<usize>,
     quotas: Vec<Quota>,
 }
 
-impl RateLimiterBuilder {
+impl RateControllerBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -79,40 +79,40 @@ impl RateLimiterBuilder {
     }
 
     #[must_use]
-    pub fn build(self) -> RateLimiter {
+    pub fn build(self) -> RateController {
         let jitter = self.jitter;
-        let governors = self
+        let rate_limiters = self
             .quotas
             .into_iter()
-            .map(|quota| Arc::new(Governor::direct(quota)))
+            .map(|quota| Arc::new(RateLimiter::direct(quota)))
             .collect::<Vec<_>>();
 
         let semaphore = self
             .max_concurrent_requests
             .map(|max_concurrent_requests| Arc::new(Semaphore::new(max_concurrent_requests)));
 
-        RateLimiter::new(jitter, governors, semaphore)
+        RateController::new(jitter, rate_limiters, semaphore)
     }
 }
 
-pub struct RateLimiter {
+pub struct RateController {
     jitter_config: JitterConfig,
-    governors: Vec<Arc<Governor<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
+    rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
     semaphore: Option<Arc<Semaphore>>,
 }
 
 #[allow(dead_code)] // will be used once the rate limiter is integrated
 pub struct Permit<'a>(Option<SemaphorePermit<'a>>);
 
-impl RateLimiter {
+impl RateController {
     #[must_use]
-    pub fn builder() -> RateLimiterBuilder {
-        RateLimiterBuilder::new()
+    pub fn builder() -> RateControllerBuilder {
+        RateControllerBuilder::new()
     }
 
     fn new(
         jitter: Option<JitterConfig>,
-        governors: Vec<Arc<Governor<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
+        rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
         semaphore: Option<Arc<Semaphore>>,
     ) -> Self {
         let jitter_config = jitter.unwrap_or(JitterConfig {
@@ -122,7 +122,7 @@ impl RateLimiter {
 
         Self {
             jitter_config,
-            governors,
+            rate_limiters,
             semaphore,
         }
     }
@@ -142,8 +142,12 @@ impl RateLimiter {
         };
 
         // check all of the rate limiters async
-        futures::future::join_all(self.governors.iter().map(|governor| governor.until_ready()))
-            .await;
+        futures::future::join_all(
+            self.rate_limiters
+                .iter()
+                .map(|limiter| limiter.until_ready()),
+        )
+        .await;
 
         // add jitter
         let mut rng = rand::rng();
@@ -162,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_acquire() {
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .with_jitter(JitterConfig {
                 min: Duration::from_millis(100),
                 max: Duration::from_millis(200),
@@ -173,7 +177,7 @@ mod tests {
             ))
             .build();
 
-        let permit = rate_limiter.acquire().await;
+        let permit = rate_controller.acquire().await;
         assert!(
             permit.is_ok(),
             "Failed to acquire permit: {:?}",
@@ -187,14 +191,16 @@ mod tests {
 
         // Test that semaphore restricts concurrency
         drop(permit);
-        let permits = (0..5).map(|_| rate_limiter.acquire()).collect::<Vec<_>>();
+        let permits = (0..5)
+            .map(|_| rate_controller.acquire())
+            .collect::<Vec<_>>();
         let mut results = futures::future::try_join_all(permits)
             .await
             .expect("Should acquire all permits");
 
         // the next request should block until one of the permits is dropped
         tokio::select! {
-            _ = rate_limiter.acquire() => {
+            _ = rate_controller.acquire() => {
                 panic!("Expected semaphore to block, but it did not.");
             },
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -208,7 +214,7 @@ mod tests {
         );
 
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after dropping one: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_some(), "Semaphore permit should be Some if semaphore is configured");
@@ -221,20 +227,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_per_second() {
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 NonZeroU32::new(2).expect("NonZeroU32 should be non-zero"),
             ))
             .build();
 
         // acquire all 2 permits at once, which should exhaust the rate limit
-        futures::future::try_join_all((0..2).map(|_| rate_limiter.acquire()))
+        futures::future::try_join_all((0..2).map(|_| rate_controller.acquire()))
             .await
             .expect("Should acquire all permits");
 
         // the next request should wait until free
         tokio::select! {
-            _ = rate_limiter.acquire() => {
+            _ = rate_controller.acquire() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
             () = tokio::time::sleep(Duration::from_millis(400)) => {}
@@ -242,7 +248,7 @@ mod tests {
 
         // next permit should occur after the next reset
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -255,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_with_multiple_quotas() {
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
@@ -267,13 +273,13 @@ mod tests {
             .build();
 
         // acquire all 10 permits at once, which should exhaust the per-minute rate limit
-        futures::future::try_join_all((0..10).map(|_| rate_limiter.acquire()))
+        futures::future::try_join_all((0..10).map(|_| rate_controller.acquire()))
             .await
             .expect("Should acquire all permits");
 
         // the next request should wait until free
         tokio::select! {
-            _ = rate_limiter.acquire() => {
+            _ = rate_controller.acquire() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
             // 10/minute is 1 every 6 seconds
@@ -282,7 +288,7 @@ mod tests {
 
         // next permit should occur after the next reset
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -295,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_hits_multiple_quotas() {
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 // per-second will get hit first
                 NonZeroU32::new(4).expect("NonZeroU32 should be non-zero"),
@@ -307,13 +313,13 @@ mod tests {
             .build();
 
         // acquire all 4 permits at once, which should exhaust the per-second rate limit
-        futures::future::try_join_all((0..4).map(|_| rate_limiter.acquire()))
+        futures::future::try_join_all((0..4).map(|_| rate_controller.acquire()))
             .await
             .expect("Should acquire all permits");
 
         // the next request should wait until free
         tokio::select! {
-            _ = rate_limiter.acquire() => {
+            _ = rate_controller.acquire() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
             () = tokio::time::sleep(Duration::from_millis(200)) => {}
@@ -321,7 +327,7 @@ mod tests {
 
         // next permit should occur after the next reset
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -334,7 +340,7 @@ mod tests {
         // now we've hit the per-minute limit
         // the next request should wait until free
         tokio::select! {
-            _ = rate_limiter.acquire() => {
+            _ = rate_controller.acquire() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
             // 6/minute is 1 every 10 seconds
@@ -343,7 +349,7 @@ mod tests {
 
         // next permit should occur after the next reset
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -356,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_jitter() {
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
@@ -369,7 +375,7 @@ mod tests {
 
         // acquiring a permit should wait at least for the jitter minimum duration
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -380,7 +386,7 @@ mod tests {
         }
 
         // a rate limit without jitter should complete near immediately
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 // purposely set a high per-second limit which should not be hit
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
@@ -388,7 +394,7 @@ mod tests {
             .build();
 
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
@@ -399,7 +405,7 @@ mod tests {
         }
 
         // rate limiter with multiple quotas should apply jitter only once
-        let rate_limiter = RateLimiterBuilder::new()
+        let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
                 NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
             ))
@@ -413,7 +419,7 @@ mod tests {
             .build();
 
         tokio::select! {
-            permit = rate_limiter.acquire() => {
+            permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
                 assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");

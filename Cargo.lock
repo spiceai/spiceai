@@ -11805,7 +11805,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime-rate-limiter"
+name = "runtime-rate-control"
 version = "1.6.0-unstable"
 dependencies = [
  "futures",

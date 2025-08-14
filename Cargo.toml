@@ -23,7 +23,7 @@ members = [
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-table-partition",
-    "crates/runtime-rate-limiter",
+    "crates/runtime-rate-control",
     "crates/s3_vectors",
     "crates/s3_vectors_metadata_filter",
     "crates/search",
