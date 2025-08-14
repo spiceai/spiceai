@@ -39,7 +39,7 @@ use crate::{
     HealthCheck,
     chat::{Chat, nsql::SqlGeneration},
     config::{GenericAuthMechanism, HostedModelConfig},
-    embeddings::{Embed, Error, HealthCheckSnafu, Result},
+    embeddings::{Embed, FailedToCreateEmbeddingSnafu, HealthCheckSnafu, Result},
 };
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
@@ -288,10 +288,12 @@ impl Embed for Databricks {
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
         self.client
-            .post("", req)
+            .post::<_, CreateEmbeddingResponse>("", req)
             .await
-            .map_err(|e| Error::FailedToCreateEmbedding { source: e.into() })
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)
     }
+
     fn size(&self) -> i32 {
         -1
     }
@@ -307,7 +309,7 @@ impl Embed for Databricks {
             })
             .await
             .boxed()
-            .map_err(|e| Error::FailedToCreateEmbedding { source: e })?;
+            .context(FailedToCreateEmbeddingSnafu)?;
 
         Ok(resp
             .data

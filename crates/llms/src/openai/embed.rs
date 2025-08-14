@@ -28,7 +28,9 @@ use crate::chunking::{
     ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
 
-use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
+use crate::embeddings::{
+    Embed, Error as EmbedError, FailedToCreateEmbeddingSnafu, Result as EmbedResult,
+};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
@@ -108,7 +110,8 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
             .embeddings()
             .create(inner_req)
             .await
-            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e.into() })?;
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)?;
 
         resp.model = outer_model;
         Ok(resp)
