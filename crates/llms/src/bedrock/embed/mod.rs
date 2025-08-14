@@ -213,7 +213,7 @@ where
             .embed_texts(texts)
             .await
             .boxed()
-            .map_err(|e| EmbedError::FailedToCreateEmbedding { source: e })?;
+            .context(FailedToCreateEmbeddingSnafu)?;
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),

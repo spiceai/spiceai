@@ -259,12 +259,11 @@ impl Embed for TeiEmbed {
         let format = req.encoding_format.unwrap_or_default();
 
         let batch_size = inputs.len();
-        let results =
-            self.embed_futures(inputs)
-                .await
-                .map_err(|e| Error::FailedToCreateEmbedding {
-                    source: Box::new(e),
-                })?;
+        let results = self
+            .embed_futures(inputs)
+            .await
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)?;
 
         let mut embeddings = Vec::with_capacity(batch_size);
         let mut prompt_tokens: u32 = 0;

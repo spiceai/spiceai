@@ -39,7 +39,7 @@ use crate::{
     HealthCheck,
     chat::{Chat, nsql::SqlGeneration},
     config::{GenericAuthMechanism, HostedModelConfig},
-    embeddings::{Embed, Error, Result},
+    embeddings::{Embed, Error, HealthCheckSnafu, Result},
 };
 
 /// [`Databricks`] is provides both [`Chat`] and [`Embed`] capabilities for Databricks models.
@@ -280,7 +280,7 @@ impl Embed for Databricks {
         self.embed(EmbeddingInput::String("health".to_string()))
             .await
             .boxed()
-            .map_err(|source| super::embeddings::Error::HealthCheckError { source })?;
+            .context(HealthCheckSnafu)?;
 
         Ok(())
     }

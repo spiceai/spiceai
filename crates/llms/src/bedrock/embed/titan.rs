@@ -17,7 +17,10 @@ limitations under the License.
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
 
-use crate::{bedrock::embed::BedrockEmbeddingConfig, embeddings::{FailedToExtractEmbeddingsSnafu, Result as EmbedResult}};
+use crate::{
+    bedrock::embed::BedrockEmbeddingConfig,
+    embeddings::{FailedToExtractEmbeddingsSnafu, Result as EmbedResult},
+};
 pub const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 
 #[derive(Debug)]
@@ -50,13 +53,16 @@ impl BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse> for TitanConf
             .map(|t| {
                 // For Titan models, we need to be more careful about token limits
                 // This is still an approximation as we don't have access to the actual tokenizer
-                ensure!(t.split_whitespace().count() <= MAX_TITAN_INPUT_LENGTH, FailedToExtractEmbeddingsSnafu {
-                    message: format!(
+                ensure!(
+                    t.split_whitespace().count() <= MAX_TITAN_INPUT_LENGTH,
+                    FailedToExtractEmbeddingsSnafu {
+                        message: format!(
                         "Input {} is longer than maximum supported length {MAX_TITAN_INPUT_LENGTH}",
                         t.len(),
                     )
-                });
-                
+                    }
+                );
+
                 Ok(TitanEmbedRequest {
                     input_text: t,
                     normalize: Some(self.normalize),
