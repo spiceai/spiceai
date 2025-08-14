@@ -48,6 +48,9 @@ on:
           - "release-lto"
         default: "release"
 
+permissions:
+  contents: write
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
