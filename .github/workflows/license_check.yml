@@ -49,7 +49,8 @@ jobs:
           os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny || true
+        run: cargo install cargo-deny --version 0.18.3 || true
+        # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
