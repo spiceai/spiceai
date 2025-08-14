@@ -17,7 +17,7 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use governor::{
-    Jitter, Quota, RateLimiter as Governor,
+    Quota, RateLimiter as Governor,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
@@ -97,7 +97,6 @@ impl RateLimiterBuilder {
 
 pub struct RateLimiter {
     jitter_config: JitterConfig,
-    jitter: Jitter,
     governors: Vec<Arc<Governor<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
     semaphore: Option<Arc<Semaphore>>,
 }
@@ -121,11 +120,8 @@ impl RateLimiter {
             max: Duration::ZERO,
         });
 
-        let jitter = Jitter::new(jitter_config.min, jitter_config.max);
-
         Self {
             jitter_config,
-            jitter,
             governors,
             semaphore,
         }
@@ -146,19 +142,13 @@ impl RateLimiter {
         };
 
         // check all of the rate limiters async
-        futures::future::join_all(
-            self.governors
-                .iter()
-                .map(|governor| governor.until_ready_with_jitter(self.jitter)),
-        )
-        .await;
+        futures::future::join_all(self.governors.iter().map(|governor| governor.until_ready()))
+            .await;
 
-        if self.governors.is_empty() {
-            // manually add some random jitter if no rate limiters are configured
-            let mut rng = rand::rng();
-            let jitter_wait = rng.random_range(self.jitter_config.min..=self.jitter_config.max);
-            tokio::time::sleep(jitter_wait).await;
-        }
+        // add jitter
+        let mut rng = rand::rng();
+        let jitter_wait = rng.random_range(self.jitter_config.min..=self.jitter_config.max);
+        tokio::time::sleep(jitter_wait).await;
 
         Ok(Permit(semaphore))
     }
@@ -405,6 +395,33 @@ mod tests {
             },
             () = tokio::time::sleep(Duration::from_nanos(100)) => {
                 panic!("Expected to acquire a permit immediately, but timed out.");
+            }
+        }
+
+        // rate limiter with multiple quotas should apply jitter only once
+        let rate_limiter = RateLimiterBuilder::new()
+            .add_quota(Quota::per_second(
+                // purposely set a high per-second limit which should not be hit
+                NonZeroU32::new(100).expect("NonZeroU32 should be non-zero"),
+            ))
+            .add_quota(Quota::per_minute(
+                // should result in per minute quota being hit
+                NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
+            ))
+            .with_jitter(JitterConfig {
+                min: Duration::from_millis(1000),
+                max: Duration::from_millis(2000),
+            })
+            .build();
+
+        tokio::select! {
+            permit = rate_limiter.acquire() => {
+                assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
+                let permit = permit.expect("should be Ok");
+                assert!(permit.0.is_none(), "Semaphore permit should be None if semaphore is not configured");
+            },
+            () = tokio::time::sleep(Duration::from_millis(1000)) => {
+                panic!("Expected to wait for at least 1000ms, but timed out.");
             }
         }
     }
