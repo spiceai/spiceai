@@ -6149,13 +6149,13 @@ dependencies = [
 
 [[package]]
 name = "headers-accept"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "244c37aaa637e64fb73af1bb2a4f3f6f2b72f1f39f1cd6f4443f0cc21fe80280"
+checksum = "e2e10a9d7b3cb1f3685b3e854706409033671618007f44de29c890beacede5e9"
 dependencies = [
  "headers-core",
  "http 1.3.1",
- "mediatype",
+ "mediatype 0.20.0",
 ]
 
 [[package]]
@@ -8061,6 +8061,12 @@ name = "mediatype"
 version = "0.19.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33746aadcb41349ec291e7f2f0a3aa6834d1d7c58066fb4b01f68efc4c4b7631"
+
+[[package]]
+name = "mediatype"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f490ea2ae935dd8ac89c472d4df28c7f6b87cc20767e1b21fd5ed6a16e7f61e4"
 
 [[package]]
 name = "memchr"
@@ -11661,7 +11667,7 @@ dependencies = [
  "keyring",
  "llms",
  "logos",
- "mediatype",
+ "mediatype 0.19.20",
  "model_components",
  "moka",
  "mysql_async",
