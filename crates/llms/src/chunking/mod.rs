@@ -171,13 +171,10 @@ mod tests {
             file_format: None,
         };
 
-        let chunker = OpenaiEmbed::new(new_openai_client(
-            DEFAULT_EMBEDDING_MODEL.to_string(),
+        let chunker = OpenaiEmbed::new(
+            new_openai_client(DEFAULT_EMBEDDING_MODEL.to_string(), None, None, None, None),
             None,
-            None,
-            None,
-            None,
-        ))
+        )
         .chunker(&cfg)
         .expect("Failed to create OpenAI chunker");
         let chunks: Vec<_> = chunker

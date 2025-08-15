@@ -99,6 +99,14 @@ pub enum Error {
     ))]
     ModelNotProvided { model_source: String },
 
+    #[snafu(display("Failed to acquire a rate controller permit. {source}"))]
+    FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
+
+    #[snafu(display(
+        "Invalid OpenAI usage tier '{tier}'. Specify a valid tier of 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'."
+    ))]
+    InvalidOpenAITier { tier: String },
+
     #[snafu(display("Failed to extract embeddings from AWS Bedrock: {message}"))]
     FailedToExtractEmbeddings { message: String },
 

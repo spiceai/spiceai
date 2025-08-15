@@ -27,6 +27,7 @@ itertools.workspace = true
 regex = "1.10.4"
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
+runtime-rate-control = { path = "../runtime-rate-control" }
 schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
