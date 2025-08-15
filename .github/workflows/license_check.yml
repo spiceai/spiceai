@@ -57,7 +57,7 @@ jobs:
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     env:
       GOVER: 1.24.2
 

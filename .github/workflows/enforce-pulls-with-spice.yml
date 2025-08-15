@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     steps:
       - uses: spiceai/pulls-with-spice-action@v1.0.6
         if: github.event_name == 'pull_request_target'

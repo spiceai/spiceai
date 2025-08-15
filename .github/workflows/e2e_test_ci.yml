@@ -57,7 +57,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
