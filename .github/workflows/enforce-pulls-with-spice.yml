@@ -16,7 +16,7 @@ jobs:
     runs-on: spiceai-macos
     steps:
       - uses: spiceai/pulls-with-spice-action@v1.0.6
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'
           required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame'
