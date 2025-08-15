@@ -114,10 +114,17 @@ pub struct RateController {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // The inner permit is never used, but it needs to be retained for the lifetime of the permit so it can be correctly dropped.
 pub struct Permit {
     permit: Option<OwnedSemaphorePermit>,
     rate_controller: Arc<RateController>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+        }
+    }
 }
 
 impl Permit {
