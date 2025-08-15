@@ -78,7 +78,7 @@ pub struct VectorQueryTableProvider {
 }
 
 impl VectorQueryTableProvider {
-    /// Execute the given physical plan of a vector index query, extract the primary key columns and convert the values: {(v1_1, v1_2, ...), (v2_1, v2_2, ...), ..., (vn_1, vn_2, ...)} into a filter predicate: `WHERE (primary_key_col1, primary_key_col2, ...) IN ((v1_1, v1_2, ...), (v2_1, v2_2, ...), ...)`.
+    /// Execute the given physical plan of a vector index query, extract the primary key columns and convert the values: {(`v1_1`, `v1_2`, ...), (`v2_1`, `v2_2`, ...), ..., (`vn_1`, `vn_2`, ...)} into a filter predicate: `WHERE (primary_key_col1, primary_key_col2, ...) IN ((v1_1, v1_2, ...), (v2_1, v2_2, ...), ...)`.
     ///
     /// When `primary_key_fields.len() == 1`, use a simplified expression `WHERE primary_key_col1 IN (v1_1, v2_1, ...)`.
     async fn base_table_query_filter(
@@ -91,7 +91,7 @@ impl VectorQueryTableProvider {
             return Err(DataFusionError::Execution(
                 "No primary key columns provided".to_string(),
             ));
-        };
+        }
 
         // For single column primary key, maintain the existing behavior
         if primary_key_fields.len() == 1 {
@@ -136,12 +136,15 @@ impl VectorQueryTableProvider {
             }
 
             // Build struct values for each row
-            let num_rows = arrays.first().map(|arr| arr.len()).unwrap_or(0);
+            let num_rows = arrays.first().map_or(0, |arr| arr.len());
             for i in 0..num_rows {
                 let mut field_values: Vec<(&str, ScalarValue)> = vec![];
                 for (j, arr) in arrays.iter().enumerate() {
                     field_values.push((
-                        pk_names.get(j).map(|s| s.as_str()).unwrap_or_default(),
+                        pk_names
+                            .get(j)
+                            .map(std::string::String::as_str)
+                            .unwrap_or_default(),
                         ScalarValue::try_from_array(arr, i)?,
                     ));
                 }

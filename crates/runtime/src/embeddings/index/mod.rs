@@ -63,8 +63,6 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`VectorIndex`].
     ///
-    /// TODO: This PR is changing it so that this [`VectorIndex`] is responsible for converting the
-    ///  internal unique key, to the jointly understood PK.
     fn primary_fields(&self) -> Vec<Field>;
 
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
@@ -84,10 +82,6 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
     /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
     ///  similarity score between `query` and the [`VectorIndex::embedded_column`].
-    ///
-    /// TODO: need to convert s3vector to
-    ///   1. Return score, not distance.
-    ///   2. Return primary key as per [`VectorIndex::primary_fields`].
     async fn query_table_provider(
         &self,
         query: &str,
