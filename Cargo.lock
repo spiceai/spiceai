@@ -11925,6 +11925,7 @@ dependencies = [
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
+ "runtime-rate-control",
  "runtime-table-partition",
  "rusqlite",
  "rustls 0.23.27",

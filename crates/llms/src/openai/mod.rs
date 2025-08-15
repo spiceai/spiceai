@@ -84,12 +84,10 @@ impl From<UsageTier> for Arc<RateController> {
             unreachable!("per_minute_quota for usage tiers are non-zero");
         };
 
-        Arc::new(
-            RateController::builder()
-                .with_max_concurrent_requests(max_concurrent_requests)
-                .add_quota(Quota::per_minute(per_minute_quota))
-                .build(),
-        )
+        RateController::builder()
+            .with_max_concurrent_requests(max_concurrent_requests)
+            .add_quota(Quota::per_minute(per_minute_quota))
+            .build()
     }
 }
 
@@ -106,13 +104,11 @@ pub(crate) fn default_rate_controller() -> Arc<RateController> {
         unreachable!("Default quota should always be non-zero");
     };
 
-    Arc::new(
-        RateController::builder()
-            .with_jitter(JitterConfig::zero())
-            .with_max_concurrent_requests(4)
-            .add_quota(Quota::per_minute(default_per_minute_quota))
-            .build(),
-    )
+    RateController::builder()
+        .with_jitter(JitterConfig::zero())
+        .with_max_concurrent_requests(4)
+        .add_quota(Quota::per_minute(default_per_minute_quota))
+        .build()
 }
 
 #[must_use]

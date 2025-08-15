@@ -17,7 +17,6 @@ limitations under the License.
 
 pub mod chat;
 pub mod embed;
-pub mod rate_limit;
 
 use std::sync::Arc;
 
@@ -33,9 +32,8 @@ use aws_sdk_bedrockruntime::{
     },
     primitives::Blob,
 };
-use governor::{RateLimiter, clock::DefaultClock, state::InMemoryState};
+use runtime_rate_control::RateController;
 use snafu::ResultExt;
-use tokio::sync::Semaphore;
 use util::{
     RetryError,
     fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder},
@@ -44,38 +42,31 @@ use util::{
 
 use aws_config::SdkConfig;
 
-use rate_limit::BedrockRateLimitConfig;
-
-use crate::bedrock::rate_limit::BedrockRateLimitConfigBuilder;
+use crate::openai::default_rate_controller;
 
 #[derive(Debug, Clone)]
 pub struct BedrockClient {
     pub(crate) client: Arc<aws_sdk_bedrockruntime::Client>,
-    rate_limiter: Arc<RateLimiter<governor::state::NotKeyed, InMemoryState, DefaultClock>>,
-    // Control the max number of concurrent requests
-    semaphore: Arc<Semaphore>,
     // Retry strategy for transient or throttling errors
     retry_strategy: FibonacciBackoff,
-    // Rate limiting configuration for logging and metrics
-    rate_config: BedrockRateLimitConfig,
+
+    rate_controller: Arc<RateController>,
 }
 
 impl From<&SdkConfig> for BedrockClient {
     fn from(value: &SdkConfig) -> Self {
-        BedrockClient::new(value, BedrockRateLimitConfigBuilder::default().build())
+        BedrockClient::new(value, default_rate_controller())
     }
 }
 
 impl BedrockClient {
     #[must_use]
-    pub fn new(config: &SdkConfig, rate_config: BedrockRateLimitConfig) -> Self {
+    pub fn new(config: &SdkConfig, rate_controller: Arc<RateController>) -> Self {
         let client = aws_sdk_bedrockruntime::Client::new(config).into();
         Self {
             client,
-            rate_limiter: Arc::new(RateLimiter::direct(rate_config.to_quota())),
-            semaphore: Arc::new(Semaphore::new(rate_config.max_concurrent_invocations)),
+            rate_controller,
             retry_strategy: default_retry_strategy(),
-            rate_config,
         }
     }
 
@@ -196,13 +187,17 @@ impl BedrockClient {
             >,
         O: Send + 'static,
     {
-        let _permit = self.semaphore.acquire().await.boxed()?;
+        let permit = self.rate_controller.acquire().await.boxed()?;
 
-        retry(self.retry_strategy.clone(), || async {
-            self.rate_limiter.until_ready().await;
+        let result = retry(self.retry_strategy.clone(), || async {
+            permit.until_ready().await;
             make_request(Arc::clone(&self.client)).await
         })
-        .await
+        .await;
+
+        drop(permit);
+
+        result
     }
 }
 
