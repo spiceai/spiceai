@@ -74,6 +74,7 @@ default = [
   "alloc-snmalloc",
   "oracle",
   "runtime/s3_vectors",
+  "mongodb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -87,6 +88,7 @@ keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
+mongodb = ["runtime/mongodb"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
 odbc = ["runtime/odbc"]
