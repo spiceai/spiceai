@@ -45,6 +45,8 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+        with:
+          os: macos
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.18.3 || true
