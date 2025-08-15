@@ -174,6 +174,7 @@ impl TableProvider for VectorScanTableProvider {
         self.table_provider.table_type()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -189,12 +190,54 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         }
 
-        let vector_table_scan = LogicalPlan::TableScan(TableScan::try_new(
-            TableReference::parse_str("vector_index"),
-            Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
-            None,
-            vec![],
-            None,
+        // Do not use [`VectorIndex::embedded_column`] from index.
+        // [`VectorScanTableProvider`] is used to populate RecordBatch in
+        // [`runtime_datafusion_index::Index::compute_index`]. On initial indexing into the index,
+        // we would get NULL values from [`VectorIndex`], we must use underlying instead.
+        let embedding_column = self.index.embedded_column();
+        let metadata_columns_from_index: Vec<_> = self
+            .index
+            .metadata_columns()
+            .iter()
+            .filter_map(|c| {
+                if c.name() == embedding_column {
+                    None
+                } else {
+                    Some(c.name().to_string())
+                }
+            })
+            .collect();
+        let mut proj = self
+            .index
+            .primary_fields()
+            .iter()
+            .map(|f| {
+                Expr::Column(Column::new(
+                    Some(TableReference::parse_str("vector_index")),
+                    f.name().clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        proj.extend(metadata_columns_from_index.iter().map(|c| {
+            Expr::Column(Column::new(
+                Some(TableReference::parse_str("vector_index")),
+                c.clone(),
+            ))
+        }));
+        proj.push(Expr::Column(Column::new(
+            Some(TableReference::parse_str("vector_index")),
+            embedding_col!(self.index.embedded_column()),
+        )));
+
+        let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
+            proj,
+            Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+                TableReference::parse_str("vector_index"),
+                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
+                None,
+                vec![],
+                None,
+            )?)),
         )?);
 
         let primary_key_fields = self.index.primary_fields();
@@ -215,15 +258,14 @@ impl TableProvider for VectorScanTableProvider {
                 vector_table_scan
             }
         } else {
-            // Columns in [`VectorIndex::metadata_columns`] will be retrieved from index, not base table.
-            let underlying_projection = projection_without_columns(
-                &self.schema().fields,
-                self.index.metadata_columns().all_names().as_slice(),
-                projection,
-            );
-            let underlying_table_scan = LogicalPlan::TableScan(
-                self.underlying_table_scan(Some(&underlying_projection), filters)?,
-            );
+            let underlying_table_scan = LogicalPlan::TableScan(self.underlying_table_scan(
+                Some(&projection_without_columns(
+                    self.schema().fields(),
+                    &metadata_columns_from_index,
+                    projection,
+                )),
+                filters,
+            )?);
 
             let join_schema = vector_table_scan
                 .schema()
@@ -271,7 +313,7 @@ impl TableProvider for VectorScanTableProvider {
                     .iter()
                     .filter(|(tbl, f)| {
                         !(primary_key_column_names.contains(f.name())
-                            && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
+                            && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
                     })
                     .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
                     .collect(),

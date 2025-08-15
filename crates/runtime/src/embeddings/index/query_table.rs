@@ -381,6 +381,7 @@ impl TableProvider for VectorQueryTableProvider {
             .collect())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,

@@ -343,7 +343,7 @@ fn table_with_projection(
     projection: Vec<Expr>,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let scan = TableScan::try_new(
-        "",
+        "tbl",
         Arc::new(DefaultTableSource::new(tbl)),
         None,
         vec![],
@@ -412,7 +412,7 @@ pub mod tests {
     use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::embeddings::index::VectorIndex;
+    use crate::{embedding_col, embeddings::index::VectorIndex};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -544,7 +544,9 @@ pub mod tests {
                 .fields()
                 .iter()
                 .filter_map(|f| {
-                    if primary_key_names.contains(f.name()) {
+                    if primary_key_names.contains(f.name())
+                        || *f.name() == embedding_col!(embedded_column)
+                    {
                         return None;
                     }
                     if f.metadata().get("filterable") == Some(&"true".to_string()) {
