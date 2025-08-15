@@ -15,8 +15,14 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use std::num::NonZeroU32;
+use std::str::FromStr;
+use std::sync::Arc;
+
 use async_openai::config::{AzureConfig, Config, OPENAI_API_BASE};
 use async_openai::{Client, config::OpenAIConfig};
+use governor::Quota;
+use runtime_rate_control::RateController;
 
 pub mod chat;
 pub mod embed;
@@ -28,6 +34,64 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageTier {
+    Free,
+    #[default]
+    Tier1,
+    Tier2,
+    Tier3,
+    Tier4,
+    Tier5,
+}
+
+impl FromStr for UsageTier {
+    type Err = crate::embeddings::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "free" => Ok(UsageTier::Free),
+            "tier1" => Ok(UsageTier::Tier1),
+            "tier2" => Ok(UsageTier::Tier2),
+            "tier3" => Ok(UsageTier::Tier3),
+            "tier4" => Ok(UsageTier::Tier4),
+            "tier5" => Ok(UsageTier::Tier5),
+            _ => Err(crate::embeddings::Error::InvalidOpenAITier {
+                tier: s.to_string(),
+            }),
+        }
+    }
+}
+
+impl From<UsageTier> for Arc<RateController> {
+    fn from(val: UsageTier) -> Self {
+        let max_concurrent_requests = match &val {
+            &UsageTier::Free => 1,
+            &UsageTier::Tier1 => 35,
+            &UsageTier::Tier2 | &UsageTier::Tier3 => 60,
+            &UsageTier::Tier4 | &UsageTier::Tier5 => 125,
+        };
+
+        let per_minute_quota = match &val {
+            &UsageTier::Free => 100,
+            &UsageTier::Tier1 => 3000,
+            &UsageTier::Tier2 | &UsageTier::Tier3 => 5000,
+            &UsageTier::Tier4 | &UsageTier::Tier5 => 10000,
+        };
+
+        let Some(per_minute_quota) = NonZeroU32::new(per_minute_quota) else {
+            unreachable!("per_minute_quota for usage tiers are non-zero");
+        };
+
+        Arc::new(
+            RateController::builder()
+                .with_max_concurrent_requests(max_concurrent_requests)
+                .add_quota(Quota::per_minute(per_minute_quota))
+                .build(),
+        )
+    }
+}
 
 #[derive(Debug)]
 pub struct Openai<C: Config> {
