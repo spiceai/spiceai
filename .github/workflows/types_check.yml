@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
 jobs:
-
   build:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
@@ -16,11 +15,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: "Linux x64"
-            runner: "spiceai-runners"
-            target_os: "linux"
-            target_arch: "x86_64"
-            target_arch_go: "amd64"
+          - name: 'Linux x64'
+            runner: 'spiceai-dev-runners'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+            target_arch_go: 'amd64'
 
     steps:
       - uses: actions/checkout@v5
@@ -107,18 +106,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        acceleration: [
+        acceleration:
+          [
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: memory },
             { engine: sqlite, mode: memory },
-            { engine: postgres},
+            { engine: postgres },
           ]
         target:
-          - name: "Linux x64"
-            runner: "ubuntu-latest"
-            target_os: "linux"
-            target_arch: "x86_64"
-            target_arch_go: "amd64"
+          - name: 'Linux x64'
+            runner: 'ubuntu-latest'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+            target_arch_go: 'amd64'
     steps:
       - uses: actions/checkout@v5
 
@@ -148,7 +148,7 @@ jobs:
         if: matrix.acceleration.engine == 'postgres'
         run: |
           echo 'PG_CONNECTION_STRING = "host=localhost port=5432 dbname=testdb user=postgres password=postgres sslmode=disable"' > .env
-  
+
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         if: matrix.acceleration.engine == 'postgres'
@@ -194,7 +194,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_int16
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test int32
         continue-on-error: true
         id: test-int32
@@ -207,7 +207,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_int32
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test int64
         continue-on-error: true
         id: test-int64
@@ -220,7 +220,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_int64
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test float32
         continue-on-error: true
         id: test-float32
@@ -233,7 +233,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_float32
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test float64
         continue-on-error: true
         id: test-float64
@@ -259,7 +259,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_date32
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test date64
         continue-on-error: true
         id: test-date64
@@ -273,7 +273,6 @@ jobs:
           table-name: t_date64
           engine: ${{ matrix.acceleration.engine }}
 
-      
       - name: Test timestamp_ms
         continue-on-error: true
         id: test-timestamp_ms
@@ -299,7 +298,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_time64_us
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test string
         continue-on-error: true
         id: test-string
@@ -338,7 +337,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_decimal128
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test decimal256
         continue-on-error: true
         id: test-decimal256
@@ -351,7 +350,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_decimal256
           engine: ${{ matrix.acceleration.engine }}
-    
+
       - name: Test list_int
         continue-on-error: true
         id: test-list_int
@@ -377,7 +376,7 @@ jobs:
                   open: arrow_types.db
           table-name: t_list_string
           engine: ${{ matrix.acceleration.engine }}
-      
+
       - name: Test duration_ms
         continue-on-error: true
         id: test-duration_ms
@@ -470,7 +469,7 @@ jobs:
             }')
 
           echo "Prepared results JSON: $results_json"
-          
+
           declare -a types=("boolean" "int8" "int16" "int32" "int64" "float32" "float64" "date32" "date64" "timestamp_ms" "time64_us" "string" "binary" "decimal128" "decimal256" "list_int" "list_string" "duration_ms")
 
           echo "| Type | Match | Non-accelerated | Accelerated |" >> $GITHUB_STEP_SUMMARY

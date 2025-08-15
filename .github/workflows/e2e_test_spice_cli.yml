@@ -2,19 +2,19 @@ name: E2E Test CLI behavior
 on:
   workflow_dispatch:
     inputs:
-        build_cli:
-          description: 'Build the CLI instead of using the specified release version'
-          required: false
-          default: 'true'
-        rel_version:
-          description: 'The version to build CLI / download released CLI'
-          required: false
-          default: '1.0.2'
+      build_cli:
+        description: 'Build the CLI instead of using the specified release version'
+        required: false
+        default: 'true'
+      rel_version:
+        description: 'The version to build CLI / download released CLI'
+        required: false
+        default: '1.0.2'
 
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -27,7 +27,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spiceai-runners",
+                runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
@@ -452,11 +452,11 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
-            target_arch_go: "arm64"
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@v5
@@ -500,11 +500,11 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
-            target_arch_go: "arm64"
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+            target_arch_go: 'arm64'
 
     steps:
       - uses: actions/checkout@v5
@@ -560,3 +560,4 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+
