@@ -551,7 +551,7 @@ mod tests {
             None,
         )));
         let plan = delete_table
-            .delete_from(&ctx.state(), &vec![filter])
+            .delete_from(&ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -570,7 +570,7 @@ mod tests {
 
         let filter = col("time_int").lt(lit(1354360273));
         let plan = delete_table
-            .delete_from(&ctx.state(), &vec![filter])
+            .delete_from(&ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -608,7 +608,7 @@ mod tests {
             None,
         )));
         let plan = delete_table
-            .delete_from(&ctx.state(), &vec![filter])
+            .delete_from(&ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -642,7 +642,7 @@ mod tests {
             None,
         )));
         let plan = delete_table
-            .delete_from(&ctx.state(), &vec![filter])
+            .delete_from(&ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 

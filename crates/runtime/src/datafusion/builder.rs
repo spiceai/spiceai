@@ -25,8 +25,8 @@ use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
-        SessionStateBuilder,
-        disk_manager::DiskManagerConfig,
+        DiskManager, SessionStateBuilder,
+        disk_manager::DiskManagerMode,
         memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
@@ -257,10 +257,11 @@ pub(crate) fn runtime_env(
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
 ) -> Arc<RuntimeEnv> {
-    let disk_manager = if let Some(directory) = temp_directory {
-        DiskManagerConfig::new_specified(vec![directory.into()])
+    let disk_manager_builder = if let Some(directory) = temp_directory {
+        let mode = DiskManagerMode::Directories(vec![directory.into()]);
+        DiskManager::builder().with_mode(mode)
     } else {
-        DiskManagerConfig::new()
+        DiskManager::builder()
     };
 
     let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
@@ -294,7 +295,7 @@ pub(crate) fn runtime_env(
     match RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
         .with_memory_pool(memory_pool)
-        .with_disk_manager(disk_manager)
+        .with_disk_manager_builder(disk_manager_builder)
         .build_arc()
     {
         Ok(runtime_env) => runtime_env,
