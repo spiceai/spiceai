@@ -476,4 +476,101 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    pub async fn test_vector_scan_index_multicolumn_pk() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk1", DataType::Int64, false),
+            Field::new("pk2", DataType::Boolean, false),
+            Field::new("pk3", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                ],
+                Schema::new(vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_basic_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_join_for_projection_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, not_where, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_join_for_projection_use_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table WHERE another_column != 'something' AND a_number > 0 LIMIT 5",
+            "scan_table_join_for_filter_use_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, not_where, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_no_join_for_metadata_projection_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table WHERE a_number > 0 LIMIT 5",
+            "scan_table_no_join_for_metadata_filter_multiple_pk",
+        )
+        .await?;
+
+        Ok(())
+    }
 }

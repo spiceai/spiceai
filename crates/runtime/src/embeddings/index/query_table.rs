@@ -687,4 +687,103 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    pub async fn test_vector_query_index_multicolumn_pk() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk1", DataType::Int64, false),
+            Field::new("pk2", DataType::Boolean, false),
+            Field::new("pk3", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorQueryTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            vector_index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                ],
+                Schema::new(vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+            query: "just a query".to_string(),
+            pre_limit: None,
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_basic_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_join_for_projection_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_join_for_projection_use_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY score desc LIMIT 5",
+            "query_table_join_for_filter_use_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_no_join_for_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table WHERE a_number > 0 ORDER BY score desc LIMIT 5",
+            "query_table_no_join_for_metadata_filter_multiple_pk",
+        )
+        .await?;
+
+        Ok(())
+    }
 }
