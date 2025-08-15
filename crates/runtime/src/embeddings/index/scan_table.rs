@@ -201,7 +201,7 @@ impl TableProvider for VectorScanTableProvider {
 
         let vector_table_scan = LogicalPlan::TableScan(TableScan::try_new(
             TableReference::parse_str("vector_index"),
-            Arc::new(DefaultTableSource::new(self.index.list_table_provider())),
+            Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
             None,
             vec![],
             None,
