@@ -46,6 +46,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.18.3 || true
         # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
