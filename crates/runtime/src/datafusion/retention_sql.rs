@@ -28,8 +28,7 @@ use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
 use crate::datafusion::builder::get_df_default_config;
-use crate::object_store_registry::default_runtime_env;
-
+use runtime_object_store::registry::default_runtime_env;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -76,10 +75,11 @@ pub enum Error {
     #[snafu(display("Failed to parse SQL expression '{expression}': {source}"))]
     ExpressionParsing {
         expression: String,
-        source: DataFusionError,
+        source: Box<DataFusionError>,
     },
 }
 
+#[allow(clippy::result_large_err)]
 pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,
@@ -126,6 +126,7 @@ pub fn parse_retention_sql(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_table_name(
     from: &sqlparser::ast::FromTable,
     expected_table: &TableReference,
@@ -173,6 +174,7 @@ fn validate_table_name(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let df_schema = DFSchema::try_from(schema).context(SchemaConversionSnafu)?;
 
@@ -184,6 +186,7 @@ fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let expr_string = format!("{sql_expr}");
     ctx.state()
         .create_logical_expr(&expr_string, &df_schema)
+        .map_err(Box::new)
         .context(ExpressionParsingSnafu {
             expression: expr_string,
         })

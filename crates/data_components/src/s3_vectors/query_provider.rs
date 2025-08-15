@@ -250,7 +250,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
 
         let client = Arc::clone(&self.client);
         let idx = self.idx.clone();
-        let limit: i32 = self.limit.try_into().unwrap_or(i32::MAX);
+        let limit: i32 = self.limit.try_into().unwrap_or(30); // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html
         let q = self.query.clone();
         let filters = self.filters.clone();
 
@@ -301,6 +301,7 @@ async fn query_vector_stream(
                 .set_filter(s3_filter.clone())
                 .set_vector_bucket_name(bucket_name.clone())
                 .set_index_arn(arn.clone())
+                .set_return_data(Some(true))
                 .set_index_name(index_name.clone())
                 .return_metadata(true)
                 .build()

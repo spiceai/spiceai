@@ -8,7 +8,7 @@ on:
       - release-*
       - release/*
     paths:
-      - "crates/llms/**"
+      - 'crates/llms/**'
 
   workflow_dispatch:
     inputs:
@@ -29,7 +29,7 @@ concurrency:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -50,7 +50,7 @@ jobs:
                 name: 'hosted',
                 needs_env: true,
                 runner: 'macOS',
-                model_allowlist: 'anthropic,openai,xai,perplexity'
+                model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
               }
             ];
 
@@ -69,7 +69,7 @@ jobs:
     name: Build Test Binary
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -101,9 +101,9 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: llms-integration-test-binary
           path: ./integration_test
@@ -118,22 +118,33 @@ jobs:
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
+          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
-              echo "Error: OpenAI API key is not defined."
+              echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
-              echo "Error: Anthropic API key is not defined."
+              echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
-              echo "Error: xAI API key is not defined."
+              echo "Error: 'SPICE_XAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: Perplexity API key is not defined."
+              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
+              exit 1
+            fi
+            export SPICE_BEDROCK_REGION="us-east-1"
+            if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
+              echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_BEDROCK_SECRET_KEY" ]; then
+              echo "Error: 'SPICE_BEDROCK_SECRET_KEY' is not defined."
               exit 1
             fi
           fi

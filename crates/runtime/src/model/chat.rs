@@ -17,7 +17,9 @@ limitations under the License.
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
+    bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
+    openai::UsageTier,
     perplexity::PerplexitySonar,
     xai::Xai,
 };
@@ -132,6 +134,8 @@ pub async fn construct_model(
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
+        #[cfg(feature = "bedrock")]
+        ModelSource::Bedrock => bedrock(model_id, params).await,
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -164,6 +168,34 @@ pub async fn construct_model(
     Ok(Arc::new(wrapper))
 }
 
+#[cfg(feature = "bedrock")]
+async fn bedrock(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "bedrock".to_string(),
+        });
+    };
+
+    let client = super::util::create_bedrock_client(&params.get_runtime_params(), "bedrock-chat")
+        .await
+        .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+
+    let id = params.get("guardrail_identifier").expose().ok();
+    let version = params.get("guardrail_version").expose().ok();
+    let trace = params.get("trace").expose().ok();
+    let mut converse = BedrockConverse::new(client.into(), model_id);
+
+    // Add Guardrail if added by user.
+    if let (Some(id), Some(version)) = (id, version) {
+        let g = GuardRail::try_new(id, version, trace)
+            .boxed()
+            .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+        converse = converse.with_guardrail(g);
+    }
+
+    Ok(Arc::new(converse) as Arc<dyn Chat>)
+}
+
 fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(api_key) = params.get("api_key").expose().ok() else {
         return Err(LlmError::FailedToLoadModel {
@@ -175,7 +207,7 @@ fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, Llm
 
 fn perplexity(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
     // PerplexitySonar only requires prefixed parameters for constructing the model.
-    let model = PerplexitySonar::from_params(model_id, &params.get_component_params())
+    let model = PerplexitySonar::from_unprefixed_params(model_id, &params.get_component_params())
         .map_err(|source| LlmError::FailedToLoadModel { source })?;
 
     Ok(Arc::new(model) as Arc<dyn Chat>)
@@ -351,6 +383,16 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
     let api_key = params.get("api_key").expose().ok();
     let org_id = params.get("org_id").expose().ok();
     let project_id = params.get("project_id").expose().ok();
+    let usage_tier = params
+        .get("usage_tier")
+        .expose()
+        .ok()
+        .map(UsageTier::from_str)
+        .transpose()
+        .map_err(|_| LlmError::InvalidParamValueError {
+            param: "openai_usage_tier".to_string(),
+            message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
+        })?;
 
     if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
@@ -377,6 +419,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
         api_key,
         org_id,
         project_id,
+        usage_tier,
     )) as Arc<dyn Chat>)
 }
 

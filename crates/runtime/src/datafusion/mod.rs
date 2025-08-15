@@ -281,7 +281,7 @@ pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
     },
     Federated {
@@ -392,6 +392,7 @@ impl DataFusion {
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
+    #[allow(clippy::result_large_err)]
     pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
@@ -459,7 +460,7 @@ impl DataFusion {
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
-                            Arc::new(accelerated_table).table_provider(),
+                            accelerated_table.table_provider(),
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -1322,6 +1323,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn register_view(
         self: &Arc<Self>,
         view: Arc<View>,
@@ -1615,6 +1617,7 @@ impl DataFusion {
             .collect_vec()
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx
@@ -1729,6 +1732,7 @@ fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn handle_accelerated_table_behavior(
     accelerated_table_behaviors: Behaviors,
     federated_table: &FederatedTable,

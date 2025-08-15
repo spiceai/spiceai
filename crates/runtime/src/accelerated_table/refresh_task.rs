@@ -49,9 +49,9 @@ use crate::{
     datafusion::{filter_converter::TimestampFilterConvert, schema},
     dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
-    object_store_registry::default_runtime_env,
     status,
 };
+use runtime_object_store::registry::default_runtime_env;
 
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
@@ -191,8 +191,8 @@ impl RefreshTask {
         // Limit parallel refreshes via a semaphore
         let _permit = self.semaphore.acquire().await;
 
-        let max_retries = if refresh.refresh_retry_enabled {
-            refresh.refresh_retry_max_attempts
+        let max_retries = if refresh.retry_enabled {
+            refresh.retry_max_attempts
         } else {
             Some(0)
         };

@@ -40,7 +40,7 @@ use crate::{
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
-    Plan(LogicalPlan, Option<QueryTracker>, RequestCacheManager),
+    Plan(Box<LogicalPlan>, Option<QueryTracker>, RequestCacheManager),
     Cached(QueryResult),
 }
 
@@ -188,7 +188,7 @@ impl Query {
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
-            plan,
+            Box::new(plan),
             tracker,
             RequestCacheManager::new(cache_status, request_raw_cache_key),
         ))

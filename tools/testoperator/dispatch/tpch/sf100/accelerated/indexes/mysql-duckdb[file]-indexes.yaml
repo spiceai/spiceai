@@ -1,6 +1,6 @@
 tests:
   bench:
-    spicepod_path: ./test/spicepods/tpch/sf100/accelerated/indexes/mysql-duckdb[file]-indexes.yaml
+    spicepod_path: accelerated/indexes/mysql-duckdb[file]-indexes.yaml
     query_set: tpch
     runner_type: spiceai-dev-large-runners
     ready_wait: 6000

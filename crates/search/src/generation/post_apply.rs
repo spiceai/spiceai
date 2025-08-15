@@ -24,6 +24,7 @@ use datafusion::{
     logical_expr::{Expr as LogicalExpr, select_expr::SelectExpr, sqlparser::ast::Expr},
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionContext,
+    sql::sqlparser::ast::Ident,
 };
 
 use futures::{Stream, StreamExt};
@@ -172,16 +173,22 @@ impl PostApplyCandidateGeneration {
                     Some(CANDIDATE_GENERATION_TABLE_NAME),
                     f.name().clone(),
                 )))).collect();
-                cols.append(&mut remaining_projection.iter().map(|s| SelectExpr::Expression(LogicalExpr::Column(Column::new(Some(TABLE_PROVIDER_TABLE_NAME), s.to_string())))).collect::<Vec<_>>());
 
-                let pks: Vec<&str> = primary_key.iter().map(String::as_str).collect();
+                cols.append(&mut remaining_projection.iter().filter_map(|s| {
+                    match s {
+                        // Intentionally ignore `quote_style`. `DataFrame::select` will reapply.
+                        Expr::Identifier(Ident{value,..}) => Some(SelectExpr::Expression(LogicalExpr::Column(Column::new(Some(TABLE_PROVIDER_TABLE_NAME), value)))),
+                        _ => None
+                    }
+                }).collect::<Vec<_>>());
 
-                let mut sql = ctx.table(CANDIDATE_GENERATION_TABLE_NAME).await?.join(
+                let mut sql = ctx.table(CANDIDATE_GENERATION_TABLE_NAME).await?.join_on(
                     ctx.table(TABLE_PROVIDER_TABLE_NAME).await?,
                     JoinType::Inner,
-                    pks.as_slice(),
-                    pks.as_slice(),
-                    None
+                    primary_key.iter().map(|pk|
+                        LogicalExpr::Column(Column::new(Some(CANDIDATE_GENERATION_TABLE_NAME), pk))
+                            .eq(LogicalExpr::Column(Column::new(Some(TABLE_PROVIDER_TABLE_NAME), pk)))
+                    )
                 )?;
 
                 if !remaining_filters.is_empty() {

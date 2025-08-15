@@ -22,7 +22,7 @@ use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
-    self, BedrockClient,
+    self,
     embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
 };
 
@@ -30,8 +30,8 @@ use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
 };
-use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use llms::openai::embed::OpenaiEmbed;
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -84,80 +84,19 @@ pub async fn try_to_embedding(
 }
 
 #[cfg(feature = "bedrock")]
-#[allow(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    use llms::bedrock::rate_limit::BedrockRateLimitConfigBuilder;
-
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
             model_source: "bedrock".to_string(),
         });
     };
 
-    // Build AWS config
-    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
-
-    // Set region if provided
-    if let Some(region) = extract_secret!(params, "aws_region") {
-        config_builder = config_builder.region(aws_config::Region::new(region.to_owned()));
-    }
-
-    // Set profile if provided
-    if let Some(profile) = extract_secret!(params, "aws_profile") {
-        config_builder = config_builder.profile_name(profile);
-    }
-
-    // Set access key and secret key if provided
-    if let (Some(access_key), Some(secret_key)) = (
-        extract_secret!(params, "aws_access_key_id"),
-        extract_secret!(params, "aws_secret_access_key"),
-    ) {
-        let session_token = extract_secret!(params, "aws_session_token");
-
-        let credentials = aws_credential_types::Credentials::new(
-            access_key,
-            secret_key,
-            session_token.map(std::string::ToString::to_string),
-            None,
-            "bedrock-embed",
-        );
-
-        config_builder = config_builder.credentials_provider(credentials);
-    }
-
-    let mut rate_limit_builder = BedrockRateLimitConfigBuilder::new();
-    params
-        .get("requests_per_min_limit")
-        .map(|rpm| match rpm.expose_secret().parse::<u32>() {
-            Ok(limit) => {
-                let _ = rate_limit_builder.requests_per_minute(limit);
-                Ok(())
-            }
-            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                source: format!("Failed to parse 'requests_per_min_limit' parameter: {e}").into(),
-            }),
-        })
-        .transpose()?;
-
-    params
-        .get("max_concurrent_invocations")
-        .map(|mci| match mci.expose_secret().parse::<usize>() {
-            Ok(limit) => {
-                let _ = rate_limit_builder.max_concurrent_invocations(limit);
-                Ok(())
-            }
-            Err(e) => Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                source: format!("Failed to parse 'max_concurrent_invocations' parameter: {e}")
-                    .into(),
-            }),
-        })
-        .transpose()?;
-
-    let config = config_builder.load().await;
-    let client = BedrockClient::new(&config, rate_limit_builder.build());
+    let client = super::util::create_bedrock_client(params, "bedrock-embed")
+        .await
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: e })?;
 
     if model_id.starts_with("amazon.titan-embed") {
         let normalize = params
@@ -422,14 +361,17 @@ fn azure(
         });
     }
 
-    Ok(Arc::new(OpenaiEmbed::new(llms::openai::new_azure_client(
-        model_name,
-        api_base,
-        api_version,
-        deployment_name,
-        entra_token,
-        api_key,
-    ))))
+    Ok(Arc::new(OpenaiEmbed::new(
+        llms::openai::new_azure_client(
+            model_name,
+            api_base,
+            api_version,
+            deployment_name,
+            entra_token,
+            api_key,
+        ),
+        None,
+    )))
 }
 
 async fn openai(
@@ -439,22 +381,33 @@ async fn openai(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     // If parameter is from secret store, it will have `openai_` prefix
-    let mut embed = OpenaiEmbed::new(llms::openai::new_openai_client(
-        model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
-        extract_secret!(params, "endpoint"),
-        params
-            .get("api_key")
-            .or(params.get("openai_api_key"))
-            .map(secrecy::ExposeSecret::expose_secret),
-        params
-            .get("org_id")
-            .or(params.get("openai_org_id"))
-            .map(secrecy::ExposeSecret::expose_secret),
-        params
-            .get("project_id")
-            .or(params.get("openai_project_id"))
-            .map(secrecy::ExposeSecret::expose_secret),
-    ));
+    let openai_usage_tier = params
+        .get("usage_tier")
+        .or(params.get("openai_usage_tier"))
+        .map(secrecy::ExposeSecret::expose_secret)
+        .map(UsageTier::from_str)
+        .transpose()?;
+
+    let mut embed = OpenaiEmbed::new(
+        llms::openai::new_openai_client(
+            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+            extract_secret!(params, "endpoint"),
+            params
+                .get("api_key")
+                .or(params.get("openai_api_key"))
+                .map(secrecy::ExposeSecret::expose_secret),
+            params
+                .get("org_id")
+                .or(params.get("openai_org_id"))
+                .map(secrecy::ExposeSecret::expose_secret),
+            params
+                .get("project_id")
+                .or(params.get("openai_project_id"))
+                .map(secrecy::ExposeSecret::expose_secret),
+            openai_usage_tier,
+        ),
+        openai_usage_tier.map(Into::into),
+    );
 
     // For OpenAI compatible embedding models, we allow users to
     // specific the tokenizer being used, so that the model can chunk data properly.

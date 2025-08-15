@@ -103,3 +103,39 @@ static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(||
 pub fn track_ai_inferences_with_spice_count(dimensions: &[KeyValue]) {
     AI_INFERENCES_WITH_SPICE_COUNT.add(1, dimensions);
 }
+
+static TEXT_EMBEDDINGS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("text_embeddings")
+        .with_description("Number of text embeddings requests.")
+        .with_unit("embedding")
+        .build()
+});
+
+pub fn track_text_embedding(dimensions: &[KeyValue]) {
+    TEXT_EMBEDDINGS.add(1, dimensions);
+}
+
+static TEXT_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("text_searches")
+        .with_description("Number of text search requests.")
+        .with_unit("search")
+        .build()
+});
+
+pub fn track_text_search(dimensions: &[KeyValue]) {
+    TEXT_SEARCHES.add(1, dimensions);
+}
+
+static VECTOR_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("vector_searches")
+        .with_description("Number of vector search requests.")
+        .with_unit("search")
+        .build()
+});
+
+pub fn track_vector_search(dimensions: &[KeyValue]) {
+    VECTOR_SEARCHES.add(1, dimensions);
+}

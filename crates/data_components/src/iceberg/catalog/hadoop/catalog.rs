@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use iceberg::io::{FileIO, InputFile};
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt, TryStreamExt};
+use iceberg::io::{Extensions, FileIO, InputFile};
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
@@ -40,12 +42,13 @@ pub enum MetadataMode {
 }
 
 /// Builder for creating a new `HadoopCatalog`
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HadoopCatalogBuilder {
     warehouse_root: Option<String>,
     file_io: Option<FileIO>,
     metadata_mode: MetadataMode,
     properties: HashMap<String, String>,
+    file_io_extensions: Extensions,
 }
 
 impl HadoopCatalogBuilder {
@@ -64,6 +67,13 @@ impl HadoopCatalogBuilder {
         self
     }
 
+    /// Sets the `FileIO` extensions for the Hadoop catalog.
+    #[must_use]
+    pub fn with_file_io_extension<T: Any + Send + Sync>(mut self, extension: T) -> Self {
+        self.file_io_extensions.add(extension);
+        self
+    }
+
     /// Sets the metadata mode for the Hadoop catalog.
     #[must_use]
     pub fn with_metadata_mode(mut self, metadata_mode: MetadataMode) -> Self {
@@ -78,6 +88,107 @@ impl HadoopCatalogBuilder {
         self
     }
 
+    /// Sets properties for the `FileIO` connection.
+    #[must_use]
+    pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties.extend(properties);
+        self
+    }
+
+    fn inner_build(self, infer_scheme: bool) -> BoxFuture<'static, Result<HadoopCatalog>> {
+        async move {
+            let mut cloned_self = self.clone();
+            let mut warehouse_root = self.warehouse_root.ok_or_else(|| {
+                Error::new(ErrorKind::DataInvalid, "Warehouse root must be specified")
+            })?;
+
+            if !warehouse_root.ends_with('/') {
+                warehouse_root.push('/');
+            }
+
+            let file_io = if let Some(file_io) = self.file_io {
+                file_io
+            } else {
+                FileIO::from_path(&warehouse_root)?
+                    .with_props(self.properties)
+                    .with_extensions(self.file_io_extensions)
+                    .build()?
+            };
+
+            let root_input = file_io.new_input(&warehouse_root).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid warehouse root: {e}"),
+                )
+            })?;
+
+            if !matches!(root_input.metadata().await?.mode, EntryMode::DIR) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Warehouse root must be a directory",
+                ));
+            }
+
+            let cloned_warehouse_root = warehouse_root.clone();
+            let catalog = HadoopCatalog {
+                warehouse_root,
+                file_io,
+                metadata_mode: self.metadata_mode,
+            };
+
+            if infer_scheme {
+                // infer if the warehouse scheme matches the scheme specified from table metadata locations
+                let cloned_catalog = catalog.clone();
+                let namespaces = cloned_catalog.list_namespaces(None).await?;
+                let tables = futures::stream::iter(namespaces)
+                    .then(|namespace| {
+                        let catalog = cloned_catalog.clone();
+                        async move { catalog.list_tables(&namespace).await }
+                    })
+                    .try_collect::<Vec<Vec<_>>>()
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                let mut inferred_scheme = None;
+                for table in tables {
+                    let metadata = catalog.load_metadata(&table).await;
+                    // lazy scheme inferring - only check until we get the first valid metadata
+                    if let Ok(m) = metadata {
+                        if let Some((scheme, _)) = m.location().split_once("://") {
+                            if !cloned_warehouse_root.starts_with(scheme) {
+                                inferred_scheme = Some(scheme.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(scheme) = inferred_scheme {
+                    tracing::debug!(
+                        "Inferred scheme '{scheme}' for warehouse root '{cloned_warehouse_root}'",
+                    );
+
+                    if let Some((actual_scheme, _)) = cloned_warehouse_root.split_once("://") {
+                        cloned_self.warehouse_root =
+                            Some(cloned_warehouse_root.replace(actual_scheme, &scheme));
+                        return cloned_self.inner_build(false).await;
+                    }
+                    // if the existing root doesn't contain a scheme, it's in an unknown format that we cannot fix
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Warehouse root '{cloned_warehouse_root}' does not start with the inferred scheme '{scheme}'. Verify the warehouse root is in the format of '<scheme>://<path>'.",
+                        ),
+                    ));
+                }
+            }
+
+            Ok(catalog)
+        }.boxed()
+    }
+
     /// Builds the `HadoopCatalog` instance.
     ///
     /// # Errors
@@ -85,46 +196,12 @@ impl HadoopCatalogBuilder {
     /// Returns an error if the warehouse root is not specified, if the `FileIO` is not specified,
     /// if the warehouse root is not a directory, or if the warehouse root does not start with the `FileIO` scheme prefix.
     pub async fn build(self) -> Result<HadoopCatalog> {
-        let mut warehouse_root = self.warehouse_root.ok_or_else(|| {
-            Error::new(ErrorKind::DataInvalid, "Warehouse root must be specified")
-        })?;
-
-        let file_io = if let Some(file_io) = self.file_io {
-            file_io
-        } else {
-            FileIO::from_path(&warehouse_root)?
-                .with_props(self.properties)
-                .build()?
-        };
-
-        let root_input = file_io.new_input(&warehouse_root).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Invalid warehouse root: {e}"),
-            )
-        })?;
-
-        if !matches!(root_input.metadata().await?.mode, EntryMode::DIR) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Warehouse root must be a directory",
-            ));
-        }
-
-        if !warehouse_root.ends_with('/') {
-            warehouse_root.push('/');
-        }
-
-        Ok(HadoopCatalog {
-            warehouse_root,
-            file_io,
-            metadata_mode: MetadataMode::Infer,
-        })
+        self.inner_build(true).await
     }
 }
 
 /// Represents a hadoop catalog backed by storage from a `FileIO`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HadoopCatalog {
     file_io: FileIO,
     warehouse_root: String,
@@ -351,9 +428,6 @@ impl Catalog for HadoopCatalog {
                 .await?
             {
                 tables.push(table_ident);
-            } else {
-                // TODO: Add something like a `MetadataMissingBehavior` to choose whether to fail or not
-                tracing::warn!("Table {} does not have metadata, skipping", table_ident);
             }
         }
 
@@ -453,11 +527,21 @@ impl HadoopCatalog {
         if let Some(metadata_file) = metadata_file_path {
             self.file_io.new_input(&metadata_file)
         } else {
-            // TODO: version hint could be .txt or .text. refactor this to support both later
-            let version_hint_path = self.version_hint_path(table_identifier, "txt");
+            let hint_one = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "txt"))?;
+            let hint_two = self
+                .file_io
+                .new_input(self.version_hint_path(table_identifier, "text"))?;
+            let hint_input = if hint_one.exists().await? {
+                Some(hint_one)
+            } else if hint_two.exists().await? {
+                Some(hint_two)
+            } else {
+                None
+            };
 
-            let input = self.file_io.new_input(&version_hint_path)?;
-            if input.exists().await? {
+            if let Some(input) = hint_input {
                 // Load the version hint file to get the latest metadata file
                 let metadata_version = input.read().await?;
                 let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
@@ -532,5 +616,30 @@ impl HadoopCatalog {
                 }
             }
         }
+    }
+
+    async fn load_metadata(&self, table_identifier: &TableIdent) -> Result<TableMetadata> {
+        let metadata_file_path = match self.metadata_mode {
+            MetadataMode::Infer => None,
+            MetadataMode::ExactOrInfer(ref metadata_file) => {
+                let input_file = self.file_io.new_input(metadata_file)?;
+                if input_file.exists().await? {
+                    Some(metadata_file.clone())
+                } else {
+                    // If the exact metadata file does not exist, infer the latest metadata file
+                    None
+                }
+            }
+            MetadataMode::Exact(ref metadata_file) => Some(metadata_file.clone()),
+        };
+
+        let metadata_file = self
+            .find_metadata_file(table_identifier, metadata_file_path)
+            .await?;
+
+        let metadata_file_content = metadata_file.read().await?;
+        Ok(serde_json::from_slice::<TableMetadata>(
+            &metadata_file_content,
+        )?)
     }
 }

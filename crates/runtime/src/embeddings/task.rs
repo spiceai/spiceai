@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::Instant};
 
-use async_openai::{
-    error::OpenAIError,
-    types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat},
+use async_openai::types::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
 use llms::{
@@ -26,6 +25,8 @@ use llms::{
     embeddings::{Embed, Result as EmbedResult, get_or_infer_size},
 };
 use tracing::{Instrument, Span};
+
+use crate::request::{AsyncMarker, RequestContext};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
 
@@ -50,6 +51,9 @@ impl TaskEmbed {
 #[async_trait]
 impl Embed for TaskEmbed {
     async fn embed<'b>(&'b self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_text_embedding(&request_context.to_dimensions());
+
         let start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&input).unwrap_or_default());
 
@@ -87,7 +91,10 @@ impl Embed for TaskEmbed {
     async fn embed_request<'b>(
         &'b self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_text_embedding(&request_context.to_dimensions());
+
         let start = Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = %serde_json::to_string(&req.input).unwrap_or_default());
 

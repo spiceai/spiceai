@@ -16,9 +16,12 @@ limitations under the License.
 
 use anyhow::Context;
 use async_openai::error::OpenAIError;
+use aws_config::{BehaviorVersion, Region, defaults};
+use aws_credential_types::Credentials;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
+    bedrock::chat::BedrockConverse,
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
@@ -34,6 +37,46 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let mut config_builder = defaults(BehaviorVersion::latest());
+
+    if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
+        config_builder = config_builder.region(Region::new(region.clone()));
+    }
+
+    match (
+        std::env::var("SPICE_BEDROCK_ACCESS_KEY"),
+        std::env::var("SPICE_BEDROCK_SECRET_KEY"),
+    ) {
+        (Ok(access_key), Ok(secret_key)) => {
+            config_builder = config_builder.credentials_provider(Credentials::new(
+                access_key,
+                secret_key,
+                std::env::var("SPICE_BEDROCK_SESSION_TOKEN").ok(),
+                None,
+                "bedrock-chat",
+            ));
+        }
+        (Err(_), Ok(_)) => {
+            return Err(anyhow::anyhow!("SPICE_BEDROCK_ACCESS_KEY not set"));
+        }
+        (Ok(_), Err(_)) => {
+            return Err(anyhow::anyhow!("SPICE_BEDROCK_SECRET_KEY not set"));
+        }
+        (Err(_), Err(_)) => {
+            return Err(anyhow::anyhow!(
+                "SPICE_BEDROCK_ACCESS_KEY & SPICE_BEDROCK_SECRET_KEY not set"
+            ));
+        }
+    }
+
+    let config = config_builder.load().await;
+    Ok(Arc::new(BedrockConverse::new(
+        Arc::new((&config).into()),
+        model_id.to_string(),
+    )) as Arc<dyn Chat>)
+}
+
 pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
         return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
@@ -47,6 +90,7 @@ pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
         model_id.to_string(),
         None,
         api_key.as_deref(),
+        None,
         None,
         None,
     ))
@@ -84,7 +128,7 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
         params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
-    let sonar = PerplexitySonar::from_params(None, &params)
+    let sonar = PerplexitySonar::from_unprefixed_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
 
     Ok(Arc::new(sonar))

@@ -1,0 +1,181 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use aws_config::{BehaviorVersion, SdkConfig};
+
+use aws_credential_types::Credentials;
+use aws_runtime::auth::sigv4::SigV4AuthScheme;
+use aws_sdk_s3::{
+    Client,
+    config::{
+        ConfigBag, IdentityCache, ResolveCachedIdentity, SharedIdentityCache,
+        auth::{DefaultAuthSchemeResolver, ResolveAuthScheme},
+        endpoint::{DefaultResolver, ResolveEndpoint},
+    },
+};
+use aws_smithy_runtime::client::retries::strategy::StandardRetryStrategy;
+use aws_smithy_runtime_api::client::{
+    auth::{AuthSchemeId, SharedAuthScheme},
+    identity::SharedIdentityResolver,
+    runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
+};
+use iceberg::io::{
+    AwsCredential as IcebergAwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader,
+};
+use object_store::{CredentialProvider, aws::AwsCredential as ObjectStoreAwsCredential};
+use snafu::prelude::*;
+
+use crate::{
+    Error, FailedToBuildAWSRuntimeComponentsSnafu, FailedToResolveIcebergCredentialsSnafu, Result,
+};
+
+#[derive(Debug)]
+pub struct S3CredentialProvider {
+    runtime: RuntimeComponents,
+    cache: SharedIdentityCache,
+    identity_resolver: SharedIdentityResolver,
+}
+
+impl S3CredentialProvider {
+    /// Loads credentials from the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials cannot be loaded from the environment.
+    pub async fn from_env() -> Result<(Self, SdkConfig)> {
+        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+
+        Ok((Self::from_config(&config)?, config))
+    }
+
+    /// Loads credentials from a given SDK configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials cannot be loaded from the provided config.
+    pub fn from_config(sdk_config: &SdkConfig) -> Result<Self> {
+        let credentials_provider = sdk_config
+            .credentials_provider()
+            .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?;
+        Ok(Self {
+            cache: IdentityCache::lazy().build(),
+            runtime: Self::build_aws_runtime_components(sdk_config, &Client::new(sdk_config))?,
+            identity_resolver: SharedIdentityResolver::new(credentials_provider),
+        })
+    }
+
+    #[must_use]
+    pub fn into_custom_loader(self) -> CustomAwsCredentialLoader {
+        CustomAwsCredentialLoader::new(Arc::new(self))
+    }
+
+    fn build_aws_runtime_components(
+        sdk_config: &SdkConfig,
+        client: &Client,
+    ) -> Result<RuntimeComponents> {
+        RuntimeComponentsBuilder::new("S3CredentialProvider")
+            .with_auth_scheme_option_resolver(Some(
+                DefaultAuthSchemeResolver::default().into_shared_resolver(),
+            ))
+            .with_endpoint_resolver(Some(DefaultResolver::new().into_shared_resolver()))
+            .with_auth_scheme(SharedAuthScheme::new(SigV4AuthScheme::new()))
+            .with_identity_cache(Some(IdentityCache::lazy().build()))
+            .with_identity_resolver(
+                AuthSchemeId::new("SpiceS3CredentialProvider"),
+                SharedIdentityResolver::new(
+                    sdk_config
+                        .credentials_provider()
+                        .ok_or_else(|| Error::FailedToGetCredentialsProviderFromConfig)?,
+                ),
+            )
+            .with_retry_strategy(Some(StandardRetryStrategy::new()))
+            .with_time_source(client.config().time_source())
+            .with_sleep_impl(client.config().sleep_impl())
+            .build()
+            .context(FailedToBuildAWSRuntimeComponentsSnafu)
+    }
+}
+
+#[async_trait]
+impl AwsCredentialLoad for S3CredentialProvider {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<IcebergAwsCredential>> {
+        // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
+        // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
+        let wrapped_credentials = self
+            .cache
+            .resolve_cached_identity(
+                self.identity_resolver.clone(),
+                &self.runtime,
+                &ConfigBag::base(),
+            )
+            .await
+            .context(FailedToResolveIcebergCredentialsSnafu)?;
+
+        let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            Error::FailedToResolveIcebergCredentials {
+                source: "No valid credentials found".into(),
+            }
+        })?;
+
+        Ok(Some(IcebergAwsCredential {
+            access_key_id: credentials.access_key_id().to_string(),
+            secret_access_key: credentials.secret_access_key().to_string(),
+            session_token: credentials.session_token().map(ToString::to_string),
+            expires_in: credentials.expiry().map(Into::into),
+        }))
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for S3CredentialProvider {
+    type Credential = ObjectStoreAwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        // `resolve_cached_identity` will first check the cache for valid, unexpired credentials, and fetch new credentials if needed.
+        // The identity resolver and runtime components are required parameters for this function, which is why they're fields of this struct.
+        let wrapped_credentials = self
+            .cache
+            .resolve_cached_identity(
+                self.identity_resolver.clone(),
+                &self.runtime,
+                &ConfigBag::base(),
+            )
+            .await
+            .map_err(|_| object_store::Error::Generic {
+                store: "S3",
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+            })?;
+
+        let credentials = wrapped_credentials.data::<Credentials>().ok_or_else(|| {
+            object_store::Error::Generic {
+                store: "S3",
+                source: "Failed to find valid credentials from the AWS credential provider chain for the S3 connection. Ensure that valid AWS credentials are provided in the environment. Details: https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credproviders.html#credproviders-default-credentials-provider-chain".into(),
+            }
+        })?;
+
+        Ok(Arc::new(ObjectStoreAwsCredential {
+            key_id: credentials.access_key_id().to_string(),
+            secret_key: credentials.secret_access_key().to_string(),
+            token: credentials.session_token().map(ToString::to_string),
+        }))
+    }
+}

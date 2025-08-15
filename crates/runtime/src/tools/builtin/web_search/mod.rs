@@ -70,7 +70,8 @@ impl TryFrom<&HashMap<String, SecretString>> for SearchEngine {
                 let model_id = params
                     .get("perplexity_model")
                     .map(secrecy::ExposeSecret::expose_secret);
-                let sonar = PerplexitySonar::from_params(model_id, params)?;
+                // For consistency with model parameter UX, we require parameters to be prefixed (i.e. `perplexity_auth_token` not just `auth_token`).
+                let sonar = PerplexitySonar::from_params(model_id, params, Some("perplexity_"))?;
                 Ok(SearchEngine::Perplexity(sonar))
             }
             _ => Err("Unknown search engine '{engine}'".into()),

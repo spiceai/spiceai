@@ -59,7 +59,7 @@ concurrency:
 jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
-    timeout-minutes: 30
+    timeout-minutes: 90
     runs-on: ${{ matrix.target.builder }}
     env:
       GOVER: 1.24.2
@@ -77,10 +77,10 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
+
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
@@ -181,7 +181,7 @@ jobs:
       matrix:
         target:
           - name: 'Linux x64'
-            runner: 'spiceai-runners'
+            runner: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
           - name: 'macOS aarch64 (Apple Silicon)'
@@ -189,10 +189,10 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -259,10 +259,10 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

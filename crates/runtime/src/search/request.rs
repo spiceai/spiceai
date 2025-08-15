@@ -125,7 +125,7 @@ pub struct SearchRequest {
     pub where_cond: Option<Expr>,
 
     /// Additional columns to return from the dataset.
-    pub additional_columns: Vec<String>,
+    pub additional_columns: Vec<sqlparser::ast::Ident>,
 
     /// Keywords to perform a lexical search and pre-filter the embedding column.
     pub keywords: Vec<String>,
@@ -139,7 +139,12 @@ impl From<SearchRequest> for SearchKey {
                 .map(|d| d.into_iter().map(Into::into).collect()),
             req.limit,
             req.where_cond,
-            Some(req.additional_columns.into_iter().map(Into::into).collect()),
+            Some(
+                req.additional_columns
+                    .into_iter()
+                    .map(|c| c.to_string().as_str().into())
+                    .collect(),
+            ),
             req.keywords.into_iter().map(Into::into).collect(),
         )
     }
@@ -161,7 +166,7 @@ impl SearchRequest {
         datasets: Option<Vec<String>>,
         limit: usize,
         where_cond: Option<Expr>,
-        additional_columns: Vec<String>,
+        additional_columns: Vec<sqlparser::ast::Ident>,
         keywords: Vec<String>,
     ) -> Self {
         SearchRequest {
@@ -202,7 +207,9 @@ impl SearchRequest {
         Ok(expr)
     }
 
-    pub fn parse_additional_columns(additional_columns: &[String]) -> super::Result<Vec<String>> {
+    pub fn parse_additional_columns(
+        additional_columns: &[String],
+    ) -> super::Result<Vec<sqlparser::ast::Ident>> {
         additional_columns
             .iter()
             .map(|c| {
@@ -290,9 +297,10 @@ impl SearchRequest {
                     });
                 }
 
-                Ok(c.clone())
+                // Standardise on quoting everything (but don't double quote).
+                Ok(sqlparser::ast::Ident::with_quote('"', c.trim_matches('"')))
             })
-            .collect::<Result<Vec<String>>>()
+            .collect::<Result<Vec<sqlparser::ast::Ident>>>()
     }
 
     pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr> {
@@ -393,7 +401,10 @@ pub(crate) mod tests {
             Ok(r) => r,
             Err(e) => panic!("failed to parse additional columns: {e}"),
         };
-        assert_eq!(resp.pop(), Some("column".to_string()));
+        assert_eq!(
+            resp.pop().map(|s| s.to_string()),
+            Some("\"column\"".to_string())
+        );
     }
 
     #[test]
@@ -403,7 +414,10 @@ pub(crate) mod tests {
                 Ok(r) => r,
                 Err(e) => panic!("failed to parse additional columns: {e}"),
             };
-        assert_eq!(resp.pop(), Some("\"quoted_column\"".to_string()));
+        assert_eq!(
+            resp.pop().map(|s| s.to_string()),
+            Some("\"quoted_column\"".to_string())
+        );
     }
 
     #[test]
@@ -414,7 +428,10 @@ pub(crate) mod tests {
                 Err(e) => panic!("failed to parse additional columns: {e}"),
             };
 
-        assert_eq!(resp.pop(), Some("qualified.column".to_string()));
+        assert_eq!(
+            resp.pop().map(|s| s.to_string()),
+            Some("\"qualified.column\"".to_string())
+        );
     }
 
     #[test]
@@ -426,7 +443,10 @@ pub(crate) mod tests {
             Err(e) => panic!("failed to parse additional columns: {e}"),
         };
 
-        assert_eq!(resp.pop(), Some("\"qualified.quoted_column\"".to_string()));
+        assert_eq!(
+            resp.pop().map(|s| s.to_string()),
+            Some("\"qualified.quoted_column\"".to_string())
+        );
     }
 
     #[test]

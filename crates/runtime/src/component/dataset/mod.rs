@@ -350,6 +350,7 @@ impl Dataset {
         self.schema.clone()
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {

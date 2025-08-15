@@ -44,6 +44,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use futures::FutureExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use std::cmp::min;
@@ -65,6 +66,7 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
+    request::{AsyncMarker, RequestContext},
     search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use tokio::sync::RwLock;
@@ -272,6 +274,12 @@ impl VectorSearchTableFunc {
 
 impl TableFunctionImpl for VectorSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        async {
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            telemetry::track_vector_search(&request_context.to_dimensions());
+        }
+        .now_or_never();
+
         let args = Self::parse_args(args)?;
         let df = self.df.upgrade().ok_or_else(|| {
             DataFusionError::Plan(format!(

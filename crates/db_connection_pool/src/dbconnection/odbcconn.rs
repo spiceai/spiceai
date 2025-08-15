@@ -132,7 +132,6 @@ where
         }
     }
 
-    #[must_use]
     async fn get_schema(
         &self,
         table_reference: &TableReference,

@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
+use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
@@ -143,12 +144,16 @@ impl DeltaTable {
 
         let table_object_store = match (
             load_credentials_from_environment,
-            object_store_aws_sdk::get_sdk_config(),
+            aws_sdk_credential_bridge::get_sdk_config(),
         ) {
             (true, Some(sdk_config)) => {
                 let region = storage_options.get("aws_region").map(ToString::to_string);
-                object_store_aws_sdk::from_s3_url_and_config(table.location(), region, sdk_config)
-                    .ok()
+                aws_sdk_credential_bridge::from_s3_url_and_config(
+                    table.location(),
+                    region,
+                    sdk_config,
+                )
+                .ok()
             }
             _ => None,
         };
