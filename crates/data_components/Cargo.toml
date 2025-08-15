@@ -101,6 +101,7 @@ duckdb = [
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
+mongodb = ["datafusion-table-providers/mongodb",]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
