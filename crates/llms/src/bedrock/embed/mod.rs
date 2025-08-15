@@ -33,7 +33,6 @@ use async_openai::types::{
     EmbeddingVector,
 };
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
