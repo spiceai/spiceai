@@ -80,22 +80,22 @@ pub struct VectorQueryTableProvider {
 impl VectorQueryTableProvider {
     /// Execute the given physical plan of a vector index query, extract the primary key columns and convert the values: {(v1_1, v1_2, ...), (v2_1, v2_2, ...), ..., (vn_1, vn_2, ...)} into a filter predicate: `WHERE (primary_key_col1, primary_key_col2, ...) IN ((v1_1, v1_2, ...), (v2_1, v2_2, ...), ...)`.
     ///
-    /// When `primary_key_columns.len() == 1`, use a simplified expression `WHERE primary_key_col1 IN (v1_1, v2_1, ...)`.
+    /// When `primary_key_fields.len() == 1`, use a simplified expression `WHERE primary_key_col1 IN (v1_1, v2_1, ...)`.
     async fn base_table_query_filter(
         &self,
         state: &dyn Session,
         physical_plan: Arc<dyn ExecutionPlan>,
-        primary_key_columns: &[Field],
+        primary_key_fields: &[Field],
     ) -> DataFusionResult<Expr> {
-        if primary_key_columns.is_empty() {
+        if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution(
                 "No primary key columns provided".to_string(),
             ));
         };
 
         // For single column primary key, maintain the existing behavior
-        if primary_key_columns.len() == 1 {
-            let primary_key_column = &primary_key_columns[0];
+        if primary_key_fields.len() == 1 {
+            let primary_key_column = &primary_key_fields[0];
             let mut expr = vec![];
 
             let mut strm = physical_plan.execute(0, state.task_ctx())?;
@@ -120,11 +120,11 @@ impl VectorQueryTableProvider {
         while let Some(Ok(rb)) = strm.next().await {
             // Get all arrays for primary key columns
             let mut arrays = vec![];
-            let pk_names: Vec<String> = primary_key_columns
+            let pk_names: Vec<String> = primary_key_fields
                 .iter()
                 .map(|pk| pk.name().clone())
                 .collect();
-            for pk_col in primary_key_columns {
+            for pk_col in primary_key_fields {
                 if let Some(arr) = rb.column_by_name(pk_col.name()) {
                     arrays.push(arr);
                 } else {
@@ -154,7 +154,7 @@ impl VectorQueryTableProvider {
             std::sync::Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
                 datafusion::functions::core::r#struct::StructFunc::new(),
             )),
-            primary_key_columns.iter().map(|f| col(f.name())).collect(),
+            primary_key_fields.iter().map(|f| col(f.name())).collect(),
         ));
 
         Ok(Expr::InList(InList::new(
@@ -528,7 +528,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field, Schema};
-    use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
     use datafusion::{
         catalog::{MemTable, TableProvider},
         sql::TableReference,

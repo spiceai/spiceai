@@ -110,18 +110,6 @@ impl VectorScanTableProvider {
         proj.contains(&idx)
     }
 
-    /// Construct the required join on expressions as per the primary key.
-    fn join_on_expr(&self) -> DataFusionResult<Vec<(Expr, Expr)>> {
-        let primary_key_columns = self.index.primary_fields();
-        let Some(pk) = primary_key_columns.first() else {
-            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
-        };
-        Ok(vec![(
-            Expr::Column(Column::new_unqualified(pk.name().clone())),
-            Expr::Column(Column::new_unqualified(pk.name().clone())),
-        )])
-    }
-
     fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
         let base = self.table_provider.schema();
         let mut qualified_fields: Vec<_> = base
@@ -210,9 +198,9 @@ impl TableProvider for VectorScanTableProvider {
         )?);
 
         let primary_key_fields = self.index.primary_fields();
-        let Some(pk) = primary_key_fields.first() else {
-            return Err(DataFusionError::Execution("Vector search index was successfully created without a primary key available during physical planning.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues".to_string()));
-        };
+        if primary_key_fields.is_empty() {
+            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
+        }
 
         let output_plan = if vector_index_table_is_sufficient(
             self.schema(),
@@ -241,12 +229,27 @@ impl TableProvider for VectorScanTableProvider {
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
-            // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
+            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+            let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
             let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
                 filters.iter().cloned().partition(|f| {
                     f.column_refs()
-                        .contains(&Column::new_unqualified(pk.name().clone()))
+                        .iter()
+                        .any(|col| primary_key_column_names.contains(col.name()))
                 });
+
+            let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
+                .iter()
+                .map(|pk_field| {
+                    (
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                    )
+                })
+                .collect();
 
             // Right Join so that all rows in the underlying table are returned.
             // Rows may not have associated vectors periodically due to indexing delays.
@@ -255,19 +258,19 @@ impl TableProvider for VectorScanTableProvider {
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Right,
                 join_constraint: JoinConstraint::On,
-                on: self.join_on_expr()?,
+                on: join_conditions,
                 filter: pre_join_filters.into_iter().reduce(Expr::and),
                 schema: join_schema.into(),
                 null_equals_null: false,
             });
 
-            // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
-            // case, we will remove first.
+            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+            // case, we will remove duplicate primary key columns from the right table.
             let deduped_schema = DFSchema::new_with_metadata(
                 join.schema()
                     .iter()
                     .filter(|(tbl, f)| {
-                        !(f.name() == pk.name()
+                        !(primary_key_column_names.contains(f.name())
                             && tbl.is_some_and(|t| *t == TableReference::parse_str("base_table")))
                     })
                     .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
