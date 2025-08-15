@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::error::OpenAIError;
 use serde::{Deserialize, Serialize};
+use snafu::ensure;
 
-use crate::bedrock::embed::BedrockEmbeddingConfig;
+use crate::{
+    bedrock::embed::BedrockEmbeddingConfig,
+    embeddings::{FailedToExtractEmbeddingsSnafu, Result as EmbedResult},
+};
 pub const TITAN_TEXT_EMBED_V2: &str = "amazon.titan-embed-text-v2:0";
 
 #[derive(Debug)]
@@ -40,29 +43,26 @@ impl BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse> for TitanConf
         }
     }
 
-    fn extract_embeddings(
-        &self,
-        resp: TitanEmbedResponse,
-    ) -> Result<(Vec<Vec<f32>>, u32), OpenAIError> {
+    fn extract_embeddings(&self, resp: TitanEmbedResponse) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
         Ok((vec![resp.embedding], resp.input_text_token_count))
     }
 
-    fn to_request_blobs(
-        &self,
-        input_text: Vec<String>,
-    ) -> Result<Vec<TitanEmbedRequest>, OpenAIError> {
+    fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<TitanEmbedRequest>> {
         input_text
             .into_iter()
             .map(|t| {
                 // For Titan models, we need to be more careful about token limits
                 // This is still an approximation as we don't have access to the actual tokenizer
-                if t.split_whitespace().count() > MAX_TITAN_INPUT_LENGTH {
-                    return Err(OpenAIError::InvalidArgument(format!(
-                        "Input {} is longer than maximum supported length {}",
+                ensure!(
+                    t.split_whitespace().count() <= MAX_TITAN_INPUT_LENGTH,
+                    FailedToExtractEmbeddingsSnafu {
+                        message: format!(
+                        "Input {} is longer than maximum supported length {MAX_TITAN_INPUT_LENGTH}",
                         t.len(),
-                        MAX_TITAN_INPUT_LENGTH
-                    )));
-                }
+                    )
+                    }
+                );
+
                 Ok(TitanEmbedRequest {
                     input_text: t,
                     normalize: Some(self.normalize),
@@ -70,7 +70,7 @@ impl BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse> for TitanConf
                     embedding_types: Some(vec!["float".to_string()]),
                 })
             })
-            .collect::<Result<Vec<TitanEmbedRequest>, OpenAIError>>()
+            .collect::<EmbedResult<Vec<TitanEmbedRequest>>>()
     }
 }
 
