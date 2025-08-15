@@ -35,7 +35,9 @@ use datafusion::{
 
 use crate::{
     embedding_col,
-    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+    embeddings::index::{
+        VectorIndex, projection_without_columns, vector_index_table_is_sufficient,
+    },
 };
 use search::generation::util::append_fields;
 
@@ -225,8 +227,15 @@ impl TableProvider for VectorScanTableProvider {
                 vector_table_scan
             }
         } else {
-            let underlying_table_scan =
-                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
+            // Columns in [`VectorIndex::metadata_columns`] will be retrieved from index, not base table.
+            let underlying_projection = projection_without_columns(
+                &self.schema().fields,
+                self.index.metadata_columns().all_names().as_slice(),
+                projection,
+            );
+            let underlying_table_scan = LogicalPlan::TableScan(
+                self.underlying_table_scan(Some(&underlying_projection), filters)?,
+            );
 
             let join_schema = vector_table_scan
                 .schema()
@@ -307,7 +316,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field, Schema};
-    use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
     use datafusion::{
         catalog::{MemTable, TableProvider},
         sql::TableReference,
@@ -338,9 +346,9 @@ mod tests {
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
-                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new("pk", DataType::Int64, false),
                     Field::new(
-                        S3_VECTOR_EMBEDDING_NAME,
+                        "body_embedding",
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),
@@ -398,9 +406,9 @@ mod tests {
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
-                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new("pk", DataType::Int64, false),
                     Field::new(
-                        S3_VECTOR_EMBEDDING_NAME,
+                        "body_embedding",
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),

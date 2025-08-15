@@ -1,7 +1,7 @@
 ---
 source: crates/runtime/src/embeddings/index/mod.rs
-assertion_line: 476
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
 ---
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                   |
@@ -14,13 +14,12 @@ expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.t
 |               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                              |
 |               |     CoalesceBatchesExec: target_batch_size=8192                                                                                        |
 |               |       FilterExec: another_column@1 != something, projection=[pk@0, body_embedding@2]                                                   |
-|               |         ProjectionExec: expr=[pk@2 as pk, another_column@0 as another_column, body_embedding@1 as body_embedding]                      |
+|               |         ProjectionExec: expr=[pk@1 as pk, another_column@0 as another_column, body_embedding@2 as body_embedding]                      |
 |               |           CoalesceBatchesExec: target_batch_size=8192                                                                                  |
 |               |             CoalesceBatchesExec: target_batch_size=8192                                                                                |
-|               |               HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@1)], projection=[another_column@1, body_embedding@2, pk@3] |
+|               |               HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@0)], projection=[another_column@1, pk@2, body_embedding@3] |
 |               |                 DataSourceExec: partitions=1, partition_sizes=[1]                                                                      |
-|               |                 ProjectionExec: expr=[data@0 as body_embedding, CAST(key@1 AS Int64) as pk]                                            |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                 |
-|               |                     ExplainExecutionPlan: projection=["data", "key"] filter=[] limit=None                                              |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                   |
+|               |                   ExplainExecutionPlan: projection=["pk", "body_embedding"] filter=[] limit=None                                       |
 |               |                                                                                                                                        |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------+

@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::{ArrowError, Field, SchemaRef};
+use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
@@ -364,6 +364,33 @@ fn table_with_projection(
     )) as Arc<dyn TableProvider>)
 }
 
+// Returns a new projection without `columns` in the projection.
+//
+// The order of `table_fields` must be consistent with projection.
+fn projection_without_columns(
+    table_fields: &Fields,
+    columns: &[String],
+    projection: Option<&Vec<usize>>,
+) -> Vec<usize> {
+    table_fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            if columns.contains(f.name()) {
+                return None;
+            }
+
+            // Don't include if not in projection input.
+            if let Some(p) = projection.as_ref() {
+                if !p.contains(&i) {
+                    return None;
+                }
+            }
+            Some(i)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::{any::Any, sync::Arc};
@@ -378,10 +405,7 @@ pub mod tests {
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use data_components::s3_vectors::{
-        MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-        query_provider::S3_VECTOR_DISTANCE_NAME,
-    };
+    use data_components::s3_vectors::{MetadataColumn, MetadataColumns};
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
         datasource::TableType,
@@ -520,13 +544,13 @@ pub mod tests {
     impl PretendVectorIndex {
         #[must_use]
         pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
+            let primary_key_names: Vec<_> =
+                primary_columns.iter().map(|f| f.name().clone()).collect();
             let cols = schema
                 .fields()
                 .iter()
                 .filter_map(|f| {
-                    if f.name() == S3_VECTOR_PRIMARY_KEY_NAME
-                        || f.name() == S3_VECTOR_EMBEDDING_NAME
-                    {
+                    if primary_key_names.contains(f.name()) {
                         return None;
                     }
                     if f.metadata().get("filterable") == Some(&"true".to_string()) {
@@ -580,13 +604,9 @@ pub mod tests {
         ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new(
-                    S3_VECTOR_DISTANCE_NAME,
-                    DataType::Float64,
-                    false,
-                ))],
+                vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
-            println!("In query_table_provider schema={:?}", schema);
+
             Ok(Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),
