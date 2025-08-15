@@ -36,9 +36,7 @@ pub enum Error {
     #[snafu(display(
         "The provided Retention SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
     ))]
-    UnableToParseSql {
-        source: DataFusionError,
-    },
+    UnableToParseSql { source: DataFusionError },
 
     #[snafu(display(
         "Expected a single SQL statement for the retention SQL, found {num_statements}.\nRewrite the SQL to only contain a single DELETE FROM statement."

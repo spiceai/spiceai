@@ -122,9 +122,7 @@ pub enum Error {
     UnableToDeleteTable { reason: String },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
-    UnableToParseSql {
-        source: DataFusionError,
-    },
+    UnableToParseSql { source: DataFusionError },
 
     #[snafu(display("{source}"))]
     RefreshSql { source: refresh_sql::Error },

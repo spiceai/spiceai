@@ -151,12 +151,16 @@ impl VectorSearchTableFunc {
             expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(ScalarValue::Int64(Some(
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            )), None));
+            expr.push(Expr::Literal(
+                ScalarValue::Int64(Some(i64::try_from(limit).unwrap_or(i64::MAX))),
+                None,
+            ));
         }
         if let Some(include_score) = args.include_score {
-            expr.push(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None));
+            expr.push(Expr::Literal(
+                ScalarValue::Boolean(Some(include_score)),
+                None,
+            ));
         }
         expr
     }

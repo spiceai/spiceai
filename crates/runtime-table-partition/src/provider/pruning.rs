@@ -58,7 +58,9 @@ fn collect_conditions(
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(col), Expr::Literal(lit, _))
-                | (Expr::Literal(lit, _), Expr::Column(col)) => Some((col.clone(), vec![lit.clone()])),
+                | (Expr::Literal(lit, _), Expr::Column(col)) => {
+                    Some((col.clone(), vec![lit.clone()]))
+                }
                 _ => None,
             }
         }

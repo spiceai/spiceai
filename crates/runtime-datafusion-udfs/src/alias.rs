@@ -18,18 +18,17 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use arrow_schema::FieldRef;
+use datafusion::logical_expr::ReturnFieldArgs;
 use datafusion::{
     common::{ExprSchema, Result as DataFusionResult},
     logical_expr::{
-        ColumnarValue, Documentation, ScalarFunctionArgs,
-        ScalarUDFImpl, Signature,
+        ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
         interval_arithmetic::Interval,
         simplify::{ExprSimplifyResult, SimplifyInfo},
         sort_properties::{ExprProperties, SortProperties},
     },
     prelude::Expr,
 };
-use datafusion::logical_expr::ReturnFieldArgs;
 
 /// Aliases an existing Scalar UDF to a new name.
 #[derive(Debug)]

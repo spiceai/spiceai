@@ -362,9 +362,10 @@ impl TableProvider for VectorScanTableProvider {
 
         let limit = LogicalPlan::Limit(Limit {
             input: Arc::new(output_proj),
-            fetch: Some(Box::new(Expr::Literal(ScalarValue::UInt64(
-                limit.map(|l| l as u64),
-            ), None))),
+            fetch: Some(Box::new(Expr::Literal(
+                ScalarValue::UInt64(limit.map(|l| l as u64)),
+                None,
+            ))),
             skip: None,
         });
 
