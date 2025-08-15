@@ -170,3 +170,4 @@ embeddings:
     name: openai_embed
     params:
       openai_api_key: ${secrets:OPENAI_API_KEY}
+      openai_usage_tier: tier5
