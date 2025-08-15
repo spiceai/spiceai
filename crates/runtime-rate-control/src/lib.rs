@@ -264,6 +264,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rate_limiter_permit_waits() {
+        let rate_controller = RateControllerBuilder::new()
+            .add_quota(Quota::per_minute(
+                NonZeroU32::new(10).expect("NonZeroU32 should be non-zero"),
+            ))
+            .build();
+
+        let permit = rate_controller.acquire().await;
+        assert!(
+            permit.is_ok(),
+            "Failed to acquire permit: {:?}",
+            permit.err()
+        );
+        let permit = permit.expect("should be Ok");
+
+        // Make 9 more waits to full the quota from the permit
+        futures::future::join_all((0..9).map(|_| permit.until_ready())).await;
+
+        // The next request should wait until the rate limit is reset
+        tokio::select! {
+            () = permit.until_ready() => {
+                panic!("Expected rate limiter to block, but it did not.");
+            },
+            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+
+        // permit should be able to be ready after the rate limit resets
+        tokio::select! {
+            () = permit.until_ready() => {}
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                panic!("Expected to be able to acquire a permit after rate limit reset, but timed out.");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_rate_limiter_per_second() {
         let rate_controller = RateControllerBuilder::new()
             .add_quota(Quota::per_second(
