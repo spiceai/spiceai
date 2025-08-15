@@ -8,7 +8,6 @@ use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::FunctionRegistry;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::memory::MemorySourceConfig;
@@ -78,7 +77,8 @@ impl TableProvider for ListUDFTable {
 
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![udf_name_array])?;
 
-        let memory_source = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
+        let memory_source =
+            MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
 
         let data_source_exec = DataSourceExec::new(Arc::new(memory_source));
 
