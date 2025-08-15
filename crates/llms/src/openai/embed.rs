@@ -324,11 +324,11 @@ mod tests {
 
     #[test]
     fn test_chunk_embedding_input_breaks_max_batch_size() {
-        let input = EmbeddingInput::StringArray(vec!["test".to_string(); 3000]);
+        let input = EmbeddingInput::StringArray(vec!["test".to_string(); 2048]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into multiple batches due to MAX_BATCH_SIZE (2048)
-        assert_eq!(batches.len(), 2);
+        // Should break into multiple batches due to MAX_BATCH_SIZE (256)
+        assert_eq!(batches.len(), 8);
 
         let total_items: usize = batches
             .iter()
@@ -341,21 +341,19 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 3000);
+        assert_eq!(total_items, 2048);
     }
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens_fits_estimator() {
-        // 1001 chunks each 300 characters = 300300 characters
-        // OpenAI estimator counts utf-8 bytes as 0.25 tokens
-        // ASCII characters are 1 byte each, so 300300 bytes = 75075 tokens (under 300k)
-        let input = EmbeddingInput::StringArray(vec!["a".repeat(300); 1001]);
+        // 256 chunks each 1900 characters = 486,400 bytes
+        // MAX_BATCH_STR_BYTES is 512 KiB, so this should fit in one batch
+        let input = EmbeddingInput::StringArray(vec!["a".repeat(1900); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should fit in one batch since estimated tokens < 300k
         assert_eq!(batches.len(), 1);
         if let EmbeddingInput::StringArray(strings) = &batches[0] {
-            assert_eq!(strings.len(), 1001);
+            assert_eq!(strings.len(), 256);
         } else {
             panic!("Expected StringArray");
         }
@@ -363,13 +361,13 @@ mod tests {
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens() {
-        // 500 chunks each 3000 ASCII characters = 1,500,000 bytes
-        // 1500,000 bytes / 4 = 375000 tokens (over 300k, should split)
-        let input = EmbeddingInput::StringArray(vec!["a".repeat(3000); 500]);
+        // 256 chunks each 5859 ASCII characters = 1,499,904 bytes
+        // MAX_BATCH_STR_BYTES is 512 KiB, so this should break into multiple batches
+        let input = EmbeddingInput::StringArray(vec!["a".repeat(5859); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into 2 batches due to exceeding MAX_BATCH_STR_BYTES
-        assert_eq!(batches.len(), 2);
+        // Should break into 3 batches due to exceeding MAX_BATCH_STR_BYTES
+        assert_eq!(batches.len(), 3);
 
         let total_items: usize = batches
             .iter()
@@ -382,18 +380,18 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 500);
+        assert_eq!(total_items, 256);
     }
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens_unicode() {
-        // 500 chunks each 1000 characters using multi-byte UTF-8 character (中)
-        // 中 is 3 bytes = 0.75 tokens * 1000 * 500 = 375000 tokens (over 300k, should split)
-        let input = EmbeddingInput::StringArray(vec!["中".repeat(1000); 500]);
+        // 256 chunks each 1500 characters using multi-byte UTF-8 character (中)
+        // 中 is 3 bytes * 1500 * 256 = 1,152,000 bytes (over MAX_BATCH_STR_BYTES, should split)
+        let input = EmbeddingInput::StringArray(vec!["中".repeat(1500); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into 2 batches due to exceeding MAX_BATCH_STR_BYTES
-        assert_eq!(batches.len(), 2);
+        // Should break into 3 batches due to exceeding MAX_BATCH_STR_BYTES
+        assert_eq!(batches.len(), 3);
 
         let total_items: usize = batches
             .iter()
@@ -406,7 +404,7 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 500);
+        assert_eq!(total_items, 256);
     }
 
     #[test]
@@ -415,7 +413,7 @@ mod tests {
         let input = EmbeddingInput::ArrayOfIntegerArray(large_array);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into chunks of MAX_BATCH_SIZE (2048)
+        // Should break into chunks of MAX_BATCH_SIZE (256)
         assert!(batches.len() > 1);
 
         let total_items: usize = batches
