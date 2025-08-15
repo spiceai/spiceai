@@ -157,9 +157,8 @@ impl GlueCatalogProvider {
         let mut tables = HashMap::new();
 
         while let Some(maybe_get_tables_output) = paginator.next().await {
-            let get_tables_output = maybe_get_tables_output.map_err(|source| Error::GetTables {
+            let get_tables_output = maybe_get_tables_output.context(GetTablesSnafu {
                 database: database.clone(),
-                source,
             })?;
             let some_tables = get_tables_output
                 .table_list
@@ -179,23 +178,22 @@ impl GlueCatalogProvider {
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
-                    .map_err(|e| Error::CreatingDataset {
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
                     })?
                     .with_app(Arc::clone(&self.app))
                     .with_runtime(runtime)
                     .build()
-                    .map_err(|e| Error::CreatingDataset {
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
                     })?;
-                let table_provider = connector.read_provider(&dataset).await.map_err(|e| {
-                    Error::CreatingDataset {
+                let table_provider = connector.read_provider(&dataset).await.boxed().context(
+                    CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
-                    }
-                })?;
+                    },
+                )?;
                 tables.insert(table.name, table_provider);
             }
         }
