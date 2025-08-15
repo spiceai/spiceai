@@ -77,7 +77,6 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
 pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &RecordBatch) {
-    let schema = record.schema();
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
@@ -108,31 +107,71 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             return;
         }
     };
-
-    let mut primary_key_projection = vec![];
-    for field in &index.primary_key {
-        let Some((idx, _)) = schema.column_with_name(field.name().as_str()) else {
+    let metadata = match extract_and_format_metadata(&index.metadata_columns.all_names(), record) {
+        Ok(m) => m,
+        Err(e) => {
             tracing::error!(
-                "Cannot write to '{}' index, data does not have column '{}'.",
+                "When writing to vector index '{}', failed to prepare metadata: {e}",
+                index.name()
+            );
+            return;
+        }
+    };
+    let primary_key = match extract_and_format_primary_key(&index.primary_key, record) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(
+                "When writing to vector index '{}', failed to prepare primary key: {e}",
+                index.name()
+            );
+            return;
+        }
+    };
+    if primary_key.len() != embedding_vectors.len() {
+        tracing::error!(
+            "When writing to vector index '{}', incompatible number of unique rows ({}) and embedding vectors ({}).",
+            index.name(),
+            primary_key.len(),
+            embedding_vectors.len(),
+        );
+        return;
+    };
+    for (name, v) in metadata.iter() {
+        if v.len() != embedding_vectors.len() {
+            tracing::error!(
+                "When writing to vector index '{}', incompatible number of unique rows ({}) and rows of '{}' metadata ({}).",
                 index.name(),
-                field.name()
+                primary_key.len(),
+                name,
+                embedding_vectors.len(),
             );
             return;
         };
-        primary_key_projection.push(idx);
     }
 
-    let mut metadata_projection = vec![];
-    for field in index.metadata_columns.iter() {
-        let Some((idx, _)) = schema.column_with_name(field.name()) else {
-            tracing::error!(
-                "Cannot write to '{}' index, data does not have column '{}'.",
-                index.name(),
+    if let Err(e) = index
+        .table
+        .write_data(embedding_vectors, primary_key, metadata)
+        .await
+    {
+        tracing::error!("Cannot write to '{}' index: {e}", index.name());
+    }
+}
+
+pub fn extract_and_format_primary_key(
+    primary_key: &[Field],
+    record: &RecordBatch,
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    let schema = record.schema();
+    let mut primary_key_projection = vec![];
+    for field in primary_key {
+        let Some((idx, _)) = schema.column_with_name(field.name().as_str()) else {
+            return Err(Box::from(format!(
+                "data does not have primary key column '{}'.",
                 field.name()
-            );
-            return;
+            )));
         };
-        metadata_projection.push(idx);
+        primary_key_projection.push(idx);
     }
 
     // Happy to clone arrays here and consume them below in `table.write_data`.
@@ -153,6 +192,41 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             Some((name.clone(), to_string_vec(data)))
         })
         .collect();
+
+    // Currently, we only support when there is one primary key column.
+    if primary_keys.len() > 1 {
+        return Err(Box::from(format!(
+            "S3 index cannot have more than one column as a primary key. {} found",
+            primary_keys.len()
+        )));
+    };
+    let Some(pk_field) = primary_key.first() else {
+        return Err(Box::from("data does not have a primary key".to_string()));
+    };
+
+    let Some(output) = primary_keys.remove(pk_field.name()) else {
+        return Err(Box::from(format!(
+            "data does not have primary key column '{}'.",
+            pk_field.name()
+        )));
+    };
+    Ok(output)
+}
+
+pub fn extract_and_format_metadata(
+    metadata_columns: &[String],
+    record: &RecordBatch,
+) -> Result<HashMap<String, Vec<Option<Value>>>, Box<dyn std::error::Error + Send + Sync>> {
+    let schema = record.schema();
+    let mut metadata_projection = vec![];
+    for name in metadata_columns {
+        let Some((idx, _)) = schema.column_with_name(name) else {
+            return Err(Box::from(format!(
+                "data does not have metadata column '{name}'.",
+            )));
+        };
+        metadata_projection.push(idx);
+    }
 
     let encoder_options = EncoderOptions::default();
     let metadata: HashMap<String, Vec<Option<Value>>> = metadata_projection
@@ -179,58 +253,7 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             Some((name.clone(), values))
         })
         .collect();
-
-    // Check all columns are of same length. Check all are same as vector.
-    let num_vectors = embedding_vectors.len();
-
-    if let Some((name, values)) = primary_keys.iter().find(|(_, v)| v.len() != num_vectors) {
-        tracing::error!(
-            "Cannot write to '{}' index, as provided data has mismatch lengths. embedding column has {embed} rows, whilst primary key column '{name}' has {len} rows. {embed} != {len}.",
-            index.name(),
-            embed = num_vectors,
-            len = values.len()
-        );
-        return;
-    }
-
-    if let Some((name, values)) = metadata.iter().find(|(_, v)| v.len() != num_vectors) {
-        tracing::error!(
-            "Cannot write to '{}' index, as provided data has mismatch lengths. embedding column has {embed} rows, whilst metadata column '{name}' has {len} rows. {embed} != {len}.",
-            index.name(),
-            embed = num_vectors,
-            len = values.len()
-        );
-        return;
-    }
-
-    // Currently, we only support when there is one primary key column.
-    if primary_keys.len() > 1 {
-        tracing::debug!("primary_keys.len() > 1");
-        return;
-    }
-    if primary_keys.is_empty() {
-        tracing::debug!("primary_keys.is_empty()");
-        return;
-    }
-
-    let Some(pk_field) = index.primary_key.first() else {
-        tracing::debug!("primary_keys.is_empty()");
-        return;
-    };
-    if let Some(key) = primary_keys.remove(pk_field.name()) {
-        if let Err(e) = index
-            .table
-            .write_data(embedding_vectors, key, metadata)
-            .await
-        {
-            tracing::error!("Cannot write to '{}' index: {e}", index.name());
-        }
-    } else {
-        tracing::warn!(
-            "Cannot write to '{}' index, no primary key was specified",
-            index.name()
-        );
-    }
+    Ok(metadata)
 }
 
 fn to_string_vec<'a, I>(iter: I) -> Vec<Option<String>>
