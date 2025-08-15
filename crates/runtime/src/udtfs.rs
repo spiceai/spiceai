@@ -60,7 +60,7 @@ impl TableProvider for ListUDFTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -76,9 +76,9 @@ impl TableProvider for ListUDFTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let udf_name_array = Arc::new(StringArray::from(self.udf_names.clone())) as ArrayRef;
 
-        let batch = RecordBatch::try_new(self.schema.clone(), vec![udf_name_array])?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![udf_name_array])?;
 
-        let memory_source = MemorySourceConfig::try_new(&[vec![batch]], self.schema.clone(), None)?;
+        let memory_source = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
 
         let data_source_exec = DataSourceExec::new(Arc::new(memory_source));
 
