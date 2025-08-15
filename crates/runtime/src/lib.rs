@@ -825,7 +825,7 @@ impl Runtime {
         let ctx = &self.datafusion().ctx;
         ctx.register_udtf(
             "list_udfs",
-            Arc::new(ListUDFTableFunc::new(Arc::clone(&ctx)))
+            Arc::new(ListUDFTableFunc::new(Arc::clone(&ctx))),
         );
 
         let components = vec![task_history, datasets, catalogs, models_and_evals];
