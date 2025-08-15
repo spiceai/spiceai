@@ -53,14 +53,14 @@ fn default_retry_strategy() -> FibonacciBackoff {
 }
 
 fn default_rate_controller() -> Arc<RateController> {
-    let Some(default_per_minute_quota) = NonZeroU32::new(3000) else {
+    let Some(default_per_minute_quota) = NonZeroU32::new(500) else {
         unreachable!("Default quota should always be non-zero");
     };
 
     Arc::new(
         RateController::builder()
             .with_jitter(JitterConfig::zero())
-            .with_max_concurrent_requests(35)
+            .with_max_concurrent_requests(4)
             .add_quota(Quota::per_minute(default_per_minute_quota))
             .build(),
     )
