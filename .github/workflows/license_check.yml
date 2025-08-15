@@ -39,7 +39,7 @@ env:
 jobs:
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@v5
 
