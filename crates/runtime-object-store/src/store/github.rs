@@ -164,7 +164,7 @@ impl ObjectStore for GitHubRawObjectStore {
                 Err(e) => {
                     yield Err(object_store::Error::Generic {
                         store: "GitHubRawObjectStore",
-                        source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("GitHub API error: {e}"))),
+                        source: Box::new(std::io::Error::other(format!("GitHub API error: {e}"))),
                     });
                     return;
                 }

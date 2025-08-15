@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
+use async_openai::error::OpenAIError;
 use bytes::Bytes;
 use governor::Quota;
 use reqwest::StatusCode;
@@ -30,8 +31,10 @@ use crate::chunking::{
     ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
 
-use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
-use async_openai::error::OpenAIError;
+use crate::embeddings::{
+    Embed, Error as EmbedError, FailedToAcquireRateControllerPermitSnafu,
+    FailedToCreateEmbeddingSnafu, Result as EmbedResult,
+};
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
@@ -119,16 +122,24 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
+
         inner_req.model.clone_from(&self.inner.model);
         let permit = self
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
-        let mut resp = self.inner.client.embeddings().create(inner_req).await?;
+            .context(FailedToAcquireRateControllerPermitSnafu)?;
+        let mut resp = self
+            .inner
+            .client
+            .embeddings()
+            .create(inner_req)
+            .await
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)?;
         drop(permit);
 
         resp.model = outer_model;
@@ -165,9 +176,7 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
                 let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
                     retry(retry_strategy, async || {
-                        let permit = rate_controller.acquire().await.map_err(|e| crate::embeddings::Error::FailedToAcquireRateControllerPermit{
-                            source: e
-                        })?;
+                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
 
                         let start = Instant::now();
                         client.embeddings().create_float(req.clone()).await

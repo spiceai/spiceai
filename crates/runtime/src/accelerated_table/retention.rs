@@ -100,13 +100,13 @@ impl super::AcceleratedTable {
                                 &dataset_name,
                                 &format!("where {time_column} < {timestamp}"),
                             );
-                            exprs.push(expr);
+                            exprs.push(Box::new(expr));
                         }
                     }
                 }
 
                 // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
-                let Some(expr) = exprs.into_iter().reduce(Expr::or) else {
+                let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
                     tracing::warn!(
                         "[retention] No valid retention filters found for dataset {dataset_name}"
                     );

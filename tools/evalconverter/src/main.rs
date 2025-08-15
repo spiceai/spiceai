@@ -34,6 +34,7 @@ struct Cli {
     verbose: bool,
 }
 
+#[allow(clippy::unnecessary_debug_formatting)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 

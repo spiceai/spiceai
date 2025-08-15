@@ -367,7 +367,7 @@ mod tests {
 
             // Calculate sample sum (approximate)
             let lower_bound = if i == 0 { 0.0 } else { buckets[i - 1] };
-            sample_sum += (lower_bound + upper_bound) / 2.0 * count as f64;
+            sample_sum += f64::midpoint(lower_bound, upper_bound) * count as f64;
         }
 
         histogram.set_sample_count(cumulative_count);

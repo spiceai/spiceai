@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::{sync::Arc, time::Instant};
 
-use async_openai::{
-    error::OpenAIError,
-    types::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat},
+use async_openai::types::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
 use llms::{
@@ -92,7 +91,7 @@ impl Embed for TaskEmbed {
     async fn embed_request<'b>(
         &'b self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_text_embedding(&request_context.to_dimensions());
 

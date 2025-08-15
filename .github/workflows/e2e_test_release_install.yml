@@ -35,7 +35,7 @@ jobs:
         run: uname -m
 
       - name: checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # The aarch64 runner does not have any tools pre-installed
       - name: Install missing tools
