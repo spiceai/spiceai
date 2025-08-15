@@ -386,8 +386,7 @@ async fn openai(
         .or(params.get("openai_usage_tier"))
         .map(secrecy::ExposeSecret::expose_secret)
         .map(UsageTier::from_str)
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()?;
 
     let mut embed = OpenaiEmbed::new(
         llms::openai::new_openai_client(
@@ -405,8 +404,9 @@ async fn openai(
                 .get("project_id")
                 .or(params.get("openai_project_id"))
                 .map(secrecy::ExposeSecret::expose_secret),
+            openai_usage_tier,
         ),
-        Some(openai_usage_tier.into()),
+        openai_usage_tier.map(Into::into),
     );
 
     // For OpenAI compatible embedding models, we allow users to

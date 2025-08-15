@@ -17,11 +17,9 @@ limitations under the License.
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use bytes::Bytes;
-use governor::Quota;
 use reqwest::StatusCode;
-use runtime_rate_control::{JitterConfig, RateController};
+use runtime_rate_control::RateController;
 use std::fmt::Debug;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
@@ -45,7 +43,7 @@ use snafu::ResultExt;
 use text_splitter::ChunkSizer;
 use tokenizers::Tokenizer;
 
-use super::Openai;
+use super::{Openai, default_rate_controller};
 
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
@@ -53,20 +51,6 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
 fn default_retry_strategy() -> FibonacciBackoff {
     FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
-}
-
-fn default_rate_controller() -> Arc<RateController> {
-    let Some(default_per_minute_quota) = NonZeroU32::new(500) else {
-        unreachable!("Default quota should always be non-zero");
-    };
-
-    Arc::new(
-        RateController::builder()
-            .with_jitter(JitterConfig::zero())
-            .with_max_concurrent_requests(4)
-            .add_quota(Quota::per_minute(default_per_minute_quota))
-            .build(),
-    )
 }
 
 /// Embedding implementation for `OpenAI` compatible embedding models.

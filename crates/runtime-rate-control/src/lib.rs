@@ -106,13 +106,15 @@ impl RateControllerBuilder {
     }
 }
 
+#[derive(Debug)]
 pub struct RateController {
     jitter_config: JitterConfig,
     rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
     semaphore: Option<Arc<Semaphore>>,
 }
 
-#[allow(dead_code)] // will be used once the rate limiter is integrated
+#[derive(Debug)]
+#[allow(dead_code)] // The inner permit is never used, but it needs to be retained for the lifetime of the permit so it can be correctly dropped.
 pub struct Permit<'a>(Option<SemaphorePermit<'a>>);
 
 impl RateController {

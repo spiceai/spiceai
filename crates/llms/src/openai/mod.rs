@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_openai::config::{AzureConfig, Config, OPENAI_API_BASE};
 use async_openai::{Client, config::OpenAIConfig};
 use governor::Quota;
-use runtime_rate_control::RateController;
+use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
 pub mod embed;
@@ -97,6 +97,22 @@ impl From<UsageTier> for Arc<RateController> {
 pub struct Openai<C: Config> {
     client: Client<C>,
     model: String,
+
+    rate_controller: Arc<RateController>,
+}
+
+pub(crate) fn default_rate_controller() -> Arc<RateController> {
+    let Some(default_per_minute_quota) = NonZeroU32::new(500) else {
+        unreachable!("Default quota should always be non-zero");
+    };
+
+    Arc::new(
+        RateController::builder()
+            .with_jitter(JitterConfig::zero())
+            .with_max_concurrent_requests(4)
+            .add_quota(Quota::per_minute(default_per_minute_quota))
+            .build(),
+    )
 }
 
 #[must_use]
@@ -129,6 +145,7 @@ pub fn new_azure_client(
     Openai {
         client: Client::with_config(cfg),
         model,
+        rate_controller: default_rate_controller(),
     }
 }
 
@@ -139,6 +156,7 @@ pub fn new_openai_client(
     api_key: Option<&str>,
     org_id: Option<&str>,
     project_id: Option<&str>,
+    usage_tier: Option<UsageTier>,
 ) -> Openai<OpenAIConfig> {
     // Default to empty API key to avoid picking up ENV variable in downstream library.
     let mut cfg = OpenAIConfig::new().with_api_key("");
@@ -161,6 +179,7 @@ pub fn new_openai_client(
     Openai {
         client: Client::with_config(cfg),
         model,
+        rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
     }
 }
 
@@ -172,6 +191,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config>(
     Openai {
         client: Client::with_config(cfg),
         model,
+        rate_controller: default_rate_controller(),
     }
 }
 

@@ -172,7 +172,14 @@ mod tests {
         };
 
         let chunker = OpenaiEmbed::new(
-            new_openai_client(DEFAULT_EMBEDDING_MODEL.to_string(), None, None, None, None),
+            new_openai_client(
+                DEFAULT_EMBEDDING_MODEL.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             None,
         )
         .chunker(&cfg)
