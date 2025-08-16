@@ -88,7 +88,7 @@ impl VectorSearch {
         let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::S3Vector;
+            use crate::embeddings::index::s3::S3Vector;
             if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
                 return s3_vector.embedding_model().await;
             }

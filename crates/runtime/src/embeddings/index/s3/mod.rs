@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use arrow_schema::Field;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
 };
@@ -36,7 +35,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     dataconnector::parameters::aws::load_config,
-    embeddings::index::{S3Vector, retry_client::S3VectorRetryClientBuilder},
+    embeddings::index::retry_client::S3VectorRetryClientBuilder,
     get_params_with_secrets,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
@@ -45,6 +44,8 @@ use crate::{
 
 mod write;
 pub use write::write;
+mod index;
+pub use index::S3Vector;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
@@ -114,16 +115,12 @@ pub async fn try_from_dataset(
     .await?;
 
     Ok(S3Vector::new(
-        S3VectorIndex {
-            table,
-            embedded_column: column.clone(),
-            primary_key,
-            metadata_columns,
-        },
-        super::IndexEmbeddingConfig {
-            model_name: config.model.clone(),
-            embedding_models,
-        },
+        table,
+        column.clone(),
+        primary_key,
+        metadata_columns,
+        config.model.clone(),
+        embedding_models,
     ))
 }
 
@@ -292,48 +289,4 @@ fn s3_vector_metadata_columns(columns: &[Column], schema: &SchemaRef) -> Metadat
         })
         .collect();
     metadata_columns.into()
-}
-
-#[derive(Debug, Clone)]
-pub struct S3VectorIndex {
-    pub table: S3VectorsTable,
-
-    /// The name of the column in the associated [`TableProvider`] that produces the `data` column in [`S3VectorsTable`].
-    pub embedded_column: String,
-
-    /// The ordered fields that comprise the underlying unique `key` in [`S3VectorsTable`]
-    pub primary_key: Vec<Field>,
-
-    /// Additional columns to add as metadata to the S3 vector index from the original dataset columns.
-    pub metadata_columns: MetadataColumns,
-}
-
-impl S3VectorIndex {
-    #[must_use]
-    pub fn primary_key_columns(&self) -> Vec<String> {
-        self.primary_key.iter().map(|f| f.name().clone()).collect()
-    }
-}
-
-impl Index for S3VectorIndex {
-    fn name(&self) -> &'static str {
-        "s3_vector_index"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn required_columns(&self) -> Vec<String> {
-        let mut pks: Vec<_> = self
-            .primary_key
-            .iter()
-            .map(arrow_schema::Field::name)
-            .cloned()
-            .collect();
-        pks.push(self.embedded_column.clone());
-        pks.extend(self.metadata_columns.iter().map(|c| c.name().to_string()));
-
-        pks
-    }
 }

@@ -20,23 +20,18 @@ use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::Field;
 use async_openai::types::EmbeddingInput;
-use datafusion::catalog::TableProvider;
 use runtime_datafusion_index::Index;
 use serde_json::Value;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
 use crate::{
-    convert_string_arrow_to_iterator,
-    embeddings::index::{
-        IndexEmbeddingConfig, s3::S3VectorIndex,
-    },
-    model::EmbeddingModelStore,
+    convert_string_arrow_to_iterator, embeddings::index::s3::S3Vector, model::EmbeddingModelStore,
 };
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
-pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &RecordBatch) {
+pub async fn write(index: &S3Vector, record: &RecordBatch) {
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
@@ -52,8 +47,8 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
     let embedding_vectors = match embed_column(
         record,
         embedded_column_idx,
-        cfg.model_name.as_str(),
-        Arc::clone(&cfg.embedding_models),
+        index.model_name.as_str(),
+        Arc::clone(&index.embedding_models),
     )
     .await
     {
