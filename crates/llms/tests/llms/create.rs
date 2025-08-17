@@ -92,6 +92,7 @@ pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
         api_key.as_deref(),
         None,
         None,
+        None,
     ))
 }
 

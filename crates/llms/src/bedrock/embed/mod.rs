@@ -33,7 +33,6 @@ use async_openai::types::{
     EmbeddingVector,
 };
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
@@ -62,7 +61,7 @@ pub fn new_titan_v2(
 ) -> BedrockEmbed<TitanEmbedRequest, TitanEmbedResponse> {
     tracing::debug!(
         "Initializing Titan v2 embedder: normalize={normalize}, dimensions={dimensions}, rate_limit={:?}",
-        client.rate_config
+        client.rate_controller
     );
 
     let config = Arc::new(TitanConfig {
@@ -84,7 +83,7 @@ pub fn new_cohere(
 ) -> BedrockEmbed<CohereEmbedRequest, CohereEmbedResponse> {
     tracing::debug!(
         "Initializing Cohere embedder: model_name={model_name}, truncate={truncate:?}, input_type={input_type}, embedding_type={embedding_type}, rate_limit={:?}",
-        client.rate_config
+        client.rate_controller
     );
 
     let config = Arc::new(CohereConfig {
@@ -109,20 +108,23 @@ where
             return Ok((Vec::new(), 0));
         }
 
-        let mut results = Vec::new();
-        let mut total_tokens = 0;
+        // join all requests, as the inner rate limit will manage concurrency
+        let results = futures::future::try_join_all(
+            request_payloads
+                .into_iter()
+                .map(|req| self.process_single_request(req)),
+        )
+        .await?;
 
-        // Run embedding requests with up to 5 requests in parallel
-        let mut stream_of_futures =
-            stream::iter(request_payloads).map(|req| self.process_single_request(req));
+        let results = results.into_iter().fold(
+            (Vec::new(), 0),
+            |(mut acc_vectors, acc_tokens), (vectors, tokens)| {
+                acc_vectors.extend(vectors);
+                (acc_vectors, acc_tokens + tokens)
+            },
+        );
 
-        while let Some(result) = stream_of_futures.next().await {
-            let (mut vectors, tokens) = result.await?;
-            results.append(&mut vectors);
-            total_tokens += tokens;
-        }
-
-        Ok((results, total_tokens))
+        Ok(results)
     }
 
     async fn process_single_request(&self, req: Rq) -> EmbedResult<(Vec<Vec<f32>>, u32)> {

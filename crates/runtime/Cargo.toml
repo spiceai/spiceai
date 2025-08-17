@@ -87,6 +87,7 @@ logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
+mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "8.0.0"
 ns_lookup = { path = "../ns_lookup" }
@@ -128,6 +129,7 @@ runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -230,6 +232,7 @@ keyring-secret-store = ["dep:keyring"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = ["model_components/full", "mcp", "dep:strsim"]
+mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]

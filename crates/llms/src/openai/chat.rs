@@ -49,7 +49,17 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+
         let stream = self.client.chat().create_stream(inner_req).await?;
+
+        drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
+        // semaphore permits aren't `Copy`, so we can't move it into the closure in `.map_ok`
 
         Ok(Box::pin(stream.map_ok(move |mut s| {
             s.model.clone_from(&outer_model);
@@ -95,7 +105,16 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+
         let mut resp = self.client.chat().create(inner_req).await?;
+
+        drop(permit);
 
         resp.model = outer_model;
         Ok(resp)
