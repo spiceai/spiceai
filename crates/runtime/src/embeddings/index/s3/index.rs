@@ -17,7 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
@@ -39,8 +39,13 @@ use datafusion::{
     common::Column,
     datasource::{DefaultTableSource, ViewTable},
     error::DataFusionError,
-    logical_expr::{BinaryExpr, Cast, LogicalPlan, Operator, Projection, TableScan, expr::Alias},
+    functions::core::{arrow_cast::ArrowCastFunc, union_extract::UnionExtractFun},
+    logical_expr::{
+        BinaryExpr, Cast, LogicalPlan, Operator, Projection, ScalarUDF, TableScan,
+        expr::{Alias, ScalarFunction},
+    },
     prelude::{Expr, lit},
+    scalar::ScalarValue,
     sql::TableReference,
 };
 use tokio::sync::RwLock;
@@ -131,37 +136,15 @@ impl VectorIndex for S3Vector {
     fn list_table_provider(
         &self,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some((pk_name, pk_data_type)) = self
-            .primary_fields()
-            .first()
-            .map(|f| (f.name().clone(), f.data_type().clone()))
-        else {
-            return Err(Box::from(
-                "Vector indexes defined without a primary key cannot be used for retrieving vectors"
-                    .to_string(),
-            ));
-        };
-
         let mut projection = metadata_columns_to_exprs(self.metadata_columns());
-        projection.extend(vec![
-            Expr::Alias(Alias::new(
-                Expr::Cast(Cast::new(
-                    Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
-                        S3_VECTOR_PRIMARY_KEY_NAME,
-                    ))),
-                    pk_data_type,
-                )),
-                None::<TableReference>,
-                pk_name,
+        projection.extend(s3_vectors_primary_key_cast(&self.primary_fields()));
+        projection.push(Expr::Alias(Alias::new(
+            Expr::Column(datafusion::common::Column::new_unqualified(
+                S3_VECTOR_EMBEDDING_NAME,
             )),
-            Expr::Alias(Alias::new(
-                Expr::Column(datafusion::common::Column::new_unqualified(
-                    S3_VECTOR_EMBEDDING_NAME,
-                )),
-                None::<TableReference>,
-                embedding_col!(self.embedded_column()),
-            )),
-        ]);
+            None::<TableReference>,
+            embedding_col!(self.embedded_column()),
+        )));
 
         table_with_projection(
             Arc::new(S3VectorsListTable::from(self.table.clone())),
@@ -182,28 +165,8 @@ impl VectorIndex for S3Vector {
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some((pk_name, pk_data_type)) = self
-            .primary_fields()
-            .first()
-            .map(|f| (f.name().clone(), f.data_type().clone()))
-        else {
-            return Err(Box::from(
-                "Vector indexes defined without a primary key cannot be used for querying vectors"
-                    .to_string(),
-            ));
-        };
-
-        let mut projection = vec![
-            Expr::Alias(Alias::new(
-                Expr::Cast(Cast::new(
-                    Box::new(Expr::Column(Column::new_unqualified(
-                        S3_VECTOR_PRIMARY_KEY_NAME,
-                    ))),
-                    pk_data_type.clone(),
-                )),
-                None::<TableReference>,
-                pk_name,
-            )),
+        let mut projection = s3_vectors_primary_key_cast(&self.primary_fields());
+        projection.extend(vec![
             Expr::Alias(Alias::new(
                 Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
                 None::<TableReference>,
@@ -218,7 +181,7 @@ impl VectorIndex for S3Vector {
                 None::<TableReference>,
                 SEARCH_SCORE_COLUMN_NAME,
             )),
-        ];
+        ]);
         projection.extend(metadata_columns_to_exprs(self.metadata_columns()));
 
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
@@ -271,4 +234,82 @@ fn table_with_projection(
         )?),
         None,
     )) as Arc<dyn TableProvider>)
+}
+
+/// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
+fn data_type_to_union_variant(dt: &DataType) -> &str {
+    // TODO Handle: "array", "object".
+    match dt {
+        DataType::Null => "null",
+        DataType::Boolean => "bool",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => "int",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "float",
+        DataType::BinaryView | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "str",
+        _ => "",
+    }
+}
+
+pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
+    match primary_key {
+        [f] => vec![Expr::Alias(Alias::new(
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Column(Column::new_unqualified(
+                    S3_VECTOR_PRIMARY_KEY_NAME,
+                ))),
+                f.data_type().clone(),
+            )),
+            None::<TableReference>,
+            f.name().clone(),
+        ))],
+        [] => vec![],
+        cols => cols
+            .iter()
+            .map(|f| {
+                let col_name = f.name();
+                let data_type = f.data_type().clone();
+                Expr::Alias(Alias::new(
+                    Expr::Cast(Cast::new(
+                        Box::new(Expr::ScalarFunction(ScalarFunction {
+                            func: Arc::new(ScalarUDF::new_from_impl(ArrowCastFunc::default())),
+                            args: vec![
+                                Expr::ScalarFunction(ScalarFunction {
+                                    func: Arc::new(ScalarUDF::new_from_impl(
+                                        UnionExtractFun::default(),
+                                    )),
+                                    args: vec![
+                                        Expr::ScalarFunction(ScalarFunction {
+                                            func: datafusion_functions_json::udfs::json_get_udf(),
+
+                                            args: vec![
+                                                Expr::Column(Column::new_unqualified(
+                                                    S3_VECTOR_PRIMARY_KEY_NAME,
+                                                )),
+                                                Expr::Literal(ScalarValue::Utf8(Some(
+                                                    col_name.clone(),
+                                                ))),
+                                            ],
+                                        }),
+                                        Expr::Literal(ScalarValue::Utf8(Some(
+                                            data_type_to_union_variant(&data_type).to_string(),
+                                        ))),
+                                    ],
+                                }),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type.to_string()))),
+                            ],
+                        })),
+                        data_type,
+                    )),
+                    None::<TableReference>,
+                    col_name.clone(),
+                ))
+            })
+            .collect(),
+    }
 }
