@@ -350,6 +350,7 @@ impl ExecutionPlan for IndexerExec {
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
