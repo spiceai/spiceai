@@ -9,22 +9,12 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
       },
       "primary_key": {
-        "id": 1318
+        "id": 6
       },
-      "score": 0.63
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
-      },
-      "primary_key": {
-        "id": 543
-      },
-      "score": 0.63
+      "score": 0.65
     },
     {
       "dataset": "qs",
@@ -39,12 +29,22 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
       },
       "primary_key": {
-        "id": 6
+        "id": 543
       },
-      "score": 0.65
+      "score": 0.63
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+      },
+      "primary_key": {
+        "id": 1318
+      },
+      "score": 0.63
     }
   ]
 }

@@ -8,27 +8,14 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "Find the product of 2 and 7."
+        "question": "<refined question>"
       },
       "dataset": "qs",
       "matches": {
-        "question": "Find the product of 2 and 7."
+        "question": "<refined question>"
       },
       "primary_key": {
-        "id": 370
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
-        "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
-      },
-      "primary_key": {
-        "id": 772
+        "id": 6
       },
       "score": 0.01
     },
@@ -47,14 +34,27 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "<refined question>"
+        "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
       "dataset": "qs",
       "matches": {
-        "question": "<refined question>"
+        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
       },
       "primary_key": {
-        "id": 6
+        "id": 772
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "Find the product of 2 and 7."
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the product of 2 and 7."
+      },
+      "primary_key": {
+        "id": 370
       },
       "score": 0.01
     }

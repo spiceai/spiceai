@@ -221,7 +221,7 @@ pub fn get_mega_science_dataset(
 
     dataset.columns = [question_column, answer_column]
         .into_iter()
-        .filter_map(|x| x)
+        .flatten()
         .collect();
 
     dataset

@@ -9,10 +9,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is created by making a choice?"
+        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },
       "primary_key": {
-        "id": 863
+        "id": 890
       },
       "score": 0.01
     },
@@ -29,10 +29,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "question": "What is created by making a choice?"
       },
       "primary_key": {
-        "id": 890
+        "id": 863
       },
       "score": 0.01
     }

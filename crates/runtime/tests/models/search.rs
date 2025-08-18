@@ -18,7 +18,7 @@ use crate::DEFAULT_TRACING_MODELS;
 use crate::models::hf::get_huggingface_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
-use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
+use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use app::{App, AppBuilder};
 use http::HeaderValue;
@@ -113,10 +113,11 @@ fn normalize_search_response(mut json: Value) -> String {
                 return Ordering::Less;
             };
 
+            // Opposite because we want to order descendingly
             if score_a > score_b {
-                return Ordering::Greater;
-            } else if score_a < score_b {
                 return Ordering::Less;
+            } else if score_a < score_b {
+                return Ordering::Greater;
             }
 
             let Some(Value::Object(a_pks)) = a.get("primary_key") else {
@@ -125,7 +126,7 @@ fn normalize_search_response(mut json: Value) -> String {
             let Some(Value::Object(b_pks)) = b.get("primary_key") else {
                 return Ordering::Equal;
             };
-            format!("{a_pks:?}").cmp(&format!("{b_pks:?}"))
+            format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
         });
         for m in matches {
             if let Some(obj) = m.as_object_mut() {

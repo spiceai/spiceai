@@ -8,27 +8,14 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "What is created by making a choice?"
+        "question": "<refined question>"
       },
       "dataset": "qs",
       "matches": {
-        "question": "What is created by making a choice?"
+        "question": "<refined question>"
       },
       "primary_key": {
-        "id": 863
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
-        "question": "Find the product of 2 and 7."
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": "Find the product of 2 and 7."
-      },
-      "primary_key": {
-        "id": 370
+        "id": 6
       },
       "score": 0.01
     },
@@ -47,14 +34,27 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "<refined question>"
+        "question": "Find the product of 2 and 7."
       },
       "dataset": "qs",
       "matches": {
-        "question": "<refined question>"
+        "question": "Find the product of 2 and 7."
       },
       "primary_key": {
-        "id": 6
+        "id": 370
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "What is created by making a choice?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "What is created by making a choice?"
+      },
+      "primary_key": {
+        "id": 863
       },
       "score": 0.01
     }

@@ -146,10 +146,7 @@ mod search {
 
     use crate::models::{
         get_mega_science_dataset, get_small_clickbench_dataset,
-        search::{
-            SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
-            run_search,
-        },
+        search::{SearchTestCase, run_search},
     };
 
     use super::*;

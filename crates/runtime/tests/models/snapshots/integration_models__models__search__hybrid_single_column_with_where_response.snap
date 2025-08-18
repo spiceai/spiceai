@@ -9,22 +9,22 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is created by making a choice?"
-      },
-      "primary_key": {
-        "id": 863
-      },
-      "score": 0.94
-    },
-    {
-      "dataset": "qs",
-      "matches": {
         "question": "<refined question>"
       },
       "primary_key": {
         "id": 6
       },
       "score": 0.95
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "What is created by making a choice?"
+      },
+      "primary_key": {
+        "id": 863
+      },
+      "score": 0.94
     }
   ]
 }
