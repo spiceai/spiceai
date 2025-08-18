@@ -62,6 +62,7 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) {
             return;
         }
     };
+
     let metadata = match extract_and_format_metadata(&index.metadata_columns.all_names(), record) {
         Ok(m) => m,
         Err(e) => {
@@ -72,6 +73,7 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) {
             return;
         }
     };
+
     let primary_key = match extract_and_format_primary_key(&index.primary_key, record) {
         Ok(m) => m,
         Err(e) => {
@@ -82,6 +84,7 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) {
             return;
         }
     };
+
     if primary_key.len() != embedding_vectors.len() {
         tracing::error!(
             "When writing to vector index '{}', incompatible number of unique rows ({}) and embedding vectors ({}).",
@@ -163,11 +166,16 @@ pub fn extract_and_format_primary_key(
                 primary_key_projection.push(idx);
             }
             let pk = record.project(&primary_key_projection).boxed()?;
-
             let mut writer = arrow_json::ArrayWriter::new(Vec::new());
             writer.write_batches(&[&pk]).boxed()?;
             writer.finish().boxed()?;
-            serde_json::from_reader::<_, Vec<Option<String>>>(writer.into_inner().as_slice())
+            let values =
+                serde_json::from_reader::<_, Vec<Value>>(writer.into_inner().as_slice()).boxed()?;
+
+            values
+                .into_iter()
+                .map(|v| serde_json::to_string(&v).map(|v| Some(v)))
+                .collect::<Result<Vec<_>, _>>()
                 .boxed()
         }
     }

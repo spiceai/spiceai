@@ -193,6 +193,7 @@ impl VectorIndex for S3Vector {
     }
 }
 
+#[async_trait]
 impl Index for S3Vector {
     fn name(&self) -> &'static str {
         "s3_vector_index"
@@ -213,6 +214,12 @@ impl Index for S3Vector {
         pks.extend(self.metadata_columns.iter().map(|c| c.name().to_string()));
 
         pks
+    }
+
+    async fn compute_index(&self, batches: Vec<RecordBatch>) {
+        for batch in batches {
+            self.write(&batch).await;
+        }
     }
 }
 
