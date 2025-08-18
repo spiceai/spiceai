@@ -113,7 +113,7 @@ impl S3Vector {
         Some(Arc::clone(model))
     }
 
-    pub async fn query_vector(
+    pub async fn compute_query_vector(
         &self,
         query: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -128,14 +128,19 @@ impl S3Vector {
             .embed(EmbeddingInput::String(query.to_string()))
             .await
             .boxed()?;
-        let Some(query_vector) = resp.pop() else {
-            return Err(Box::from(format!(
+
+        match (resp.pop(), resp.pop()) {
+            (Some(query_vector), None) => Ok(query_vector),
+            // Second pattern is unreachable.
+            (None, None) | (None, Some(_)) => Err(Box::from(format!(
                 "Embedding model '{}' produced no embedding for the query '{query}'.",
                 self.cfg.model_name,
-            )));
-        };
-
-        Ok(query_vector)
+            ))),
+            (Some(_), Some(_)) => Err(Box::from(format!(
+                "Embedding model '{}' unexpectedly produced more than one embedding for the query '{query}'.",
+                self.cfg.model_name,
+            ))),
+        }
     }
 }
 
@@ -245,9 +250,8 @@ impl VectorIndex for S3Vector {
         ];
         projection.extend(metadata_columns_to_exprs(self.metadata_columns()));
 
-        // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
-        // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
-        let vector = self.query_vector(query).await?;
+        // TODO: Don't embed query in logical planning: https://github.com/spiceai/spiceai/issues/6783
+        let vector = self.compute_query_vector(query).await?;
         let tp = Arc::new(S3VectorsQueryTable::new(self.index.table.clone(), vector));
 
         table_with_projection(tp, projection).boxed()
