@@ -53,7 +53,10 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     fn list_table_provider(&self) -> Arc<dyn TableProvider>;
     fn metadata_columns(&self) -> &MetadataColumns;
     fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider>;
-    async fn write(&self, record: &RecordBatch);
+    async fn write(
+        &self,
+        record: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn query_table_provider(
         &self,
         query: &str,
@@ -102,8 +105,11 @@ impl VectorIndex for S3Vector {
         Arc::new(VectorScanTableProvider::new(table, self))
     }
 
-    async fn write(&self, record: &RecordBatch) {
-        s3::write(&self.index, &self.cfg, record).await;
+    async fn write(
+        &self,
+        record: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        s3::write(&self.index, &self.cfg, record).await.boxed()
     }
 
     async fn query_table_provider(
@@ -149,10 +155,14 @@ impl Index for S3Vector {
         self.index.required_columns()
     }
 
-    async fn compute_index(&self, batches: Vec<RecordBatch>) {
-        for rb in batches {
-            self.write(&rb).await;
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        for rb in &batches {
+            self.write(rb).await.map_err(DataFusionError::External)?;
         }
+        Ok(batches)
     }
 }
 
@@ -431,7 +441,13 @@ pub mod tests {
             table
         }
 
-        async fn write(&self, _record: &RecordBatch) {}
+        async fn write(
+            &self,
+            _record: &RecordBatch,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
         async fn query_table_provider(
             &self,
             _query: &str,

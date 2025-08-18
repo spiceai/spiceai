@@ -76,10 +76,15 @@ impl Index for FullTextDatabaseIndex {
         required_columns.into_iter().collect()
     }
 
-    async fn compute_index(&self, batches: Vec<RecordBatch>) {
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
         if let Err(e) = self.update_index(batches.as_slice()).await {
             tracing::error!("Failed to update full text search index: {e}");
+            return Err(DataFusionError::External(Box::new(e)));
         }
+        Ok(batches)
     }
 }
 
