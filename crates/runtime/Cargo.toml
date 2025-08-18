@@ -259,9 +259,5 @@ sqlite = [
     "dep:rusqlite",
 ]
 
-[[bench]]
-harness = false
-name = "vector_search"
-
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"
