@@ -19,6 +19,7 @@ use llms::{
     anthropic::Anthropic,
     bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
+    openai::UsageTier,
     perplexity::PerplexitySonar,
     xai::Xai,
 };
@@ -382,6 +383,16 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
     let api_key = params.get("api_key").expose().ok();
     let org_id = params.get("org_id").expose().ok();
     let project_id = params.get("project_id").expose().ok();
+    let usage_tier = params
+        .get("usage_tier")
+        .expose()
+        .ok()
+        .map(UsageTier::from_str)
+        .transpose()
+        .map_err(|_| LlmError::InvalidParamValueError {
+            param: "openai_usage_tier".to_string(),
+            message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
+        })?;
 
     if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
@@ -408,6 +419,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
         api_key,
         org_id,
         project_id,
+        usage_tier,
     )) as Arc<dyn Chat>)
 }
 

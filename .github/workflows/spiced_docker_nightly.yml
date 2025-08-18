@@ -1,16 +1,9 @@
-##################################################################################################################################
-#                                                                                                                                #
-#  WARNING: TOOL-GENERATED FILE - DO NOT EDIT MANUALLY!                                                                          #
-#                                                                                                                                #
-#  Command: yq 'explode(.)' .github/workflow_templates/spiced_docker_nightly.yml > .github/workflows/spiced_docker_nightly.yml   #
-#                                                                                                                                #
-#  Keep this notice at the top of the file.                                                                                      #
-#                                                                                                                                #
-##################################################################################################################################
 name: spiced_docker_nightly
+
 on:
   schedule:
-    - cron: "0 9 * * *" # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+    - cron: '0 9 * * *' # Runs the workflow at 9:00 AM UTC (1AM PT) every day
+
   workflow_dispatch:
     inputs:
       publish:
@@ -19,22 +12,25 @@ on:
         type: boolean
         default: false
       profile_option:
-        description: "Which Rust build profile to use? (Default is release)"
+        description: 'Which Rust build profile to use? (Default is release)'
         required: false
         type: choice
         options:
-          - "release"
-          - "release-lto"
-        default: "release"
+          - 'release'
+          - 'release-lto'
+        default: 'release'
+
 jobs:
   check_commits:
     runs-on: ubuntu-latest
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
+
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Check new commits since latest nightly build
         id: check_commits
         run: |
@@ -54,17 +50,21 @@ jobs:
           echo "New commits found. Proceeding with the build."
           echo "has_new_commits=true" >> $GITHUB_OUTPUT
         shell: bash
+
   setup:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
+
     runs-on: ubuntu-latest
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
+
       - name: Add REL_VERSION to output
         id: set_version
         run: |
@@ -75,14 +75,18 @@ jobs:
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
+
   build-arm64:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
+
     runs-on: hosted-linux-arm-runner
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+
       - name: Add nightly postfix to version in Cargo.toml
         env:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
@@ -95,6 +99,7 @@ jobs:
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
+
       - name: Install docker
         run: |
           sudo apt-get update
@@ -104,23 +109,28 @@ jobs:
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
       - name: Start Docker service
         run: |
           sudo systemctl start docker
           sudo systemctl status docker
+
       - name: chown /var/run/docker.sock to current user
         run: |
           sudo chown $USER /var/run/docker.sock
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
+
       - name: default
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release" >> $GITHUB_ENV
-      - name: Build ARM64 ${{ env.IMAGE_TAG }} image
+      - &build-arm64-image
+        name: Build ARM64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -137,66 +147,34 @@ jobs:
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - name: Build ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-arm64-image
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - name: Build ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-arm64-image
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - name: Build ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-arm64-image
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
+
   build-amd64:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
-    runs-on: spiceai-runners
+
+    runs-on: spiceai-dev-runners
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+
       - name: Add nightly postfix to version in Cargo.toml
         env:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
@@ -209,17 +187,20 @@ jobs:
           fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           # Enable docker driver for layer caching
           driver-opts: |
             image=moby/buildkit:latest
+
       - name: default
         run: |
           echo "IMAGE_TAG=models" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-      - name: Build AMD64 ${{ env.IMAGE_TAG }} image
+      - &build-amd64-image
+        name: Build AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -236,78 +217,48 @@ jobs:
         run: |
           echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
-      - name: Build AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-amd64-image
       - name: models-mimalloc
         run: |
           echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
-      - name: Build AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-amd64-image
       - name: models-sysalloc
         run: |
           echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
-      - name: Build AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - *build-amd64-image
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
+
   publish:
     needs: [check_commits, setup, build-amd64, build-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
+
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           path: /tmp
           pattern: images-*
+
       - name: Verify artifacts
         run: |
           ls -l /tmp
           ls -l /tmp/images-amd64
           ls -l /tmp/images-arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Start local registry
         run: |
           docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
       - name: Login to GitHub Package Registry
         if: github.event_name == 'schedule' || inputs.publish
         uses: docker/login-action@v3
@@ -315,6 +266,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Import images and create manifests
         env:
           REL_VERSION: ${{ needs.setup.outputs.rel_version }}
@@ -362,10 +314,12 @@ jobs:
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
-      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v4
         if: github.event_name == 'schedule' || inputs.publish
         with:
           fetch-depth: 0
+
       - name: Update nightly tag
         if: github.event_name == 'schedule' || inputs.publish
         run: |

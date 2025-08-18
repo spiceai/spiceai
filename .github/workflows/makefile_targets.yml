@@ -36,7 +36,7 @@ concurrency:
 jobs:
   make_install:
     name: make install*
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     env:
       GOVER: 1.24.2
 
@@ -53,7 +53,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-      
+
       - name: Set up make
         uses: ./.github/actions/setup-make
 
