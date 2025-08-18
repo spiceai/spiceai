@@ -175,7 +175,7 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
-anyhow = "1.0.86"
+anyhow = "1.0.99"
 async-graphql = "7.0.16"
 async-graphql-axum = "7.0.16"
 azure_core = "0.26.0"
