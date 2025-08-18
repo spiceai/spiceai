@@ -59,8 +59,12 @@ jobs:
         with:
           os: 'darwin'
 
-      # Build the test binary without running tests
-      - name: Build AI integration test binary
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      # Build the test archive without running tests
+      - name: Build AI integration test archive
         env:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
@@ -75,15 +79,14 @@ jobs:
              echo "Excluding extended_tests"
            fi
 
-           TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
-           cp $TEST_BINARY_PATH ./ai_integration_test
+           cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration_models.tar.zst
 
-      # Upload the test binary as an artifact
-      - name: Upload test binary
+      # Upload the test archive as an artifact
+      - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
-          name: ai-integration-test-binary
-          path: ./ai_integration_test
+          name: ai-integration-test-archive
+          path: ./integration_models.tar.zst
           retention-days: 1
 
   test-openai:
@@ -94,16 +97,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Set up Open.ai API Key
         run: |
@@ -117,7 +119,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst openai_test
 
       - name: Run Beta functionality embeddings test
         env:
@@ -127,7 +129,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture openai_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst openai_embeddings_beta_requirements
 
   test-hf:
     name: Test Huggingface Models
@@ -138,16 +140,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run integration test
         env:
@@ -157,7 +158,7 @@ jobs:
             echo "Error: Hugging Face API Token is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture huggingface_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst huggingface_test
 
       - name: Run Beta functionality embedding tests
         env:
@@ -167,7 +168,7 @@ jobs:
             echo "Error: Hugging Face API Token is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture hf_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst hf_embeddings_beta_requirements
 
   test-local:
     name: Test Local Models
@@ -177,20 +178,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run Beta functionality embedding tests
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture local_embeddings_beta_requirements
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst local_embeddings_beta_requirements
 
   test-bedrock:
     name: Test Bedrock Models
@@ -201,23 +201,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run Beta functionality embedding tests
         env:
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture bedrock_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst bedrock_test
 
   test-workers:
     name: Test Workers
@@ -227,16 +226,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Set up Open.ai API Key
         run: |
@@ -250,7 +248,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture workers
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst workers
 
   test-search:
     name: Test Search
@@ -262,16 +260,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download test binary
+      - name: Download test archive
         uses: actions/download-artifact@v5
         with:
-          name: ai-integration-test-binary
+          name: ai-integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/ai_integration_test
+          curl -LsSf https://get.nexte.st/latest/darwin | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Set up Open.ai API Key
         run: |
@@ -287,4 +284,4 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture search
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration_models.tar.zst search
