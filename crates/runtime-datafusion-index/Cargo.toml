@@ -12,5 +12,9 @@ version.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
-tracing.workspace = true
 itertools.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
