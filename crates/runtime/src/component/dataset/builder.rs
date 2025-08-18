@@ -88,16 +88,29 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
-            tracing::debug!(
-                "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
-                dataset.name
-            );
             if vector_engine.enabled && acceleration.is_none() {
+                tracing::debug!(
+                    "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
+                    dataset.name
+                );
                 acceleration = Some(acceleration::Acceleration {
                     enabled: true,
                     engine: Engine::Void,
                     ..Default::default()
                 });
+            }
+
+            // Chunking with vector engines is not supported (yet).
+            for column in &dataset.columns {
+                for embedding in &column.embeddings {
+                    if embedding.chunking.is_some() {
+                        return Err(crate::Error::InvalidSpicepodDataset {
+                            source: Error::ChunkingNotSupportedForVectorEngine {
+                                column: column.name.clone(),
+                            },
+                        });
+                    }
+                }
             }
         }
 

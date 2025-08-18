@@ -32,7 +32,7 @@ use runtime_datafusion_index::Index;
 use s3_vectors::{Client, S3Vectors};
 use search::generation::util::get_primary_keys;
 use serde_json::Value;
-use snafu::ResultExt;
+use snafu::prelude::*;
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
@@ -49,6 +49,43 @@ use crate::{
     parameters::{ParameterSpec, Parameters},
     secrets::Secrets,
 };
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display("Embedding model '{model_name}' was not found"))]
+    EmbeddingModelNotFound { model_name: String },
+
+    #[snafu(display("{source}"))]
+    FailedToEmbed { source: llms::embeddings::Error },
+
+    #[snafu(display(
+        "Failed to update '{index}' index. An error occurred embedding the underlying dataset column '{column}'. Error: '{source}'."
+    ))]
+    FailedToEmbedColumn {
+        index: String,
+        column: String,
+        source: Box<Error>,
+    },
+
+    #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
+    ColumnNotFound { index: String, column: String },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, as provided data has mismatch lengths. embedding column has {embed} rows, whilst primary key column '{primary_key_column}' has {len} rows. {embed} != {len}."
+    ))]
+    LengthMismatch {
+        index: String,
+        embed: usize,
+        primary_key_column: String,
+        len: usize,
+    },
+
+    #[snafu(display("Cannot write to '{index}' index: {source}"))]
+    CannotWriteIndex {
+        index: String,
+        source: data_components::s3_vectors::Error,
+    },
+}
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
@@ -76,7 +113,11 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
-pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &RecordBatch) {
+pub async fn write(
+    index: &S3VectorIndex,
+    cfg: &IndexEmbeddingConfig,
+    record: &RecordBatch,
+) -> Result<(), Error> {
     let schema = record.schema();
     let Some((embedded_column_idx, _)) = record
         .schema()
@@ -87,7 +128,7 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             index.name(),
             index.embedded_column
         );
-        return;
+        return Ok(());
     };
 
     let embedding_vectors = match embed_column(
@@ -100,24 +141,21 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
     {
         Ok(vectors) => vectors,
         Err(e) => {
-            tracing::error!(
-                "Failed to update '{}' index. An error occurred embedding the underlying dataset column '{}'. Error: '{e}'.",
-                index.name(),
-                index.embedded_column
-            );
-            return;
+            return Err(Box::new(e)).context(FailedToEmbedColumnSnafu {
+                index: index.name().to_string(),
+                column: index.embedded_column.clone(),
+            });
         }
     };
 
     let mut primary_key_projection = vec![];
     for field in &index.primary_key {
         let Some((idx, _)) = schema.column_with_name(field.name().as_str()) else {
-            tracing::error!(
-                "Cannot write to '{}' index, data does not have column '{}'.",
-                index.name(),
-                field.name()
-            );
-            return;
+            return ColumnNotFoundSnafu {
+                index: index.name().to_string(),
+                column: field.name().to_string(),
+            }
+            .fail();
         };
         primary_key_projection.push(idx);
     }
@@ -125,12 +163,11 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
     let mut metadata_projection = vec![];
     for field in index.metadata_columns.iter() {
         let Some((idx, _)) = schema.column_with_name(field.name()) else {
-            tracing::error!(
-                "Cannot write to '{}' index, data does not have column '{}'.",
-                index.name(),
-                field.name()
-            );
-            return;
+            return ColumnNotFoundSnafu {
+                index: index.name().to_string(),
+                column: field.name().to_string(),
+            }
+            .fail();
         };
         metadata_projection.push(idx);
     }
@@ -184,38 +221,38 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
     let num_vectors = embedding_vectors.len();
 
     if let Some((name, values)) = primary_keys.iter().find(|(_, v)| v.len() != num_vectors) {
-        tracing::error!(
-            "Cannot write to '{}' index, as provided data has mismatch lengths. embedding column has {embed} rows, whilst primary key column '{name}' has {len} rows. {embed} != {len}.",
-            index.name(),
-            embed = num_vectors,
-            len = values.len()
-        );
-        return;
+        return LengthMismatchSnafu {
+            index: index.name().to_string(),
+            embed: num_vectors,
+            primary_key_column: name.to_string(),
+            len: values.len(),
+        }
+        .fail();
     }
 
     if let Some((name, values)) = metadata.iter().find(|(_, v)| v.len() != num_vectors) {
-        tracing::error!(
-            "Cannot write to '{}' index, as provided data has mismatch lengths. embedding column has {embed} rows, whilst metadata column '{name}' has {len} rows. {embed} != {len}.",
-            index.name(),
-            embed = num_vectors,
-            len = values.len()
-        );
-        return;
+        return LengthMismatchSnafu {
+            index: index.name().to_string(),
+            embed: num_vectors,
+            primary_key_column: name.to_string(),
+            len: values.len(),
+        }
+        .fail();
     }
 
     // Currently, we only support when there is one primary key column.
     if primary_keys.len() > 1 {
         tracing::debug!("primary_keys.len() > 1");
-        return;
+        return Ok(());
     }
     if primary_keys.is_empty() {
         tracing::debug!("primary_keys.is_empty()");
-        return;
+        return Ok(());
     }
 
     let Some(pk_field) = index.primary_key.first() else {
         tracing::debug!("primary_keys.is_empty()");
-        return;
+        return Ok(());
     };
     if let Some(key) = primary_keys.remove(pk_field.name()) {
         if let Err(e) = index
@@ -223,7 +260,9 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             .write_data(embedding_vectors, key, metadata)
             .await
         {
-            tracing::error!("Cannot write to '{}' index: {e}", index.name());
+            return Err(e).context(CannotWriteIndexSnafu {
+                index: index.name().to_string(),
+            });
         }
     } else {
         tracing::warn!(
@@ -231,6 +270,8 @@ pub async fn write(index: &S3VectorIndex, cfg: &IndexEmbeddingConfig, record: &R
             index.name()
         );
     }
+
+    Ok(())
 }
 
 fn to_string_vec<'a, I>(iter: I) -> Vec<Option<String>>
@@ -248,16 +289,17 @@ async fn embed_column(
     column_idx: usize,
     model_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-) -> Result<Vec<Option<Vec<f32>>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<Option<Vec<f32>>>, Error> {
     let Some(data) = convert_string_arrow_to_iterator!(rb.column(column_idx)) else {
         return Ok(vec![]);
     };
 
     let embedding_guard = embedding_models.read().await;
     let Some(model) = embedding_guard.get(model_name) else {
-        return Err(Box::from(format!(
-            "Embedding model '{model_name}' was not found"
-        )));
+        return EmbeddingModelNotFoundSnafu {
+            model_name: model_name.to_string(),
+        }
+        .fail();
     };
 
     let mut nulls = vec![];
@@ -274,7 +316,7 @@ async fn embed_column(
     let embedded_data = model
         .embed(EmbeddingInput::StringArray(column))
         .await
-        .boxed()?;
+        .context(FailedToEmbedSnafu)?;
 
     let mut result: Vec<Option<Vec<f32>>> = vec![];
     let mut value_ptr = 0;

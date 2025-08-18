@@ -44,7 +44,6 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
-use futures::FutureExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use std::cmp::min;
@@ -278,12 +277,6 @@ impl VectorSearchTableFunc {
 
 impl TableFunctionImpl for VectorSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        async {
-            let request_context = RequestContext::current(AsyncMarker::new().await);
-            telemetry::track_vector_search(&request_context.to_dimensions());
-        }
-        .now_or_never();
-
         let args = Self::parse_args(args)?;
         let df = self.df.upgrade().ok_or_else(|| {
             DataFusionError::Plan(format!(
@@ -419,6 +412,9 @@ impl TableProvider for VectorSearchUDTFProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_vector_search(&request_context.to_dimensions());
+
         let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self
