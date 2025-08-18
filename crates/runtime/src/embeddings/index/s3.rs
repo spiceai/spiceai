@@ -17,8 +17,11 @@ limitations under the License.
 use std::{any::Any, collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
-    array::{LargeStringArray, RecordBatch, StringArray, StringViewArray},
-    datatypes::SchemaRef,
+    array::{
+        Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
+        StringViewArray,
+    },
+    datatypes::{DataType, Field, SchemaRef},
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::Field;
@@ -43,7 +46,11 @@ use tokio::sync::RwLock;
 use crate::{
     convert_string_arrow_to_iterator,
     dataconnector::parameters::aws::load_config,
-    embeddings::index::{IndexEmbeddingConfig, S3Vector, retry_client::S3VectorRetryClientBuilder},
+    embedding_col,
+    embeddings::{
+        common::is_valid_embedding_type,
+        index::{IndexEmbeddingConfig, S3Vector, retry_client::S3VectorRetryClientBuilder},
+    },
     get_params_with_secrets,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
@@ -85,6 +92,14 @@ pub enum Error {
         index: String,
         source: data_components::s3_vectors::Error,
     },
+
+    #[snafu(display(
+        "Cannot create embedding array: no valid embeddings found to determine dimension"
+    ))]
+    CannotDetermineEmbeddingDimension,
+
+    #[snafu(display("Cannot update embedding column in record batch: {source}"))]
+    CannotUpdateEmbeddingColumn { source: arrow::error::ArrowError },
 }
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
@@ -116,8 +131,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 pub async fn write(
     index: &S3VectorIndex,
     cfg: &IndexEmbeddingConfig,
-    record: &RecordBatch,
-) -> Result<(), Error> {
+    record: RecordBatch,
+) -> Result<RecordBatch, Error> {
     let schema = record.schema();
     let Some((embedded_column_idx, _)) = record
         .schema()
@@ -131,20 +146,52 @@ pub async fn write(
         return Ok(());
     };
 
-    let embedding_vectors = match embed_column(
-        record,
-        embedded_column_idx,
-        cfg.model_name.as_str(),
-        Arc::clone(&cfg.embedding_models),
-    )
-    .await
-    {
-        Ok(vectors) => vectors,
-        Err(e) => {
-            return Err(Box::new(e)).context(FailedToEmbedColumnSnafu {
-                index: index.name().to_string(),
-                column: index.embedded_column.clone(),
-            });
+    // Check if there's an existing embedding column in the batch
+    let embedding_column_name = embedding_col!(index.embedded_column);
+    let existing_embedding_column = record
+        .schema()
+        .column_with_name(&embedding_column_name)
+        .map(|(idx, _)| idx);
+
+    let embedding_vectors = match existing_embedding_column {
+        Some(embedding_idx) => {
+            // Extract existing embeddings and compute only missing ones
+            match embed_column_with_existing(
+                &record,
+                embedded_column_idx,
+                embedding_idx,
+                cfg.model_name.as_str(),
+                Arc::clone(&cfg.embedding_models),
+            )
+            .await
+            {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    return Err(Box::new(e)).context(FailedToEmbedColumnSnafu {
+                        index: index.name().to_string(),
+                        column: index.embedded_column.clone(),
+                    });
+                }
+            }
+        }
+        None => {
+            // No existing embeddings, compute all from scratch
+            match embed_column(
+                &record,
+                embedded_column_idx,
+                cfg.model_name.as_str(),
+                Arc::clone(&cfg.embedding_models),
+            )
+            .await
+            {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    return Err(Box::new(e)).context(FailedToEmbedColumnSnafu {
+                        index: index.name().to_string(),
+                        column: index.embedded_column.clone(),
+                    });
+                }
+            }
         }
     };
 
@@ -271,7 +318,81 @@ pub async fn write(
         );
     }
 
-    Ok(())
+    // Update the embedding column in the batch with computed embeddings
+    let updated_record =
+        update_embedding_column_in_batch(record, &index.embedded_column, &embedding_vectors)?;
+
+    Ok(updated_record)
+}
+
+/// Update the embedding column in the RecordBatch with the computed embeddings.
+fn update_embedding_column_in_batch(
+    record: RecordBatch,
+    embedded_column_name: &str,
+    embedding_vectors: &[Option<Vec<f32>>],
+) -> Result<RecordBatch, Error> {
+    let embedding_column_name = embedding_col!(embedded_column_name);
+
+    // Check if the embedding column already exists
+    let schema = record.schema();
+    let embedding_column_idx = schema
+        .column_with_name(&embedding_column_name)
+        .map(|(idx, _)| idx);
+
+    if let Some(idx) = embedding_column_idx {
+        // Update existing embedding column
+        let mut columns: Vec<Arc<dyn Array>> = (0..record.num_columns())
+            .map(|i| Arc::clone(record.column(i)))
+            .collect();
+
+        // Create new embedding array
+        let embedding_array = create_embedding_array(embedding_vectors)?;
+        columns[idx] = embedding_array;
+
+        // Create new RecordBatch with updated column
+        RecordBatch::try_new(schema, columns).context(CannotUpdateEmbeddingColumnSnafu)
+    } else {
+        // If embedding column doesn't exist, return original batch
+        // This shouldn't happen in normal operation since we check for it earlier
+        Ok(record)
+    }
+}
+
+/// Create an Arrow array from embedding vectors.
+fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<dyn Array>, Error> {
+    use arrow::array::{ArrayBuilder, FixedSizeListBuilder, Float32Builder};
+
+    // Determine embedding dimension from first non-null embedding
+    let dimension = embedding_vectors
+        .iter()
+        .find_map(|opt| opt.as_ref().map(|v| v.len()))
+        .unwrap_or(0) as i32;
+
+    ensure!(dimension > 0, CannotDetermineEmbeddingDimensionSnafu);
+
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
+
+    for embedding_opt in embedding_vectors {
+        match embedding_opt {
+            Some(embedding) => {
+                let float_builder = builder.values();
+                for &value in embedding {
+                    float_builder.append_value(value);
+                }
+                builder.append(true);
+            }
+            None => {
+                // Append nulls for missing embeddings
+                let float_builder = builder.values();
+                for _ in 0..dimension {
+                    float_builder.append_null();
+                }
+                builder.append(false);
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
 }
 
 fn to_string_vec<'a, I>(iter: I) -> Vec<Option<String>>
@@ -279,6 +400,101 @@ where
     I: Iterator<Item = Option<&'a str>>,
 {
     iter.map(|opt| opt.map(ToString::to_string)).collect()
+}
+
+/// Embed the given `column_idx` from the [`RecordBatch`]s, checking for existing embeddings first.
+///
+/// If an embedding already exists for a row, use it. Otherwise compute a new embedding.
+async fn embed_column_with_existing(
+    rb: &RecordBatch,
+    column_idx: usize,
+    embedding_column_idx: usize,
+    model_name: &str,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
+) -> Result<Vec<Option<Vec<f32>>>, Error> {
+    let Some(text_data) = convert_string_arrow_to_iterator!(rb.column(column_idx)) else {
+        return Ok(vec![]);
+    };
+
+    // Extract existing embeddings from the embedding column
+    let existing_embeddings = extract_existing_embeddings(rb.column(embedding_column_idx))?;
+
+    let embedding_guard = embedding_models.read().await;
+    let Some(model) = embedding_guard.get(model_name) else {
+        return EmbeddingModelNotFoundSnafu {
+            model_name: model_name.to_string(),
+        }
+        .fail();
+    };
+
+    let mut texts_to_embed = vec![];
+    let mut embed_indices = vec![];
+    let mut result: Vec<Option<Vec<f32>>> = vec![None; rb.num_rows()];
+
+    // Identify which rows need new embeddings
+    for (i, (text_opt, existing_embedding)) in text_data.zip(existing_embeddings.iter()).enumerate()
+    {
+        if let Some(embedding) = existing_embedding {
+            // Use existing embedding
+            result[i] = Some(embedding.clone());
+        } else if let Some(text) = text_opt {
+            if !text.is_empty() {
+                // Need to compute new embedding
+                texts_to_embed.push(text.to_string());
+                embed_indices.push(i);
+            }
+        }
+        // If text is None or empty and no existing embedding, result[i] remains None
+    }
+
+    // Compute embeddings only for rows that need them
+    if !texts_to_embed.is_empty() {
+        let embedded_data = model
+            .embed(EmbeddingInput::StringArray(texts_to_embed))
+            .await
+            .context(FailedToEmbedSnafu)?;
+
+        // Place computed embeddings in their correct positions
+        for (embed_idx, result_idx) in embed_indices.iter().enumerate() {
+            if let Some(embedding) = embedded_data.get(embed_idx) {
+                result[*result_idx] = Some(embedding.clone());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Extract existing embeddings from an embedding column.
+/// Returns a vector where each element is either Some(embedding) or None.
+fn extract_existing_embeddings(column: &Arc<dyn Array>) -> Result<Vec<Option<Vec<f32>>>, Error> {
+    let mut embeddings = vec![];
+
+    if let Some(fixed_list) = column.as_any().downcast_ref::<FixedSizeListArray>() {
+        // Handle FixedSizeList of floats
+        for i in 0..fixed_list.len() {
+            if fixed_list.is_null(i) {
+                embeddings.push(None);
+            } else {
+                let values = fixed_list.value(i);
+                if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
+                    let embedding: Vec<f32> = (0..float_array.len())
+                        .map(|j| float_array.value(j))
+                        .collect();
+                    embeddings.push(Some(embedding));
+                } else {
+                    embeddings.push(None);
+                }
+            }
+        }
+    } else {
+        // Column exists but isn't in expected format, treat all as None
+        for _ in 0..column.len() {
+            embeddings.push(None);
+        }
+    }
+
+    Ok(embeddings)
 }
 
 /// Embed the given `column_idx` from the [`RecordBatch`]s, assuming it is a String-like value.
@@ -602,4 +818,347 @@ impl Index for S3VectorIndex {
 
         pks
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayBuilder, FixedSizeListBuilder, Float32Builder, StringArray};
+    use arrow::datatypes::{DataType, Schema};
+    use async_openai::types::EmbeddingInput;
+    use async_trait::async_trait;
+    use llms::embeddings::{Embed, Error as EmbedError};
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    // Mock embedding model for testing
+    struct MockEmbedModel {
+        embeddings: HashMap<String, Vec<f32>>,
+    }
+
+    impl MockEmbedModel {
+        fn new() -> Self {
+            let mut embeddings = HashMap::new();
+            embeddings.insert("hello".to_string(), vec![0.1, 0.2, 0.3]);
+            embeddings.insert("world".to_string(), vec![0.4, 0.5, 0.6]);
+            embeddings.insert("test".to_string(), vec![0.7, 0.8, 0.9]);
+            Self { embeddings }
+        }
+    }
+
+    #[async_trait]
+    impl Embed for MockEmbedModel {
+        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, EmbedError> {
+            match input {
+                EmbeddingInput::String(s) => {
+                    if let Some(embedding) = self.embeddings.get(&s) {
+                        Ok(vec![embedding.clone()])
+                    } else {
+                        Ok(vec![vec![1.0, 1.0, 1.0]]) // Default embedding
+                    }
+                }
+                EmbeddingInput::StringArray(strings) => {
+                    let mut result = Vec::new();
+                    for s in strings {
+                        if let Some(embedding) = self.embeddings.get(&s) {
+                            result.push(embedding.clone());
+                        } else {
+                            result.push(vec![1.0, 1.0, 1.0]); // Default embedding
+                        }
+                    }
+                    Ok(result)
+                }
+                _ => Err(EmbedError::FailedToCreateEmbedding {
+                    source: "Unsupported input type".into(),
+                }),
+            }
+        }
+
+        /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.
+        fn size(&self) -> i32 {
+            self.embeddings
+                .values()
+                .next()
+                .map_or(-1, |v| v.len() as i32)
+        }
+    }
+}
+
+// Helper function to create a test RecordBatch with text and embedding columns
+fn create_test_record_batch_with_embeddings(
+    texts: Vec<Option<&str>>,
+    embeddings: Vec<Option<Vec<f32>>>,
+) -> RecordBatch {
+    let text_array = StringArray::from(texts);
+
+    // Create embedding array
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+    for embedding_opt in embeddings {
+        match embedding_opt {
+            Some(embedding) => {
+                let float_builder = builder.values();
+                for &value in &embedding {
+                    float_builder.append_value(value);
+                }
+                builder.append(true);
+            }
+            None => {
+                let float_builder = builder.values();
+                for _ in 0..3 {
+                    float_builder.append_null();
+                }
+                builder.append(false);
+            }
+        }
+    }
+    let embedding_array = builder.finish();
+
+    let schema = Schema::new(vec![
+        Field::new("text", DataType::Utf8, true),
+        Field::new(
+            "text_embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+            true,
+        ),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(text_array), Arc::new(embedding_array)],
+    )
+    .expect("Failed to create test RecordBatch")
+}
+
+// Helper function to create a test RecordBatch with only text column
+fn create_test_record_batch_text_only(texts: Vec<Option<&str>>) -> RecordBatch {
+    let text_array = StringArray::from(texts);
+    let schema = Schema::new(vec![Field::new("text", DataType::Utf8, true)]);
+
+    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(text_array)])
+        .expect("Failed to create test RecordBatch with text only")
+}
+
+// Helper function to create embedding model store
+async fn create_mock_embedding_store() -> Arc<RwLock<EmbeddingModelStore>> {
+    let mut store = EmbeddingModelStore::default();
+    store.insert("test_model".to_string(), Arc::new(MockEmbedModel::new()));
+    Arc::new(RwLock::new(store))
+}
+
+#[test]
+fn test_extract_existing_embeddings_valid_fixed_size_list() {
+    // Create a FixedSizeListArray with embeddings
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+
+    // First embedding: [0.1, 0.2, 0.3]
+    let float_builder = builder.values();
+    float_builder.append_value(0.1);
+    float_builder.append_value(0.2);
+    float_builder.append_value(0.3);
+    builder.append(true);
+
+    // Second embedding: null
+    let float_builder = builder.values();
+    for _ in 0..3 {
+        float_builder.append_null();
+    }
+    builder.append(false);
+
+    // Third embedding: [0.7, 0.8, 0.9]
+    let float_builder = builder.values();
+    float_builder.append_value(0.7);
+    float_builder.append_value(0.8);
+    float_builder.append_value(0.9);
+    builder.append(true);
+
+    let embedding_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+    let result =
+        extract_existing_embeddings(&embedding_array).expect("Failed to extract embeddings");
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0], Some(vec![0.1, 0.2, 0.3]));
+    assert_eq!(result[1], None);
+    assert_eq!(result[2], Some(vec![0.7, 0.8, 0.9]));
+}
+
+#[test]
+fn test_extract_existing_embeddings_invalid_column_type() {
+    // Create a StringArray instead of FixedSizeListArray
+    let string_array =
+        Arc::new(StringArray::from(vec!["not", "an", "embedding"])) as Arc<dyn Array>;
+
+    let result = extract_existing_embeddings(&string_array)
+        .expect("Failed to extract embeddings from invalid column type");
+
+    // Should return None for all rows when column format is invalid
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0], None);
+    assert_eq!(result[1], None);
+    assert_eq!(result[2], None);
+}
+
+#[test]
+fn test_create_embedding_array_valid_embeddings() {
+    let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
+
+    let result = create_embedding_array(&embeddings).expect("Failed to create embedding array");
+
+    let fixed_list = result
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("Result should be FixedSizeListArray");
+
+    assert_eq!(fixed_list.len(), 3);
+    assert!(!fixed_list.is_null(0));
+    assert!(fixed_list.is_null(1));
+    assert!(!fixed_list.is_null(2));
+
+    // Check first embedding values
+    let first_values = fixed_list.value(0);
+    let first_floats = first_values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("Values should be Float32Array");
+    assert_eq!(first_floats.value(0), 0.1);
+    assert_eq!(first_floats.value(1), 0.2);
+    assert_eq!(first_floats.value(2), 0.3);
+}
+
+#[test]
+fn test_create_embedding_array_empty_embeddings() {
+    let embeddings: Vec<Option<Vec<f32>>> = vec![None, None];
+
+    let result = create_embedding_array(&embeddings);
+
+    // Should fail because no valid embeddings to determine dimension
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        Error::CannotDetermineEmbeddingDimension
+    ));
+}
+
+#[test]
+fn test_update_embedding_column_in_batch_with_existing_column() {
+    let record = create_test_record_batch_with_embeddings(
+        vec![Some("hello"), Some("world")],
+        vec![None, None], // Existing embeddings are null
+    );
+
+    let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
+
+    let result = update_embedding_column_in_batch(record, "text", &new_embeddings)
+        .expect("Failed to update embedding column");
+
+    // Verify the updated batch has the new embeddings
+    let embedding_column = result.column(1);
+    let fixed_list = embedding_column
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("Embedding column should be FixedSizeListArray");
+
+    assert!(!fixed_list.is_null(0));
+    assert!(!fixed_list.is_null(1));
+
+    let first_values = fixed_list.value(0);
+    let first_floats = first_values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("Values should be Float32Array");
+    assert_eq!(first_floats.value(0), 0.1);
+    assert_eq!(first_floats.value(1), 0.2);
+    assert_eq!(first_floats.value(2), 0.3);
+}
+
+#[test]
+fn test_update_embedding_column_in_batch_without_existing_column() {
+    let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
+
+    let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
+
+    let result = update_embedding_column_in_batch(record.clone(), "text", &new_embeddings)
+        .expect("Failed to handle missing embedding column");
+
+    // Should return original batch when embedding column doesn't exist
+    assert_eq!(result.num_columns(), record.num_columns());
+    assert_eq!(result.num_rows(), record.num_rows());
+}
+
+#[tokio::test]
+async fn test_embed_column_with_existing_mixed_embeddings() {
+    let record = create_test_record_batch_with_embeddings(
+        vec![Some("hello"), Some("world"), Some("new")],
+        vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])],
+    );
+
+    let embedding_models = create_mock_embedding_store().await;
+
+    let result = embed_column_with_existing(
+        &record,
+        0, // text column index
+        1, // embedding column index
+        "test_model",
+        embedding_models,
+    )
+    .await
+    .expect("Failed to embed column with existing embeddings");
+
+    assert_eq!(result.len(), 3);
+    // First embedding should be reused from existing
+    assert_eq!(result[0], Some(vec![0.1, 0.2, 0.3]));
+    // Second should be computed (world -> [0.4, 0.5, 0.6] from mock)
+    assert_eq!(result[1], Some(vec![0.4, 0.5, 0.6]));
+    // Third should be reused from existing
+    assert_eq!(result[2], Some(vec![0.7, 0.8, 0.9]));
+}
+
+#[tokio::test]
+async fn test_embed_column_with_existing_all_existing() {
+    let record = create_test_record_batch_with_embeddings(
+        vec![Some("hello"), Some("world")],
+        vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])],
+    );
+
+    let embedding_models = create_mock_embedding_store().await;
+
+    let result = embed_column_with_existing(
+        &record,
+        0, // text column index
+        1, // embedding column index
+        "test_model",
+        embedding_models,
+    )
+    .await
+    .expect("Failed to embed column with all existing embeddings");
+
+    assert_eq!(result.len(), 2);
+    // Both embeddings should be reused
+    assert_eq!(result[0], Some(vec![0.1, 0.2, 0.3]));
+    assert_eq!(result[1], Some(vec![0.4, 0.5, 0.6]));
+}
+
+#[tokio::test]
+async fn test_embed_column_with_existing_no_existing() {
+    let record = create_test_record_batch_with_embeddings(
+        vec![Some("hello"), Some("world")],
+        vec![None, None], // No existing embeddings
+    );
+
+    let embedding_models = create_mock_embedding_store().await;
+
+    let result = embed_column_with_existing(
+        &record,
+        0, // text column index
+        1, // embedding column index
+        "test_model",
+        embedding_models,
+    )
+    .await
+    .expect("Failed to embed column with no existing embeddings");
+
+    assert_eq!(result.len(), 2);
+    // Both should be computed from mock model
+    assert_eq!(result[0], Some(vec![0.1, 0.2, 0.3])); // hello
+    assert_eq!(result[1], Some(vec![0.4, 0.5, 0.6])); // world
 }

@@ -208,8 +208,8 @@ impl VectorIndex for S3Vector {
 
     async fn write(
         &self,
-        record: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         s3::write(&self.index, &self.cfg, record).await.boxed()
     }
 
@@ -282,10 +282,12 @@ impl Index for S3Vector {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        for rb in &batches {
-            self.write(rb).await.map_err(DataFusionError::External)?;
+        let mut computed_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+        for rb in batches {
+            let computed_batch = self.write(rb).await.map_err(DataFusionError::External)?;
+            // computed_batches.push(computed_batch);
         }
-        Ok(batches)
+        Ok(computed_batches)
     }
 }
 
