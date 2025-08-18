@@ -37,7 +37,7 @@ pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Match {
     /// The matches for this result
-    matches: HashMap<String, MatchType>,
+    matches: HashMap<String, Matches>,
 
     /// Addditional data from the `dataset` requested by the user.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -59,21 +59,11 @@ pub struct Match {
 
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(untagged)]
-pub enum MatchType {
-    Single(Value),
-    Multiple(Vec<Value>),
-}
+pub struct Matches(Vec<Value>);
 
-impl From<Vec<Value>> for MatchType {
+impl From<Vec<Value>> for Matches {
     fn from(mut value: Vec<Value>) -> Self {
-        if value.len() == 1 {
-            let Some(v) = value.pop() else {
-                unreachable!("The value array must have one element");
-            };
-            return MatchType::Single(v);
-        }
-        MatchType::Multiple(value)
+        Matches(std::mem::take(&mut value))
     }
 }
 
@@ -203,7 +193,7 @@ pub async fn to_matches(
 /// Convert a map of {column name -> column values}, to a per-row representation.
 fn transpose_and_convert(
     column_format: HashMap<String, Vec<Vec<Value>>>,
-) -> Vec<HashMap<String, MatchType>> {
+) -> Vec<HashMap<String, Matches>> {
     let max_rows = column_format
         .values()
         .map(std::vec::Vec::len)
@@ -233,12 +223,12 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
-    fn sort_result(v: Vec<HashMap<String, MatchType>>) -> Vec<Vec<(String, MatchType)>> {
+    fn sort_result(v: Vec<HashMap<String, Matches>>) -> Vec<Vec<(String, Matches)>> {
         v.into_iter()
             .map(|x| {
                 x.into_iter()
                     .sorted_by_key(|(a, _)| a.clone())
-                    .collect::<Vec<(String, MatchType)>>()
+                    .collect::<Vec<(String, Matches)>>()
             })
             .collect::<Vec<_>>()
     }

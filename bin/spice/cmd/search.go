@@ -49,7 +49,7 @@ type SearchRequest struct {
 }
 
 type SearchMatch struct {
-	Matches    map[string]string      `json:"matches"`
+	Matches    map[string][]string    `json:"matches"`
 	Score      float64                `json:"score"`
 	Dataset    string                 `json:"dataset"`
 	PrimaryKey map[string]interface{} `json:"primary_key"`
@@ -192,14 +192,15 @@ spice search --cloud
 						cmd.Printf(" %s=%v", key, value)
 					}
 				}
-				if len(match.Matches) == 1 {
-					// This will only print a single line.
-					for _, value := range match.Matches {
-						cmd.Printf("\n%s", value)
-					}
-				} else {
-					for col, value := range match.Matches {
-						cmd.Printf("\n%s: %s", col, value)
+
+				withColumns := len(match.Matches) > 0
+				for col, values := range match.Matches {
+					for _, value := range values {
+						if withColumns {
+							cmd.Printf("\n%s: %s", col, value)
+						} else {
+							cmd.Printf("\n%s", value)
+						}
 					}
 				}
 				cmd.Print("\n\n")
