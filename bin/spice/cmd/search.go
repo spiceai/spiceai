@@ -193,12 +193,18 @@ spice search --cloud
 					}
 				}
 
-				withColumns := len(match.Matches) > 0
+				withColumns := len(match.Matches) > 1
 				for col, values := range match.Matches {
-					for _, value := range values {
-						if withColumns {
+					withMatchNumber := len(values) > 1
+					for i, value := range values {
+						switch {
+						case withColumns && withMatchNumber:
+							cmd.Printf("\n%s[match #%d]: %s", col, i+1, value)
+						case withColumns:
 							cmd.Printf("\n%s: %s", col, value)
-						} else {
+						case withMatchNumber:
+							cmd.Printf("\nmatch #%d: %s", i+1, value)
+						default:
 							cmd.Printf("\n%s", value)
 						}
 					}
