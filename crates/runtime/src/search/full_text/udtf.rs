@@ -27,13 +27,17 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::sync::{Arc, Weak};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Weak},
+};
 
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
-    common::Column,
+    common::{Column, Constraints, Statistics},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
@@ -247,6 +251,42 @@ impl TableProvider for TextSearchIndexProviderWrapper {
 
     fn table_type(&self) -> TableType {
         self.inner.table_type()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
     }
 
     async fn scan(
