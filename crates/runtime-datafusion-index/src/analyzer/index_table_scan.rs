@@ -391,12 +391,12 @@ impl ExecutionPlan for IndexerExec {
                 let indexes = indexes.clone();
                 async move {
                     if let Ok(batch) = batch.as_ref() {
-                        futures::future::join_all(
+                        futures::future::try_join_all(
                             indexes
                                 .iter()
                                 .map(|index| index.compute_index(vec![batch.clone()])),
                         )
-                        .await;
+                        .await?;
                     }
                     batch
                 }
@@ -607,7 +607,15 @@ mod test {
 
         let df = ctx.table("test_idx_table").await.expect("valid");
 
-        let _results = df.collect().await.expect("should complete");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should return an error on indexing");
+        assert!(matches!(err, DataFusionError::Execution(_)));
+        assert_eq!(
+            err.to_string(),
+            "Execution error: Some error while indexing".to_string()
+        );
         assert_eq!(1, index.compute_index_calls());
     }
 }
