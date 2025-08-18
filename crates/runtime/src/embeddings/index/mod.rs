@@ -611,6 +611,7 @@ pub mod tests {
             &self,
             _record: &RecordBatch,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
         }
         async fn query_table_provider(
             &self,
