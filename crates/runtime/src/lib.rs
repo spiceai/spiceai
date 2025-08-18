@@ -68,6 +68,8 @@ use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
+use crate::udtfs::ListUDFTableFunc;
+
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
@@ -109,6 +111,7 @@ pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
+mod udtfs;
 mod view;
 mod worker;
 
@@ -818,6 +821,12 @@ impl Runtime {
                 tracing::error!("Failed to initialize management of the Spice runtime: {err}");
             }
         }
+
+        let ctx = &self.datafusion().ctx;
+        ctx.register_udtf(
+            "list_udfs",
+            Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
+        );
 
         let components = vec![task_history, datasets, catalogs, models_and_evals];
 

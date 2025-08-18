@@ -115,7 +115,7 @@ run:
 
 .PHONY: docker
 docker:
-	docker buildx build -t spiceai-rust:local-dev .
+	docker buildx build --build-arg RUST_PROFILE=release -t spiceai-rust:local-dev .
 
 .PHONY: docker-run
 docker-run:
