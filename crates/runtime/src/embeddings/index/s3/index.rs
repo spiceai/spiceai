@@ -158,7 +158,7 @@ impl VectorIndex for S3Vector {
     }
 
     async fn write(&self, record: &RecordBatch) {
-        write::write(self, record).await
+        write::write(self, record).await;
     }
 
     async fn query_table_provider(

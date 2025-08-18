@@ -174,7 +174,7 @@ pub fn extract_and_format_primary_key(
 
             values
                 .into_iter()
-                .map(|v| serde_json::to_string(&v).map(|v| Some(v)))
+                .map(|v| serde_json::to_string(&v).map(Some))
                 .collect::<Result<Vec<_>, _>>()
                 .boxed()
         }
