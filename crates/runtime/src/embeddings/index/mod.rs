@@ -132,7 +132,7 @@ impl S3Vector {
         match (resp.pop(), resp.pop()) {
             (Some(query_vector), None) => Ok(query_vector),
             // Second pattern is unreachable.
-            (None, None) | (None, Some(_)) => Err(Box::from(format!(
+            (None, None | Some(_)) => Err(Box::from(format!(
                 "Embedding model '{}' produced no embedding for the query '{query}'.",
                 self.cfg.model_name,
             ))),
