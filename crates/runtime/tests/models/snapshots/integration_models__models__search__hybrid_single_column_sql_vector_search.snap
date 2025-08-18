@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "id": 6,
+    "question": "<refined question>",
+    "trunc(vector_search().score,Int64(3))": 0.97
+  },
+  {
+    "id": 863,
+    "question": "What is created by making a choice?",
+    "trunc(vector_search().score,Int64(3))": 0.954
+  },
+  {
+    "id": 370,
+    "question": "Find the product of 2 and 7.",
+    "trunc(vector_search().score,Int64(3))": 0.953
+  },
+  {
+    "id": 1326,
+    "question": "Écrire 7 en base 2.",
+    "trunc(vector_search().score,Int64(3))": 0.952
+  }
+]

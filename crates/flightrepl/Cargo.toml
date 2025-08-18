@@ -22,7 +22,9 @@ prost = { version = "0.13.1", default-features = false, features = [
 reqwest.workspace = true
 rustyline = { version="16.0.0", features=["custom-bindings", "with-dirs", "with-file-history", "derive"] }
 serde_json.workspace = true
+sqlparser.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+tokio = { workspace = true }
 flight_client = { path = "../flight_client" }
 
 [target.'cfg(windows)'.dependencies]

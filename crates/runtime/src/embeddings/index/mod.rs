@@ -17,19 +17,30 @@ limitations under the License.
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use arrow::array::RecordBatch;
-use arrow_schema::{ArrowError, Field, SchemaRef};
+use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
-    MetadataColumns, list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
+use search::SEARCH_SCORE_COLUMN_NAME;
 use snafu::ResultExt;
 
-use crate::model::EmbeddingModelStore;
+use crate::{
+    embedding_col, embeddings::index::query_table::metadata_columns_to_exprs,
+    model::EmbeddingModelStore,
+};
 use datafusion::{
-    catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,
+    catalog::TableProvider,
+    common::Column,
+    datasource::{DefaultTableSource, ViewTable},
+    error::DataFusionError,
+    logical_expr::{BinaryExpr, Cast, LogicalPlan, Operator, Projection, TableScan, expr::Alias},
+    prelude::{Expr, lit},
+    sql::TableReference,
 };
 use tokio::sync::RwLock;
 
@@ -40,24 +51,47 @@ pub(crate) mod scan_table;
 pub use query_table::VectorQueryTableProvider;
 pub use scan_table::VectorScanTableProvider;
 
-#[derive(Debug, Clone)]
-pub struct IndexEmbeddingConfig {
-    pub model_name: String,
-    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-}
-
+/// A [`VectorIndex`] is a table index that can provide vector similarity results for arbitrary queries (see [`VectorIndex::query_table_provider`]).
+///
+/// A [`VectorIndex`] can have additional metadata columns to improve the filter capabilities of
+/// [`VectorIndex::query_table_provider`], or to reduce the need for joining the [`TableProvider`]s
+///  of the vector index and underlying table.
 #[async_trait]
 pub trait VectorIndex: std::fmt::Debug + Send + Sync {
+    /// The name of the column, in the underlying table, of the column for which vector similarity is performed against.
     fn embedded_column(&self) -> String;
+
+    /// All [`Field`]s that define a primary key between the underlying table and the [`VectorIndex`].
+    ///
     fn primary_fields(&self) -> Vec<Field>;
-    fn list_table_provider(&self) -> Arc<dyn TableProvider>;
+
+    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
+    /// columns and the associated embedding vectors of the [`VectorIndex::embedded_column`].
+    ///
+    /// The associated embedding vector column will be [`VectorIndex::embedded_column`] with `_embedding` appended (e.g. `body_embedding`).
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// The additional columns available in the [`VectorIndex`].
     fn metadata_columns(&self) -> &MetadataColumns;
-    fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider>;
+
+    /// Update the index based on a [`RecordBatch`] from the underlying table.
     async fn write(&self, record: &RecordBatch);
+
+    /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
+    /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
+    ///  similarity score between `query` and the [`VectorIndex::embedded_column`].
     async fn query_table_provider(
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexEmbeddingConfig {
+    pub model_name: String,
+    pub embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 /// Implementations of indexes that can produce embedding vectors for a column in the associated [`IndexedTableProvider`], and some, provide efficient search mechanism for it.
@@ -78,6 +112,36 @@ impl S3Vector {
         let model = model_lock.get(&self.cfg.model_name)?;
         Some(Arc::clone(model))
     }
+
+    pub async fn compute_query_vector(
+        &self,
+        query: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        let models = self.cfg.embedding_models.read().await;
+        let Some(embedding_model) = models.get(&self.cfg.model_name) else {
+            return Err(Box::from(format!(
+                "Vector index requires '{}' embedding model, but is not available.",
+                self.cfg.model_name
+            )));
+        };
+        let mut resp = embedding_model
+            .embed(EmbeddingInput::String(query.to_string()))
+            .await
+            .boxed()?;
+
+        match (resp.pop(), resp.pop()) {
+            (Some(query_vector), None) => Ok(query_vector),
+            // Second pattern is unreachable.
+            (None, None | Some(_)) => Err(Box::from(format!(
+                "Embedding model '{}' produced no embedding for the query '{query}'.",
+                self.cfg.model_name,
+            ))),
+            (Some(_), Some(_)) => Err(Box::from(format!(
+                "Embedding model '{}' unexpectedly produced more than one embedding for the query '{query}'.",
+                self.cfg.model_name,
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -90,16 +154,53 @@ impl VectorIndex for S3Vector {
         self.index.primary_key.clone()
     }
 
-    fn list_table_provider(&self) -> Arc<dyn TableProvider> {
-        Arc::new(S3VectorsListTable::from(self.index.table.clone()))
+    /// Use a [`S3VectorsListTable`] and then:
+    ///   1. Convert the primary key to its appropriate name and data type
+    ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
+    fn list_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((pk_name, pk_data_type)) = self
+            .primary_fields()
+            .first()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+        else {
+            return Err(Box::from(
+                "Vector indexes defined without a primary key cannot be used for retrieving vectors"
+                    .to_string(),
+            ));
+        };
+
+        let mut projection = metadata_columns_to_exprs(self.metadata_columns());
+        projection.extend(vec![
+            Expr::Alias(Alias::new(
+                Expr::Cast(Cast::new(
+                    Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                        S3_VECTOR_PRIMARY_KEY_NAME,
+                    ))),
+                    pk_data_type,
+                )),
+                None::<TableReference>,
+                pk_name,
+            )),
+            Expr::Alias(Alias::new(
+                Expr::Column(datafusion::common::Column::new_unqualified(
+                    S3_VECTOR_EMBEDDING_NAME,
+                )),
+                None::<TableReference>,
+                embedding_col!(self.embedded_column()),
+            )),
+        ]);
+
+        table_with_projection(
+            Arc::new(S3VectorsListTable::from(self.index.table.clone())),
+            projection,
+        )
+        .boxed()
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
         &self.index.metadata_columns
-    }
-
-    fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-        Arc::new(VectorScanTableProvider::new(table, self))
     }
 
     async fn write(&self, record: &RecordBatch) {
@@ -110,28 +211,50 @@ impl VectorIndex for S3Vector {
         &self,
         query: &str,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.cfg.embedding_models.read().await;
-        let Some(embedding_model) = models.get(&self.cfg.model_name) else {
-            return Err(Box::from(format!(
-                "Vector index requires '{}' embedding model, but is not available.",
-                self.cfg.model_name
-            )));
-        };
-        let mut resp = embedding_model
-            .embed(EmbeddingInput::String(query.to_string()))
-            .await
-            .boxed()?;
-        let Some(query_vector) = resp.pop() else {
-            return Err(Box::from(format!(
-                "Embedding model '{}' produced no embedding for the query '{query}'.",
-                self.cfg.model_name,
-            )));
+        let Some((pk_name, pk_data_type)) = self
+            .primary_fields()
+            .first()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+        else {
+            return Err(Box::from(
+                "Vector indexes defined without a primary key cannot be used for querying vectors"
+                    .to_string(),
+            ));
         };
 
-        Ok(Arc::new(S3VectorsQueryTable::new(
-            self.index.table.clone(),
-            query_vector,
-        )))
+        let mut projection = vec![
+            Expr::Alias(Alias::new(
+                Expr::Cast(Cast::new(
+                    Box::new(Expr::Column(Column::new_unqualified(
+                        S3_VECTOR_PRIMARY_KEY_NAME,
+                    ))),
+                    pk_data_type.clone(),
+                )),
+                None::<TableReference>,
+                pk_name,
+            )),
+            Expr::Alias(Alias::new(
+                Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
+                None::<TableReference>,
+                embedding_col!(self.embedded_column()),
+            )),
+            Expr::Alias(Alias::new(
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(lit(1.0)),
+                    Operator::Minus,
+                    Box::new(Expr::Column(Column::new_unqualified("distance"))),
+                )),
+                None::<TableReference>,
+                SEARCH_SCORE_COLUMN_NAME,
+            )),
+        ];
+        projection.extend(metadata_columns_to_exprs(self.metadata_columns()));
+
+        // TODO: Don't embed query in logical planning: https://github.com/spiceai/spiceai/issues/6783
+        let vector = self.compute_query_vector(query).await?;
+        let tp = Arc::new(S3VectorsQueryTable::new(self.index.table.clone(), vector));
+
+        table_with_projection(tp, projection).boxed()
     }
 }
 
@@ -219,6 +342,53 @@ pub(super) fn vector_index_filters(
         .collect()
 }
 
+fn table_with_projection(
+    tbl: Arc<dyn TableProvider>,
+    projection: Vec<Expr>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let scan = TableScan::try_new(
+        "tbl",
+        Arc::new(DefaultTableSource::new(tbl)),
+        None,
+        vec![],
+        None,
+    )?;
+    Ok(Arc::new(ViewTable::new(
+        LogicalPlan::Projection(Projection::try_new(
+            projection,
+            Arc::new(LogicalPlan::TableScan(scan)),
+        )?),
+        None,
+    )) as Arc<dyn TableProvider>)
+}
+
+// Returns a new projection without `columns` in the projection.
+//
+// The order of `table_fields` must be consistent with projection.
+fn projection_without_columns(
+    table_fields: &Fields,
+    columns: &[String],
+    projection: Option<&Vec<usize>>,
+) -> Vec<usize> {
+    table_fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            if columns.contains(f.name()) {
+                return None;
+            }
+
+            // Don't include if not in projection input.
+            if let Some(p) = projection.as_ref() {
+                if !p.contains(&i) {
+                    return None;
+                }
+            }
+            Some(i)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::{any::Any, sync::Arc};
@@ -233,10 +403,7 @@ pub mod tests {
         util::pretty,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use data_components::s3_vectors::{
-        MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-        query_provider::S3_VECTOR_DISTANCE_NAME,
-    };
+    use data_components::s3_vectors::{MetadataColumn, MetadataColumns};
     use datafusion::{
         catalog::{MemTable, Session, TableProvider},
         datasource::TableType,
@@ -249,7 +416,7 @@ pub mod tests {
     use search::generation::util::append_fields;
     use snafu::ResultExt;
 
-    use crate::embeddings::index::VectorIndex;
+    use crate::{embedding_col, embeddings::index::VectorIndex};
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -375,12 +542,14 @@ pub mod tests {
     impl PretendVectorIndex {
         #[must_use]
         pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
+            let primary_key_names: Vec<_> =
+                primary_columns.iter().map(|f| f.name().clone()).collect();
             let cols = schema
                 .fields()
                 .iter()
                 .filter_map(|f| {
-                    if f.name() == S3_VECTOR_PRIMARY_KEY_NAME
-                        || f.name() == S3_VECTOR_EMBEDDING_NAME
+                    if primary_key_names.contains(f.name())
+                        || *f.name() == embedding_col!(embedded_column)
                     {
                         return None;
                     }
@@ -411,24 +580,21 @@ pub mod tests {
             self.primary_columns.clone()
         }
 
-        fn list_table_provider(&self) -> Arc<dyn TableProvider> {
-            Arc::new(ExplainMemTable(
-                MemTable::try_new(
-                    Arc::new(self.schema.clone()),
-                    vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
-                        self.schema.clone(),
-                    ))]],
-                )
-                .expect("Could not build PretendVectorIndex::list_table_provider"),
-            ))
+        fn list_table_provider(
+            &self,
+        ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+            let mem_table = MemTable::try_new(
+                Arc::new(self.schema.clone()),
+                vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
+                    self.schema.clone(),
+                ))]],
+            )
+            .boxed()?;
+            Ok(Arc::new(ExplainMemTable(mem_table)))
         }
 
         fn metadata_columns(&self) -> &MetadataColumns {
             &self.metadata
-        }
-
-        fn augment_table(self: Arc<Self>, table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
-            table
         }
 
         async fn write(&self, _record: &RecordBatch) {}
@@ -438,13 +604,9 @@ pub mod tests {
         ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new(
-                    S3_VECTOR_DISTANCE_NAME,
-                    DataType::Float64,
-                    false,
-                ))],
+                vec![Arc::new(Field::new("score", DataType::Float64, false))],
             );
-            println!("In query_table_provider schema={:?}", schema);
+
             Ok(Arc::new(ExplainMemTable(
                 MemTable::try_new(
                     Arc::clone(&schema),

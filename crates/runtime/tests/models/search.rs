@@ -17,8 +17,8 @@ limitations under the License.
 use crate::DEFAULT_TRACING_MODELS;
 use crate::models::hf::get_huggingface_embeddings;
 use crate::models::openai::get_openai_embeddings;
-use crate::models::{create_api_bindings_config, http_post};
-use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
+use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
+use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use app::{App, AppBuilder};
 use http::HeaderValue;
@@ -28,12 +28,11 @@ use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::config::Config;
 use serde_json::{Value, json};
-use spicepod::acceleration::Acceleration;
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
-use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -98,13 +97,44 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
+        // To avoid inconsistent snapshots when scores are equal (common when using RRF),
+        // we also order based on primary key.
+        matches.sort_by(|a, b| {
+            let Some(Value::Number(num_a)) = a.get("score") else {
+                return Ordering::Greater;
+            };
+            let Some(score_a) = num_a.as_f64() else {
+                return Ordering::Greater;
+            };
+            let Some(Value::Number(num_b)) = b.get("score") else {
+                return Ordering::Less;
+            };
+            let Some(score_b) = num_b.as_f64() else {
+                return Ordering::Less;
+            };
+
+            // Opposite because we want to order descendingly
+            if score_a > score_b {
+                return Ordering::Less;
+            } else if score_a < score_b {
+                return Ordering::Greater;
+            }
+
+            let Some(Value::Object(a_pks)) = a.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            let Some(Value::Object(b_pks)) = b.get("primary_key") else {
+                return Ordering::Equal;
+            };
+            format!("{b_pks:?}").cmp(&format!("{a_pks:?}"))
+        });
         for m in matches {
             if let Some(obj) = m.as_object_mut() {
                 if let Some(Value::Number(n)) = obj.get("score") {
                     if let Some(score) = n.as_f64() {
                         if let Some(truncated_score) =
-                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                        // Keep 2 decimals
+                            serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
+                        // Keep 4 decimals
                         {
                             obj.insert("score".to_string(), Value::Number(truncated_score));
                         }
@@ -294,72 +324,74 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     .await
 }
 
+// Use two different embedding models on a single column.
 #[tokio::test]
-#[ignore]
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-        .await
-        .map_err(anyhow::Error::msg)?;
-    let mut ds = catalog_page_tpch_dataset_w_embeddings(
-        "multi_embedding_models",
-        "openai_embeddings",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        None,
-    );
-    ds.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![ColumnLevelEmbeddingConfig {
-            model: "hf_minilm".to_string(),
-            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            chunking: None,
-            vector_size: None,
-        }],
-        description: None,
-        full_text_search: None,
-        metadata: HashMap::new(),
-    });
-
-    let app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .with_embedding(get_openai_embeddings(
-            Some("text-embedding-3-small"),
-            "openai_embeddings",
-        ))
-        .build();
     run_search(
-        app,
+        AppBuilder::new("search_app")
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                None,
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }, ColumnLevelEmbeddingConfig {
+                        model: "openai_embeddings".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
+                    description: None,
+                    full_text_search: None,
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
-                name: "multi_embedding_models_basic",
+                name: "multi_embeddings_basic",
                 body: json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_embedding_models"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
             SearchTestCase {
-                name: "multi_embedding_models_additional",
+                name: "multi_embeddings_additional_columns",
                 body: json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multi_embedding_models"],
-                    "additional_columns": ["cp_catalog_number"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 }),
             },
             SearchTestCase {
-                name: "multi_embedding_models_where",
+                name: "multi_embeddings_with_where",
                 body: json!({
-                    "text": "new patient",
-                    "datasets": ["multi_embedding_models"],
-                    "where": "cp_catalog_page_sk % 2 = 0"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
-        vec![],
+        vec![(
+            "multi_embeddings_sql_vector_search",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        ],
     )
     .await
 }
@@ -403,292 +435,317 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     .await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: Generated candidates have inconsistent columns. From "cp_catalog_page_sk: Int32, cp_catalog_number: Int32, score: Float64, value: LargeUtf8". And "cp_catalog_page_sk: Int32, value: Utf8, score: Float64".
 #[tokio::test]
-#[ignore]
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpch_dataset_w_embeddings(
-        "hybrid_column_search",
-        "hf_minilm",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        None,
-    );
-    let col: &mut Column = ds.columns.first_mut().expect("column to be defined");
-    col.full_text_search = Some(FullTextSearchConfig {
-        enabled: true,
-        row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-    });
-    let column_name = col.name.clone();
-
-    let app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .build();
     run_search(
-        app,
+        AppBuilder::new("search_app")
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    description: None,
+                    metadata: HashMap::new(),
+                }),
+                None,
+            ))
+            .build(),
         vec![
             SearchTestCase {
-                name: "hybrid_column_search_basic",
+                name: "hybrid_single_column_basic",
                 body: json!({
-                    "text": "basic",
-                    "limit": 2,
-                    "datasets": ["hybrid_column_search"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
             SearchTestCase {
-                name: "hybrid_column_search_additional",
+                name: "hybrid_single_column_additional_columns",
                 body: json!({
-                    "text": "basic",
-                    "limit": 2,
-                    "datasets": ["hybrid_column_search"],
-                    "additional_columns": ["cp_catalog_number"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 }),
             },
             SearchTestCase {
-                name: "hybrid_column_search_where",
+                name: "hybrid_single_column_with_where",
                 body: json!({
-                    "text": "basic",
-                    "datasets": ["hybrid_column_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
-        vec![
-            (
-                "hybrid_column_sql_text_search_basic",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
-            ), (
-                "hybrid_column_sql_text_search_projection",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM text_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
-            ), (
-                "hybrid_column_sql_text_search_filters",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM text_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
-            ),
-            (
-                "hybrid_column_sql_vector_search_basic",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
-            ), (
-                "hybrid_column_sql_vector_search_projection",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name}, cp_catalog_number FROM vector_search(public.hybrid_column_search, 'basic', {column_name}) LIMIT 4").as_str()
-            ), (
-                "hybrid_column_sql_vector_search_filters",
-                format!("SELECT cp_catalog_page_sk, trunc(score, 3), {column_name} FROM vector_search(spice.public.hybrid_column_search, 'basic', {column_name}) WHERE cp_catalog_page_sk % 2 = 1 LIMIT 4").as_str()
-            ),
+        vec![(
+            "hybrid_single_column_sql_text_search",
+            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_single_column_sql_vector_search",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+        ),
         ],
     )
-        .await
+    .await
 }
 
 #[tokio::test]
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpch_dataset_w_embeddings(
-        "multi_column_hybrid_search",
-        "hf_minilm",
-        Some(vec!["cp_catalog_page_sk".to_string()]),
-        Some(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 512,
-            overlap_size: 128,
-            trim_whitespace: false,
-        }),
-    );
-    ds.columns.push(Column {
-        name: "cp_department".to_string(),
-        embeddings: vec![],
-        description: None,
-        full_text_search: Some(FullTextSearchConfig {
-            enabled: true,
-            row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-        }),
-        metadata: HashMap::new(),
-    });
-
-    let app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .build();
     run_search(
-        app,
+        AppBuilder::new("search_app")
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
+                    description: None,
+                    full_text_search: None,
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
-                name: "multi_column_hybrid_basic",
+                name: "hybrid_multiple_column_basic",
                 body: json!({
-                    "text": "department",
-                    "limit": 2,
-                    "datasets": ["multi_column_hybrid_search"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
             SearchTestCase {
-                name: "multi_column_hybrid_additional",
+                name: "hybrid_multiple_column_additional_columns",
                 body: json!({
-                    "text": "patient",
-                    "limit": 2,
-                    "datasets": ["multi_column_hybrid_search"],
-                    "additional_columns": ["cp_catalog_number"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 }),
             },
             SearchTestCase {
-                name: "multi_column_hybrid_where",
+                name: "hybrid_multiple_column_with_where",
                 body: json!({
-                    "text": "general",
-                    "datasets": ["multi_column_hybrid_search"],
-                    "where": "cp_catalog_page_sk % 2 = 1"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
-        vec![],
+        vec![(
+            "hybrid_multiple_column_sql_text_search",
+            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_text_search_wrong_column",
+            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_vector_search",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+        ),
+        (
+            "hybrid_multiple_column_sql_vector_search_wrong_column",
+            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4"
+        ),
+        ],
     )
     .await
 }
 
 // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
-#[ignore]
 async fn test_text_search() -> Result<(), anyhow::Error> {
-    let mut ds = get_tpcds_dataset("item", Some("item"), None);
-    ds.columns = vec![Column {
-        name: "i_item_desc".to_string(),
-        embeddings: vec![],
-        description: None,
-        full_text_search: Some(FullTextSearchConfig {
-            enabled: true,
-            row_ids: Some(vec!["i_item_sk".to_string()]),
-        }),
-        metadata: HashMap::new(),
-    }];
-
     run_search(
-        AppBuilder::new("search_app").with_dataset(ds).build(),
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                None,
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
                 name: "text_search_basic",
                 body: json!({
-                    "text": "Patient",
-                    "limit": 2,
-                    "datasets": ["item"],
-                    "additional_columns": ["i_color", "i_item_id"],
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
             SearchTestCase {
-                name: "text_search_with_extra_columns_and_where",
+                name: "text_search_additional_columns",
                 body: json!({
-                    "text": "Patient",
-                    "datasets": ["item"],
-                    "additional_columns": ["i_color", "i_item_id"],
-                    "where": "i_color='smoke'",
-                    "limit": 1,
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
+                }),
+            },
+            SearchTestCase {
+                name: "text_search_with_where",
+                body: json!({
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
         vec![
             (
                 "text_search_sql_text_search_basic",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ), (
                 "text_search_sql_text_search_projection",
-                "SELECT i_item_sk, i_color, i_item_id, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') LIMIT 4"
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4"
             ), (
                 "text_search_sql_text_search_filters",
-                "SELECT i_item_sk, i_item_desc, trunc(score, 3) FROM text_search(item, 'Patient') where i_color='smoke' LIMIT 4"
-            )
-        ]
+                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
+            ), (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+
+                "text_search_sql_text_search_no_score",
+                "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4"
+            ),
+            (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+                "text_search_sql_text_search_random",
+                "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+            ),
+        ],
     )
     .await
 }
 
-// HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
-#[ignore]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
-    let mut ds = get_tpcds_dataset(
-            "catalog_page",
-            Some("catalog_page"),
-            Some("select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from catalog_page limit 20".to_string().as_str()),
-        );
-    ds.columns = vec![
-        Column {
-            name: "cp_description".to_string(),
-            embeddings: vec![],
-            description: None,
-            full_text_search: Some(FullTextSearchConfig {
-                enabled: true,
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            }),
-            metadata: HashMap::new(),
-        },
-        Column {
-            name: "cp_department".to_string(),
-            embeddings: vec![],
-            description: None,
-            full_text_search: Some(FullTextSearchConfig {
-                enabled: true,
-                row_ids: Some(vec!["cp_catalog_page_sk".to_string()]),
-            }),
-            metadata: HashMap::new(),
-        },
-    ];
     run_search(
-        AppBuilder::new("search_app").with_dataset(ds).build(),
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["id".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
         vec![
             SearchTestCase {
                 name: "multi_text_column_basic",
                 body: json!({
-                    "text": "In general basic",
-                    "limit": 2,
-                    "datasets": ["catalog_page"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
                 }),
             },
             SearchTestCase {
-                name: "multi_text_column_fused",
+                name: "multi_text_column_additional_columns",
                 body: json!({
-                    "text": "In general basic department",
-                    "limit": 2,
-                    "datasets": ["catalog_page"],
-                    "additional_columns": ["cp_department", "cp_description"]
+                    "text": "second",
+                    "limit": 4,
+                    "datasets": ["qs"],
+                    "additional_columns": ["question"],
                 }),
             },
             SearchTestCase {
-                name: "multi_text_column_additional",
+                name: "multi_text_column_with_where",
                 body: json!({
-                    "text": "In general basic",
-                    "limit": 2,
-                    "datasets": ["catalog_page"],
-                    "additional_columns": ["cp_catalog_number"],
-                }),
-            },
-            SearchTestCase {
-                name: "multi_text_column_where",
-                body: json!({
-                    "text": "In general basic",
-                    "datasets": ["catalog_page"],
-                    "where": "cp_department='DEPARTMENT'"
+                    "text": "secondary",
+                    "datasets": ["qs"],
+                    "where": "subject!='math'",
+                    "limit": 4,
                 }),
             },
         ],
         vec![
             (
-                "multi_text_column_sql_text_search_basic",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
-            ),
-            // We expect an error if dataset has > 1 column and specific column isn't added in `text_search`.
-            (
-                "multi_text_column_sql_text_search_error",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department FROM text_search(catalog_page, 'DEPARTMENT') LIMIT 4"
+                "multi_text_column_sql_text_search_basic_answer",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ), (
+                "multi_text_column_sql_text_search_basic_question",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
             ),
             (
-                "multi_text_column_sql_text_search_additional",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_department, cp_description, cp_catalog_number FROM text_search(catalog_page, 'DEPARTMENT', cp_department) LIMIT 4"
+                // When there are multiple columns, `text_search` needs column explicitly as input.
+                "multi_text_column_sql_text_search_error_without_column",
+                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
+            ),
+            (
+                "multi_text_column_sql_text_search_projection",
+                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
             ), (
                 "multi_text_column_sql_text_search_filters",
-                "SELECT cp_catalog_page_sk, trunc(score, 3), cp_description FROM text_search(catalog_page, 'In general basic', cp_description) where cp_department='DEPARTMENT'LIMIT 4"
-            )
-        ]
+                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"
+            ), (
+                "multi_text_column_sql_text_search_no_score",
+                "SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ),
+            (
+                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
+                "multi_text_column_sql_text_search_random",
+                "SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
+            ),
+        ],
     )
     .await
 }
@@ -697,6 +754,8 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[ignore]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
+    use spicepod::{acceleration::Acceleration, param::Params};
+
     let api_config = start_app(
         AppBuilder::new("search_app")
             .with_dataset(catalog_page_tpch_dataset_w_embeddings(
@@ -834,7 +893,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -843,7 +902,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let duration = start.elapsed();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -897,7 +956,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let mut bypass_headers = HeaderMap::new();
             bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "pre_cache",
+                name: "with_cache_bypass_pre_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,
@@ -906,7 +965,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             let duration = start.elapsed().as_secs_f64();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
-                name: "post_cache",
+                name: "with_cache_bypass_post_cache",
                 body: json!({
                     "text": "new patient",
                     "limit": 2,

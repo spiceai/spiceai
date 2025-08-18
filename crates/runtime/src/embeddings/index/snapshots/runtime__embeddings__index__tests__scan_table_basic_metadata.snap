@@ -1,16 +1,14 @@
 ---
 source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
 ---
-+---------------+---------------------------------------------------------------------------------+
-| plan_type     | plan                                                                            |
-+---------------+---------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                            |
-|               |   TableScan: my_vectored_table projection=[pk, body_embedding]                  |
-| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                   |
-|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]       |
-|               |     ProjectionExec: expr=[CAST(key@1 AS Int64) as pk, data@0 as body_embedding] |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1      |
-|               |         ExplainExecutionPlan: projection=["data", "key"] filter=[] limit=None   |
-|               |                                                                                 |
-+---------------+---------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------+
+| plan_type     | plan                                                                             |
++---------------+----------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                             |
+|               |   TableScan: my_vectored_table projection=[pk, body_embedding]                   |
+| physical_plan | SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[false]         |
+|               |   ExplainExecutionPlan: projection=["pk", "body_embedding"] filter=[] limit=None |
+|               |                                                                                  |
++---------------+----------------------------------------------------------------------------------+

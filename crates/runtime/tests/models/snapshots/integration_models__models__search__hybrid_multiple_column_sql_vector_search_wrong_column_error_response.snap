@@ -1,0 +1,7 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: e.to_string()
+snapshot_kind: text
+---
+HTTP error: 400 Bad Request - Failed to execute query: Internal error: User function 'vector_search' is called on table 'qs' that does not have a embedding index on 'answer' column. Index is on column(s): question..
+This was likely caused by a bug in DataFusion's code and we would welcome that you file an bug report in our issue tracker

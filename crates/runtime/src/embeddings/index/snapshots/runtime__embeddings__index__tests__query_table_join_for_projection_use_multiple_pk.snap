@@ -1,0 +1,21 @@
+---
+source: crates/runtime/src/embeddings/index/mod.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                     |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.score DESC NULLS FIRST, fetch=5                                                                                                                                  |
+|               |   TableScan: my_vectored_table projection=[pk1, pk2, pk3, another_column, not_where, score]                                                                                              |
+| physical_plan | SortPreservingMergeExec: [score@5 DESC], fetch=5                                                                                                                                         |
+|               |   SortExec: TopK(fetch=5), expr=[score@5 DESC], preserve_partitioning=[true]                                                                                                             |
+|               |     ProjectionExec: expr=[pk1@1 as pk1, pk2@2 as pk2, pk3@3 as pk3, another_column@0 as another_column, not_where@4 as not_where, score@5 as score]                                      |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                                                        |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                      |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(pk1@0, pk1@0), (pk2@1, pk2@1), (pk3@2, pk3@2)], projection=[another_column@3, pk1@4, pk2@5, pk3@6, not_where@7, score@8] |
+|               |             DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                            |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                         |
+|               |               ExplainExecutionPlan: projection=["pk1", "pk2", "pk3", "not_where", "score"] filter=[] limit=None                                                                          |
+|               |                                                                                                                                                                                          |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
