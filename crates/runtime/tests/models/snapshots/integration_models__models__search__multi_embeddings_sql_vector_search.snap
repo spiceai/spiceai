@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp
+snapshot_kind: text
+---
+[
+  {
+    "id": 6,
+    "question": "<refined question>",
+    "trunc(vector_search().score,Int64(3))": 0.655
+  },
+  {
+    "id": 58,
+    "question": "Compare the fractions and write the appropriate sign ('<', '>', or '=') between them:  \n$\\frac{5}{6} \\square \\frac{5}{5}$",
+    "trunc(vector_search().score,Int64(3))": 0.645
+  },
+  {
+    "id": 543,
+    "question": "Is $\\frac{7 \\text { erasers }}{12 \\text { pencils }}$ an example of a ratio or a rate?",
+    "trunc(vector_search().score,Int64(3))": 0.636
+  },
+  {
+    "id": 1318,
+    "question": "Write the decimal `2.3` in words and then express it as a fraction or mixed number.",
+    "trunc(vector_search().score,Int64(3))": 0.631
+  }
+]
