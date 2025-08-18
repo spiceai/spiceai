@@ -30,14 +30,15 @@ limitations under the License.
 use std::sync::{Arc, Weak};
 
 use datafusion::{
-    catalog::{TableFunctionImpl, TableProvider},
+    catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
+    datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
+    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
-use futures::FutureExt;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::{
     index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
@@ -186,12 +187,6 @@ impl TextSearchTableFunc {
 
 impl TableFunctionImpl for TextSearchTableFunc {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        async {
-            let request_context = RequestContext::current(AsyncMarker::new().await);
-            telemetry::track_text_search(&request_context.to_dimensions());
-        }
-        .now_or_never();
-
         let args = Self::parse_args(args)?;
 
         let df = self.df.upgrade().ok_or_else(|| {
@@ -223,12 +218,47 @@ impl TableFunctionImpl for TextSearchTableFunc {
         };
 
         let column = args.column(&fts_index.search_fields)?;
-        Ok(Arc::new(TextSearchIndexProvider {
-            query: args.query.clone(),
-            column,
-            pre_limit: args.limit,
-            index: fts_index.clone(),
-            underlying: table_provider,
+        Ok(Arc::new(TextSearchIndexProviderWrapper {
+            inner: Arc::new(TextSearchIndexProvider {
+                query: args.query.clone(),
+                column,
+                pre_limit: args.limit,
+                index: fts_index.clone(),
+                underlying: table_provider,
+            }),
         }))
+    }
+}
+
+#[derive(Debug)]
+struct TextSearchIndexProviderWrapper {
+    inner: Arc<TextSearchIndexProvider>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for TextSearchIndexProviderWrapper {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.inner.as_any()
+    }
+
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_text_search(&request_context.to_dimensions());
+
+        self.inner.scan(state, projection, filters, limit).await
     }
 }
