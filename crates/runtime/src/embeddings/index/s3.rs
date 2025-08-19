@@ -18,7 +18,7 @@ use std::{any::Any, collections::HashMap, num::TryFromIntError, str::FromStr, sy
 
 use arrow::{
     array::{
-        Array, FixedSizeListArray, FixedSizeListBuilder, Float32Array, Float32Builder,
+        Array, ListArray, ListBuilder, Float32Array, Float32Builder,
         LargeStringArray, RecordBatch, StringArray, StringViewArray,
     },
     datatypes::{Field, SchemaRef},
@@ -371,7 +371,7 @@ fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<
 
     ensure!(dimension > 0, CannotDetermineEmbeddingDimensionSnafu);
 
-    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dimension);
+    let mut builder = ListBuilder::new(Float32Builder::new());
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
@@ -468,13 +468,13 @@ async fn embed_column_with_existing(
 fn extract_existing_embeddings(column: &Arc<dyn Array>) -> Vec<Option<Vec<f32>>> {
     let mut embeddings = vec![];
 
-    if let Some(fixed_list) = column.as_any().downcast_ref::<FixedSizeListArray>() {
-        // Handle FixedSizeList of floats
-        for i in 0..fixed_list.len() {
-            if fixed_list.is_null(i) {
+    if let Some(list_array) = column.as_any().downcast_ref::<ListArray>() {
+        // Handle List of floats
+        for i in 0..list_array.len() {
+            if list_array.is_null(i) {
                 embeddings.push(None);
             } else {
-                let values = fixed_list.value(i);
+                let values = list_array.value(i);
                 if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
                     let embedding: Vec<f32> = (0..float_array.len())
                         .map(|j| float_array.value(j))
@@ -821,7 +821,7 @@ impl Index for S3VectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeListBuilder, Float32Builder, StringArray};
+    use arrow::array::{ListBuilder, Float32Builder, StringArray};
     use arrow::datatypes::{DataType, Schema};
     use async_openai::types::EmbeddingInput;
     use async_trait::async_trait;
@@ -892,7 +892,7 @@ mod tests {
         let text_array = StringArray::from(texts);
 
         // Create embedding array
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        let mut builder = ListBuilder::new(Float32Builder::new());
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
                 let float_builder = builder.values();
@@ -914,7 +914,7 @@ mod tests {
             Field::new("text", DataType::Utf8, true),
             Field::new(
                 "text_embedding",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
                 true,
             ),
         ]);
@@ -943,9 +943,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_existing_embeddings_valid_fixed_size_list() {
-        // Create a FixedSizeListArray with embeddings
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+    fn test_extract_existing_embeddings_valid_list() {
+        // Create a ListArray with embeddings
+        let mut builder = ListBuilder::new(Float32Builder::new());
 
         // First embedding: [0.1, 0.2, 0.3]
         let float_builder = builder.values();
@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_extract_existing_embeddings_invalid_column_type() {
-        // Create a StringArray instead of FixedSizeListArray
+        // Create a StringArray instead of ListArray
         let string_array =
             Arc::new(StringArray::from(vec!["not", "an", "embedding"])) as Arc<dyn Array>;
 
@@ -1000,18 +1000,18 @@ mod tests {
 
         let result = create_embedding_array(&embeddings).expect("Failed to create embedding array");
 
-        let fixed_list = result
+        let list_array = result
             .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Result should be FixedSizeListArray");
+            .downcast_ref::<ListArray>()
+            .expect("Result should be ListArray");
 
-        assert_eq!(fixed_list.len(), 3);
-        assert!(!fixed_list.is_null(0));
-        assert!(fixed_list.is_null(1));
-        assert!(!fixed_list.is_null(2));
+        assert_eq!(list_array.len(), 3);
+        assert!(!list_array.is_null(0));
+        assert!(list_array.is_null(1));
+        assert!(!list_array.is_null(2));
 
         // Check first embedding values
-        let first_values = fixed_list.value(0);
+        let first_values = list_array.value(0);
         let first_floats = first_values
             .as_any()
             .downcast_ref::<Float32Array>()
@@ -1050,15 +1050,15 @@ mod tests {
 
         // Verify the updated batch has the new embeddings
         let embedding_column = result.column(1);
-        let fixed_list = embedding_column
+        let list_array = embedding_column
             .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .expect("Embedding column should be FixedSizeListArray");
+            .downcast_ref::<ListArray>()
+            .expect("Embedding column should be ListArray");
 
-        assert!(!fixed_list.is_null(0));
-        assert!(!fixed_list.is_null(1));
+        assert!(!list_array.is_null(0));
+        assert!(!list_array.is_null(1));
 
-        let first_values = fixed_list.value(0);
+        let first_values = list_array.value(0);
         let first_floats = first_values
             .as_any()
             .downcast_ref::<Float32Array>()
