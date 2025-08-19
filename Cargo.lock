@@ -3671,7 +3671,7 @@ dependencies = [
  "logos",
  "mailparse",
  "object_store",
- "opendal",
+ "opendal 0.54.0",
  "oracle",
  "rdkafka",
  "regex",
@@ -6768,7 +6768,7 @@ dependencies = [
  "murmur3",
  "num-bigint",
  "once_cell",
- "opendal",
+ "opendal 0.53.3",
  "ordered-float 4.6.0",
  "parquet",
  "rand 0.8.5",
@@ -9598,6 +9598,32 @@ dependencies = [
  "percent-encoding",
  "quick-xml 0.37.5",
  "reqsign",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid 1.18.0",
+]
+
+[[package]]
+name = "opendal"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffb9838d0575c6dbaf3fcec7255af8d5771996d4af900bbb6fa9a314dec00a1a"
+dependencies = [
+ "anyhow",
+ "backon",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures",
+ "getrandom 0.2.16",
+ "http 1.3.1",
+ "http-body 1.0.1",
+ "log",
+ "md-5",
+ "percent-encoding",
+ "quick-xml 0.37.5",
  "reqwest",
  "serde",
  "serde_json",
