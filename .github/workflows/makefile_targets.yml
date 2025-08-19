@@ -36,7 +36,7 @@ concurrency:
 jobs:
   make_install:
     name: make install*
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     env:
       GOVER: 1.24.2
 
