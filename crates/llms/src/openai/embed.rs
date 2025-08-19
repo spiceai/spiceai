@@ -57,7 +57,7 @@ fn default_retry_strategy() -> FibonacciBackoff {
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
 /// chunks (instead of the default `OpenAI` BPE tokenizer).
-pub struct OpenaiEmbed<C: Config> {
+pub struct OpenaiEmbed<C: Config + Clone> {
     pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
     // Retry strategy for transient or throttling errors
@@ -67,7 +67,7 @@ pub struct OpenaiEmbed<C: Config> {
     rate_controller: Arc<RateController>,
 }
 
-impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
+impl<C: Config + Debug + Clone> std::fmt::Debug for OpenaiEmbed<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenaiEmbed")
             .field("inner", &self.inner)
@@ -75,7 +75,7 @@ impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
     }
 }
 
-impl<C: Config> OpenaiEmbed<C> {
+impl<C: Config + Clone> OpenaiEmbed<C> {
     #[must_use]
     pub fn new(inner: Openai<C>, rate_controller: Option<Arc<RateController>>) -> Self {
         Self {
@@ -102,7 +102,7 @@ impl<C: Config> OpenaiEmbed<C> {
 }
 
 #[async_trait]
-impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
+impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,

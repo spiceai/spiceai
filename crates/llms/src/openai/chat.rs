@@ -32,7 +32,7 @@ use tracing_futures::Instrument;
 use super::Openai;
 
 #[async_trait]
-impl<C: Config + Send + Sync> Chat for Openai<C> {
+impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
         if self.supports_structured_output() {

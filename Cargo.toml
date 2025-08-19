@@ -71,13 +71,11 @@ arrow-ipc = "55.1"
 arrow-json = "55.1"
 arrow-odbc = "16"
 arrow-schema = "55.1"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "21373192d0c3fa94c4438b8e677a9cc2350c7fca", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "e1580b0cdccfbf9b6e52321650324cd2ddb023d0", features = [
     "byot",
 ] }
-
-
 async-stream = "0.3.5"
-async-trait = "0.1.86"
+async-trait = "0.1.89"
 aws-config = "1.8.5"
 aws-credential-types = "1.2"
 aws-runtime = "1.5.10"
@@ -102,7 +100,7 @@ byte-unit = "5.1.4"
 bytes = "1.10.0"
 charset = "0.1.5"
 chrono = "0.4.38"
-clap = { version = "4.5.36", features = ["derive", "env"] }
+clap = { version = "4.5.45", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -134,7 +132,7 @@ imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe179
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
 itertools = "0.14"
-logos = "0.15.0"
+logos = "0.15.1"
 mailparse = "0.15.0"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.2.2", features = ["openssl-tls"] }
@@ -166,7 +164,7 @@ prometheus = "0.13"
 r2d2 = "0.8.10"
 rand = "0.9.2"
 regex = "1.10.3"
-reqwest = { version = "0.12.5", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "ec71bd9b735c87cc903c33ed643a04bfd661273e" }
 rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
@@ -181,7 +179,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "89
 sqlparser = "0.58.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "5.3.1", features = ["async"] }
-tantivy = "0.24.1"
+tantivy = "0.24.2"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
     "tds73",
@@ -195,7 +193,7 @@ tokio-postgres = { version = "0.7.13", features = [
 ] }
 tokio-rusqlite = "0.5.1"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-util = { version = "0.7.11", features = ["compat"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
 tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
 tower = "0.5.2"
