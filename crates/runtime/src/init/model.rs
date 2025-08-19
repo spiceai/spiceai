@@ -122,7 +122,7 @@ impl Runtime {
         let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok((l, Some(responses_model))) => {
-                    let mut llm_map = self.llms.write().await;
+                    let mut llm_map = self.chat_llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     drop(llm_map);
                     let mut responses_llm_map = self.responses_llms.write().await;
@@ -130,7 +130,7 @@ impl Runtime {
                     Ok(())
                 }
                 Ok((l, None)) => {
-                    let mut llm_map = self.llms.write().await;
+                    let mut llm_map = self.chat_llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
@@ -183,7 +183,7 @@ impl Runtime {
                 ml_map.remove(&m.name);
             }
             Some(ModelType::Llm) => {
-                let mut llm_map = self.llms.write().await;
+                let mut llm_map = self.chat_llms.write().await;
                 llm_map.remove(&m.name);
             }
             None => return,
