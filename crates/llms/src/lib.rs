@@ -22,7 +22,6 @@ pub mod chunking;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
-pub mod model;
 pub mod openai;
 pub mod perplexity;
 pub mod progress;

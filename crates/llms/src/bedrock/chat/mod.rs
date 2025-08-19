@@ -701,9 +701,3 @@ impl Chat for BedrockConverse {
         None
     }
 }
-
-impl crate::model::Model for BedrockConverse {
-    fn as_chat(&self) -> Option<&dyn Chat> {
-        Some(self)
-    }
-}

@@ -285,12 +285,6 @@ impl Chat for RouterModel {
     }
 }
 
-impl llms::model::Model for RouterModel {
-    fn as_chat(&self) -> Option<&dyn Chat> {
-        Some(self)
-    }
-}
-
 /// Assumes all elements of `cfg` are [`worker::RouterConfig::Weighted`].
 /// Returns `None` if `cfg.len() <=0`
 fn select_from_weighted(cfg: &[worker::RouterConfig]) -> Option<String> {
