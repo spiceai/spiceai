@@ -18,8 +18,8 @@ use std::{any::Any, collections::HashMap, num::TryFromIntError, str::FromStr, sy
 
 use arrow::{
     array::{
-        Array, ListArray, ListBuilder, Float32Array, Float32Builder,
-        LargeStringArray, RecordBatch, StringArray, StringViewArray,
+        Array, Float32Array, Float32Builder, LargeStringArray, ListArray, ListBuilder, RecordBatch,
+        StringArray, StringViewArray,
     },
     datatypes::{Field, SchemaRef},
 };
@@ -821,7 +821,7 @@ impl Index for S3VectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ListBuilder, Float32Builder, StringArray};
+    use arrow::array::{Float32Builder, ListBuilder, StringArray};
     use arrow::datatypes::{DataType, Schema};
     use async_openai::types::EmbeddingInput;
     use async_trait::async_trait;
