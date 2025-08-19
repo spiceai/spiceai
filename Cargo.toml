@@ -132,7 +132,7 @@ imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe179
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
 itertools = "0.14"
-logos = "0.15.0"
+logos = "0.15.1"
 mailparse = "0.15.0"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.2.2", features = ["openssl-tls"] }
