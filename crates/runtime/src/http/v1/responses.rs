@@ -8,6 +8,7 @@ use async_openai::types::responses::{
     Content, CreateResponse, OutputContent, Response as OpenAIResponse, ResponseEvent,
     ResponseStream,
 };
+use async_stream::stream;
 use axum::{
     Extension, Json,
     http::{HeaderMap, StatusCode},
