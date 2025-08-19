@@ -26,11 +26,21 @@ use llms::{
     responses::Responses,
 };
 use secrecy::SecretString;
+use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
-fn supports_responses_api(model_type: Option<ModelSource>) -> bool {
-    model_type.is_some_and(|t| matches!(t, ModelSource::OpenAi))
+static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
+
+fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
+    if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
+        return false;
+    }
+    match spicepod_model.params.get("endpoint") {
+        None => true,
+        Some(Value::String(s)) => s == DEFAULT_OPENAI_ENDPOINT,
+        _ => false,
+    }
 }
 
 impl Runtime {
@@ -46,7 +56,7 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        let responses_model = if supports_responses_api(m.get_source()) {
+        let responses_model = if supports_responses_api(&m) {
             Some(
                 try_to_responses_model(&m, &params, Arc::new(self.clone()))
                     .await
