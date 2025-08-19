@@ -55,9 +55,3 @@ impl Chat for PerplexitySonar {
         Ok(resp.response)
     }
 }
-
-impl crate::model::Model for PerplexitySonar {
-    fn as_chat(&self) -> Option<&dyn Chat> {
-        Some(self)
-    }
-}

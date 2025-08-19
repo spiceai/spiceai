@@ -440,12 +440,6 @@ impl Chat for ToolUsingChat {
     }
 }
 
-impl llms::model::Model for ToolUsingChat {
-    fn as_chat(&self) -> Option<&dyn Chat> {
-        Some(self)
-    }
-}
-
 /// Create a new [`CreateChatCompletionRequest`] with new messages.
 ///
 /// Remove `tool_choice` if it is named (since it was just used), and set it to `Auto`.

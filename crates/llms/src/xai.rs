@@ -156,9 +156,3 @@ impl Chat for Xai {
         self.client.chat().create(self.alter_request(req)).await
     }
 }
-
-impl super::model::Model for Xai {
-    fn as_chat(&self) -> Option<&dyn Chat> {
-        Some(self)
-    }
-}
