@@ -24,6 +24,7 @@ use arrow::{
     datatypes::{Field, SchemaRef},
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
+use arrow_schema::DataType;
 use async_openai::types::EmbeddingInput;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
@@ -372,6 +373,9 @@ fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<
     ensure!(dimension > 0, CannotDetermineEmbeddingDimensionSnafu);
 
     let mut builder = ListBuilder::new(Float32Builder::new());
+
+    let field = Field::new_list_field(DataType::Float32, false);
+    builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
