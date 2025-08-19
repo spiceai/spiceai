@@ -375,7 +375,7 @@ fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<
     let mut builder = ListBuilder::new(Float32Builder::new());
 
     let field = Field::new_list_field(DataType::Float32, false);
-    builder.with_field(field);
+    builder = builder.with_field(field);
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
