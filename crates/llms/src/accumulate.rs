@@ -216,8 +216,6 @@ pub mod tests {
                     {
                         "index":0,
                         "message":{
-                            "content":null,
-                            "refusal":null,
                             "tool_calls":[
                                 {
                                     "id":"call_AGU5KhGhzAsH14iFbZcvHNzx",
@@ -229,18 +227,16 @@ pub mod tests {
                                 }
                             ],
                             "role":"assistant",
-                            "function_call":null,
-                            "audio": null,
                         },
                         "finish_reason":"stop",
-                        "logprobs":null
                     }
                 ],
                 "created":1_736_724_650,
                 "model":"not_needed",
                 "service_tier":"default",
                 "system_fingerprint":"fp_72ed7ab54c",
-                "object":"chat.completion.chunk"
+                "object":"chat.completion.chunk",
+                "usage": null,
             })
         );
     }

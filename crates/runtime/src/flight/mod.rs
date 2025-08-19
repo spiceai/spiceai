@@ -393,7 +393,8 @@ pub async fn start(
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
-    let svc = FlightServiceServer::new(service);
+    let svc = FlightServiceServer::new(service)
+        .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
