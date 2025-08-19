@@ -634,6 +634,13 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "limit": 4,
                 }),
             },
+            SearchTestCase {
+                name: "text_search_basic_without_defined_dataset",
+                body: json!({
+                    "text": "second",
+                    "limit": 4,
+                })
+            }
         ],
         vec![
             (
