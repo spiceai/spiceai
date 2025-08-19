@@ -32,7 +32,7 @@ pub struct Model2Vec {
 }
 
 impl Model2Vec {
-    fn from_name(name: &str) -> Result<Self, super::embeddings::Error> {
+    pub fn from_name(name: &str) -> Result<Self, super::embeddings::Error> {
         let model = StaticModel::from_pretrained(
             &name,
             None,
@@ -40,6 +40,7 @@ impl Model2Vec {
             None
         ).map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into()})?;
 
+        tracing::trace!("Model2Vec::from_name {}", name);
         Ok(Self { name: name.to_string(), model })
     }
 }

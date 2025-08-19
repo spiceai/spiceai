@@ -43,6 +43,7 @@ use token_provider::registry::TokenProviderRegistry;
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
+use llms::model2vec::Model2Vec;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
@@ -80,7 +81,23 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
+        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params).await
     }
+}
+
+async fn model2vec(
+    model_id: Option<String>,
+    _params: &HashMap<String, SecretString>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "model2vec".to_string(),
+        });
+    };
+
+    Model2Vec::from_name(&model_id)
+        .map(|m| Arc::new(m) as Arc<dyn Embed>)
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: Box::new(e) })
 }
 
 #[cfg(feature = "bedrock")]
