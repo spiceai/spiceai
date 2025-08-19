@@ -16,10 +16,12 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, str::FromStr};
 
-use async_openai::error::{ApiError, OpenAIError};
 use serde::{Deserialize, Serialize};
 
-use crate::{bedrock::embed::BedrockEmbeddingConfig, embeddings::Error as EmbedError};
+use crate::{
+    bedrock::embed::BedrockEmbeddingConfig,
+    embeddings::{Error as EmbedError, Result as EmbedResult},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CohereEmbedRequest {
@@ -189,7 +191,7 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
     fn extract_embeddings(
         &self,
         mut resp: CohereEmbedResponse,
-    ) -> Result<(Vec<Vec<f32>>, u32), OpenAIError> {
+    ) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
         // Estimate token count for Cohere models (approximate)
         let estimated_tokens: u32 = if let Some(texts) = resp.texts {
             texts
@@ -200,39 +202,34 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
             0
         };
 
-        let Some(float_embedding) = resp.embeddings.remove(&self.embedding_type) else {
-            return Err(OpenAIError::ApiError(ApiError {
+        let float_embedding = resp
+            .embeddings
+            .remove(&self.embedding_type)
+            .ok_or_else(|| EmbedError::FailedToExtractEmbeddings {
                 message: format!(
                     "No {} vectors found in Cohere response.",
                     self.embedding_type
                 ),
-                r#type: None,
-                param: None,
-                code: None,
-            }));
-        };
+            })?;
 
         Ok((float_embedding, estimated_tokens))
     }
 
-    fn to_request_blobs(
-        &self,
-        input_text: Vec<String>,
-    ) -> Result<Vec<CohereEmbedRequest>, OpenAIError> {
+    fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<CohereEmbedRequest>> {
         input_text
             .chunks(MAX_COHERE_TEXTS_PER_REQUEST)
             .map(|t| {
-                if let Some(err) = t.iter().find_map(|t| {
+                if let Some(message) = t.iter().find_map(|t| {
                     if t.len() > MAX_COHERE_INPUT_CHARACTER_LENGTH {
-                        Some(OpenAIError::InvalidArgument(format!(
+                        Some(format!(
                             "Input {} is longer than maximum supported length {MAX_COHERE_INPUT_CHARACTER_LENGTH}",
                             t.len()
-                        )))
+                        ))
                     } else {
                         None
                     }
                 }) {
-                    return Err(err)
+                    return Err(EmbedError::FailedToConstructRequestBlobs { message });
                 }
 
                 Ok(CohereEmbedRequest {
@@ -242,7 +239,7 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
                     embedding_types: Some(vec![self.embedding_type.clone()]),
                 })
             })
-            .collect::<Result<Vec<CohereEmbedRequest>, OpenAIError>>()
+            .collect::<EmbedResult<Vec<CohereEmbedRequest>>>()
     }
 
     fn dimensions(&self) -> i32 {

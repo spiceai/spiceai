@@ -42,6 +42,8 @@ pub mod flightsql;
 pub mod iceberg;
 #[cfg(feature = "debezium")]
 pub mod kafka;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]

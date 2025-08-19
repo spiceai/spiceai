@@ -24,7 +24,7 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.983
+      "score": 0.98
     }
   ]
 }

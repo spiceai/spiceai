@@ -27,6 +27,7 @@ itertools.workspace = true
 regex = "1.10.4"
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
+runtime-rate-control = { path = "../runtime-rate-control" }
 schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -67,7 +68,7 @@ tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
 [dev-dependencies]
-anyhow = "1.0.86"
+anyhow = "1.0.99"
 aws-credential-types.workspace = true
 dotenvy.workspace = true
 insta.workspace = true

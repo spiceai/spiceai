@@ -69,14 +69,28 @@ jobs:
         run: |
           cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
 
-      - name: Upload test archive
+      - name: Build AWS SDK Credential Bridge Integration Test Binary
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          CARGO_INCREMENTAL: 0
+        run: |
+          cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
+
+      - name: Upload test archive (integration_aws_sdk)
         uses: actions/upload-artifact@v4
         with:
           name: integration_aws_sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
           retention-days: 1
 
-  test:
+      - name: Upload test archive (integration_aws_sdk_credential_bridge)
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration_aws_sdk_credential_bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge.tar.zst
+          retention-days: 1
+
+  test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: build
     permissions: read-all
@@ -114,3 +128,46 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_test/integration_aws_sdk.tar.zst
+
+  test-aws-sdk-credential-bridge:
+    name: AWS SDK Credential Bridge Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: integration_aws_sdk_credential_bridge-test-archive
+          path: ./integration_aws_sdk_credential_bridge_test
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        if: github.repository == 'spiceai/spiceai'
+        with:
+          registry: spiceaitestimages.azurecr.io
+          username: spiceai-repo-pull
+          password: ${{ secrets.AZCR_PASSWORD }}
+
+      - name: Run AWS SDK integration test
+        env:
+          AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
+          AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
+          AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
+          AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
+          AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst

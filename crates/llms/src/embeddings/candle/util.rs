@@ -99,9 +99,24 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
 }
 
 fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
-    let api = ApiBuilder::new()
+    let mut builder = ApiBuilder::new()
         .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string))
+        .with_token(hf_token.map(ToString::to_string));
+
+    if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
+        let cache_path: PathBuf = cache_dir.into();
+        if cache_path.exists() {
+            tracing::debug!("Using HF_HUB_CACHE directory {:?}", cache_path);
+            builder = builder.with_cache_dir(cache_path);
+        } else {
+            tracing::debug!(
+                "HF_HUB_CACHE directory {:?} does not exist, ignoring.",
+                cache_path
+            );
+        }
+    }
+
+    let api = builder
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;

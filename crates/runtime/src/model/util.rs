@@ -14,11 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, num::NonZeroU32};
 
-use llms::bedrock::{BedrockClient, rate_limit::BedrockRateLimitConfigBuilder};
+use governor::Quota;
+use llms::bedrock::BedrockClient;
+use runtime_rate_control::RateControllerBuilder;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
+
+// Maximum number of concurrently running requests.
+// The overall request rate is controlled by the rate_limiter.
+const DEFAULT_MAX_CONCURRENT_INVOCATIONS: usize = 40;
 
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
@@ -62,22 +68,34 @@ pub(super) async fn create_bedrock_client(
         config_builder = config_builder.credentials_provider(credentials);
     }
 
-    let mut rate_limit_builder = BedrockRateLimitConfigBuilder::new();
-    if let Some(rpm) = params
+    let mut rate_limit_builder = RateControllerBuilder::default();
+    let rpm = if let Some(rpm) = params
         .get("requests_per_min_limit")
-        .map(|rpm| rpm.expose_secret().parse::<u32>().boxed())
+        .map(|rpm| rpm.expose_secret().parse::<NonZeroU32>().boxed())
         .transpose()?
     {
-        let _ = rate_limit_builder.requests_per_minute(rpm);
-    }
+        rpm
+    } else {
+        let Some(rpm) = NonZeroU32::new(1_500) else {
+            unreachable!("Default RPM should always be non-zero");
+        };
 
-    if let Some(invocations) = params
+        rpm
+    };
+
+    rate_limit_builder = rate_limit_builder.add_quota(Quota::per_minute(rpm));
+
+    let max_concurrent_requests = if let Some(invocations) = params
         .get("max_concurrent_invocations")
         .map(|inv| inv.expose_secret().parse::<usize>().boxed())
         .transpose()?
     {
-        let _ = rate_limit_builder.max_concurrent_invocations(invocations);
-    }
+        invocations
+    } else {
+        DEFAULT_MAX_CONCURRENT_INVOCATIONS
+    };
+
+    rate_limit_builder = rate_limit_builder.with_max_concurrent_requests(max_concurrent_requests);
 
     let config = config_builder.load().await;
     Ok(BedrockClient::new(&config, rate_limit_builder.build()))
