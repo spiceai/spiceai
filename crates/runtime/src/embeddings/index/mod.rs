@@ -24,6 +24,7 @@ use data_components::s3_vectors::{
     MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
+use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use search::SEARCH_SCORE_COLUMN_NAME;
@@ -79,8 +80,8 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     /// Update the index based on a [`RecordBatch`] from the underlying table.
     async fn write(
         &self,
-        record: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
 
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
     /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
@@ -282,12 +283,10 @@ impl Index for S3Vector {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let mut computed_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
-        for rb in batches {
-            let computed_batch = self.write(rb).await.map_err(DataFusionError::External)?;
-            // computed_batches.push(computed_batch);
-        }
-        Ok(computed_batches)
+        let futs = batches
+            .into_iter()
+            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        try_join_all(futs).await
     }
 }
 
@@ -611,10 +610,11 @@ pub mod tests {
 
         async fn write(
             &self,
-            _record: &RecordBatch,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
+            record: RecordBatch,
+        ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(record)
         }
+
         async fn query_table_provider(
             &self,
             _query: &str,
