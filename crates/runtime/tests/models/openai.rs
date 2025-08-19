@@ -640,6 +640,84 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
         .await
 }
 
+#[tokio::test]
+async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseEvent::ResponseCompleted(_)
+                        | ResponseEvent::ResponseIncomplete(_)
+                        | ResponseEvent::ResponseFailed(_) => {
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            assert!(final_response.contains("The quick brown fox jumps over the lazy dog"));
+            assert!(delta_count > 1);
+
+            Ok(())
+        })
+        .await
+}
+
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
 #[allow(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
