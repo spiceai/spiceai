@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::http::{
-    traceparent::override_task_history_with_traceparent, v1::chat::openai_error_to_response,
+    traceparent::override_task_history_with_traceparent,
+    v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response},
 };
 use async_openai::types::responses::{
     Content, CreateResponse, OutputContent, Response as OpenAIResponse, ResponseEvent,
@@ -40,6 +41,87 @@ fn extract_text(resp: &OpenAIResponse) -> Option<String> {
         })
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    operation_id = "post_chat_completions",
+    tag = "AI",
+    request_body(
+        description = "Create a chat completion request using a language model.",
+        content((
+            serde::Value = "application/json",
+            example = json!({
+                "model": "gpt-4o",
+                "input": "You are a helpful assistant.",
+                "stream": false
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Chat completion generated successfully", content((
+            serde::Value = "application/json",
+            example = json!({
+                "created_at": 1_755_639_134,
+                "id": "resp_68a4ed5e2258819485ece563a803bbf2075163a5e5b1c982",
+                "metadata": {},
+                "model": "test",
+                "object": "response",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "annotations": [],
+                                "text": "Thank you! How can I assist you today?"
+                            }
+                        ],
+                        "id": "msg_68a4ed5eb7e88194bf0b2560d8b5c0c1075163a5e5b1c982",
+                        "role": "assistant",
+                        "status": "completed"
+                    }
+                ],
+                "parallel_tool_calls": true,
+                "reasoning": {},
+                "store": true,
+                "service_tier": "default",
+                "status": "completed",
+                "temperature": 1.0,
+                "text": {
+                    "format": {
+                        "type": "text"
+                    }
+                },
+                "tool_choice": "auto",
+                "tools": [],
+                "top_p": 1.0,
+                "truncation": "disabled",
+                "usage": {
+                    "input_tokens": 13,
+                    "input_tokens_details": {
+                        "audio_tokens": null,
+                        "cached_tokens": 0
+                    },
+                    "output_tokens": 11,
+                    "output_tokens_details": {
+                        "accepted_prediction_tokens": null,
+                        "audio_tokens": null,
+                        "reasoning_tokens": 0,
+                        "rejected_prediction_tokens": null
+                    },
+                    "total_tokens": 24
+                }
+            })
+        ))),
+        (status = 404, description = "The specified model was not found"),
+        (status = 500, description = "An internal server error occurred while processing the chat completion", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "An internal server error occurred while processing the chat completion."
+            })
+        )))
+    )
+))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     headers: HeaderMap,
@@ -59,72 +141,48 @@ pub(crate) async fn post(
     async move {
         let model_id = req.model.clone();
         let stream = req.stream.unwrap_or(false);
-        match llms.read().await.get(&model_id) {
-            Some(model) => {
-                if stream {
-                    // Streaming response
-                    create_response_sse_response(model, req, span_clone).await
-                } else {
-                    // Non-streaming response
-                    match model.responses_request(req).await {
-                        Ok(response) => {
-                            if let Some(message) = extract_text(&response) {
-                                tracing::info!(target: "task_history", parent: &span_clone, captured_output = %message);
-                            }
-                            tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                            Json(response).into_response()
-                        }
-                        Err(e) => {
-                            tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                            tracing::error!("Error from v1/responses: {e}");
+        let Some(model) = llms.read().await.get(&model_id).cloned() else {
+            return (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response();
+        };
 
-                            openai_error_to_response(e)
-                        }
+        if stream {
+            // Streaming response
+            create_response_sse_response(model, req, span_clone).await
+        } else {
+            // Non-streaming response
+            match model.responses_request(req).await {
+                Ok(response) => {
+                    if let Some(message) = extract_text(&response) {
+                        tracing::info!(target: "task_history", parent: &span_clone, captured_output = %message);
                     }
+                    tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
+
+                    Json(response).into_response()
+                }
+                Err(e) => {
+                    tracing::error!(target: "task_history", parent: &span_clone, "{e}");
+                    tracing::error!("Error from v1/responses: {e}");
+
+                    openai_error_to_response(e)
                 }
             }
-            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
         }
     }
     .instrument(span)
     .await
 }
 
-// Copied from chat.rs for error event formatting
-use serde::Serialize;
-#[derive(Serialize)]
-pub struct ApiError {
-    message: String,
-}
-
-#[derive(Serialize)]
-pub struct OpenaiErrorEvent {
-    r#type: String,
-    error: ApiError,
-}
-
-impl OpenaiErrorEvent {
-    pub fn new(err: impl Into<String>) -> Self {
-        Self {
-            r#type: "error".to_string(),
-            error: ApiError {
-                message: err.into(),
-            },
-        }
-    }
-}
-
 fn to_openai_error_event(err: impl Into<String>) -> Event {
-    Event::default()
-        .event("error")
-        .json_data(OpenaiErrorEvent::new(err))
-        .unwrap_or_default()
+    Event::default().event("error").data(
+        serde_json::to_string(&OpenaiErrorEvent::new(err))
+            .unwrap_or_else(|_| r#"{"error": "Failed to serialize error"}"#.to_string()),
+    )
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ResponseStream`].
 async fn create_response_sse_response(
-    model: &Arc<dyn Responses>,
+    model: Arc<dyn Responses>,
     req: CreateResponse,
     span: Span,
 ) -> Response {
@@ -164,10 +222,12 @@ async fn create_response_sse_response(
                         _ => false
                     };
 
-                    yield Ok::<Event, Infallible>(Event::default().json_data(response_event).unwrap_or_else(|e| {
-                        tracing::error!("Failed to serialize response event: {e}");
-                        to_openai_error_event(e.to_string())
-                    }));
+                    yield Ok::<Event, Infallible>(Event::default()
+                        .data(serde_json::to_string(&response_event).unwrap_or_else(|e| {
+                            tracing::error!("Failed to serialize response event: {e}");
+                            format!(r#"{{"error": "Serialization failed: {e}"}}"#)
+                        }))
+                    );
 
                     if should_break {
                         break;
@@ -188,6 +248,6 @@ async fn create_response_sse_response(
     };
 
     Sse::new(Box::pin(sse_stream))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_INTERVAL)))
         .into_response()
 }

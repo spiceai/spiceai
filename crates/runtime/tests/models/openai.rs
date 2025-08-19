@@ -29,13 +29,14 @@ use crate::{
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::{CreateResponseArgs, OutputContent};
+use async_openai::types::responses::{CreateResponseArgs, OutputContent, ResponseEvent};
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, EmbeddingInput,
     responses::{Content, Response as OpenAIResponse},
 };
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
@@ -504,7 +505,8 @@ fn extract_text(response: &OpenAIResponse) -> Option<String> {
         })
 }
 
-async fn openai_test_responses_api() -> Result<(), anyhow::Error> {
+#[tokio::test]
+async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
@@ -515,10 +517,7 @@ async fn openai_test_responses_api() -> Result<(), anyhow::Error> {
 
             let model = get_openai_model("gpt-4o-mini", "openai_model");
 
-            let app = AppBuilder::new("text-to-sql")
-                .with_dataset(get_taxi_trips_dataset())
-                .with_model(model)
-                .build();
+            let app = AppBuilder::new("responses_api").with_model(model).build();
 
             let api_config = create_api_bindings_config();
             let http_base_url = format!("http://{}", api_config.http_bind_address);
@@ -542,7 +541,7 @@ async fn openai_test_responses_api() -> Result<(), anyhow::Error> {
                 OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
             let openai_client = OpenAIClient::with_config(openai_config);
             let request = CreateResponseArgs::default()
-                .model("gpt-4o-mini")
+                .model("openai_model")
                 .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
                 .build()?;
 
@@ -552,6 +551,84 @@ async fn openai_test_responses_api() -> Result<(), anyhow::Error> {
                 text.is_some_and(|t| t.contains("The quick brown fox jumps over the lazy dog")),
                 "Response text did not match expected output"
             );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseEvent::ResponseCompleted(_)
+                        | ResponseEvent::ResponseIncomplete(_)
+                        | ResponseEvent::ResponseFailed(_) => {
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            assert!(final_response.contains("The quick brown fox jumps over the lazy dog"));
+            assert!(delta_count > 1);
 
             Ok(())
         })
