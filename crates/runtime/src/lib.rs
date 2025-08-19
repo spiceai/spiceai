@@ -419,7 +419,7 @@ pub struct Runtime {
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
-    /// LLMs that support the OpenAI Responses API
+    // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     workers: WorkerRegistry,

@@ -16,25 +16,70 @@ limitations under the License.
 
 use std::pin::Pin;
 
-use crate::chat::nsql::SqlGeneration;
 use async_openai::{
     error::OpenAIError,
-    types::responses::{CreateResponse, Response, ResponseStream},
+    types::responses::{CreateResponse, CreateResponseArgs, Response, ResponseStream},
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use snafu::prelude::*;
+use tracing_futures::Instrument;
+
+use crate::chat::nsql::SqlGeneration;
 
 #[derive(Debug, Snafu)]
-pub enum Error {}
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display(
+        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToLoadModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display(
+        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToRunModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display(
+        "Failed to check the status of the model. An error occurred: {source}. Verify the model configuration and try again."
+    ))]
+    HealthCheckError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait Responses: Sync + Send {
-    fn as_sql(&self) -> Option<&dyn SqlGeneration>;
-    async fn run(&self, prompt: String) -> Result<Option<String>>;
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+    async fn run(&self, prompt: String) -> Result<Option<String>> {
+        let span = tracing::Span::current();
+
+        async move {
+            let req = CreateResponseArgs::default()
+                .input(prompt)
+                .build()
+                .boxed()
+                .context(FailedToLoadModelSnafu)?;
+
+            let resp = self
+                .responses_request(req)
+                .await
+                .boxed()
+                .context(FailedToRunModelSnafu)?;
+
+            Ok(resp.output_text)
+        }
+        .instrument(span)
+        .await
+    }
+
     async fn health(&self) -> Result<()>;
     async fn stream<'a>(
         &self,
@@ -43,10 +88,6 @@ pub trait Responses: Sync + Send {
         let resp = self.run(prompt).await;
         Ok(Box::pin(stream! { yield resp }))
     }
-
-    async fn responses_stream(
-        &self,
-        request: CreateResponse,
-    ) -> Result<ResponseStream, OpenAIError>;
-    async fn responses_request(&self, request: CreateResponse) -> Result<Response, OpenAIError>;
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError>;
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError>;
 }

@@ -121,7 +121,15 @@ impl Runtime {
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
         let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
-                Ok(l) => {
+                Ok((l, Some(responses_model))) => {
+                    let mut llm_map = self.llms.write().await;
+                    llm_map.insert(m.name.clone(), l);
+                    drop(llm_map);
+                    let mut responses_llm_map = self.responses_llms.write().await;
+                    responses_llm_map.insert(m.name.clone(), responses_model);
+                    Ok(())
+                }
+                Ok((l, None)) => {
                     let mut llm_map = self.llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     Ok(())

@@ -162,6 +162,11 @@ pub enum Error {
         model: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Model '{from}' does not support the OpenAI Responses API. Change the model provider to 'openai' to use the Responses API or use the Chat Completions API."
+    ))]
+    ResponsesNotSupported { from: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

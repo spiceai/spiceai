@@ -48,7 +48,7 @@ pub use eval::{
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
-pub use responses::LLMResponsesModelStore;
+pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
 
 use crate::DataFusion;
