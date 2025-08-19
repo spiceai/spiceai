@@ -1,5 +1,5 @@
 ---
-name: Apache DataFusion Upgrade
+name: DataFusion Upgrade
 about: Checklist for upgrading to a new major version of Apache DataFusion.
 title: 'Upgrade Apache DataFusion to version X.Y.Z'
 labels: enhancement
