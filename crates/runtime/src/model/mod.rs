@@ -26,6 +26,7 @@ pub(crate) mod eval;
 mod metrics;
 mod model_context;
 pub(crate) mod params;
+mod responses;
 mod tool_use;
 mod util;
 mod wrapper;
@@ -47,6 +48,7 @@ pub use eval::{
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
+pub use responses::LLMResponsesModelStore;
 pub use tool_use::ToolUsingChat;
 
 use crate::DataFusion;
