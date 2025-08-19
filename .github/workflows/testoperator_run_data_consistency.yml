@@ -52,7 +52,7 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
           - 'spicehq-dev-runners'
@@ -64,7 +64,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio

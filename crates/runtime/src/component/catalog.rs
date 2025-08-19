@@ -206,6 +206,7 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 }
 
 impl CatalogBuilder {
+    #[allow(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         validate_identifier(name).context(crate::ComponentSnafu)?;
 

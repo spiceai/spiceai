@@ -28,6 +28,7 @@ use arrow_flight::{
     flight_service_client::FlightServiceClient,
 };
 
+use crate::completer::SchemaCache;
 use clap::Parser;
 use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
@@ -39,16 +40,20 @@ use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
-use rustyline::history::FileHistory;
-use rustyline::{Completer, ConditionalEventHandler, Helper, Hinter, KeyEvent, Validator};
-use rustyline::{Editor, EventHandler, Modifiers};
+use rustyline::{
+    CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
+};
+use rustyline::{Editor, EventHandler};
 use serde_json::json;
+use tokio::sync::{RwLock, oneshot};
+use tokio::task::JoinHandle;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
 pub mod cache_control;
+mod completer;
 mod config;
 
 #[derive(Parser, Debug)]
@@ -147,8 +152,43 @@ impl ConditionalEventHandler for KeyEventHandler {
     }
 }
 
-#[derive(Completer, Helper, Hinter, Validator)]
-struct EditorHelper;
+#[derive(Helper, Hinter, Validator)]
+struct EditorHelper {
+    schema_cache: Arc<RwLock<SchemaCache>>,
+    flight_client: Option<FlightServiceClient<Channel>>,
+    api_key: Option<String>,
+    user_agent: String,
+    refresh_task_handle: Option<JoinHandle<()>>,
+    shutdown_sender: Option<oneshot::Sender<()>>,
+}
+
+impl EditorHelper {
+    pub fn new(
+        flight_client: Option<FlightServiceClient<Channel>>,
+        api_key: Option<String>,
+        user_agent: String,
+    ) -> Self {
+        Self {
+            schema_cache: Arc::new(RwLock::new(SchemaCache::new())),
+            flight_client,
+            api_key,
+            user_agent,
+            refresh_task_handle: None,
+            shutdown_sender: None,
+        }
+    }
+}
+
+impl Drop for EditorHelper {
+    fn drop(&mut self) {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.refresh_task_handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 impl Highlighter for EditorHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
@@ -213,16 +253,26 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     // Ensure ANSI support on Windows is enabled for proper color display.
     let _ = ansi_term::enable_ansi_support();
 
-    let mut rl = Editor::<EditorHelper, FileHistory>::new()?;
-    rl.set_helper(Some(EditorHelper));
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .completion_show_all_if_ambiguous(true)
+        .build();
+
+    let mut rl = Editor::with_config(config)?;
+
+    rl.set_helper(Some(EditorHelper::new(
+        Some(client.clone()),
+        repl_config.api_key.clone(),
+        user_agent.to_string(),
+    )));
+    if let Some(helper) = rl.helper_mut() {
+        helper.start_refreshing(300);
+    }
 
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
-    rl.bind_sequence(
-        KeyEvent::new('\t', Modifiers::NONE),
-        rustyline::Cmd::Insert(1, "\t".to_string()),
-    );
+
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
@@ -353,6 +403,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 );
             }
         }
+    }
+
+    if let Some(helper) = rl.helper_mut() {
+        helper.stop_refreshing();
     }
 
     Ok(())

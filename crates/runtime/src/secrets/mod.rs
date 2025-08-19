@@ -34,7 +34,7 @@ pub enum Error {
 
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
     UnableToInitializeAwsSecretsManager {
-        source: stores::aws_secrets_manager::Error,
+        source: Box<stores::aws_secrets_manager::Error>,
     },
 
     #[snafu(display("Unable to parse secret value"))]
@@ -225,6 +225,7 @@ pub enum SecretStoreType {
     AwsSecretsManager(String),
 }
 
+#[allow(clippy::result_large_err)]
 fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
@@ -258,6 +259,7 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     let Some(selector) = selector else {
         return SecretStoreRequiresSecretSelectorSnafu {
@@ -269,6 +271,7 @@ fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     Ok(selector.to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn require_no_selector(provider: &str, selector: Option<&str>) -> Result<()> {
     if selector.is_some() {
         SecretStoreInvalidSecretSelectorSnafu {
@@ -339,7 +342,9 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
             secret_store
                 .init()
                 .await
-                .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+                .map_err(|e| Error::UnableToInitializeAwsSecretsManager {
+                    source: Box::new(e),
+                })?;
 
             Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
         }

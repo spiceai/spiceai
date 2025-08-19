@@ -70,7 +70,7 @@ jobs:
           echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio

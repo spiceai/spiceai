@@ -1,0 +1,40 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+      },
+      "primary_key": {
+        "id": 890
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "<refined question>"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "What is created by making a choice?"
+      },
+      "primary_key": {
+        "id": 863
+      },
+      "score": 0.01
+    }
+  ]
+}

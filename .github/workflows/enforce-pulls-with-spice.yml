@@ -8,15 +8,15 @@ on:
     types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     steps:
       - uses: spiceai/pulls-with-spice-action@v1.0.6
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'
           required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame,kind/upstream-merge'

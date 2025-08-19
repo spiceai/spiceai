@@ -284,7 +284,7 @@ impl ConvertJdbcPlaceholdersVisitor {
     }
 
     fn visit_statement(&mut self, statement: &mut Statement) {
-        statement.visit(self);
+        let _ = statement.visit(self);
     }
 }
 

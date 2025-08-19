@@ -122,10 +122,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         // Try to unwrap the Arc - this should succeed since we dropped the stream
         let tee = Arc::try_unwrap(self.shared)
             .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to recover inner reader - multiple references still exist",
-                )
+                io::Error::other("Failed to recover inner reader - multiple references still exist")
             })?
             .into_inner();
 

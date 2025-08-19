@@ -296,7 +296,7 @@ impl Runtime {
         self: Arc<Self>,
         ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -555,13 +555,19 @@ impl Runtime {
             .await?;
 
         // create new accelerated table for updated data connector
-        let accelerated_table = self
-            .df
-            .create_accelerated_table(&ds, Arc::clone(&connector), federated_table, self.secrets())
-            .await
-            .context(UnableToCreateAcceleratedTableSnafu {
-                dataset: ds.name.clone(),
-            })?;
+        let accelerated_table = Arc::new(
+            self.df
+                .create_accelerated_table(
+                    &ds,
+                    Arc::clone(&connector),
+                    federated_table,
+                    self.secrets(),
+                )
+                .await
+                .context(UnableToCreateAcceleratedTableSnafu {
+                    dataset: ds.name.clone(),
+                })?,
+        );
 
         let notifier = accelerated_table.refresher().on_complete_notification();
 
@@ -868,5 +874,5 @@ pub struct RegisterDatasetContext {
     data_connector: Arc<dyn DataConnector>,
     federated_read_table: FederatedTable,
     source: String,
-    accelerated_table: Option<AcceleratedTable>,
+    accelerated_table: Option<Arc<AcceleratedTable>>,
 }

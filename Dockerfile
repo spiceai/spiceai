@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.86
+ARG RUST_VERSION=1.87
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
@@ -107,8 +107,6 @@ RUN chown -R 65534:65534 /spice_sandbox/app
 RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
 RUN chown -R 65534:65534 /spice_sandbox/.cache
 RUN chmod -R 755 /spice_sandbox/.cache
-ENV HF_HOME=/spice_sandbox/.cache/huggingface
-ENV HF_HUB_CACHE=/spice_sandbox/.cache/huggingface/hub
 
 FROM scratch
 
@@ -119,5 +117,8 @@ USER 65534:65534
 EXPOSE 8090 50051
 
 WORKDIR /app
+
+ENV HF_HOME=/.cache/huggingface
+ENV HF_HUB_CACHE=/.cache/huggingface/hub
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

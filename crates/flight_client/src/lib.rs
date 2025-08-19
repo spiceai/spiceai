@@ -50,11 +50,11 @@ pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
-pub struct TonicStatusError(tonic::Status);
+pub struct TonicStatusError(Box<tonic::Status>);
 
 impl From<tonic::Status> for TonicStatusError {
     fn from(status: tonic::Status) -> Self {
-        TonicStatusError(status)
+        TonicStatusError(Box::new(status))
     }
 }
 
@@ -241,7 +241,7 @@ impl Credentials {
 /// also designed to be cheap to clone.
 #[derive(Debug, Clone)]
 pub struct FlightClient {
-    flight_client: FlightServiceClient<Channel>,
+    client: FlightServiceClient<Channel>,
     credentials: Credentials,
     url: Arc<str>,
     metadata: Option<tonic::metadata::MetadataMap>,
@@ -268,7 +268,7 @@ impl FlightClient {
             .context(UnableToConnectToServerSnafu)?;
 
         Ok(FlightClient {
-            flight_client: FlightServiceClient::new(flight_channel)
+            client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
@@ -291,8 +291,8 @@ impl FlightClient {
         max_encoding_message_size: usize,
         max_decoding_message_size: usize,
     ) -> Self {
-        self.flight_client = self
-            .flight_client
+        self.client = self
+            .client
             .max_encoding_message_size(max_encoding_message_size)
             .max_decoding_message_size(max_decoding_message_size);
         self
@@ -330,7 +330,7 @@ impl FlightClient {
         }
 
         let schema_result = self
-            .flight_client
+            .client
             .clone()
             .get_schema(req)
             .await
@@ -372,7 +372,7 @@ impl FlightClient {
         }
 
         let schema_result = self
-            .flight_client
+            .client
             .clone()
             .get_schema(req)
             .await
@@ -414,7 +414,7 @@ impl FlightClient {
         }
 
         let info = self
-            .flight_client
+            .client
             .clone()
             .get_flight_info(req)
             .await
@@ -441,7 +441,7 @@ impl FlightClient {
             }
 
             let (md, response_stream, _ext) = self
-                .flight_client
+                .client
                 .clone()
                 .do_get(req)
                 .await
@@ -491,7 +491,7 @@ impl FlightClient {
         }
 
         let (_md, response_stream, _ext) = self
-            .flight_client
+            .client
             .clone()
             .do_exchange(req)
             .await
@@ -557,7 +557,7 @@ impl FlightClient {
                 .insert("authorization", auth_header_value);
         }
 
-        let resp = match self.flight_client.clone().do_put(publish_request).await {
+        let resp = match self.client.clone().do_put(publish_request).await {
             Ok(resp) => resp,
             Err(e) => match e.code() {
                 tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
@@ -598,22 +598,17 @@ impl FlightClient {
             .parse()
             .context(InvalidMetadataSnafu)?;
         req.metadata_mut().insert("authorization", val);
-        let mut resp = self
-            .flight_client
-            .clone()
-            .handshake(req)
-            .await
-            .map_err(|e| {
-                if is_connection_reset_error(&e) {
-                    Error::ConnectionReset {
-                        source: TonicStatusError::from(e),
-                    }
-                } else {
-                    Error::UnableToPerformHandshake {
-                        source: TonicStatusError::from(e),
-                    }
+        let mut resp = self.client.clone().handshake(req).await.map_err(|e| {
+            if is_connection_reset_error(&e) {
+                Error::ConnectionReset {
+                    source: TonicStatusError::from(e),
                 }
-            })?;
+            } else {
+                Error::UnableToPerformHandshake {
+                    source: TonicStatusError::from(e),
+                }
+            }
+        })?;
 
         let mut token: Option<Token> = None;
 
@@ -657,7 +652,7 @@ impl FlightClient {
     }
 
     pub fn client(&self) -> &FlightServiceClient<Channel> {
-        &self.flight_client
+        &self.client
     }
 }
 

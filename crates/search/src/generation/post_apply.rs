@@ -200,6 +200,7 @@ impl PostApplyCandidateGeneration {
 
                     sql = sql.filter(filter_expr)?;
                 }
+
                 sql = sql.select(cols)?;
 
                 match sql.collect().await {

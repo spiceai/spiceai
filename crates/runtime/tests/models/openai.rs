@@ -145,11 +145,8 @@ mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
     use crate::models::{
-        get_small_clickbench_dataset,
-        search::{
-            SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
-            run_search,
-        },
+        get_mega_science_dataset, get_small_clickbench_dataset,
+        search::{SearchTestCase, run_search},
     };
 
     use super::*;
@@ -159,57 +156,54 @@ mod search {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
-        let app = AppBuilder::new("search_app")
-            // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
-            .with_dataset(get_taxi_trips_dataset())
-            .with_dataset(item_tpch_dataset_w_embeddings(
-                "item",
-                "openai_embeddings",
-                Some(vec!["i_item_sk".to_string()]),
-                None,
-            ))
-            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
-                "catalog_page_with_chunking",
-                "openai_embeddings",
-                Some(vec!["cp_catalog_page_sk".to_string()]),
-                Some(EmbeddingChunkConfig {
-                    enabled: true,
-                    target_chunk_size: 512,
-                    overlap_size: 128,
-                    trim_whitespace: false,
-                }),
-            ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
-            ))
-            .build();
-
         run_search(
-            app,
+            AppBuilder::new("search_app")
+                .with_embedding(get_openai_embeddings(
+                    Some("text-embedding-3-small"),
+                    "openai_embeddings",
+                ))
+                .with_dataset(get_mega_science_dataset(
+                    Some("qs"),
+                    None,
+                    Some(Column {
+                        name: "answer".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "openai_embeddings".into(),
+                            chunking: None,
+                            row_ids: Some(vec!["id".to_string()]),
+                            vector_size: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
+                        metadata: HashMap::new(),
+                    }),
+                ))
+                .build(),
             vec![
                 SearchTestCase {
                     name: "openai_basic",
                     body: json!({
-                        "text": "new patient",
-                        "limit": 2,
-                        "datasets": ["item"],
-                        "additional_columns": ["i_color", "i_item_id"],
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
                     }),
                 },
                 SearchTestCase {
-                    name: "openai_all_datasets",
+                    name: "openai_additional_columns",
                     body: json!({
-                        "text": "new patient",
-                        "limit": 2,
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
                     }),
                 },
                 SearchTestCase {
-                    name: "openai_chunking",
+                    name: "openai_with_where",
                     body: json!({
-                        "text": "friends",
-                        "datasets": ["catalog_page_with_chunking"],
-                        "limit": 1,
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
                     }),
                 },
             ],

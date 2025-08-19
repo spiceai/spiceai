@@ -20,11 +20,8 @@ use std::{
     sync::Arc,
 };
 
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::{
-        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
-    },
+use async_openai::types::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -256,23 +253,17 @@ impl Embed for TeiEmbed {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    async fn embed_request(
-        &self,
-        req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         let model_name = req.model.clone();
         let inputs = inputs_from_openai(&req.input);
         let format = req.encoding_format.unwrap_or_default();
 
         let batch_size = inputs.len();
-        let results = self.embed_futures(inputs).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let results = self
+            .embed_futures(inputs)
+            .await
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)?;
 
         let mut embeddings = Vec::with_capacity(batch_size);
         let mut prompt_tokens: u32 = 0;

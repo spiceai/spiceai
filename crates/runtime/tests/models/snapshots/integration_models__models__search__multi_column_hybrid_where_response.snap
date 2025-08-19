@@ -9,12 +9,12 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Close customers might struggle away different mem"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 15
       },
-      "score": 0.942
+      "score": 0.9361
     },
     {
       "dataset": "multi_column_hybrid_search",
@@ -29,12 +29,12 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 1
       },
-      "score": 0.936
+      "score": 0.9421
     }
   ]
 }
