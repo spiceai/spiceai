@@ -186,7 +186,7 @@ dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json"] }
-jsonpath-rust = "0.7.3"
+jsonpath-rust = "1.0.4"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
 scopeguard = "1.2.0"
