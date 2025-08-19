@@ -91,8 +91,8 @@ impl From<UsageTier> for Arc<RateController> {
     }
 }
 
-#[derive(Debug)]
-pub struct Openai<C: Config> {
+#[derive(Debug, Clone)]
+pub struct Openai<C: Config + Clone> {
     client: Client<C>,
     model: String,
 
@@ -180,7 +180,7 @@ pub fn new_openai_client(
 }
 
 #[must_use]
-pub fn new_openai_client_with_config<C: async_openai::config::Config>(
+pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     model: String,
     cfg: C,
 ) -> Openai<C> {
@@ -191,7 +191,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config>(
     }
 }
 
-impl<C: Config> Openai<C> {
+impl<C: Config + Clone> Openai<C> {
     /// Returns true if the `OpenAI` compatible model supports [structured outputs](https://platform.openai.com/docs/guides/structured-outputs/).
     /// This is only supported for GPT-4o models from `OpenAI` (i.e not any other compatible servers).
     fn supports_structured_output(&self) -> bool {
