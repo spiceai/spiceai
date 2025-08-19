@@ -126,6 +126,9 @@ pub enum Error {
 
     #[snafu(display("Primary key column '{column}' not found in table.",))]
     PrimaryKeyNotFound { column: String },
+
+    #[snafu(display("Failed to retrieve primary key from the table: {source}."))]
+    FailedToRetrievePrimaryKey { source: ArrowError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

@@ -40,8 +40,11 @@ pub fn append_fields(schema: &SchemaRef, new_fields: Vec<Arc<Field>>) -> SchemaR
 }
 
 pub async fn get_primary_keys(tbl: &Arc<dyn TableProvider>) -> Result<Vec<String>, ArrowError> {
-    let constraint_idx = tbl
-        .constraints()
+    let constraints = tbl.constraints();
+
+    tracing::trace!("Table constraints: {constraints:?}");
+
+    let constraint_idx = constraints
         .map(|c| c.iter())
         .unwrap_or_default()
         .find_map(|c| match c {

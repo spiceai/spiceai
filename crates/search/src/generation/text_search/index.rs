@@ -97,9 +97,15 @@ impl FullTextDatabaseIndex {
         // Use 'primary_key_override', fallback to underlying in table.
         let pks = match (primary_key_override, get_primary_keys(&inner).await) {
             (Some(pks), _) => pks,
-            (None, Ok(pks)) if !pks.is_empty() => pks,
-            (None, _) => {
-                return Err(super::Error::NoPrimaryKey);
+            (None, Ok(pks)) => {
+                if pks.is_empty() {
+                    return Err(super::Error::NoPrimaryKey);
+                }
+
+                pks
+            }
+            (None, Err(e)) => {
+                return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
             }
         };
 
