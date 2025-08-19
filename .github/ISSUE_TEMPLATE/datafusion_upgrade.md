@@ -16,7 +16,7 @@ This issue tracks the process of upgrading Spice OSS to a new major version of A
 
 ## Forked Dependency Upgrades
 
-The following forked dependencies use DataFusion and need to be upgraded to maintain compatibility. This typically involves pulling the latest changes from the upstream repository, resolving conflicts, and updating the commit hash in our `Cargo.toml` (See [Core Dependency Upgrade](#core-dependency-upgrade)).
+The following forked dependencies use DataFusion and need to be upgraded in lockstep. This typically involves pulling the latest changes from the upstream repository, resolving conflicts, and updating the commit hash in `Cargo.toml` (See [Core Dependency Upgrade](#core-dependency-upgrade)).
 
 - [ ]  **datafusion**: Update our fork of the datafusion repo.
   - [ ] Branch from the lastest `spice-<X-1>` branch and name it `spice-<X>`. 
