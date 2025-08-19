@@ -112,6 +112,9 @@ pub enum Error {
 
     #[snafu(display("Failed to construct request blobs: {message}"))]
     FailedToConstructRequestBlobs { message: String },
+
+    #[snafu(display("Unsupported embedding input for {model}: {message}"))]
+    UnsupportedEmbeddingInput { model: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
