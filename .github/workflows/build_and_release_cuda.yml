@@ -214,7 +214,7 @@ jobs:
 
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs: build
     env:
       ARTIFACT_DIR: ./release

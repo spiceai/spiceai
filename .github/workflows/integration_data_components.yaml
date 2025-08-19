@@ -44,7 +44,7 @@ env:
 jobs:
   test:
     name: Test Data Components
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@v5
         with:
