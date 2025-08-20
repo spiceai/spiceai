@@ -256,7 +256,6 @@ pub(crate) fn routes(
             )
             .route("/v1/evals", get(v1::eval::list))
             .route("/v1/workers", get(v1::workers::get))
-            .layer(Extension(Arc::clone(&rt.chat_llms)))
             .layer(Extension(Arc::clone(&rt.completion_llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))

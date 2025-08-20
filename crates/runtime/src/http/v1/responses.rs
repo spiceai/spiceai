@@ -192,7 +192,7 @@ async fn create_response_sse_response(
     req: CreateResponse,
     span: Span,
 ) -> Response {
-    let mut strm: ResponseStream = match model.responses_stream(req).await {
+    let strm: ResponseStream = match model.responses_stream(req).await {
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");

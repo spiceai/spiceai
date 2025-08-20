@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::responses::{
-    CreateResponse, CreateResponseArgs, Response, ResponseStream,
+use async_openai::{
+    error::OpenAIError,
+    types::responses::{CreateResponse, CreateResponseArgs, Response, ResponseStream},
 };
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -38,20 +39,6 @@ pub enum Error {
         "Failed to invoke the model: {source}. Verify the model configuration and try again."
     ))]
     HealthCheckError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display("Failed to stream response from model: {source}"))]
-    StreamError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display("Failed to retrieve response from model: {source}"))]
-    ResponseError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    #[snafu(display(
-        "An internal error occurred: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
-    ))]
-    InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -86,6 +73,6 @@ pub trait Responses: Sync + Send {
     }
 
     async fn health(&self) -> Result<()>;
-    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream>;
-    async fn responses_request(&self, req: CreateResponse) -> Result<Response>;
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError>;
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError>;
 }

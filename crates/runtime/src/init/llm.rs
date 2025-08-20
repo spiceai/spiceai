@@ -26,9 +26,8 @@ use llms::{
     responses::Responses,
 };
 use secrecy::SecretString;
-use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::{Model as SpicepodModel};
+use spicepod::component::model::Model as SpicepodModel;
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -53,7 +52,6 @@ impl Runtime {
                 .map_err(try_map_boxed_error_to_box)
                 .context(UnableToInitializeLlmSnafu)?;
         }
-
 
         if let Some(model) = responses_model {
             if model.health().await.is_ok() {
