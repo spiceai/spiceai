@@ -73,7 +73,9 @@ pub fn construct_model(
     let model = match prefix {
         ModelSource::OpenAi => openai(model_id, params),
         _ => Err(LlmError::ResponsesNotSupported {
-            from: component.from.clone(),
+            from: component.get_source().ok_or(LlmError::UnknownModelSource {
+                from: component.from.clone(),
+            })?,
         }),
     }?;
 

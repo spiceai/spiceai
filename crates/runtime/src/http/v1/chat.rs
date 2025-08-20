@@ -21,7 +21,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
+use crate::{
+    http::traceparent::override_task_history_with_traceparent, model::LLMChatCompletionsModelStore,
+};
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
@@ -118,7 +120,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
     )
 ))]
 pub(crate) async fn post(
-    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
@@ -382,7 +384,7 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::LLMModelStore,
+        model::LLMChatCompletionsModelStore,
     };
     use async_openai::{
         error::OpenAIError,
@@ -433,7 +435,7 @@ mod tests {
     }
 
     async fn run_post(progress_header: Option<&'static str>) -> Vec<String> {
-        let mut store = LLMModelStore::new();
+        let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
 

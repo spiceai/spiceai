@@ -28,20 +28,7 @@ use llms::{
 use secrecy::SecretString;
 use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::{Model as SpicepodModel, ModelSource};
-
-static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
-
-fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
-    if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
-        return false;
-    }
-    match spicepod_model.params.get("endpoint") {
-        None => true,
-        Some(Value::String(s)) => s == DEFAULT_OPENAI_ENDPOINT,
-        _ => false,
-    }
-}
+use spicepod::component::model::{Model as SpicepodModel};
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -49,33 +36,17 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<(Arc<dyn Chat>, Option<Arc<dyn Responses>>)> {
-        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+    ) -> Result<(Option<Arc<dyn Chat>>, Option<Arc<dyn Responses>>)> {
+        let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
+            .ok();
 
-        let responses_model = if supports_responses_api(&m) {
-            Some(
-                try_to_responses_model(&m, &params, Arc::new(self.clone()))
-                    .await
-                    .boxed()
-                    .map_err(try_map_boxed_error_to_box)
-                    .context(UnableToInitializeLlmSnafu)?,
-            )
-        } else {
-            None
-        };
-
-        l.health()
+        let mut responses_model = try_to_responses_model(&m, &params, Arc::new(self.clone()))
             .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
+            .ok();
 
-        if let Some(responses_model) = &responses_model {
-            responses_model
+        if let Some(model) = &completions_model {
+            model
                 .health()
                 .await
                 .boxed()
@@ -83,6 +54,15 @@ impl Runtime {
                 .context(UnableToInitializeLlmSnafu)?;
         }
 
-        Ok((l, responses_model))
+
+        if let Some(model) = responses_model {
+            if model.health().await.is_ok() {
+                responses_model = Some(model);
+            } else {
+                responses_model = None;
+            }
+        }
+
+        Ok((completions_model, responses_model))
     }
 }

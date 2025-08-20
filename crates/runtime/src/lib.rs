@@ -52,7 +52,7 @@ use futures::Stream;
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
-use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
+use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
@@ -418,7 +418,7 @@ pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    chat_llms: Arc<RwLock<LLMModelStore>>,
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,

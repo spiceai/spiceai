@@ -55,7 +55,7 @@ spiceai = { workspace = true }
 nix = { version = "0.30", features = ["signal"] }
 
 [dev-dependencies]
-rstest = "0.25.0"
+rstest = "0.26.1"
 
 [features]
 anonymous_telemetry = []

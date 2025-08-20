@@ -24,6 +24,7 @@ use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use spicepod::component::model::ModelSource;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -166,7 +167,7 @@ pub enum Error {
     #[snafu(display(
         "Model '{from}' does not support the OpenAI Responses API. Change the model provider to 'openai' to use the Responses API or use the Chat Completions API."
     ))]
-    ResponsesNotSupported { from: String },
+    ResponsesNotSupported { from: ModelSource },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
