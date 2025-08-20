@@ -25,8 +25,8 @@ use tracing_futures::Instrument;
 use crate::{
     openai::Openai,
     responses::{
-        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, OpenAISnafu,
-        ResponseOpenAISnafu, Responses, Result,
+        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, OpenAISnafu, Responses,
+        Result,
     },
 };
 
@@ -92,7 +92,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .create(inner_req)
             .await
             .boxed()
-            .context(ResponseOpenAISnafu)?;
+            .context(OpenAISnafu)?;
 
         drop(permit);
 

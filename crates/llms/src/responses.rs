@@ -44,10 +44,6 @@ pub enum Error {
     OpenAIError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[snafu(display("Failed to retrieve response from OpenAI: {source}."))]
-    ResponseOpenAIError {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
     #[snafu(display(
         "An internal error occurred: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]
