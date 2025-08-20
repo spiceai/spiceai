@@ -37,6 +37,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
 
         let mut req = CreateResponseArgs::default()
             .input("ping")
+            .model(self.model.clone())
             .build()
             .boxed()
             .context(FailedToLoadModelSnafu)?;
