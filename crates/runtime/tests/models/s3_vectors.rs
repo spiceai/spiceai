@@ -170,7 +170,8 @@ mod search {
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
         // Generate a unique index name so the same test can be run in parallel
-        let index_name = format!("test-index-{}", rand::random::<u16>() % 10000);
+        // let index_name = format!("test-index-{}", rand::random::<u16>() % 11);
+        let index_name = format!("test-index-14");
 
         for (data_path, test_name) in [
             ("update/data_v1.json", "data_v1"),
