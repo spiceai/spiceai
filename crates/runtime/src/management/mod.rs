@@ -129,7 +129,7 @@ impl Management {
 
     pub async fn start(&self) -> Result<(), Error> {
         self.start_task_history_export().await?;
-        tracing::info!("Initialized management of the Spice runtime");
+        tracing::info!("Connected to Spice Cloud for management and monitoring");
         Ok(())
     }
 
