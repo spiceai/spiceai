@@ -329,8 +329,8 @@ impl FullTextDatabaseIndex {
     }
 
     #[must_use]
-    pub fn column_is_pk(&self, column: &str) -> bool {
-        self.primary_key.len() == 1 && self.primary_key.first().map(String::as_str) == Some(column)
+    pub fn column_is_part_of_pk(&self, column: &str) -> bool {
+        self.primary_key.contains(&column.to_string())
     }
 }
 
