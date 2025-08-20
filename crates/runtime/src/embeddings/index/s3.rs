@@ -18,8 +18,8 @@ use std::{any::Any, collections::HashMap, num::TryFromIntError, str::FromStr, sy
 
 use arrow::{
     array::{
-        Array, Float32Array, Float32Builder, LargeStringArray, ListArray, ListBuilder, RecordBatch,
-        StringArray, StringViewArray,
+        Array, Float32Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray,
+        StringViewArray,
     },
     datatypes::{Field, SchemaRef},
 };
@@ -692,68 +692,8 @@ impl Index for S3VectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float32Builder, ListBuilder, StringArray};
+    use arrow::array::{Float32Array, Float32Builder, ListArray, ListBuilder, StringArray};
     use arrow::datatypes::{DataType, Schema};
-    use async_openai::types::EmbeddingInput;
-    use async_trait::async_trait;
-    use llms::embeddings::{Embed, Error as EmbedError};
-    use std::collections::HashMap;
-    use tokio::sync::RwLock;
-
-    #[derive(Debug)]
-    // Mock embedding model for testing
-    struct MockEmbedModel {
-        embeddings: HashMap<String, Vec<f32>>,
-    }
-
-    impl MockEmbedModel {
-        fn new() -> Self {
-            let mut embeddings = HashMap::new();
-            embeddings.insert("hello".to_string(), vec![0.1, 0.2, 0.3]);
-            embeddings.insert("world".to_string(), vec![0.4, 0.5, 0.6]);
-            embeddings.insert("test".to_string(), vec![0.7, 0.8, 0.9]);
-            Self { embeddings }
-        }
-    }
-
-    #[async_trait]
-    impl Embed for MockEmbedModel {
-        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, EmbedError> {
-            match input {
-                EmbeddingInput::String(s) => {
-                    if let Some(embedding) = self.embeddings.get(&s) {
-                        Ok(vec![embedding.clone()])
-                    } else {
-                        Ok(vec![vec![1.0, 1.0, 1.0]]) // Default embedding
-                    }
-                }
-                EmbeddingInput::StringArray(strings) => {
-                    let mut result = Vec::new();
-                    for s in strings {
-                        if let Some(embedding) = self.embeddings.get(&s) {
-                            result.push(embedding.clone());
-                        } else {
-                            result.push(vec![1.0, 1.0, 1.0]); // Default embedding
-                        }
-                    }
-                    Ok(result)
-                }
-                _ => Err(EmbedError::FailedToCreateEmbedding {
-                    source: "Unsupported input type".into(),
-                }),
-            }
-        }
-
-        /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.
-        #[allow(clippy::cast_possible_wrap)]
-        #[allow(clippy::cast_possible_truncation)]
-        fn size(&self) -> i32 {
-            self.embeddings
-                .values()
-                .next()
-                .map_or(-1, |v| v.len() as i32)
-        }
-    }
 
     // Helper function to create a test RecordBatch with text and embedding columns
     fn create_test_record_batch_with_embeddings(
@@ -802,13 +742,6 @@ mod tests {
 
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(text_array)])
             .expect("Failed to create test RecordBatch with text only")
-    }
-
-    // Helper function to create embedding model store
-    fn create_mock_embedding_store() -> Arc<RwLock<EmbeddingModelStore>> {
-        let mut store = EmbeddingModelStore::default();
-        store.insert("test_model".to_string(), Arc::new(MockEmbedModel::new()));
-        Arc::new(RwLock::new(store))
     }
 
     #[test]
