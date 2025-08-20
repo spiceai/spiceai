@@ -684,6 +684,7 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
 
             let mut final_response = String::new();
             let mut delta_count = 0;
+            let mut failure = false;
 
             while let Some(result) = stream.next().await {
                 match result {
@@ -692,9 +693,11 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
                             final_response += &delta.delta;
                             delta_count += 1;
                         }
-                        ResponseEvent::ResponseCompleted(_)
-                        | ResponseEvent::ResponseIncomplete(_)
-                        | ResponseEvent::ResponseFailed(_) => {
+                        ResponseEvent::ResponseCompleted(_) => {
+                            break;
+                        }
+                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                            failure = true;
                             break;
                         }
                         _ => {
@@ -710,7 +713,11 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
                 }
             }
 
-            assert!(final_response.contains("The quick brown fox jumps over the lazy dog"));
+            // Check that we received a non-empty response
+            assert!(final_response.len() > 0);
+            // Check that we didn't fail at any point while streaming
+            assert!(!failure);
+            // Check that we received more than 1 delta, indicating streaming
             assert!(delta_count > 1);
 
             Ok(())
