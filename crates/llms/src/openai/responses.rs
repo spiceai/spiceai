@@ -25,8 +25,8 @@ use tracing_futures::Instrument;
 use crate::{
     openai::Openai,
     responses::{
-        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, OpenAISnafu, Responses,
-        Result,
+        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, ResponseSnafu, Responses,
+        Result, StreamSnafu,
     },
 };
 
@@ -67,7 +67,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .create_stream(inner_req)
             .await
             .boxed()
-            .context(OpenAISnafu)?;
+            .context(StreamSnafu)?;
 
         drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
 
@@ -92,7 +92,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .create(inner_req)
             .await
             .boxed()
-            .context(OpenAISnafu)?;
+            .context(ResponseSnafu)?;
 
         drop(permit);
 

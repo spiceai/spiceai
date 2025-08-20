@@ -40,8 +40,12 @@ pub enum Error {
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[snafu(display("Failed to retrieve response from OpenAI: {source}."))]
-    OpenAIError {
+    #[snafu(display("Failed to stream response from model: {source}"))]
+    StreamError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display("Failed to retrieve response from model: {source}"))]
+    ResponseError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display(
