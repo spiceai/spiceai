@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
 use crate::embeddings::Embed;
+use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use model2vec_rs::model::StaticModel;
@@ -28,20 +28,19 @@ use std::fmt::{Debug, Formatter};
 /// transformer models into static word embeddings.
 pub struct Model2Vec {
     pub name: String,
-    model: StaticModel
+    model: StaticModel,
 }
 
 impl Model2Vec {
     pub fn from_name(name: &str) -> Result<Self, super::embeddings::Error> {
-        let model = StaticModel::from_pretrained(
-            &name,
-            None,
-            None,
-            None
-        ).map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into()})?;
+        let model = StaticModel::from_pretrained(&name, None, None, None)
+            .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         tracing::trace!("Model2Vec::from_name {}", name);
-        Ok(Self { name: name.to_string(), model })
+        Ok(Self {
+            name: name.to_string(),
+            model,
+        })
     }
 }
 
@@ -53,19 +52,21 @@ impl Debug for Model2Vec {
 
 #[async_trait]
 impl Embed for Model2Vec {
-    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+    async fn embed(
+        &self,
+        input: EmbeddingInput,
+    ) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
         self.embed_sync(input)
     }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
         match input {
-            EmbeddingInput::String(s) =>
-                Ok(vec![self.model.encode_single(&s)]),
-            EmbeddingInput::StringArray(sentences) =>
-                Ok(self.model.encode(&sentences)),
-            _ => Err(
-                UnsupportedEmbeddingInput { model: self.name.clone(), message: "Model2Vec models only support strings or vectors of strings".to_string() }
-            ),
+            EmbeddingInput::String(s) => Ok(vec![self.model.encode_single(&s)]),
+            EmbeddingInput::StringArray(sentences) => Ok(self.model.encode(&sentences)),
+            _ => Err(UnsupportedEmbeddingInput {
+                model: self.name.clone(),
+                message: "Model2Vec models only support strings or vectors of strings".to_string(),
+            }),
         }
     }
 
@@ -80,9 +81,9 @@ impl Embed for Model2Vec {
 
 #[cfg(test)]
 mod tests {
-    use async_openai::types::EmbeddingInput;
     use crate::embeddings::Embed;
     use crate::model2vec::Model2Vec;
+    use async_openai::types::EmbeddingInput;
 
     #[tokio::test]
     async fn test_embed() {
@@ -114,9 +115,7 @@ mod tests {
             assert_eq!(embedded_sentence.len(), 256);
         }
 
-        let embed_ints = model
-            .embed(EmbeddingInput::IntegerArray(vec![1]))
-            .await;
+        let embed_ints = model.embed(EmbeddingInput::IntegerArray(vec![1])).await;
 
         assert!(embed_ints.is_err());
 

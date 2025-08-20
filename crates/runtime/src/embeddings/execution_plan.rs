@@ -36,16 +36,17 @@ use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use llms::chunking::Chunker;
 use llms::embeddings::Embed;
+use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc, thread};
 
-use std::fmt;
-use futures::future;
-use tokio::sync::RwLock;
-use tokio::task;
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
+use futures::future;
+use std::fmt;
+use tokio::sync::RwLock;
+use tokio::task;
 
 use super::table::EmbeddingColumnConfig;
 
@@ -293,7 +294,7 @@ pub(crate) async fn compute_additional_embedding_columns(
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = if model.supports_sync_embeddings() {
-                get_vectors_in_process(arr_iter, Arc::clone(&model), cfg.vector_size).await?
+                get_vectors_in_process(arr_iter, Arc::clone(&model), cfg.vector_size)?
             } else {
                 get_vectors(arr_iter, &**model, cfg.vector_size).await?
             };
@@ -407,52 +408,44 @@ pub(super) async fn get_vectors(
     Ok(builder.finish())
 }
 
-pub(super) async fn get_vectors_in_process(
-    arr: impl Iterator<Item = Option<&str>>,
+/// Embed a [`StringArray`] using the provided [`Embed`] model with parallel processing.
+/// Similar to [`get_vectors`] but runs synchronously and processes embeddings in parallel
+/// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
+/// where each [`String`] gets embedded into a single [`f32`] vector.
+pub(super) fn get_vectors_in_process<'a>(
+    arr: impl Iterator<Item = Option<&'a str>>,
     model: Arc<dyn Embed>,
     vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     let inputs: Vec<Option<String>> = arr.map(|o| o.map(ToString::to_string)).collect();
 
     let mut builder = FixedSizeListBuilder::with_capacity(
-        PrimitiveBuilder::<Float32Type>::with_capacity(
-            inputs.len() * (vector_length as usize),
-        ),
+        PrimitiveBuilder::<Float32Type>::with_capacity(inputs.len() * (vector_length as usize)),
         vector_length,
         inputs.len(),
-    ).with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
-    for batch in inputs.chunks(1000) {
-        let batch = batch.to_vec();
+    // Process embeddings in parallel, yielding None for empty strings or null values
+    let embeds: Vec<_> = inputs
+        .into_par_iter()
+        .map(|o| match o {
+            Some(input) if input.is_empty() => None,
+            Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
+            _ => None,
+        })
+        .collect();
 
-        let tasks: Vec<_> = batch.into_iter().map(|o| task::spawn_blocking({
-            let task_model = Arc::clone(&model);
-
-            move || {
-                match o.clone() {
-                    Some(input) if input.is_empty() => {
-                        None
-                    }
-                    Some(input) => {
-                        task_model
-                            .embed_sync(EmbeddingInput::String(input))
-                            .ok()
-                    }
-                    _ => None
-                }
+    // Load arrow FSLA
+    for embed in embeds {
+        match embed {
+            Some(embedding) => {
+                builder.values().append_slice(&embedding[0]);
+                builder.append(true);
             }
-        })).collect();
-
-        for result in future::join_all(tasks).await {
-            match result {
-                Ok(Some(embedding)) => {
-                    builder.values().append_slice(&embedding[0]);
-                    builder.append(true);
-                }
-                _ => {
-                    builder.values().append_nulls(vector_length as usize);
-                    builder.append(false);
-                }
+            _ => {
+                builder.values().append_nulls(vector_length as usize);
+                builder.append(false);
             }
         }
     }
@@ -599,7 +592,6 @@ async fn get_vectors_with_chunker(
 #[allow(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
-
     use crate::embeddings::execution_plan::get_vectors;
     use arrow::{
         array::{Array, AsArray},

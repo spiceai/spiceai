@@ -30,6 +30,7 @@ use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
 };
+use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -43,7 +44,6 @@ use token_provider::registry::TokenProviderRegistry;
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
-use llms::model2vec::Model2Vec;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
@@ -81,7 +81,7 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
-        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params).await
+        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params).await,
     }
 }
 
@@ -97,7 +97,9 @@ async fn model2vec(
 
     Model2Vec::from_name(&model_id)
         .map(|m| Arc::new(m) as Arc<dyn Embed>)
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel { source: Box::new(e) })
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+            source: Box::new(e),
+        })
 }
 
 #[cfg(feature = "bedrock")]

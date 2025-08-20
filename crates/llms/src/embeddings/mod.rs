@@ -13,6 +13,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+use crate::embeddings::Error::UnsupportedSyncInvocation;
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector, EncodingFormat,
@@ -21,7 +22,6 @@ use async_trait::async_trait;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{any, fmt::Debug, sync::Arc};
-use crate::embeddings::Error::UnsupportedSyncInvocation;
 
 pub mod candle;
 
@@ -140,10 +140,14 @@ pub trait Embed: Debug + Sync + Send {
 
     fn embed_sync(&self, _input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         let name = any::type_name::<Self>();
-        Err(UnsupportedSyncInvocation { model: name.to_string() })
+        Err(UnsupportedSyncInvocation {
+            model: name.to_string(),
+        })
     }
 
-    fn supports_sync_embeddings(&self) -> bool { false }
+    fn supports_sync_embeddings(&self) -> bool {
+        false
+    }
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].

@@ -167,7 +167,7 @@ pub enum EmbeddingPrefix {
     File,
     Databricks,
     Bedrock,
-    Model2Vec
+    Model2Vec,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {

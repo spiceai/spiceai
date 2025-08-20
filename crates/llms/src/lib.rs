@@ -21,11 +21,11 @@ pub mod chunking;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
+pub mod model2vec;
 pub mod openai;
 pub mod perplexity;
 pub mod progress;
 pub mod xai;
-pub mod model2vec;
 
 pub enum HealthCheck {
     Required,
