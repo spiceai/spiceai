@@ -40,8 +40,8 @@ pub enum Error {
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[snafu(display("Failed to retrieve stream response from OpenAI: {source}."))]
-    StreamOpenAIError {
+    #[snafu(display("Failed to retrieve response from OpenAI: {source}."))]
+    OpenAIError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display("Failed to retrieve response from OpenAI: {source}."))]
@@ -49,7 +49,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display(
-        "An internal error occurred. Report a bug at https://github.com/spiceai/spiceai/issues."
+        "An internal error occurred: {source}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,

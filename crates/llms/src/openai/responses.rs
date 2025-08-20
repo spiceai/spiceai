@@ -16,7 +16,6 @@ limitations under the License.
 
 use async_openai::{
     config::Config,
-    error::OpenAIError,
     types::responses::{CreateResponse, CreateResponseArgs, Response, ResponseStream},
 };
 use async_trait::async_trait;
@@ -26,8 +25,8 @@ use tracing_futures::Instrument;
 use crate::{
     openai::Openai,
     responses::{
-        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, ResponseOpenAISnafu,
-        Responses, Result, StreamOpenAISnafu,
+        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, OpenAISnafu,
+        ResponseOpenAISnafu, Responses, Result,
     },
 };
 
@@ -68,7 +67,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .create_stream(inner_req)
             .await
             .boxed()
-            .context(StreamOpenAISnafu)?;
+            .context(OpenAISnafu)?;
 
         drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
 
@@ -84,7 +83,6 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))
             .boxed()
             .context(InternalSnafu)?;
 
