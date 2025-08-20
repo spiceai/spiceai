@@ -8,7 +8,6 @@ use async_openai::types::responses::{
     Content, CreateResponse, OutputContent, Response as OpenAIResponse, ResponseEvent,
     ResponseStream,
 };
-use async_stream::stream;
 use axum::{
     Extension, Json,
     http::{HeaderMap, StatusCode},
@@ -48,11 +47,11 @@ fn extract_text(resp: &OpenAIResponse) -> String {
 
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
-    path = "/v1/chat/completions",
-    operation_id = "post_chat_completions",
+    path = "/v1/responses",
+    operation_id = "post_chat_responses",
     tag = "AI",
     request_body(
-        description = "Create a chat completion request using a language model.",
+        description = "Create an Open AI Responses API using a language model.",
         content((
             serde::Value = "application/json",
             example = json!({
@@ -63,7 +62,7 @@ fn extract_text(resp: &OpenAIResponse) -> String {
         ))
     ),
     responses(
-        (status = 200, description = "Chat completion generated successfully", content((
+        (status = 200, description = "Response generated successfully", content((
             serde::Value = "application/json",
             example = json!({
                 "created_at": 1_755_639_134,
@@ -138,7 +137,9 @@ pub(crate) async fn post(
         "ai_chat",
         input = %serde_json::to_string(&req).unwrap_or_default()
     );
-    span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+    span.in_scope(
+        || tracing::info!(target: "task_history", model = %req.model, api = "responses", "labels"),
+    );
 
     override_task_history_with_traceparent(&span.clone(), &headers);
 
@@ -168,7 +169,6 @@ pub(crate) async fn post(
                 }
                 Err(e) => {
                     tracing::error!(target: "task_history", parent: &span_clone, "{e}");
-                    tracing::error!("Error from v1/responses: {e}");
 
                     openai_error_to_response(e)
                 }
@@ -196,61 +196,73 @@ async fn create_response_sse_response(
         Ok(stream) => stream,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            tracing::error!("Error from v1/responses: {e}");
             return openai_error_to_response(e);
         }
     };
 
-    let sse_stream = stream! {
-        let mut captured_output = String::new();
-        let mut id: Option<u64> = None;
-        while let Some(msg) = strm.next().instrument(span.clone()).await {
-            match msg {
-                Ok(response_event) => {
-                    let should_break = match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
-                            captured_output.push_str(&delta.delta);
-                            false
-                        },
-                        ResponseEvent::ResponseCompleted(resp) => {
-                            if id.is_none() {
-                                id = Some(resp.sequence_number);
-                            }
-                            true
-                        },
-                        ResponseEvent::ResponseIncomplete(resp) => {
-                            if id.is_none() {
-                                id = Some(resp.sequence_number);
-                            }
-                            true
-                        },
-                        ResponseEvent::ResponseFailed(_) => true,
-                        _ => false
-                    };
+    let sse_stream = {
+        let span_clone = span.clone();
+        futures::stream::unfold(
+            (strm, String::new(), None::<u64>, span_clone),
+            move |(mut strm, mut captured_output, mut id, span)| async move {
+                if let Some(msg) = strm.next().instrument(span.clone()).await {
+                    match msg {
+                        Ok(response_event) => {
+                            let should_break = match &response_event {
+                                ResponseEvent::ResponseOutputTextDelta(delta) => {
+                                    captured_output.push_str(&delta.delta);
+                                    false
+                                }
+                                ResponseEvent::ResponseCompleted(resp) => {
+                                    if id.is_none() {
+                                        id = Some(resp.sequence_number);
+                                    }
+                                    true
+                                }
+                                ResponseEvent::ResponseIncomplete(resp) => {
+                                    if id.is_none() {
+                                        id = Some(resp.sequence_number);
+                                    }
+                                    true
+                                }
+                                ResponseEvent::ResponseFailed(_) => true,
+                                _ => false,
+                            };
 
-                    yield Ok::<Event, Infallible>(Event::default()
-                        .data(serde_json::to_string(&response_event).unwrap_or_else(|e| {
-                            tracing::error!("Failed to serialize response event: {e}");
-                            format!(r#"{{"error": "Serialization failed: {e}"}}"#)
-                        }))
-                    );
+                            let event = Ok::<Event, Infallible>(Event::default().data(
+                                serde_json::to_string(&response_event).unwrap_or_else(|e| {
+                                    format!(r#"{{"error": "Serialization failed: {e}"}}"#)
+                                }),
+                            ));
 
-                    if should_break {
-                        break;
+                            if should_break {
+                                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                                if let Some(id) = id {
+                                    tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
+                                }
+                                Some((event, (strm, captured_output, id, span)))
+                            } else {
+                                Some((event, (strm, captured_output, id, span)))
+                            }
+                        }
+                        Err(e) => {
+                            let event = Ok(to_openai_error_event(e.to_string()));
+                            tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                            if let Some(id) = id {
+                                tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
+                            }
+                            Some((event, (strm, captured_output, id, span)))
+                        }
                     }
-                },
-                Err(e) => {
-                    tracing::error!("Error encountered in response stream: {e}");
-                    yield Ok(to_openai_error_event(e.to_string()));
-                    break;
+                } else {
+                    tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                    if let Some(id) = id {
+                        tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
+                    }
+                    None
                 }
-            }
-        };
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
-        if let Some(id) = id {
-            tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
-        }
-        drop(span);
+            },
+        )
     };
 
     Sse::new(Box::pin(sse_stream))
