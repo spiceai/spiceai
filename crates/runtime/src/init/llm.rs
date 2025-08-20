@@ -26,7 +26,6 @@ use llms::{
     responses::Responses,
 };
 use secrecy::SecretString;
-use serde_json::Value;
 use snafu::ResultExt;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
