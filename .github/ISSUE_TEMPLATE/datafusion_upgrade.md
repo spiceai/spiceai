@@ -15,13 +15,19 @@ This issue tracks the process of upgrading Spice OSS to a new major version of D
 - [ ]  Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading.html ).
 - [ ]  Read the DataFusion [blog](https://datafusion.apache.org/blog/) for the latest release.
 
+## Upgrade DataFusion Fork
+- [ ]  Sync the forked main branch with the upstream repository.
+- [ ]  Create a new branch named `spice-X` from the tagged release, `X.Y.Z`, that is being upgraded to.
+- [ ]  Run `cargo test` to confirm that all upstream tests pass, or make note of which tests fail for reference.
+- [ ]  View the previous branch (i.e. `spice-<X-1>`) commit history. For every commit after the upstream (previous) release commit:
+  - Confirm the commit has been merged upstream and is in the new release **OR**
+  - Cherry-pick the commit onto the new `spice-X` branch. This may involve resolving merge conflicts.
+- [ ]  Rerun `cargo test` confirming there are no new failed tests.
+- [ ]  If there are no commits that need to be cherry-picked, the upstream repository can be used directly.
+
 ## Forked Dependency Upgrades
 
 The following forked dependencies use DataFusion and need to be upgraded in lockstep. This typically involves pulling the latest changes from the upstream repository, resolving conflicts, and updating the commit hash in `Cargo.toml` (See [Core Dependency Upgrade](#core-dependency-upgrade)).
-
-- [ ]  **datafusion**: Update the fork of the datafusion repo.
-  - [ ] Branch from the lastest `spice-<X-1>` branch and name it `spice-<X>`.
-  - [ ] Merge from the upstream release tag `vX.Y.Z`
 - [ ]  **datafusion-federation**: Update the fork to be compatible with the new DataFusion version.
 - [ ]  **datafusion-table-providers**: Update the fork to be compatible with the new DataFusion version.
   - Do not merge the into the `spiceai` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
