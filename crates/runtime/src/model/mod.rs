@@ -28,9 +28,11 @@ mod model_context;
 pub(crate) mod params;
 mod responses;
 mod tool_use;
+mod tool_use_responses;
 mod util;
 mod wrapper;
 
+use crate::DataFusion;
 pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use eval::{
@@ -50,8 +52,7 @@ pub use model_context::{
 };
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
-
-use crate::DataFusion;
+pub use tool_use_responses::ToolUsingResponses;
 
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 

@@ -24,7 +24,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Runtime;
+use crate::model::ToolUsingResponses;
 use crate::model::params::get_params_spec;
+use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::parameters::Parameters;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
@@ -78,6 +80,25 @@ pub fn construct_model(
             })?,
         }),
     }?;
+
+    let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
+        params.get("responses_tools").expose().ok().and_then(|v| {
+            Some(
+                v.split(",")
+                    .map(str::trim)
+                    .map(OpenAIResponsesTools::try_from)
+                    .filter_map(Result::ok)
+                    .collect(),
+            )
+        });
+
+    tracing::info!("{:?}", openai_responses_tools);
+
+    let model = if let Some(openai_tools) = openai_responses_tools {
+        Arc::new(ToolUsingResponses::new(model, openai_tools)) as Arc<dyn Responses>
+    } else {
+        model
+    };
 
     Ok(model)
 }
