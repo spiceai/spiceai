@@ -119,7 +119,7 @@ duckdb = "1.3.2"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
-governor = "0.10.0"
+governor = "0.10.1"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
