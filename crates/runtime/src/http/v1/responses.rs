@@ -18,6 +18,7 @@ use axum::{
     },
 };
 use futures::StreamExt;
+use itertools::Itertools;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -25,10 +26,24 @@ use tracing::{Instrument, Span};
 
 use crate::model::LLMResponsesModelStore;
 use llms::responses::Responses;
-fn extract_text(resp: &OpenAIResponse) -> Option<String> {
+
+fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
-        .first()
-        .and_then(|out| serde_json::to_string_pretty(out).ok())
+        .iter()
+        .filter_map(|out| {
+            if let OutputContent::Message(msg) = out {
+                msg.content.first().and_then(|c| {
+                    if let Content::OutputText(text) = c {
+                        Some(text.text.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+        .join("\n")
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -143,7 +158,8 @@ pub(crate) async fn post(
             // Non-streaming response
             match model.responses_request(req).await {
                 Ok(response) => {
-                    if let Some(message) = extract_text(&response) {
+                    let message = extract_text(&response);
+                    if !message.is_empty() {
                         tracing::info!(target: "task_history", parent: &span_clone, captured_output = %message);
                     }
                     tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
