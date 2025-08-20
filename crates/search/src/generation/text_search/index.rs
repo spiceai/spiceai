@@ -327,6 +327,11 @@ impl FullTextDatabaseIndex {
         let schema = schema_builder.build();
         Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
     }
+
+    #[must_use]
+    pub fn column_is_pk(&self, column: &str) -> bool {
+        self.primary_key.len() == 1 && self.primary_key.first().map(String::as_str) == Some(column)
+    }
 }
 
 /// An implementation of [`TantivyDocument::parse_json`] that can parse a JSON array of JSON
