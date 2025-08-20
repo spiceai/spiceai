@@ -17,8 +17,14 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{Result, Runtime, UnableToInitializeLlmSnafu, model::try_to_chat_model};
-use llms::chat::{Chat, try_map_boxed_error_to_box};
+use crate::{
+    Result, Runtime, UnableToInitializeLlmSnafu,
+    model::{try_to_chat_model, try_to_responses_model},
+};
+use llms::{
+    chat::{Chat, try_map_boxed_error_to_box},
+    responses::Responses,
+};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
@@ -29,18 +35,32 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<Arc<dyn Chat>> {
-        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+    ) -> Result<(Option<Arc<dyn Chat>>, Option<Arc<dyn Responses>>)> {
+        let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
+            .ok();
 
-        l.health()
+        let mut responses_model = try_to_responses_model(&m, &params, Arc::new(self.clone()))
             .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
-        Ok(l)
+            .ok();
+
+        if let Some(model) = &completions_model {
+            model
+                .health()
+                .await
+                .boxed()
+                .map_err(try_map_boxed_error_to_box)
+                .context(UnableToInitializeLlmSnafu)?;
+        }
+
+        if let Some(model) = responses_model {
+            if model.health().await.is_ok() {
+                responses_model = Some(model);
+            } else {
+                responses_model = None;
+            }
+        }
+
+        Ok((completions_model, responses_model))
     }
 }

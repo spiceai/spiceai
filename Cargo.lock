@@ -4331,7 +4331,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d2f7815f805cd9916c7a967990d81f4bf60027c2#d2f7815f805cd9916c7a967990d81f4bf60027c2"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f29051403dc5692ff78d300efdeb1b708797cee8#f29051403dc5692ff78d300efdeb1b708797cee8"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7880,6 +7880,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spicepod",
  "tempfile",
  "text-embeddings-backend",
  "text-embeddings-backend-candle",
@@ -10463,9 +10464,9 @@ dependencies = [
 
 [[package]]
 name = "postcard"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c1de96e20f51df24ca73cafcc4690e044854d803259db27a00a461cb3b9d17a"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
 dependencies = [
  "cobs",
  "embedded-io 0.4.0",

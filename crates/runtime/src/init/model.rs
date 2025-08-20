@@ -121,11 +121,27 @@ impl Runtime {
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
         let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
-                Ok(l) => {
-                    let mut llm_map = self.llms.write().await;
+                Ok((Some(l), Some(responses_model))) => {
+                    let mut llm_map = self.completion_llms.write().await;
+                    llm_map.insert(m.name.clone(), l);
+                    drop(llm_map);
+                    let mut responses_llm_map = self.responses_llms.write().await;
+                    responses_llm_map.insert(m.name.clone(), responses_model);
+                    Ok(())
+                }
+                Ok((None, Some(responses))) => {
+                    let mut responses_llm_map = self.responses_llms.write().await;
+                    responses_llm_map.insert(m.name.clone(), responses);
+                    Ok(())
+                }
+                Ok((Some(l), None)) => {
+                    let mut llm_map = self.completion_llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
+                Ok((None, None)) => unreachable!(
+                    "All LLMs are required to implement either `Chat` or `Responses` or both in order to be inserted into a registry"
+                ),
                 Err(e) => Err(Error::FailedToLoadLLM {
                     name: m.name.clone(),
                     source: Box::new(e),
@@ -175,7 +191,7 @@ impl Runtime {
                 ml_map.remove(&m.name);
             }
             Some(ModelType::Llm) => {
-                let mut llm_map = self.llms.write().await;
+                let mut llm_map = self.completion_llms.write().await;
                 llm_map.remove(&m.name);
             }
             None => return,
