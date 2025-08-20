@@ -28,17 +28,7 @@ use llms::responses::Responses;
 fn extract_text(resp: &OpenAIResponse) -> Option<String> {
     resp.output
         .first()
-        .and_then(|out| {
-            if let OutputContent::Message(msg) = out {
-                msg.content.first()
-            } else {
-                None
-            }
-        })
-        .and_then(|content| match content {
-            Content::OutputText(output_text) => Some(output_text.text.clone()),
-            Content::Refusal(_) => None,
-        })
+        .and_then(|out| serde_json::to_string_pretty(out).ok())
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
