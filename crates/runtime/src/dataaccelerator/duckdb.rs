@@ -325,8 +325,6 @@ impl DataAccelerator for DuckDBAccelerator {
         source: Option<&dyn AccelerationSource>,
         _partition_by: Option<PartitionBy>,
     ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::trace!("cmd.constraints: {:?}", cmd.constraints);
-
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
