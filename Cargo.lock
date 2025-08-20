@@ -7845,6 +7845,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "spicepod",
  "tempfile",
  "text-embeddings-backend",
  "text-embeddings-backend-candle",

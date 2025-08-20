@@ -25,7 +25,10 @@ use tracing_futures::Instrument;
 
 use crate::{
     openai::Openai,
-    responses::{Error::HealthCheckError, FailedToLoadModelSnafu, Responses, Result},
+    responses::{
+        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, ResponseOpenAISnafu,
+        Responses, Result, StreamOpenAISnafu,
+    },
 };
 
 #[async_trait]
@@ -48,7 +51,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
         Ok(())
     }
 
-    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
 
@@ -56,16 +59,23 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .boxed()
+            .context(InternalSnafu)?;
 
-        let stream = self.client.responses().create_stream(inner_req).await?;
+        let stream = self
+            .client
+            .responses()
+            .create_stream(inner_req)
+            .await
+            .boxed()
+            .context(StreamOpenAISnafu)?;
 
         drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
 
         Ok(Box::pin(stream))
     }
 
-    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -74,9 +84,17 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::StreamError(e.to_string()))
+            .boxed()
+            .context(InternalSnafu)?;
 
-        let mut resp = self.client.responses().create(inner_req).await?;
+        let mut resp = self
+            .client
+            .responses()
+            .create(inner_req)
+            .await
+            .boxed()
+            .context(ResponseOpenAISnafu)?;
 
         drop(permit);
 

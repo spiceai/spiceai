@@ -31,7 +31,7 @@ mod tool_use;
 mod util;
 mod wrapper;
 
-pub use chat::{LLMModelStore, try_to_chat_model};
+pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use eval::{
     dataset::{DatasetInput, DatasetOutput},

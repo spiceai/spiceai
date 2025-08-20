@@ -14,15 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::pin::Pin;
-
-use async_openai::{
-    error::OpenAIError,
-    types::responses::{CreateResponse, CreateResponseArgs, Response, ResponseStream},
+use async_openai::types::responses::{
+    CreateResponse, CreateResponseArgs, Response, ResponseStream,
 };
-use async_stream::stream;
 use async_trait::async_trait;
-use futures::Stream;
 use snafu::prelude::*;
 use tracing_futures::Instrument;
 
@@ -31,22 +26,32 @@ use crate::chat::nsql::SqlGeneration;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display(
-        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to load the model: {source}"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[snafu(display(
-        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Failed to invoke the model: {source}"))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display(
-        "Failed to check the status of the model. An error occurred: {source}. Verify the model configuration and try again."
+        "Failed to invoke the model: {source}. Verify the model configuration and try again."
     ))]
     HealthCheckError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display("Failed to retrieve stream response from OpenAI: {source}."))]
+    StreamOpenAIError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display("Failed to retrieve response from OpenAI: {source}."))]
+    ResponseOpenAIError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display(
+        "An internal error occurred. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -81,13 +86,6 @@ pub trait Responses: Sync + Send {
     }
 
     async fn health(&self) -> Result<()>;
-    async fn stream<'a>(
-        &self,
-        prompt: String,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
-        let resp = self.run(prompt).await;
-        Ok(Box::pin(stream! { yield resp }))
-    }
-    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError>;
-    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError>;
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream>;
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response>;
 }
