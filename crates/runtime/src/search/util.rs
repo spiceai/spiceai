@@ -145,18 +145,27 @@ pub async fn get_primary_keys_with_overrides(
     Ok(tbl_to_pks)
 }
 
-pub async fn user_tables_with_embeddings(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
-    let mut tables_with_embeddings = Vec::new();
+pub async fn user_tables_that_can_search(df: &Arc<DataFusion>) -> Result<Vec<TableReference>> {
+    let mut searchable_tables = Vec::new();
 
     for t in df.get_user_table_names() {
         if embedding_columns_from_table(df, &t)
             .await
             .is_some_and(|cols| !cols.is_empty())
         {
-            tables_with_embeddings.push(t);
+            searchable_tables.push(t);
+            continue;
+        }
+
+        if full_text_search_candidates(df, &t)
+            .await
+            .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
+        {
+            searchable_tables.push(t);
         }
     }
-    Ok(tables_with_embeddings)
+
+    Ok(searchable_tables)
 }
 
 /// Returns the column names of a [`TableReference`] that have associated embedding column(s)

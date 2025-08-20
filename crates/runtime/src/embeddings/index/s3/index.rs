@@ -157,8 +157,11 @@ impl VectorIndex for S3Vector {
         &self.metadata_columns
     }
 
-    async fn write(&self, record: &RecordBatch) {
-        write::write(self, record).await;
+    async fn write(
+        &self,
+        record: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        write::write(self, record).await.boxed()
     }
 
     async fn query_table_provider(
@@ -216,10 +219,14 @@ impl Index for S3Vector {
         pks
     }
 
-    async fn compute_index(&self, batches: Vec<RecordBatch>) {
-        for batch in batches {
-            self.write(&batch).await;
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        for rb in &batches {
+            self.write(rb).await.map_err(DataFusionError::External)?;
         }
+        Ok(batches)
     }
 }
 

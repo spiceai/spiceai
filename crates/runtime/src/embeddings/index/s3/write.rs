@@ -20,18 +20,86 @@ use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::Field;
 use async_openai::types::EmbeddingInput;
+use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use serde_json::Value;
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
 use crate::{
-    convert_string_arrow_to_iterator, embeddings::index::s3::S3Vector, model::EmbeddingModelStore,
+    convert_string_arrow_to_iterator,
+    embeddings::index::{VectorIndex, s3::S3Vector},
+    model::EmbeddingModelStore,
 };
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display("Embedding model '{model_name}' was not found"))]
+    EmbeddingModelNotFound { model_name: String },
+
+    #[snafu(display("{source}"))]
+    FailedToEmbed { source: llms::embeddings::Error },
+
+    #[snafu(display(
+        "Failed to update '{index}' index. An error occurred embedding the underlying dataset column '{column}'. Error: '{source}'."
+    ))]
+    FailedToEmbedColumn {
+        index: String,
+        column: String,
+        source: Box<Error>,
+    },
+
+    #[snafu(display("Cannot write to '{index}' index, data does not have column '{column}'."))]
+    ColumnNotFound { index: String, column: String },
+
+    #[snafu(display("Cannot write to '{index}' index, index has no primary key field(s)."))]
+    NoPrimaryKeyField { index: String },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, an issue processing arrow records: {source}."
+    ))]
+    ArrowError {
+        index: String,
+        source: arrow::error::ArrowError,
+    },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, an issue processing JSON values: {source}."
+    ))]
+    JsonError {
+        index: String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, primary key could not be serialized: {source}"
+    ))]
+    FailedToSerializePrimaryKey {
+        index: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Cannot write to '{index}' index, as provided data has mismatch lengths. {mismatch_source} has {mismatch_length} rows, whilst primary key column '{}' has {len} rows. {mismatch_source} != {len}.", primary_key_columns.iter().map(|f| f.name().clone()).join(", ")
+    ))]
+    LengthMismatch {
+        mismatch_source: String,
+        index: String,
+        mismatch_length: usize,
+        primary_key_columns: Vec<Field>,
+        len: usize,
+    },
+
+    #[snafu(display("Cannot write to '{index}' index: {source}"))]
+    CannotWriteIndex {
+        index: String,
+        source: data_components::s3_vectors::Error,
+    },
+}
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
 #[allow(clippy::too_many_lines)]
-pub async fn write(index: &S3Vector, record: &RecordBatch) {
+pub async fn write(index: &S3Vector, record: &RecordBatch) -> Result<(), Error> {
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
@@ -41,79 +109,51 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) {
             index.name(),
             index.embedded_column
         );
-        return;
+        return Ok(());
     };
 
-    let embedding_vectors = match embed_column(
+    let embedding_vectors = embed_column(
         record,
         embedded_column_idx,
         index.model_name.as_str(),
         Arc::clone(&index.embedding_models),
     )
-    .await
-    {
-        Ok(vectors) => vectors,
-        Err(e) => {
-            tracing::error!(
-                "Failed to update '{}' index. An error occurred embedding the underlying dataset column '{}'. Error: '{e}'.",
-                index.name(),
-                index.embedded_column
-            );
-            return;
-        }
-    };
+    .await?;
 
-    let metadata = match extract_and_format_metadata(&index.metadata_columns.all_names(), record) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(
-                "When writing to vector index '{}', failed to prepare metadata: {e}",
-                index.name()
-            );
-            return;
-        }
-    };
-
-    let primary_key = match extract_and_format_primary_key(&index.primary_key, record) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(
-                "When writing to vector index '{}', failed to prepare primary key: {e}",
-                index.name()
-            );
-            return;
-        }
-    };
+    let metadata =
+        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), record)?;
+    let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, record)?;
 
     if primary_key.len() != embedding_vectors.len() {
-        tracing::error!(
-            "When writing to vector index '{}', incompatible number of unique rows ({}) and embedding vectors ({}).",
-            index.name(),
-            primary_key.len(),
-            embedding_vectors.len(),
-        );
-        return;
+        return LengthMismatchSnafu {
+            index: index.name().to_string(),
+            primary_key_columns: index.primary_fields(),
+            len: primary_key.len(),
+            mismatch_length: embedding_vectors.len(),
+            mismatch_source: index.embedded_column.clone(),
+        }
+        .fail();
     }
     for (name, v) in &metadata {
-        if v.len() != embedding_vectors.len() {
-            tracing::error!(
-                "When writing to vector index '{}', incompatible number of unique rows ({}) and rows of '{}' metadata ({}).",
-                index.name(),
-                primary_key.len(),
-                name,
-                embedding_vectors.len(),
-            );
-            return;
+        if v.len() != primary_key.len() {
+            return LengthMismatchSnafu {
+                index: index.name().to_string(),
+                primary_key_columns: index.primary_fields(),
+                len: primary_key.len(),
+                mismatch_length: v.len(),
+                mismatch_source: name.clone(),
+            }
+            .fail();
         }
     }
 
-    if let Err(e) = index
+    index
         .table
         .write_data(embedding_vectors, primary_key, metadata)
         .await
-    {
-        tracing::error!("Cannot write to '{}' index: {e}", index.name());
-    }
+        .context(CannotWriteIndexSnafu {
+            index: index.name().to_string(),
+        })
 }
 
 /// Given a [`RecordBatch`] of data from a [`VectorIndex`]'s associated [`TableProvider`], extract and format the primary key, so as to be ready for indexing into `S3Vectors`.
@@ -122,17 +162,19 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) {
 ///  - When there is a single [`Field`] in `primary_key`, the relevant [`ArrayRef`] is cast to a [`StringArray`] via [`arrow::compute::cast`].
 ///  - Otherwise, consider the [`Field`] as a sub-[`RecordBatch`] and convert to a string via [`arrow_json`].
 pub fn extract_and_format_primary_key(
+    index_name: &str,
     primary_key: &[Field],
     record: &RecordBatch,
-) -> Result<Vec<Option<String>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<Option<String>>, Error> {
     let schema = record.schema();
     match primary_key {
         [f] => {
             let Some((i, _)) = schema.column_with_name(f.name().as_str()) else {
-                return Err(Box::from(format!(
-                    "data does not have primary key column '{}'.",
-                    f.name()
-                )));
+                return ColumnNotFoundSnafu {
+                    index: index_name.to_string(),
+                    column: f.name().clone(),
+                }
+                .fail();
             };
             let c = record.column(i);
 
@@ -142,56 +184,81 @@ pub fn extract_and_format_primary_key(
             }
 
             // Otherwise cast to UTF8.
-            let str_array = arrow::compute::cast(&c, &arrow_schema::DataType::Utf8).boxed()?;
-            let Some(data) = convert_string_arrow_to_iterator!(str_array) else {
-                return Err(Box::from(format!(
-                    "primary key '{}' in data could not be serialized",
-                    f.name()
-                )));
+            let string_arr =
+                arrow::compute::cast(&c, &arrow_schema::DataType::Utf8).context(ArrowSnafu {
+                    index: index_name.to_string(),
+                })?;
+            let Some(data) = convert_string_arrow_to_iterator!(string_arr) else {
+                return Err(Error::FailedToSerializePrimaryKey {
+                    index: index_name.to_string(),
+                    source: Box::from(format!(
+                        "could not cast a '{}' column (column '{}') into string type",
+                        f.data_type(),
+                        f.name()
+                    )),
+                });
             };
             Ok(to_string_vec(data))
         }
-        [] => Err(Box::from(
-            "data does not have a primary key column".to_string(),
-        )),
+        [] => Err(Error::NoPrimaryKeyField {
+            index: index_name.to_string(),
+        }),
         _ => {
             let mut primary_key_projection = vec![];
             for field in primary_key {
                 let Some((idx, _)) = schema.column_with_name(field.name().as_str()) else {
-                    return Err(Box::from(format!(
-                        "data does not have primary key column '{}'.",
-                        field.name()
-                    )));
+                    return ColumnNotFoundSnafu {
+                        index: index_name.to_string(),
+                        column: field.name().clone(),
+                    }
+                    .fail();
                 };
                 primary_key_projection.push(idx);
             }
-            let pk = record.project(&primary_key_projection).boxed()?;
+            let pk = record
+                .project(&primary_key_projection)
+                .context(ArrowSnafu {
+                    index: index_name.to_string(),
+                })?;
+
             let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-            writer.write_batches(&[&pk]).boxed()?;
-            writer.finish().boxed()?;
-            let values =
-                serde_json::from_reader::<_, Vec<Value>>(writer.into_inner().as_slice()).boxed()?;
+            writer.write_batches(&[&pk]).context(ArrowSnafu {
+                index: index_name.to_string(),
+            })?;
+            writer.finish().context(ArrowSnafu {
+                index: index_name.to_string(),
+            })?;
+
+            let values = serde_json::from_reader::<_, Vec<Value>>(writer.into_inner().as_slice())
+                .context(JsonSnafu {
+                index: index_name.to_string(),
+            })?;
 
             values
                 .into_iter()
                 .map(|v| serde_json::to_string(&v).map(Some))
                 .collect::<Result<Vec<_>, _>>()
-                .boxed()
+                .context(JsonSnafu {
+                    index: index_name.to_string(),
+                })
         }
     }
 }
 
 pub fn extract_and_format_metadata(
+    index_name: &str,
     metadata_columns: &[String],
     record: &RecordBatch,
-) -> Result<HashMap<String, Vec<Option<Value>>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<HashMap<String, Vec<Option<Value>>>, Error> {
     let schema = record.schema();
     let mut metadata_projection = vec![];
     for name in metadata_columns {
         let Some((idx, _)) = schema.column_with_name(name) else {
-            return Err(Box::from(format!(
-                "data does not have metadata column '{name}'.",
-            )));
+            return ColumnNotFoundSnafu {
+                index: index_name.to_string(),
+                column: name,
+            }
+            .fail();
         };
         metadata_projection.push(idx);
     }
@@ -239,16 +306,17 @@ async fn embed_column(
     column_idx: usize,
     model_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-) -> Result<Vec<Option<Vec<f32>>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<Option<Vec<f32>>>, Error> {
     let Some(data) = convert_string_arrow_to_iterator!(rb.column(column_idx)) else {
         return Ok(vec![]);
     };
 
     let embedding_guard = embedding_models.read().await;
     let Some(model) = embedding_guard.get(model_name) else {
-        return Err(Box::from(format!(
-            "Embedding model '{model_name}' was not found"
-        )));
+        return EmbeddingModelNotFoundSnafu {
+            model_name: model_name.to_string(),
+        }
+        .fail();
     };
 
     let mut nulls = vec![];
@@ -265,7 +333,7 @@ async fn embed_column(
     let embedded_data = model
         .embed(EmbeddingInput::StringArray(column))
         .await
-        .boxed()?;
+        .context(FailedToEmbedSnafu)?;
 
     let mut result: Vec<Option<Vec<f32>>> = vec![];
     let mut value_ptr = 0;

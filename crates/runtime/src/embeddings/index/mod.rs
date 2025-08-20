@@ -14,14 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
 use async_trait::async_trait;
 use data_components::s3_vectors::MetadataColumns;
-use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 
 use datafusion::{
@@ -61,7 +59,10 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     fn metadata_columns(&self) -> &MetadataColumns;
 
     /// Update the index based on a [`RecordBatch`] from the underlying table.
-    async fn write(&self, record: &RecordBatch);
+    async fn write(
+        &self,
+        record: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
     /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
@@ -370,7 +371,13 @@ pub mod tests {
             &self.metadata
         }
 
-        async fn write(&self, _record: &RecordBatch) {}
+        async fn write(
+            &self,
+            _record: &RecordBatch,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
         async fn query_table_provider(
             &self,
             _query: &str,

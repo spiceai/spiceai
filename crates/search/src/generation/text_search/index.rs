@@ -76,10 +76,15 @@ impl Index for FullTextDatabaseIndex {
         required_columns.into_iter().collect()
     }
 
-    async fn compute_index(&self, batches: Vec<RecordBatch>) {
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
         if let Err(e) = self.update_index(batches.as_slice()).await {
             tracing::error!("Failed to update full text search index: {e}");
+            return Err(DataFusionError::External(Box::new(e)));
         }
+        Ok(batches)
     }
 }
 
@@ -92,9 +97,15 @@ impl FullTextDatabaseIndex {
         // Use 'primary_key_override', fallback to underlying in table.
         let pks = match (primary_key_override, get_primary_keys(&inner).await) {
             (Some(pks), _) => pks,
-            (None, Ok(pks)) if !pks.is_empty() => pks,
-            (None, _) => {
-                return Err(super::Error::NoPrimaryKey);
+            (None, Ok(pks)) => {
+                if pks.is_empty() {
+                    return Err(super::Error::NoPrimaryKey);
+                }
+
+                pks
+            }
+            (None, Err(e)) => {
+                return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
             }
         };
 
@@ -314,6 +325,7 @@ impl FullTextDatabaseIndex {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
         let schema = schema_builder.build();
+
         Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
     }
 }

@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
-use super::util::user_tables_with_embeddings;
+use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
@@ -245,11 +245,11 @@ impl VectorSearch {
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
-            None => user_tables_with_embeddings(&self.df).await?,
+            None => user_tables_that_can_search(&self.df).await?,
         };
 
         if tables.is_empty() {
-            return Err(Error::NoTablesWithEmbeddingsFound {});
+            return Err(Error::NoTablesWithSearchFound {});
         }
 
         let span = match Span::current() {

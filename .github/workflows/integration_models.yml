@@ -93,6 +93,8 @@ jobs:
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5
@@ -137,6 +139,8 @@ jobs:
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5
@@ -176,6 +180,8 @@ jobs:
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5
@@ -200,6 +206,8 @@ jobs:
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5
@@ -226,6 +234,8 @@ jobs:
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5
@@ -259,6 +269,8 @@ jobs:
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
         uses: actions/download-artifact@v5

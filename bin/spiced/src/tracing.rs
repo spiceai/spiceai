@@ -67,6 +67,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "llms",
     "tpc_extension",
     "workers",
+    "search",
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off";

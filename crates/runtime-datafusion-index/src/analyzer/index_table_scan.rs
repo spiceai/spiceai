@@ -391,16 +391,231 @@ impl ExecutionPlan for IndexerExec {
                 let indexes = indexes.clone();
                 async move {
                     if let Ok(batch) = batch.as_ref() {
-                        futures::future::join_all(
+                        futures::future::try_join_all(
                             indexes
                                 .iter()
                                 .map(|index| index.compute_index(vec![batch.clone()])),
                         )
-                        .await;
+                        .await?;
                     }
                     batch
                 }
             });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        any::Any,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+    use datafusion::{
+        arrow::{
+            self,
+            array::{ArrayRef, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        },
+        catalog::{MemTable, TableProvider},
+        error::DataFusionError,
+        execution::{SessionState, SessionStateBuilder, context::QueryPlanner},
+        logical_expr::LogicalPlan,
+        physical_plan::ExecutionPlan,
+        physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
+        prelude::SessionContext,
+    };
+
+    use crate::{
+        Index, IndexedTableProvider,
+        analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
+    };
+
+    #[derive(Debug, Default)]
+    pub struct TestQueryPlanner {}
+
+    impl TestQueryPlanner {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+
+    #[async_trait]
+    impl QueryPlanner for TestQueryPlanner {
+        async fn create_physical_plan(
+            &self,
+            logical_plan: &LogicalPlan,
+            session_state: &SessionState,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+                IndexTableScanExtensionPlanner::new(),
+            )]);
+            physical_planner
+                .create_physical_plan(logical_plan, session_state)
+                .await
+        }
+    }
+
+    pub struct TestIndex {
+        required_cols: Vec<String>,
+        #[allow(clippy::type_complexity)]
+        compute_index_cb: Option<fn(Vec<RecordBatch>) -> Result<Vec<RecordBatch>, DataFusionError>>,
+        calls: AtomicUsize,
+    }
+
+    impl TestIndex {
+        #[allow(clippy::type_complexity)]
+        fn new(
+            required_cols: Vec<String>,
+            compute_index_cb: Option<
+                fn(Vec<RecordBatch>) -> Result<Vec<RecordBatch>, DataFusionError>,
+            >,
+        ) -> Self {
+            Self {
+                required_cols,
+                compute_index_cb,
+                calls: AtomicUsize::default(),
+            }
+        }
+
+        fn compute_index_calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Debug for TestIndex {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestIndex")
+                .field("required_cols", &self.required_cols)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl Index for TestIndex {
+        fn name(&self) -> &'static str {
+            "s3_vector_index"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            self.required_cols.clone()
+        }
+
+        async fn compute_index(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<Vec<RecordBatch>, DataFusionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(compute_index_cb) = self.compute_index_cb {
+                return compute_index_cb(batches);
+            }
+            Ok(batches)
+        }
+    }
+
+    fn get_ctx() -> SessionContext {
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_query_planner(Arc::new(TestQueryPlanner::new()))
+            .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+            .build();
+
+        SessionContext::new_with_state(state)
+    }
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]))
+    }
+
+    #[allow(clippy::expect_used)]
+    fn test_empty_batch() -> RecordBatch {
+        let empty_columns: Vec<ArrayRef> = test_schema()
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+
+        RecordBatch::try_new(test_schema(), empty_columns).expect("valid batch")
+    }
+
+    #[allow(clippy::expect_used)]
+    fn mem_table() -> Arc<dyn TableProvider> {
+        let empty_batch = test_empty_batch();
+        let mem_table = Arc::new(
+            MemTable::try_new(empty_batch.schema(), vec![vec![empty_batch]]).expect("valid table"),
+        );
+        mem_table as Arc<dyn TableProvider>
+    }
+
+    fn index_table(
+        index: Arc<dyn Index + Send + Sync>,
+        table: Arc<dyn TableProvider>,
+    ) -> Arc<dyn TableProvider> {
+        Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
+    }
+
+    #[tokio::test]
+    async fn optimizer_rule_happy_path() {
+        let ctx = get_ctx();
+        let index = Arc::new(TestIndex::new(vec!["id".to_string()], None));
+        let index_table = index_table(
+            Arc::clone(&index) as Arc<dyn Index + Send + Sync>,
+            mem_table(),
+        );
+
+        ctx.register_table("test_idx_table", index_table)
+            .expect("valid table");
+
+        let df = ctx.table("test_idx_table").await.expect("valid");
+
+        let _results = df.collect().await.expect("should complete");
+        assert_eq!(1, index.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn optimizer_rule_indexer_error() {
+        let ctx = get_ctx();
+        let index = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|_| {
+                Err(DataFusionError::Execution(
+                    "Some error while indexing".to_string(),
+                ))
+            }),
+        ));
+        let index_table = index_table(
+            Arc::clone(&index) as Arc<dyn Index + Send + Sync>,
+            mem_table(),
+        );
+
+        ctx.register_table("test_idx_table", index_table)
+            .expect("valid table");
+
+        let df = ctx.table("test_idx_table").await.expect("valid");
+
+        let err = df
+            .collect()
+            .await
+            .expect_err("should return an error on indexing");
+        assert!(matches!(err, DataFusionError::Execution(_)));
+        assert_eq!(
+            err.to_string(),
+            "Execution error: Some error while indexing".to_string()
+        );
+        assert_eq!(1, index.compute_index_calls());
     }
 }
