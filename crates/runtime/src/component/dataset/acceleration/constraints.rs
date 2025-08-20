@@ -77,8 +77,14 @@ impl Acceleration {
     #[allow(clippy::needless_pass_by_value)]
     pub fn table_constraints(&self, schema: SchemaRef) -> dataset::Result<Option<Constraints>> {
         if self.indexes.is_empty() && self.primary_key.is_none() {
+            tracing::trace!(
+                "No indexes or primary key identified for accelerator table constraints",
+            );
             return Ok(None);
         }
+
+        tracing::trace!("Primary key definition: {:?}", self.primary_key);
+        tracing::trace!("Indexes: {:?}", self.indexes);
 
         let mut table_constraints: Vec<Constraint> = Vec::new();
 
@@ -106,6 +112,8 @@ impl Acceleration {
 
             table_constraints.push(tc);
         }
+
+        tracing::trace!("Table constraints: {table_constraints:?}");
 
         Ok(Some(Constraints::new_unverified(table_constraints)))
     }
