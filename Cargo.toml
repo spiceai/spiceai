@@ -71,11 +71,11 @@ arrow-ipc = "55.1"
 arrow-json = "55.1"
 arrow-odbc = "16"
 arrow-schema = "55.1"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "e1580b0cdccfbf9b6e52321650324cd2ddb023d0", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "60e8643bc089502bb2bd76c33adb60bdb489b475", features = [
     "byot",
 ] }
 async-stream = "0.3.5"
-async-trait = "0.1.86"
+async-trait = "0.1.89"
 aws-config = "1.8.5"
 aws-credential-types = "1.2"
 aws-runtime = "1.5.10"
@@ -119,7 +119,7 @@ duckdb = "1.3.2"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
-governor = "0.10.0"
+governor = "0.10.1"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
