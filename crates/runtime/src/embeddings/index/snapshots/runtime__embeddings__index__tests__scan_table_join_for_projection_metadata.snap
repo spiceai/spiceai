@@ -1,22 +1,20 @@
 ---
 source: crates/runtime/src/embeddings/index/mod.rs
-assertion_line: 476
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                               |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                               |
-|               |   TableScan: my_vectored_table projection=[pk, another_column, body_embedding]                                                     |
-| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                      |
-|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                          |
-|               |     ProjectionExec: expr=[pk@2 as pk, another_column@0 as another_column, body_embedding@1 as body_embedding]                      |
-|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                  |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@1)], projection=[another_column@1, body_embedding@2, pk@3] |
-|               |             DataSourceExec: partitions=1, partition_sizes=[1]                                                                      |
-|               |             ProjectionExec: expr=[data@0 as body_embedding, CAST(key@1 AS Int64) as pk]                                            |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                 |
-|               |                 ExplainExecutionPlan: projection=["data", "key"] filter=[] limit=None                                              |
-|               |                                                                                                                                    |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                             |
++---------------+----------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                             |
+|               |   TableScan: my_vectored_table projection=[pk, another_column, body_embedding]                                                   |
+| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                    |
+|               |   CoalesceBatchesExec: target_batch_size=8192, fetch=5                                                                           |
+|               |     SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                      |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                |
+|               |         HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@0)], projection=[pk@0, another_column@1, body_embedding@3] |
+|               |           DataSourceExec: partitions=1, partition_sizes=[1]                                                                      |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                   |
+|               |             ExplainExecutionPlan: projection=["pk", "body_embedding"] filter=[] limit=None                                       |
+|               |                                                                                                                                  |
++---------------+----------------------------------------------------------------------------------------------------------------------------------+

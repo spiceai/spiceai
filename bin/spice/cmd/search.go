@@ -48,13 +48,31 @@ type SearchRequest struct {
 	Where             string   `json:"where,omitempty"`
 }
 
+type StringOrSlice []string
+
+func (s *StringOrSlice) UnmarshalJSON(data []byte) error {
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		*s = StringOrSlice{single}
+		return nil
+	}
+
+	var multiple []string
+	if err := json.Unmarshal(data, &multiple); err == nil {
+		*s = multiple
+		return nil
+	}
+
+	return fmt.Errorf("invalid format for StringOrSlice: %s", data)
+}
+
 type SearchMatch struct {
-	Matches    map[string]string      `json:"matches"`
-	Score      float64                `json:"score"`
-	Dataset    string                 `json:"dataset"`
-	PrimaryKey map[string]interface{} `json:"primary_key"`
-	Metadata   map[string]interface{} `json:"metadata"`
-	Data       map[string]interface{} `json:"data"`
+	Matches    map[string]StringOrSlice `json:"matches"`
+	Score      float64                  `json:"score"`
+	Dataset    string                   `json:"dataset"`
+	PrimaryKey map[string]interface{}   `json:"primary_key"`
+	Metadata   map[string]interface{}   `json:"metadata"`
+	Data       map[string]interface{}   `json:"data"`
 }
 
 type SearchResponse struct {
@@ -192,14 +210,21 @@ spice search --cloud
 						cmd.Printf(" %s=%v", key, value)
 					}
 				}
-				if len(match.Matches) == 1 {
-					// This will only print a single line.
-					for _, value := range match.Matches {
-						cmd.Printf("\n%s", value)
-					}
-				} else {
-					for col, value := range match.Matches {
-						cmd.Printf("\n%s: %s", col, value)
+
+				withColumns := len(match.Matches) > 1
+				for col, values := range match.Matches {
+					withMatchNumber := len(values) > 1
+					for i, value := range values {
+						switch {
+						case withColumns && withMatchNumber:
+							cmd.Printf("\n%s - match #%d: %s", col, i+1, value)
+						case withColumns:
+							cmd.Printf("\n%s: %s", col, value)
+						case withMatchNumber:
+							cmd.Printf("\nmatch #%d: %s", i+1, value)
+						default:
+							cmd.Printf("\n%s", value)
+						}
 					}
 				}
 				cmd.Print("\n\n")

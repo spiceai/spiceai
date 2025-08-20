@@ -470,6 +470,7 @@ impl Default for Acceleration {
 }
 
 /// Returns true if the `query_federation` parameter is set to "disabled".
+#[allow(clippy::result_large_err)]
 fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
     if let Some(params) = params {
         if let Some(value) = params.data.remove("query_federation") {

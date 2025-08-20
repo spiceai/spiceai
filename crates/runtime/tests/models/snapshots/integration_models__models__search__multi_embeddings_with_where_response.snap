@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "$\\boxed{\\text{True}}$, because severe post-treatment cardiopulmonary complications sometimes occur."
+      },
+      "primary_key": {
+        "id": 120
+      },
+      "score": 0.63
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.63
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Consequential late effects are late effects that develop as a consequence of severe early effects."
+      },
+      "primary_key": {
+        "id": 810
+      },
+      "score": 0.62
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+      },
+      "primary_key": {
+        "id": 890
+      },
+      "score": 0.62
+    }
+  ]
+}

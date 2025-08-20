@@ -81,6 +81,7 @@ enum PathReference {
 }
 
 impl std::fmt::Debug for PathReference {
+    #[allow(clippy::unnecessary_debug_formatting)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PathReference::Direct(path) => write!(f, "Direct({path})"),

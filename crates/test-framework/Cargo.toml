@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 ahash.workspace = true
-anyhow = "1.0.95"
+anyhow = "1.0.99"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
@@ -32,7 +32,7 @@ octocrab = "0.44.1"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
-rand = "0.9.2"
+rand.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

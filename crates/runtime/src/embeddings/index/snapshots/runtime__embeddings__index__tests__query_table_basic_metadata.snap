@@ -1,16 +1,14 @@
 ---
 source: crates/runtime/src/embeddings/index/mod.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
 ---
-+---------------+-----------------------------------------------------------------------------------+
-| plan_type     | plan                                                                              |
-+---------------+-----------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.score DESC NULLS FIRST, fetch=5                           |
-|               |   TableScan: my_vectored_table projection=[pk, score]                             |
-| physical_plan | SortPreservingMergeExec: [score@1 DESC], fetch=5                                  |
-|               |   SortExec: TopK(fetch=5), expr=[score@1 DESC], preserve_partitioning=[true]      |
-|               |     ProjectionExec: expr=[CAST(key@0 AS Int64) as pk, 1 - distance@1 as score]    |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1        |
-|               |         ExplainExecutionPlan: projection=["key", "distance"] filter=[] limit=None |
-|               |                                                                                   |
-+---------------+-----------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                   |
++---------------+----------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.score DESC NULLS FIRST, fetch=5                                |
+|               |   TableScan: my_vectored_table projection=[pk, score]                                  |
+| physical_plan | SortExec: TopK(fetch=5), expr=[score@1 DESC NULLS LAST], preserve_partitioning=[false] |
+|               |   ExplainExecutionPlan: projection=["pk", "score"] filter=[] limit=None                |
+|               |                                                                                        |
++---------------+----------------------------------------------------------------------------------------+

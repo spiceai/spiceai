@@ -43,15 +43,15 @@ pub(crate) async fn run(args: &DataConsistencyArgs) -> anyhow::Result<()> {
 
         if *count == 0 {
             println!(
-                "WARN - No data returned for query '{query}' for {:#?}",
-                args.test_args.common.spicepod_path
+                "WARN - No data returned for query '{query}' for {}",
+                args.test_args.common.spicepod_path.display()
             );
         }
 
         if *second_count == 0 {
             println!(
-                "WARN - No data returned for query '{query}' for {:#?}",
-                args.compare_spicepod
+                "WARN - No data returned for query '{query}' for {}",
+                args.compare_spicepod.display()
             );
         }
     }

@@ -35,9 +35,9 @@ pub enum Error {
     DataSourceNotFound { table: TableReference },
 
     #[snafu(display(
-        "Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."
+        "Vector search failed: No tables with embeddings or full text search indexes are available. Ensure embeddings or full text search indexes are configured and try again."
     ))]
-    NoTablesWithEmbeddingsFound {},
+    NoTablesWithSearchFound {},
 
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },

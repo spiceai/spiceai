@@ -11,14 +11,14 @@ snapshot_kind: text
       "matches": {
         "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
       },
-      "score": 0.786
+      "score": 0.78
     },
     {
       "dataset": "clickbench_no_chunking",
       "matches": {
         "Referer": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
       },
-      "score": 0.786
+      "score": 0.78
     }
   ]
 }

@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/mongo/mod.rs
+description: MongoDB Integration Test Results
+---
++----+------------------------------------------+---------------------------------------+-----------------------------------------+
+| id | col_text_utf8                            | col_varchar_utf8                      | col_normal_text                         |
++----+------------------------------------------+---------------------------------------+-----------------------------------------+
+| 1  | 🚀 This text contains UTF8 characters 😊 | 🦄 Another UTF8 string with emojis 🎉 | Regular text with no special characters |
++----+------------------------------------------+---------------------------------------+-----------------------------------------+

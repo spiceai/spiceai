@@ -36,12 +36,12 @@ concurrency:
 jobs:
   make_install:
     name: make install*
-    runs-on: spiceai-runners
+    runs-on: spicehq-dev-runners
     env:
       GOVER: 1.24.2
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -53,7 +53,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-      
+
       - name: Set up make
         uses: ./.github/actions/setup-make
 

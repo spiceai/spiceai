@@ -201,7 +201,7 @@ impl EmbeddingConnector {
                 for (column, config) in embedding_columns {
                     use runtime_datafusion_index::Index;
 
-                    use crate::embeddings::index::VectorIndex;
+                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
                     let vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
@@ -224,8 +224,10 @@ impl EmbeddingConnector {
 
                     // augment the previous underlying table provider with the vector index
                     // this will result in recursive augmentation of the underlying table for N embedding columns
-                    provider.underlying = (Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>)
-                        .augment_table(provider.underlying);
+                    provider.underlying = Arc::new(VectorScanTableProvider::new(
+                        provider.underlying,
+                        Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>,
+                    )) as Arc<dyn TableProvider>;
                     provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);
                 }
                 tracing::info!(

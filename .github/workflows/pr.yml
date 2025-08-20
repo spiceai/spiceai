@@ -39,7 +39,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -73,7 +73,7 @@ jobs:
     needs: check_changes
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -156,7 +156,7 @@ jobs:
     needs: check_changes
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -227,7 +227,7 @@ jobs:
     needs: check_changes
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and push Docker images
         uses: docker/build-push-action@v6

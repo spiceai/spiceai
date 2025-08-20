@@ -2,19 +2,19 @@ name: E2E Test CLI behavior
 on:
   workflow_dispatch:
     inputs:
-        build_cli:
-          description: 'Build the CLI instead of using the specified release version'
-          required: false
-          default: 'true'
-        rel_version:
-          description: 'The version to build CLI / download released CLI'
-          required: false
-          default: '1.0.2'
+      build_cli:
+        description: 'Build the CLI instead of using the specified release version'
+        required: false
+        default: 'true'
+      rel_version:
+        description: 'The version to build CLI / download released CLI'
+        required: false
+        default: '1.0.2'
 
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spicehq-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -27,7 +27,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spiceai-runners",
+                runner: "spicehq-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
@@ -61,7 +61,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.event.inputs.build_cli == 'true'
 
       - name: Set up Go
@@ -123,11 +123,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -226,11 +226,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -307,11 +307,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -369,11 +369,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -452,18 +452,18 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
-            target_arch_go: "arm64"
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+            target_arch_go: 'arm64'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -500,18 +500,18 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
-            target_arch_go: "arm64"
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+            target_arch_go: 'arm64'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -560,3 +560,4 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+

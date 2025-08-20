@@ -41,7 +41,7 @@ jobs:
     name: Check Rust Licenses
     runs-on: spiceai-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -49,19 +49,20 @@ jobs:
           os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny || true
+        run: cargo install cargo-deny --version 0.18.3 || true
+        # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: spiceai-macos
+    runs-on: spicehq-dev-runners
     env:
       GOVER: 1.24.2
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
         uses: actions/setup-go@v5

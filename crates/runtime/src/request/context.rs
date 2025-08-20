@@ -215,7 +215,6 @@ impl AuthRequestContext for RequestContext {
             .map_err(|_| "Failed to set auth principal".into())
     }
 
-    #[must_use]
     fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
         self.auth_principal.get()
     }

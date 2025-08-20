@@ -192,7 +192,6 @@ impl KubernetesSecretStore {
 
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
-    #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
         // First try looking for `spice_my_key` and then `my_key`
         let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");

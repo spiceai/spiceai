@@ -1,0 +1,62 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "data": {
+        "question": "<refined question>"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "<refined question>"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "primary_key": {
+        "id": 361
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "Find the product of 2 and 7."
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the product of 2 and 7."
+      },
+      "primary_key": {
+        "id": 370
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "What is created by making a choice?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "What is created by making a choice?"
+      },
+      "primary_key": {
+        "id": 863
+      },
+      "score": 0.01
+    }
+  ]
+}

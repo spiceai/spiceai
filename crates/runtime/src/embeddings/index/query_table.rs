@@ -25,9 +25,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 
-use data_components::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-};
+use data_components::s3_vectors::MetadataColumns;
 
 use datafusion::{
     catalog::Session,
@@ -35,12 +33,12 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        BinaryExpr, Cast, Expr, Filter, Join, LogicalPlan, Operator, Projection, Sort, SortExpr,
-        TableProviderFilterPushDown, TableScan,
-        expr::{Alias, InList},
+        Expr, Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableProviderFilterPushDown,
+        TableScan,
+        expr::{InList, ScalarFunction},
     },
     physical_plan::ExecutionPlan,
-    prelude::lit,
+    prelude::col,
     scalar::ScalarValue,
     sql::TableReference,
 };
@@ -52,7 +50,9 @@ use tokio_stream::StreamExt;
 
 use crate::{
     embedding_col,
-    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+    embeddings::index::{
+        VectorIndex, projection_without_columns, vector_index_table_is_sufficient,
+    },
 };
 use crate::{embeddings::index::vector_index_filters, search::util::find_concrete_table_provider};
 use search::generation::util::append_fields;
@@ -78,26 +78,91 @@ pub struct VectorQueryTableProvider {
 }
 
 impl VectorQueryTableProvider {
-    /// Execute the given physical plan of a vector index query, extract the primary key column and convert the values: {v1, v2, ..., vn} into a filter predicate: `WHERE primary_key_column IN (v1, v2,...,vn)`.
+    /// Execute the given physical plan of a vector index query, extract the primary key columns and convert the values: {(`v1_1`, `v1_2`, ...), (`v2_1`, `v2_2`, ...), ..., (`vn_1`, `vn_2`, ...)} into a filter predicate: `WHERE (primary_key_col1, primary_key_col2, ...) IN ((v1_1, v1_2, ...), (v2_1, v2_2, ...), ...)`.
+    ///
+    /// When `primary_key_fields.len() == 1`, use a simplified expression `WHERE primary_key_col1 IN (v1_1, v2_1, ...)`.
     async fn base_table_query_filter(
         &self,
         state: &dyn Session,
         physical_plan: Arc<dyn ExecutionPlan>,
-        primary_key_column: String,
+        primary_key_fields: &[Field],
     ) -> DataFusionResult<Expr> {
-        let mut expr = vec![];
+        if primary_key_fields.is_empty() {
+            return Err(DataFusionError::Execution(
+                "No primary key columns provided".to_string(),
+            ));
+        }
+
+        // For single column primary key, maintain the existing behavior
+        if primary_key_fields.len() == 1 {
+            let primary_key_column = &primary_key_fields[0];
+            let mut expr = vec![];
+
+            let mut strm = physical_plan.execute(0, state.task_ctx())?;
+            while let Some(Ok(rb)) = strm.next().await {
+                if let Some(arr) = rb.column_by_name(primary_key_column.name()) {
+                    for i in 0..arr.len() {
+                        expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?));
+                    }
+                }
+            }
+            return Ok(Expr::InList(InList::new(
+                Box::new(Expr::Column(Column::from_name(primary_key_column.name()))),
+                expr,
+                false,
+            )));
+        }
+
+        // For composite primary keys, collect struct values for IN expression
+        let mut struct_exprs = vec![];
 
         let mut strm = physical_plan.execute(0, state.task_ctx())?;
         while let Some(Ok(rb)) = strm.next().await {
-            if let Some(arr) = rb.column_by_name(primary_key_column.as_str()) {
-                for i in 0..arr.len() {
-                    expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?));
+            // Get all arrays for primary key columns
+            let mut arrays = vec![];
+            let pk_names: Vec<String> = primary_key_fields
+                .iter()
+                .map(|pk| pk.name().clone())
+                .collect();
+            for pk_col in primary_key_fields {
+                if let Some(arr) = rb.column_by_name(pk_col.name()) {
+                    arrays.push(arr);
+                } else {
+                    return Err(DataFusionError::Execution(format!(
+                        "Primary key column '{}' not found in query result",
+                        pk_col.name()
+                    )));
                 }
             }
+
+            // Build struct values for each row
+            let num_rows = arrays.first().map_or(0, |arr| arr.len());
+            for i in 0..num_rows {
+                let mut field_values: Vec<(&str, ScalarValue)> = vec![];
+                for (j, arr) in arrays.iter().enumerate() {
+                    field_values.push((
+                        pk_names
+                            .get(j)
+                            .map(std::string::String::as_str)
+                            .unwrap_or_default(),
+                        ScalarValue::try_from_array(arr, i)?,
+                    ));
+                }
+                struct_exprs.push(Expr::Literal(field_values.into()));
+            }
         }
+
+        // Create struct expression for LHS of IN: struct(col1, col2, ...)
+        let struct_expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            std::sync::Arc::new(datafusion::logical_expr::ScalarUDF::new_from_impl(
+                datafusion::functions::core::r#struct::StructFunc::new(),
+            )),
+            primary_key_fields.iter().map(|f| col(f.name())).collect(),
+        ));
+
         Ok(Expr::InList(InList::new(
-            Box::new(Expr::Column(Column::from_name(primary_key_column.clone()))),
-            expr,
+            Box::new(struct_expr),
+            struct_exprs,
             false,
         )))
     }
@@ -146,7 +211,7 @@ impl VectorQueryTableProvider {
         // Remove embedding column and metadata columns of vector index.
         let base_proj = (0..self.get_underlying_schema().fields().len()).collect::<Vec<_>>();
         let base_proj =
-            self.underlying_projection_without_metadata(metadata_columns, Some(&base_proj));
+            projection_without_columns(&self.schema().fields, metadata_columns, Some(&base_proj));
         let base_proj = self.remove_embedding_column(base_proj, embedded_column);
 
         let filter_refs: Vec<_> = filters.iter().collect();
@@ -203,36 +268,8 @@ impl VectorQueryTableProvider {
         indexed.get_underlying().schema()
     }
 
-    // Remove any fields that can be returned from the vector indexes `metadata_columns`.
-    fn underlying_projection_without_metadata(
-        &self,
-        metadata_columns: &[String],
-        projection: Option<&Vec<usize>>,
-    ) -> Vec<usize> {
-        self.schema()
-            .fields()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                // Don't include columns from vector index
-                if metadata_columns.contains(f.name()) {
-                    return None;
-                }
-
-                // Don't include if not requested by user
-                if let Some(p) = projection.as_ref() {
-                    if !p.contains(&i) {
-                        return None;
-                    }
-                }
-                Some(i)
-            })
-            .collect()
-    }
-
     async fn vector_index_table(
         &self,
-        pk: &Field,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<LogicalPlan, DataFusionError> {
@@ -240,41 +277,9 @@ impl VectorQueryTableProvider {
             .vector_index
             .query_table_provider(self.query.as_str())
             .await?;
-        let query_table_ref = TableReference::parse_str("vector_index");
-
-        let mut query_table_projection_exprs = vec![
-            Expr::Alias(Alias::new(
-                Expr::Cast(Cast::new(
-                    Box::new(Expr::Column(Column::new_unqualified(
-                        S3_VECTOR_PRIMARY_KEY_NAME,
-                    ))),
-                    pk.data_type().clone(),
-                )),
-                Some(query_table_ref.clone()),
-                pk.name().to_string(),
-            )),
-            Expr::Alias(Alias::new(
-                Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
-                None::<TableReference>,
-                embedding_col!(self.vector_index.embedded_column()),
-            )),
-            Expr::Alias(Alias::new(
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(lit(1.0)),
-                    Operator::Minus,
-                    Box::new(Expr::Column(Column::new_unqualified("distance"))),
-                )),
-                Some(query_table_ref.clone()),
-                SEARCH_SCORE_COLUMN_NAME,
-            )),
-        ];
-
-        query_table_projection_exprs.extend(metadata_columns_to_exprs(
-            self.vector_index.metadata_columns(),
-        ));
 
         let query_table_scan = TableScan::try_new(
-            query_table_ref.clone(),
+            TableReference::parse_str("vector_index"),
             Arc::new(DefaultTableSource::new(query_table)),
             None,
             vector_index_filters(
@@ -290,10 +295,7 @@ impl VectorQueryTableProvider {
             self.limit_to_use(limit),
         )?;
 
-        Ok(LogicalPlan::Projection(Projection::try_new(
-            query_table_projection_exprs.clone(),
-            Arc::new(LogicalPlan::TableScan(query_table_scan)),
-        )?))
+        Ok(LogicalPlan::TableScan(query_table_scan))
     }
 
     /// Determine whether and how to pick between
@@ -379,6 +381,7 @@ impl TableProvider for VectorQueryTableProvider {
             .collect())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -387,10 +390,10 @@ impl TableProvider for VectorQueryTableProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let primary_key_fields = self.vector_index.primary_fields();
-        let Some(pk) = primary_key_fields.first() else {
+        if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
-        };
-        let vector_index_table = self.vector_index_table(pk, filters, limit).await?;
+        }
+        let vector_index_table = self.vector_index_table(filters, limit).await?;
 
         // Only join on base table if required.
         let base_logical_plan: LogicalPlan = if vector_index_table_is_sufficient(
@@ -415,7 +418,7 @@ impl TableProvider for VectorQueryTableProvider {
                 self.base_table_query_filter(
                     state,
                     state.create_physical_plan(&vector_index_table).await?,
-                    pk.name().to_string(),
+                    &primary_key_fields,
                 )
                 .await?,
             );
@@ -430,34 +433,46 @@ impl TableProvider for VectorQueryTableProvider {
                 .schema()
                 .join(underlying_table_scan.schema())?;
 
-            // If the filter affects the primary key, we must apply after we have removed the duplicate primary key column.
+            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+            let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
             let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
                 filters.iter().cloned().partition(|f| {
                     f.column_refs()
-                        .contains(&Column::new_unqualified(pk.name().clone()))
+                        .iter()
+                        .any(|col| primary_key_column_names.contains(col.name()))
                 });
+
+            let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
+                .iter()
+                .map(|pk_field| {
+                    (
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                    )
+                })
+                .collect();
 
             let join = LogicalPlan::Join(Join {
                 left: Arc::new(vector_index_table),
                 right: Arc::new(underlying_table_scan),
                 join_type: JoinType::Left,
                 join_constraint: JoinConstraint::On,
-                on: vec![(
-                    Expr::Column(Column::new_unqualified(pk.name().clone())),
-                    Expr::Column(Column::new_unqualified(pk.name().clone())),
-                )],
+                on: join_conditions,
                 filter: pre_join_filters.into_iter().reduce(Expr::and),
                 schema: join_schema.into(),
                 null_equals_null: false,
             });
 
-            // DataFusion will not deduplicate the `Join::on` key. For simplicity with non-join
-            // case, we will remove first.
+            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+            // case, we will remove duplicate primary key columns from the right table.
             let deduped_schema = DFSchema::new_with_metadata(
                 join.schema()
                     .iter()
                     .filter(|(tbl, f)| {
-                        !(f.name() == pk.name()
+                        !(primary_key_column_names.contains(f.name())
                             && tbl.is_some_and(|t| *t == TableReference::parse_str("tbl")))
                     })
                     .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
@@ -504,7 +519,7 @@ impl TableProvider for VectorQueryTableProvider {
 
 /// Convert a [`MetadataColumns`] into a set of [`Expr`]s suitable for a projection.
 #[must_use]
-fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
+pub(super) fn metadata_columns_to_exprs(metadata_columns: &MetadataColumns) -> Vec<Expr> {
     metadata_columns
         .iter()
         .map(|c| Expr::Column(Column::new_unqualified(c.name())))
@@ -517,7 +532,6 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field, Schema};
-    use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
     use datafusion::{
         catalog::{MemTable, TableProvider},
         sql::TableReference,
@@ -547,9 +561,9 @@ mod tests {
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
-                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new("pk", DataType::Int64, false),
                     Field::new(
-                        S3_VECTOR_EMBEDDING_NAME,
+                        "body_embedding",
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),
@@ -608,9 +622,9 @@ mod tests {
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
-                    Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+                    Field::new("pk", DataType::Int64, false),
                     Field::new(
-                        S3_VECTOR_EMBEDDING_NAME,
+                        "body_embedding",
                         DataType::new_fixed_size_list(DataType::Float32, 10, false),
                         false,
                     ),
@@ -672,6 +686,105 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, score from my_vectored_table WHERE a_number > 0 ORDER BY score desc LIMIT 5",
             "query_table_no_join_for_metadata_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_vector_query_index_multicolumn_pk() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk1", DataType::Int64, false),
+            Field::new("pk2", DataType::Boolean, false),
+            Field::new("pk3", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorQueryTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            vector_index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                ],
+                Schema::new(vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+            query: "just a query".to_string(),
+            pre_limit: None,
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_basic_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_join_for_projection_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_join_for_projection_use_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY score desc LIMIT 5",
+            "query_table_join_for_filter_use_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, not_where, score from my_vectored_table ORDER BY score desc LIMIT 5",
+            "query_table_no_join_for_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, score from my_vectored_table WHERE a_number > 0 ORDER BY score desc LIMIT 5",
+            "query_table_no_join_for_metadata_filter_multiple_pk",
         )
         .await?;
 

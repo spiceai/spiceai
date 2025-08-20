@@ -101,6 +101,11 @@ pub enum Error {
         "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified for a given dataset.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     ))]
     MultipleRefreshExpressionSpecified,
+
+    #[snafu(display(
+        "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
+    ))]
+    ChunkingNotSupportedForVectorEngine { column: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -350,6 +355,7 @@ impl Dataset {
         self.schema.clone()
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {

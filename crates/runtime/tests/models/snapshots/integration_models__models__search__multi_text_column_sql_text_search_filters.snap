@@ -5,8 +5,8 @@ snapshot_kind: text
 ---
 [
   {
-    "cp_catalog_page_sk": 1,
-    "trunc(text_search().score,Int64(3))": 8.125,
-    "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+    "id": 890,
+    "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume.",
+    "score": 7.522
   }
 ]
