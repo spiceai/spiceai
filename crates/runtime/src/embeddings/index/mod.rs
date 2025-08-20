@@ -20,7 +20,6 @@ use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
 use async_trait::async_trait;
 use data_components::s3_vectors::MetadataColumns;
-use snafu::ResultExt;
 
 use datafusion::{
     catalog::TableProvider, error::DataFusionError, logical_expr::LogicalPlan, prelude::Expr,

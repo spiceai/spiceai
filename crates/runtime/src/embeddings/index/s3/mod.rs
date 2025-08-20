@@ -22,7 +22,6 @@ use data_components::s3_vectors::{
 };
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
-use runtime_datafusion_index::Index;
 use s3_vectors::{Client, S3Vectors};
 use search::generation::util::get_primary_keys;
 use snafu::ResultExt;

@@ -58,7 +58,7 @@ pub enum Error {
     #[snafu(display(
         "Cannot write to '{index}' index, an issue processing arrow records: {source}."
     ))]
-    ArrowError {
+    IssueWithArrowProcessing {
         index: String,
         source: arrow::error::ArrowError,
     },
@@ -66,7 +66,7 @@ pub enum Error {
     #[snafu(display(
         "Cannot write to '{index}' index, an issue processing JSON values: {source}."
     ))]
-    JsonError {
+    IssueWithJsonProcessing {
         index: String,
         source: serde_json::Error,
     },
@@ -121,8 +121,10 @@ pub async fn write(index: &S3Vector, record: &RecordBatch) -> Result<(), Error> 
     .await?;
 
     let metadata =
-        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), record)?;
-    let primary_key = extract_and_format_primary_key(index.name(), &index.primary_key, record)?;
+        extract_and_format_metadata(index.name(), &index.metadata_columns.all_names(), record)
+            .map_err(|e| *e)?;
+    let primary_key =
+        extract_and_format_primary_key(index.name(), &index.primary_key, record).map_err(|e| *e)?;
 
     if primary_key.len() != embedding_vectors.len() {
         return LengthMismatchSnafu {
@@ -165,7 +167,7 @@ pub fn extract_and_format_primary_key(
     index_name: &str,
     primary_key: &[Field],
     record: &RecordBatch,
-) -> Result<Vec<Option<String>>, Error> {
+) -> Result<Vec<Option<String>>, Box<Error>> {
     let schema = record.schema();
     match primary_key {
         [f] => {
@@ -174,7 +176,8 @@ pub fn extract_and_format_primary_key(
                     index: index_name.to_string(),
                     column: f.name().clone(),
                 }
-                .fail();
+                .fail()
+                .map_err(Box::from);
             };
             let c = record.column(i);
 
@@ -184,25 +187,26 @@ pub fn extract_and_format_primary_key(
             }
 
             // Otherwise cast to UTF8.
-            let string_arr =
-                arrow::compute::cast(&c, &arrow_schema::DataType::Utf8).context(ArrowSnafu {
+            let string_arr = arrow::compute::cast(&c, &arrow_schema::DataType::Utf8).context(
+                IssueWithArrowProcessingSnafu {
                     index: index_name.to_string(),
-                })?;
+                },
+            )?;
             let Some(data) = convert_string_arrow_to_iterator!(string_arr) else {
-                return Err(Error::FailedToSerializePrimaryKey {
+                return Err(Box::from(Error::FailedToSerializePrimaryKey {
                     index: index_name.to_string(),
                     source: Box::from(format!(
                         "could not cast a '{}' column (column '{}') into string type",
                         f.data_type(),
                         f.name()
                     )),
-                });
+                }));
             };
             Ok(to_string_vec(data))
         }
-        [] => Err(Error::NoPrimaryKeyField {
+        [] => Err(Box::from(Error::NoPrimaryKeyField {
             index: index_name.to_string(),
-        }),
+        })),
         _ => {
             let mut primary_key_projection = vec![];
             for field in primary_key {
@@ -211,26 +215,30 @@ pub fn extract_and_format_primary_key(
                         index: index_name.to_string(),
                         column: field.name().clone(),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Box::from);
                 };
                 primary_key_projection.push(idx);
             }
-            let pk = record
-                .project(&primary_key_projection)
-                .context(ArrowSnafu {
-                    index: index_name.to_string(),
-                })?;
+            let pk =
+                record
+                    .project(&primary_key_projection)
+                    .context(IssueWithArrowProcessingSnafu {
+                        index: index_name.to_string(),
+                    })?;
 
             let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-            writer.write_batches(&[&pk]).context(ArrowSnafu {
-                index: index_name.to_string(),
-            })?;
-            writer.finish().context(ArrowSnafu {
+            writer
+                .write_batches(&[&pk])
+                .context(IssueWithArrowProcessingSnafu {
+                    index: index_name.to_string(),
+                })?;
+            writer.finish().context(IssueWithArrowProcessingSnafu {
                 index: index_name.to_string(),
             })?;
 
             let values = serde_json::from_reader::<_, Vec<Value>>(writer.into_inner().as_slice())
-                .context(JsonSnafu {
+                .context(IssueWithJsonProcessingSnafu {
                 index: index_name.to_string(),
             })?;
 
@@ -238,9 +246,10 @@ pub fn extract_and_format_primary_key(
                 .into_iter()
                 .map(|v| serde_json::to_string(&v).map(Some))
                 .collect::<Result<Vec<_>, _>>()
-                .context(JsonSnafu {
+                .context(IssueWithJsonProcessingSnafu {
                     index: index_name.to_string(),
                 })
+                .map_err(Box::from)
         }
     }
 }
@@ -249,7 +258,7 @@ pub fn extract_and_format_metadata(
     index_name: &str,
     metadata_columns: &[String],
     record: &RecordBatch,
-) -> Result<HashMap<String, Vec<Option<Value>>>, Error> {
+) -> Result<HashMap<String, Vec<Option<Value>>>, Box<Error>> {
     let schema = record.schema();
     let mut metadata_projection = vec![];
     for name in metadata_columns {
@@ -258,7 +267,8 @@ pub fn extract_and_format_metadata(
                 index: index_name.to_string(),
                 column: name,
             }
-            .fail();
+            .fail()
+            .map_err(Box::from);
         };
         metadata_projection.push(idx);
     }
