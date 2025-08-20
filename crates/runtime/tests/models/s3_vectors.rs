@@ -57,7 +57,7 @@ mod search {
         );
 
         // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u16>() % 10000);
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         test_dataset.vectors = Some(new_s3_vector_store(
             "spice-ci-tests-s3-vectors-basic",
@@ -104,7 +104,7 @@ mod search {
         let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
 
         // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u16>() % 10000);
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         test_dataset.vectors = Some(new_s3_vector_store(
             "spice-ci-tests-s3-vectors-filters-pushdown",
@@ -170,8 +170,7 @@ mod search {
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
         // Generate a unique index name so the same test can be run in parallel
-        // let index_name = format!("test-index-{}", rand::random::<u16>() % 11);
-        let index_name = format!("test-index-14");
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         for (data_path, test_name) in [
             ("update/data_v1.json", "data_v1"),
