@@ -20,7 +20,8 @@ use async_openai::types::{
 use async_trait::async_trait;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
-use std::{fmt::Debug, sync::Arc};
+use std::{any, fmt::Debug, sync::Arc};
+use crate::embeddings::Error::UnsupportedSyncInvocation;
 
 pub mod candle;
 
@@ -115,6 +116,9 @@ pub enum Error {
 
     #[snafu(display("Unsupported embedding input for {model}: {message}"))]
     UnsupportedEmbeddingInput { model: String, message: String },
+
+    #[snafu(display("Model {model} does not support sync invocations."))]
+    UnsupportedSyncInvocation { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -133,6 +137,13 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 #[async_trait]
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    fn embed_sync(&self, _input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        let name = any::type_name::<Self>();
+        Err(UnsupportedSyncInvocation { model: name.to_string() })
+    }
+
+    fn supports_sync_embeddings(&self) -> bool { false }
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].

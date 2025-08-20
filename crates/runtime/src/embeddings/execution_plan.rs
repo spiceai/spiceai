@@ -38,11 +38,12 @@ use llms::chunking::Chunker;
 use llms::embeddings::Embed;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, sync::Arc, thread};
 
 use std::fmt;
+use futures::future;
 use tokio::sync::RwLock;
-
+use tokio::task;
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 
@@ -261,6 +262,7 @@ pub(crate) async fn compute_additional_embedding_columns(
         } = cfg;
         tracing::trace!("Embedding column '{col}' with model {model_name}");
         let read_guard = embedding_models.read().await;
+
         let Some(model) = read_guard.get(model_name) else {
             tracing::debug!(
                 "When embedding col='{col}', model {model_name} expected, but not found"
@@ -290,7 +292,12 @@ pub(crate) async fn compute_additional_embedding_columns(
 
             Arc::new(vectors) as ArrayRef
         } else {
-            let fixed_size_array = get_vectors(arr_iter, &**model, cfg.vector_size).await?;
+            let fixed_size_array = if model.supports_sync_embeddings() {
+                get_vectors_in_process(arr_iter, Arc::clone(&model), cfg.vector_size).await?
+            } else {
+                get_vectors(arr_iter, &**model, cfg.vector_size).await?
+            };
+
             tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
@@ -395,6 +402,59 @@ pub(super) async fn get_vectors(
         null_ptr += 1;
         output_ptr += 1;
         builder.append(false);
+    }
+
+    Ok(builder.finish())
+}
+
+pub(super) async fn get_vectors_in_process(
+    arr: impl Iterator<Item = Option<&str>>,
+    model: Arc<dyn Embed>,
+    vector_length: i32,
+) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let inputs: Vec<Option<String>> = arr.map(|o| o.map(ToString::to_string)).collect();
+
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(
+            inputs.len() * (vector_length as usize),
+        ),
+        vector_length,
+        inputs.len(),
+    ).with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+
+    for batch in inputs.chunks(1000) {
+        let batch = batch.to_vec();
+
+        let tasks: Vec<_> = batch.into_iter().map(|o| task::spawn_blocking({
+            let task_model = Arc::clone(&model);
+
+            move || {
+                match o.clone() {
+                    Some(input) if input.is_empty() => {
+                        None
+                    }
+                    Some(input) => {
+                        task_model
+                            .embed_sync(EmbeddingInput::String(input))
+                            .ok()
+                    }
+                    _ => None
+                }
+            }
+        })).collect();
+
+        for result in future::join_all(tasks).await {
+            match result {
+                Ok(Some(embedding)) => {
+                    builder.values().append_slice(&embedding[0]);
+                    builder.append(true);
+                }
+                _ => {
+                    builder.values().append_nulls(vector_length as usize);
+                    builder.append(false);
+                }
+            }
+        }
     }
 
     Ok(builder.finish())

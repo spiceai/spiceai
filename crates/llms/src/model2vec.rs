@@ -54,6 +54,10 @@ impl Debug for Model2Vec {
 #[async_trait]
 impl Embed for Model2Vec {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+        self.embed_sync(input)
+    }
+
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
         match input {
             EmbeddingInput::String(s) =>
                 Ok(vec![self.model.encode_single(&s)]),
@@ -63,6 +67,10 @@ impl Embed for Model2Vec {
                 UnsupportedEmbeddingInput { model: self.name.clone(), message: "Model2Vec models only support strings or vectors of strings".to_string() }
             ),
         }
+    }
+
+    fn supports_sync_embeddings(&self) -> bool {
+        true
     }
 
     fn size(&self) -> i32 {

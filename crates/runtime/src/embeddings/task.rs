@@ -87,6 +87,14 @@ impl Embed for TaskEmbed {
         self.inner.chunker(cfg)
     }
 
+    fn supports_sync_embeddings(&self) -> bool {
+        self.inner.supports_sync_embeddings()
+    }
+
+    fn embed_sync(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+        self.inner.embed_sync(input)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     async fn embed_request<'b>(
         &'b self,
