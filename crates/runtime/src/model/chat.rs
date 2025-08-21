@@ -40,7 +40,7 @@ use crate::{
     tools::{options::SpiceToolsOptions, utils::get_tools},
 };
 
-pub type LLMModelStore = HashMap<String, Arc<dyn Chat>>;
+pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
 // Default recursion limit for tool usage to prevent infinite loops.
 // This limit can be adjusted using the `tool_recursion_limit` model parameter.

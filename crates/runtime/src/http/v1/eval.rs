@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
-    model::{EvalScorerRegistry, LLMModelStore, handle_eval_run, sql_query_for},
+    model::{EvalScorerRegistry, LLMChatCompletionsModelStore, handle_eval_run, sql_query_for},
     request::{AsyncMarker, RequestContext},
 };
 
@@ -92,7 +92,7 @@ pub(crate) struct RunEval {
     )
 ))]
 pub(crate) async fn post(
-    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
     accept: Option<TypedHeader<Accept>>,

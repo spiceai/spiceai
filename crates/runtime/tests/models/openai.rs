@@ -27,11 +27,16 @@ use crate::{
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
+use async_openai::Client as OpenAIClient;
+use async_openai::config::OpenAIConfig;
+use async_openai::types::responses::{CreateResponseArgs, OutputContent, ResponseEvent, Status};
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, EmbeddingInput,
+    responses::{Content, Response as OpenAIResponse},
 };
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
@@ -477,6 +482,158 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
             verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
             verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+
+            Ok(())
+        })
+        .await
+}
+
+fn extract_text(response: &OpenAIResponse) -> Option<String> {
+    response
+        .output
+        .first()
+        .and_then(|out| {
+            if let OutputContent::Message(msg) = out {
+                msg.content.first()
+            } else {
+                None
+            }
+        })
+        .and_then(|content| match content {
+            Content::OutputText(output_text) => Some(output_text.text.clone()),
+            Content::Refusal(_) => None,
+        })
+}
+
+#[tokio::test]
+async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .build()?;
+
+            let response = openai_client.responses().create(request).await?;
+            let text = extract_text(&response);
+            assert_eq!(response.model, "openai_model".to_string());
+            assert!(text.is_some());
+            assert_eq!(response.status, Status::Completed);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+            let mut failure = false;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseEvent::ResponseCompleted(_) => {
+                            break;
+                        }
+                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                            failure = true;
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            // Check that we received a non-empty response
+            assert!(!final_response.is_empty());
+            // Check that we didn't fail at any point while streaming
+            assert!(!failure);
+            // Check that we received more than 1 delta, indicating streaming
+            assert!(delta_count > 1);
 
             Ok(())
         })

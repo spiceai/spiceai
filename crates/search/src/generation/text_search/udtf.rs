@@ -109,12 +109,7 @@ impl TextSearchIndexProvider {
     // - `SEARCH_SCORE_COLUMN_NAME`
     // - Search column (avoid duplicating from index).
     fn projection_for_underlying(&self, projection: Option<&Vec<usize>>) -> Vec<usize> {
-        // let search_column_idx = self
-        //     .schema()
-        //     .column_with_name(&self.column)
-        //     .map(|(idx, _)| idx);
-
-        let search_column_is_pk: bool = false; //  = self.index.column_is_pk(&self.column);
+        let search_column_is_pk = self.index.column_is_part_of_pk(&self.column);
 
         // Continue to include the search column if the search column is the primary key
         // This retains the column for the later table join operations

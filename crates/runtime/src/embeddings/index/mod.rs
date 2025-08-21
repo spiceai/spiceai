@@ -19,6 +19,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Fields, SchemaRef};
 use async_trait::async_trait;
+
 use data_components::s3_vectors::MetadataColumns;
 
 use datafusion::{
@@ -60,8 +61,8 @@ pub trait VectorIndex: std::fmt::Debug + Send + Sync {
     /// Update the index based on a [`RecordBatch`] from the underlying table.
     async fn write(
         &self,
-        record: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
 
     /// A [`TableProvider`] containing the [`VectorIndex::primary_fields`], additional metadata
     /// columns, the associated embedding vectors of the [`VectorIndex::embedded_column`] and the
@@ -372,9 +373,9 @@ pub mod tests {
 
         async fn write(
             &self,
-            _record: &RecordBatch,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
+            record: RecordBatch,
+        ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(record)
         }
 
         async fn query_table_provider(

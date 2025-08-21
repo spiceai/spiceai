@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
+use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
@@ -585,6 +586,10 @@ impl Drop for AcceleratedTable {
 impl TableProvider for AcceleratedTable {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.accelerator.constraints()
     }
 
     fn schema(&self) -> SchemaRef {

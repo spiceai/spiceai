@@ -34,7 +34,7 @@ use tracing_futures::Instrument;
 
 use crate::datafusion::DataFusion;
 
-use super::{EvalScorerRegistry, LLMModelStore, Scorer};
+use super::{EvalScorerRegistry, LLMChatCompletionsModelStore, Scorer};
 
 pub(crate) mod dataset;
 pub(crate) mod result;
@@ -174,7 +174,7 @@ pub async fn handle_eval_run(
     eval: &Eval,
     model_name: String,
     df: Arc<DataFusion>,
-    llms: Arc<RwLock<LLMModelStore>>,
+    llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     scorer_registry: EvalScorerRegistry,
 ) -> Result<EvalRunId> {
     let span = tracing::span!(
@@ -213,7 +213,7 @@ pub async fn handle_eval_run(
 #[allow(clippy::implicit_hasher)]
 async fn run_eval(
     id: &EvalRunId,
-    llm_store: Arc<RwLock<LLMModelStore>>,
+    llm_store: Arc<RwLock<LLMChatCompletionsModelStore>>,
     model_name: String,
     eval: &Eval,
     df: Arc<DataFusion>,
