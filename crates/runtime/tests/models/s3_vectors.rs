@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use aws_config::{BehaviorVersion, Region};
+use aws_credential_types::Credentials;
+use s3_vectors::Client;
+use snafu::ResultExt;
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::Dataset,
@@ -24,9 +28,13 @@ use spicepod::{
 mod search {
     use crate::{
         configure_test_datafusion,
-        models::{hf::get_huggingface_embeddings, search::item_tpcds_dataset_w_embeddings},
+        models::{
+            hf::get_huggingface_embeddings, s3_vectors::delete_index,
+            search::item_tpcds_dataset_w_embeddings,
+        },
         utils::verify_env_secret_exists,
     };
+
     use app::AppBuilder;
     use spicepod::vector::VectorStore;
     use std::sync::Arc;
@@ -105,11 +113,12 @@ mod search {
 
         // Generate a unique index name for each test run
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+        let bucket_name = "spice-ci-tests-s3-vectors-filters-pushdown";
+        test_dataset.vectors = Some(new_s3_vector_store(bucket_name, &index_name));
 
-        test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-tests-s3-vectors-filters-pushdown",
-            &index_name,
-        ));
+        delete_index(bucket_name, index_name.as_str())
+            .await
+            .expect("failed to delete index {} before test. ");
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
@@ -125,7 +134,7 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
-            SELECT 
+            SELECT
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
@@ -142,7 +151,7 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
-            explain SELECT 
+            explain SELECT
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
@@ -170,6 +179,7 @@ mod search {
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
         // Generate a unique index name so the same test can be run in parallel
+        let bucket_name = "spice-ci-tests-s3-vectors-overwrite";
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         for (data_path, test_name) in [
@@ -178,10 +188,11 @@ mod search {
         ] {
             let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
 
-            ds.vectors = Some(new_s3_vector_store(
-                "spice-ci-tests-s3-vectors-overwrite",
-                &index_name,
-            ));
+            ds.vectors = Some(new_s3_vector_store(bucket_name, &index_name));
+
+            delete_index(bucket_name, index_name.as_str())
+                .await
+                .expect("failed to delete index {} before test. ");
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
@@ -328,6 +339,36 @@ pub fn get_package_delivery_dataset(
     ];
 
     dataset
+}
+
+async fn delete_index(
+    bucket_name: &str,
+    index_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+        .region(Region::from_static("us-east-2"))
+        .credentials_provider(Credentials::new(
+            std::env::var("AWS_S3_VECTORS_KEY").ok().unwrap_or_default(),
+            std::env::var("AWS_S3_VECTORS_SECRET")
+                .ok()
+                .unwrap_or_default(),
+            None,
+            None,
+            "S3Vectors",
+        ))
+        .load()
+        .await;
+
+    let s3_vector_client = Client::new(&config);
+    s3_vector_client
+        .delete_index()
+        .set_index_name(Some(index_name.to_string()))
+        .set_vector_bucket_name(Some(bucket_name.to_string()))
+        .send()
+        .await
+        .boxed()?;
+
+    Ok(())
 }
 
 fn vectors_filterable_col(name: &str) -> Column {
