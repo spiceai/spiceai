@@ -190,23 +190,6 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         }
 
-        // Do not use [`VectorIndex::embedded_column`] from index.
-        // [`VectorScanTableProvider`] is used to populate RecordBatch in
-        // [`runtime_datafusion_index::Index::compute_index`]. On initial indexing into the index,
-        // we would get NULL values from [`VectorIndex`], we must use underlying instead.
-        let embedding_column = self.index.embedded_column();
-        let metadata_columns_from_index: Vec<_> = self
-            .index
-            .metadata_columns()
-            .iter()
-            .filter_map(|c| {
-                if c.name() == embedding_column {
-                    None
-                } else {
-                    Some(c.name().to_string())
-                }
-            })
-            .collect();
         let mut proj = self
             .index
             .primary_fields()
@@ -218,12 +201,6 @@ impl TableProvider for VectorScanTableProvider {
                 ))
             })
             .collect::<Vec<_>>();
-        proj.extend(metadata_columns_from_index.iter().map(|c| {
-            Expr::Column(Column::new(
-                Some(TableReference::parse_str("vector_index")),
-                c.clone(),
-            ))
-        }));
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
             embedding_col!(self.index.embedded_column()),
@@ -258,14 +235,8 @@ impl TableProvider for VectorScanTableProvider {
                 vector_table_scan
             }
         } else {
-            let underlying_table_scan = LogicalPlan::TableScan(self.underlying_table_scan(
-                Some(&projection_without_columns(
-                    self.schema().fields(),
-                    &metadata_columns_from_index,
-                    projection,
-                )),
-                filters,
-            )?);
+            let underlying_table_scan =
+                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
             let join_schema = vector_table_scan
                 .schema()
