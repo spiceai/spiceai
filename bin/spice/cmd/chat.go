@@ -108,6 +108,62 @@ type ChatCompletion struct {
 	Usage             *Usage   `json:"usage"`
 }
 
+type ResponsesRequestBody struct {
+	Model  string `json:"model"`
+	Input  string `json:"input"`
+	Stream *bool  `json:"stream,omitempty"`
+}
+
+func NewResponsesRequestBody(model string, input string, stream bool) *ResponsesRequestBody {
+	return &ResponsesRequestBody{
+		Model:  model,
+		Input:  input,
+		Stream: &stream,
+	}
+}
+
+// ResponseOutput represents the main output structure
+type ResponseOutput struct {
+	Type    string                 `json:"type"`
+	ID      string                 `json:"id"`
+	Status  string                 `json:"status"`
+	Role    string                 `json:"role"`
+	Content []ResponseContentBlock `json:"content"`
+}
+
+// ResponseContentBlock represents individual content blocks
+type ResponseContentBlock struct {
+	Type        string   `json:"type"`
+	Text        string   `json:"text"`
+	Annotations []string `json:"annotations"`
+}
+
+// ResponseUsageDetails represents detailed token usage information
+type ResponseUsageDetails struct {
+	CachedTokens    int `json:"cached_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// ResponseUsage represents usage statistics
+type ResponseUsage struct {
+	InputTokens         int                   `json:"input_tokens"`
+	InputTokensDetails  *ResponseUsageDetails `json:"input_tokens_details"`
+	OutputTokens        int                   `json:"output_tokens"`
+	OutputTokensDetails *ResponseUsageDetails `json:"output_tokens_details"`
+	TotalTokens         int                   `json:"total_tokens"`
+}
+
+// ResponsesAPIResponse represents the complete response from the Responses API
+type ResponsesAPIResponse struct {
+	ID        string           `json:"id"`
+	Object    string           `json:"object"`
+	CreatedAt int64            `json:"created_at"`
+	Status    string           `json:"status"`
+	Model     string           `json:"model"`
+	Output    []ResponseOutput `json:"output"`
+	Usage     *ResponseUsage   `json:"usage"`
+}
+
 type Usage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	PromptTokens     int `json:"prompt_tokens"`
@@ -243,7 +299,88 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 		}
 
-		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
+		// Check if responses API should be used
+		useResponsesAPI, err := cmd.Flags().GetBool("responses")
+		if err != nil {
+			slog.Error("could not get responses flag", "error", err)
+			os.Exit(1)
+		}
+
+		// Handler for Responses API - handles non-streaming responses
+		handleResponsesAPI := func(messages []Message, useSpinner bool) ([]Message, error) {
+			// Convert message history to input string for Responses API
+			input := messagesToInput(messages)
+
+			// Show spinner if requested
+			var done chan bool
+			if useSpinner {
+				done = make(chan bool)
+				go func() {
+					util.ShowSpinner(done)
+				}()
+			}
+
+			body := NewResponsesRequestBody(model, input, false) // No streaming for responses API
+
+			startTime := time.Now()
+			response, err := sendResponsesRequest(rtcontext, body)
+			if err != nil {
+				if useSpinner {
+					done <- true
+				}
+				slog.Error("failed to send responses request to spiced", "error", err)
+				return messages, fmt.Errorf("failed to send responses request: %w", err)
+			}
+			defer response.Body.Close()
+
+			if useSpinner {
+				done <- true
+			}
+
+			// Parse the non-streaming response
+			var responsesResponse ResponsesAPIResponse
+			decoder := json.NewDecoder(response.Body)
+			err = decoder.Decode(&responsesResponse)
+			if err != nil {
+				slog.Error("failed to decode responses response", "error", err)
+				return messages, fmt.Errorf("failed to decode responses response: %w", err)
+			}
+
+			endTime := time.Now()
+			duration := endTime.Sub(startTime)
+
+			// Extract text from the response output
+			var responseMessage string
+			for _, output := range responsesResponse.Output {
+				for _, content := range output.Content {
+					if content.Type == "output_text" {
+						responseMessage += content.Text
+					}
+				}
+			}
+
+			// Print the response
+			cmd.Printf("%s", responseMessage)
+
+			if responseMessage != "" {
+				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+			}
+
+			// Show usage information
+			if responsesResponse.Usage != nil {
+				cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
+					responsesResponse.Usage,
+					duration,
+				))
+			} else {
+				cmd.Print("\n\n")
+			}
+
+			return messages, nil
+		}
+
+		// Handler for Chat Completions API - handles streaming responses
+		handleChatCompletions := func(messages []Message, useSpinner bool) ([]Message, error) {
 			// Only create these variables if using spinner
 			var done chan bool
 			var doneLoading bool
@@ -353,6 +490,14 @@ spice chat --model <model> "What is Spice.ai?"
 			return messages, nil
 		}
 
+		// Main message handler that delegates to the appropriate API handler
+		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
+			if useResponsesAPI {
+				return handleResponsesAPI(messages, useSpinner)
+			}
+			return handleChatCompletions(messages, useSpinner)
+		}
+
 		if len(args) > 0 {
 			userMessage := args[0]
 
@@ -427,6 +572,43 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	return rtcontext.Do("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
+func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequestBody) (*http.Response, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request body: %w", err)
+	}
+	return rtcontext.Do("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+}
+
+// messagesToInput converts a message history into a single input string for the Responses API
+func messagesToInput(messages []Message) string {
+	var parts []string
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user":
+			parts = append(parts, fmt.Sprintf("User: %s", msg.Content))
+		case "assistant":
+			parts = append(parts, fmt.Sprintf("Assistant: %s", msg.Content))
+		case "system":
+			parts = append(parts, fmt.Sprintf("System: %s", msg.Content))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// generateResponsesUsageMessage generates a usage message for Responses API statistics
+func generateResponsesUsageMessage(u *ResponseUsage, totalTime time.Duration) string {
+	times := fmt.Sprintf("Time: %.2fs.", totalTime.Seconds())
+	if u == nil {
+		return times
+	}
+
+	tps := float64(u.OutputTokens) / totalTime.Seconds()
+	return fmt.Sprintf(
+		"%s Tokens: %d. Input: %d. Output: %d (%.2f/s).", times, u.TotalTokens, u.InputTokens, u.OutputTokens, tps,
+	)
+}
+
 func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
 	if strings.HasPrefix(chunk, "event: error") {
 		scanner.Scan() // read line with error message
@@ -448,6 +630,7 @@ func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error)
 func init() {
 	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
+	chatCmd.Flags().Bool("responses", false, "Whether to use the responses API for all completions")
 
 	RootCmd.AddCommand(chatCmd)
 }

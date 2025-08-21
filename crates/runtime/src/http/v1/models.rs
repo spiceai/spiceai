@@ -23,6 +23,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use csv::Writer;
+use llms::responses::Responses;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -40,6 +41,10 @@ pub struct ModelsQueryParams {
     /// If true, includes the status of each model in the response.
     #[serde(default)]
     pub status: bool,
+
+    /// If true, includes only models that support the responses API
+    #[serde(default)]
+    pub responses: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,6 +125,7 @@ text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",r
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
+    Extension(responses_models): Extension<Arc<RwLock<HashMap<String, Arc<dyn Responses>>>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
     let statuses = if params.status {
@@ -127,10 +133,23 @@ pub(crate) async fn get(
     } else {
         HashMap::default()
     };
-    let models = match app.read().await.as_ref() {
+
+    let responses_models = if params.responses {
+        let guard = responses_models.read().await;
+        Some(guard.keys().cloned().collect::<Vec<_>>())
+    } else {
+        None
+    };
+
+    let mut models = match app.read().await.as_ref() {
         Some(a) => a
             .models
             .iter()
+            .filter(|model| {
+                responses_models
+                    .as_ref()
+                    .is_some_and(|r| r.contains(&&model.name))
+            })
             .map(|m| {
                 let d = if m.datasets.is_empty() {
                     None
@@ -155,27 +174,28 @@ pub(crate) async fn get(
         }
     };
 
-    let worker_statuses = if params.status {
-        rt.status.get_worker_statuses()
-    } else {
-        HashMap::default()
-    };
-    let worker_registry = rt.workers.read().await;
-    let workers = worker_registry
-        .iter()
-        .filter_map(|(name, worker)| {
-            Arc::clone(worker).as_model()?;
-            Some(OpenAIModel {
-                id: name.clone(),
-                object: "model".to_string(),
-                owned_by: "spiceai".to_string(),
-                datasets: None,
-                status: worker_statuses.get(name).copied(),
+    if !params.responses {
+        let worker_statuses = if params.status {
+            rt.status.get_worker_statuses()
+        } else {
+            HashMap::default()
+        };
+        let worker_registry = rt.workers.read().await;
+        let workers = worker_registry
+            .iter()
+            .filter_map(|(name, worker)| {
+                Arc::clone(worker).as_model()?;
+                Some(OpenAIModel {
+                    id: name.clone(),
+                    object: "model".to_string(),
+                    owned_by: "spiceai".to_string(),
+                    datasets: None,
+                    status: worker_statuses.get(name).copied(),
+                })
             })
-        })
-        .collect::<Vec<OpenAIModel>>();
-
-    let models = [workers, models].concat().clone();
+            .collect::<Vec<OpenAIModel>>();
+        models.extend(workers.into_iter());
+    }
 
     match params.format {
         Format::Json => (
