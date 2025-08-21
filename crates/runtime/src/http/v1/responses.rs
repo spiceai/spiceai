@@ -5,8 +5,8 @@ use crate::http::{
     v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response},
 };
 use async_openai::types::responses::{
-    Content, CreateResponse, OutputContent, OutputMessage, Response as OpenAIResponse,
-    ResponseCompleted, ResponseEvent, ResponseIncomplete, ResponseStream,
+    Content, CreateResponse, OutputContent, Response as OpenAIResponse, ResponseEvent,
+    ResponseStream,
 };
 use axum::{
     Extension, Json,
@@ -30,12 +30,16 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
         .iter()
         .filter_map(|out| {
-            let OutputContent::Message(OutputMessage { content, .. }) = out else {
-                return None;
-            };
-            match content.first()? {
-                Content::OutputText(output_text) => Some(output_text.text.clone()),
-                Content::Refusal(_) => None,
+            if let OutputContent::Message(msg) = out {
+                msg.content.first().and_then(|c| {
+                    if let Content::OutputText(text) = c {
+                        Some(text.text.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
             }
         })
         .join("\n")
@@ -139,12 +143,15 @@ pub(crate) async fn post(
 
     override_task_history_with_traceparent(&span.clone(), &headers);
 
+    tracing::debug!("called");
+
     let span_clone = span.clone();
     async move {
         let model_id = req.model.clone();
         let stream = req.stream.unwrap_or(false);
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {
+            tracing::debug!("model not found: {}", model_id);
             return (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response();
         };
 
@@ -153,8 +160,12 @@ pub(crate) async fn post(
             create_response_sse_response(model, req, span_clone).await
         } else {
             // Non-streaming response
+            tracing::debug!(
+                "non streaming response"
+            );
             match model.responses_request(req).await {
                 Ok(response) => {
+                    tracing::debug!("response: {:?}", response);
                     let message = extract_text(&response);
                     if !message.is_empty() {
                         tracing::info!(target: "task_history", parent: &span_clone, captured_output = %message);
@@ -164,6 +175,7 @@ pub(crate) async fn post(
                     Json(response).into_response()
                 }
                 Err(e) => {
+                    tracing::debug!("{e:?}");
                     tracing::error!(target: "task_history", parent: &span_clone, "{e}");
 
                     openai_error_to_response(e)
@@ -209,16 +221,15 @@ async fn create_response_sse_response(
                                     captured_output.push_str(&delta.delta);
                                     false
                                 }
-                                ResponseEvent::ResponseIncomplete(ResponseIncomplete {
-                                    sequence_number,
-                                    ..
-                                })
-                                | ResponseEvent::ResponseCompleted(ResponseCompleted {
-                                    sequence_number,
-                                    ..
-                                }) => {
+                                ResponseEvent::ResponseCompleted(resp) => {
                                     if id.is_none() {
-                                        id = Some(*sequence_number);
+                                        id = Some(resp.sequence_number);
+                                    }
+                                    true
+                                }
+                                ResponseEvent::ResponseIncomplete(resp) => {
+                                    if id.is_none() {
+                                        id = Some(resp.sequence_number);
                                     }
                                     true
                                 }

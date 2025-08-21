@@ -23,7 +23,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] =
         COMMON_MODEL_PARAMETERS,
     );
 
-const OPENAI_PARAM_LEN: usize = 5;
+const OPENAI_PARAM_LEN: usize = 6;
 
 pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint")
@@ -39,4 +39,7 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::component("usage_tier")
         .description("The current usage tier for the OpenAI account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.")
         .default("tier1"),
+    ParameterSpec::component("responses_tools")
+        .description("The OpenAI Responses tools to use when calling the model from the Responses API")
+        .default("")
 ];

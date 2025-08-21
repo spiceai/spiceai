@@ -168,6 +168,11 @@ pub enum Error {
         "Model '{from}' does not support the OpenAI Responses API. Change the model provider to 'openai' to use the Responses API or use the Chat Completions API."
     ))]
     ResponsesNotSupported { from: ModelSource },
+
+    #[snafu(display(
+        "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
+    ))]
+    ToolNotFound { tool: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
