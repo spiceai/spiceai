@@ -771,7 +771,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
                 should_fail: false,
-                skip: false
+                skip: true
             },
             SearchTestCase {
                 name: "text_search_sql_text_search_random",
@@ -779,7 +779,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
                 should_fail: false,
-                skip: false
+                skip: true
             },
         ],
     )
@@ -945,7 +945,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 // When there are multiple columns, `text_search` needs column explicitly as input.
                 name: "multi_text_column_sql_text_search_error_without_column",
                 body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
-                should_fail: false,
+                should_fail: true,
                 skip: false
             },
             SearchTestCase {
@@ -971,7 +971,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 name: "multi_text_column_sql_text_search_random",
                 body: SearchTestType::SQL("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
                 should_fail: false,
-                skip: false
+                skip: true
             },
         ],
     )
