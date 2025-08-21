@@ -20,6 +20,7 @@ use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
+use anyhow::Context;
 use app::{App, AppBuilder};
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
@@ -34,14 +35,31 @@ use spicepod::component::embeddings::EmbeddingChunkConfig;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
+pub enum SearchTestType {
+    HTTP(serde_json::Value),
+    SQL(&'static str),
+}
+
+impl Display for SearchTestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchTestType::HTTP(value) => write!(f, "{}", value.to_string()),
+            SearchTestType::SQL(query) => write!(f, "{query}"),
+        }
+    }
+}
+
 pub struct SearchTestCase {
     pub name: &'static str,
-    pub body: serde_json::Value,
+    pub body: SearchTestType,
+    pub should_fail: bool,
+    pub skip: bool,
 }
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
@@ -58,6 +76,7 @@ pub async fn run_search_test(
     base_url: &str,
     ts: &SearchTestCase,
     extra_headers: Option<HeaderMap>,
+    should_fail: bool,
 ) -> Result<(), anyhow::Error> {
     tracing::info!("Running test cases {}", ts.name);
 
@@ -67,26 +86,32 @@ pub async fn run_search_test(
 
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    match http_post(
+    let resp = http_post(
         &format!("{base_url}/v1/search").to_string(),
         &ts.body.to_string(),
         headers,
     )
-    .await
-    {
-        Ok(response_str) => {
-            let response = serde_json::from_str(&response_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
+    .await;
 
-            insta::assert_snapshot!(
-                format!("{}_response", ts.name),
-                normalize_search_response(response)
-            );
+    if should_fail {
+        if resp.is_ok() {
+            return Err(anyhow::anyhow!(format!(
+                "Test {} was expected to fail but succeeded",
+                ts.name
+            )));
         }
-        Err(e) => {
-            insta::assert_snapshot!(format!("{}_error_response", ts.name), e.to_string());
-        }
+
+        let err = resp.err().context("Test was expected to fail")?;
+        insta::assert_snapshot!(format!("{}_error_response", ts.name), err.to_string());
+        return Ok(());
     }
+
+    let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
+    insta::assert_snapshot!(
+        format!("{}_response", ts.name),
+        normalize_search_response(resp)
+    );
+
     Ok(())
 }
 
@@ -227,7 +252,6 @@ async fn start_app(app: App) -> Result<Config, anyhow::Error> {
 pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
-    test_sql_cases: Vec<(&str, &str)>,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -236,18 +260,34 @@ pub(crate) async fn run_search(
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             for ts in test_cases {
-                run_search_test(http_base_url.as_str(), &ts, None).await?;
-            }
-            for (sql_test_name, sql) in test_sql_cases {
-                match http_sql(http_base_url.as_str(), sql).await {
-                    Ok(resp) => {
-                        insta::assert_json_snapshot!(sql_test_name, resp);
+                if ts.skip {
+                    tracing::info!("Skipping test {}", ts.name);
+                    continue;
+                }
+
+                match ts.body {
+                    SearchTestType::HTTP(ref body) => {
+                        run_search_test(http_base_url.as_str(), &ts, None, ts.should_fail).await?;
                     }
-                    Err(e) => {
-                        insta::assert_snapshot!(
-                            format!("{sql_test_name}_error_response"),
-                            e.to_string()
-                        );
+                    SearchTestType::SQL(sql) => {
+                        let resp = http_sql(http_base_url.as_str(), sql).await;
+                        if ts.should_fail {
+                            if resp.is_ok() {
+                                return Err(anyhow::anyhow!(format!(
+                                    "Test {} was expected to fail but succeeded",
+                                    ts.name
+                                )));
+                            }
+
+                            let err = resp.err().context("Test was expected to fail")?;
+                            insta::assert_snapshot!(
+                                format!("{}_error_response", ts.name),
+                                err.to_string()
+                            );
+                            return Ok(());
+                        }
+
+                        insta::assert_json_snapshot!(ts.name, resp?);
                     }
                 }
             }
@@ -295,31 +335,36 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "multi_column_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
                     "datasets": ["multi_column_search"]
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
             SearchTestCase {
                 name: "multi_column_additional",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
                     "datasets": ["multi_column_search"],
                     "additional_columns": ["cp_catalog_number"],
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
             SearchTestCase {
                 name: "multi_column_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "datasets": ["multi_column_search"],
                     "where": "cp_catalog_page_sk % 2 = 1"
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
         ],
-        vec![],
     )
     .await
 }
@@ -342,17 +387,20 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 None,
                 Some(Column {
                     name: "answer".to_string(),
-                    embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }, ColumnLevelEmbeddingConfig {
-                        model: "openai_embeddings".into(),
-                        chunking: None,
-                        row_ids: Some(vec!["id".to_string()]),
-                        vector_size: None,
-                    }],
+                    embeddings: vec![
+                        ColumnLevelEmbeddingConfig {
+                            model: "hf_minilm".into(),
+                            chunking: None,
+                            row_ids: Some(vec!["id".to_string()]),
+                            vector_size: None,
+                        },
+                        ColumnLevelEmbeddingConfig {
+                            model: "openai_embeddings".into(),
+                            chunking: None,
+                            row_ids: Some(vec!["id".to_string()]),
+                            vector_size: None,
+                        },
+                    ],
                     description: None,
                     full_text_search: None,
                     metadata: HashMap::new(),
@@ -362,35 +410,44 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "multi_embeddings_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "multi_embeddings_additional_columns",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "multi_embeddings_with_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
                     "where": "subject!='math'",
                     "limit": 4,
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
-        ],
-        vec![(
-            "multi_embeddings_sql_vector_search",
-            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
-        ),
+            SearchTestCase {
+                name: "multi_embeddings_sql_vector_search",
+                body: SearchTestType::SQL(
+                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
         ],
     )
     .await
@@ -424,13 +481,14 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
         app,
         vec![SearchTestCase {
             name: "multi_column_no_pks_basic",
-            body: json!({
+            body: SearchTestType::HTTP(json!({
                 "text": "new patient",
                 "limit": 2,
                 "datasets": ["mulit_column_no_pks"]
-            }),
+            })),
+            should_fail: true,
+            skip: false,
         }],
-        vec![],
     )
     .await
 }
@@ -466,39 +524,52 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "hybrid_single_column_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "hybrid_single_column_additional_columns",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "hybrid_single_column_with_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
                     "where": "subject!='math'",
                     "limit": 4,
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
-        ],
-        vec![(
-            "hybrid_single_column_sql_text_search",
-            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-        ),
-        (
-            "hybrid_single_column_sql_vector_search",
-            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
-        ),
+            SearchTestCase {
+                name: "hybrid_single_column_sql_text_search",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "hybrid_single_column_sql_vector_search",
+                body: SearchTestType::SQL(
+                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
         ],
     )
     .await
@@ -541,47 +612,68 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "hybrid_multiple_column_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "hybrid_multiple_column_additional_columns",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "hybrid_multiple_column_with_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
                     "where": "subject!='math'",
                     "limit": 4,
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
-        ],
-        vec![(
-            "hybrid_multiple_column_sql_text_search",
-            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-        ),
-        (
-            "hybrid_multiple_column_sql_text_search_wrong_column",
-            "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
-        ),
-        (
-            "hybrid_multiple_column_sql_vector_search",
-            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4"
-        ),
-        (
-            "hybrid_multiple_column_sql_vector_search_wrong_column",
-            "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4"
-        ),
+            SearchTestCase {
+                name: "hybrid_multiple_column_sql_text_search",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "hybrid_multiple_column_sql_text_search_wrong_column",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4",
+                ),
+                should_fail: true,
+                skip: false
+            },
+            SearchTestCase {
+                name: "hybrid_multiple_column_sql_vector_search",
+                body: SearchTestType::SQL(
+                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "hybrid_multiple_column_sql_vector_search_wrong_column",
+                body: SearchTestType::SQL(
+                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+                ),
+                should_fail: true,
+                skip: false
+            },
         ],
     )
     .await
@@ -610,59 +702,85 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "text_search_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "text_search_additional_columns",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "text_search_with_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
                     "where": "subject!='math'",
                     "limit": 4,
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "text_search_basic_without_defined_dataset",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
-                })
-            }
-        ],
-        vec![
-            (
-                "text_search_sql_text_search_basic",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            ), (
-                "text_search_sql_text_search_projection",
-                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            ), (
-                "text_search_sql_text_search_filters",
-                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
-            ), (
-                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-
-                "text_search_sql_text_search_no_score",
-                "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            ),
-            (
-                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-                "text_search_sql_text_search_random",
-                "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
-            ),
+                })),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "text_search_sql_text_search_basic",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "text_search_sql_text_search_projection",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "text_search_sql_text_search_filters",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "text_search_sql_text_search_no_score",
+                body: SearchTestType::SQL(
+                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "text_search_sql_text_search_random",
+                body: SearchTestType::SQL(
+                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+                ),
+                should_fail: false,
+                skip: false
+            },
         ],
     )
     .await
@@ -690,19 +808,21 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
         vec![
             SearchTestCase {
                 name: "test_text_search_where_rowid_is_search_column_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "test_text_search_sql_where_rowid_is_search_column_basic",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
             }
-        ],
-        vec![
-            (
-                "test_text_search_sql_where_rowid_is_search_column_basic",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            )
-        ],
+        ]
     )
     .await
 }
@@ -729,18 +849,20 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
         vec![
             SearchTestCase {
                 name: "test_text_search_where_rowid_is_search_column_composite_pk_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "test_text_search_sql_where_rowid_is_search_column_composite_pk_basic",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
             }
-        ],
-        vec![
-            (
-                "test_text_search_sql_where_rowid_is_search_column_composite_pk_basic",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            )
         ],
     )
     .await
@@ -777,59 +899,80 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "multi_text_column_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "multi_text_column_additional_columns",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "second",
                     "limit": 4,
                     "datasets": ["qs"],
                     "additional_columns": ["question"],
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
             SearchTestCase {
                 name: "multi_text_column_with_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "secondary",
                     "datasets": ["qs"],
                     "where": "subject!='math'",
                     "limit": 4,
-                }),
+                })),
+                should_fail: false,
+                skip: false
             },
-        ],
-        vec![
-            (
-                "multi_text_column_sql_text_search_basic_answer",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
-            ), (
-                "multi_text_column_sql_text_search_basic_question",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"
-            ),
-            (
+            SearchTestCase {
+                name: "multi_text_column_sql_text_search_basic_answer",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "multi_text_column_sql_text_search_basic_question",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
                 // When there are multiple columns, `text_search` needs column explicitly as input.
-                "multi_text_column_sql_text_search_error_without_column",
-                "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"
-            ),
-            (
-                "multi_text_column_sql_text_search_projection",
-                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
-            ), (
-                "multi_text_column_sql_text_search_filters",
-                "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"
-            ), (
-                "multi_text_column_sql_text_search_no_score",
-                "SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
-            ),
-            (
+                name: "multi_text_column_sql_text_search_error_without_column",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "multi_text_column_sql_text_search_projection",
+                body: SearchTestType::SQL("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "multi_text_column_sql_text_search_filters",
+                body: SearchTestType::SQL("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
+                name: "multi_text_column_sql_text_search_no_score",
+                body: SearchTestType::SQL("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
+            SearchTestCase {
                 // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-                "multi_text_column_sql_text_search_random",
-                "SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"
-            ),
+                name: "multi_text_column_sql_text_search_random",
+                body: SearchTestType::SQL("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+                should_fail: false,
+                skip: false
+            },
         ],
     )
     .await
@@ -911,31 +1054,36 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
         vec![
             SearchTestCase {
                 name: "multi_embedding_parent_child_basic",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
                     "datasets": ["multiple_columns"]
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
             SearchTestCase {
                 name: "multi_embedding_parent_child_additional",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
                     "datasets": ["multiple_columns"],
                     "additional_columns": ["cp_catalog_number"],
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
             SearchTestCase {
                 name: "multi_embedding_parent_child_where",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "datasets": ["multiple_columns"],
                     "where": "cp_catalog_page_sk % 2 = 0"
-                }),
+                })),
+                should_fail: false,
+                skip: false,
             },
         ],
-        vec![],
     )
     .await
 }
@@ -979,20 +1127,24 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
                 name: "with_cache_pre_cache",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
-                }),
-            }, None).await?;
+                })),
+                should_fail: false,
+                skip: false
+            }, None, false).await?;
             let duration = start.elapsed();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
                 name: "with_cache_post_cache",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
-                }),
-            }, None).await?;
+                })),
+                should_fail: false,
+                skip: false
+            }, None, false).await?;
             let duration_cached = start.elapsed();
             assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
             Ok(())
@@ -1042,20 +1194,24 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
             bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
             run_search_test(http_base_url.as_str(), &SearchTestCase {
                 name: "with_cache_bypass_pre_cache",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
-                }),
-            }, Some(bypass_headers.clone())).await?;
+                })),
+                should_fail: false,
+                skip: false
+            }, Some(bypass_headers.clone()), false).await?;
             let duration = start.elapsed().as_secs_f64();
             let start = Instant::now();
             run_search_test(http_base_url.as_str(), &SearchTestCase {
                 name: "with_cache_bypass_post_cache",
-                body: json!({
+                body: SearchTestType::HTTP(json!({
                     "text": "new patient",
                     "limit": 2,
-                }),
-            }, Some(bypass_headers)).await?;
+                })),
+                should_fail: false,
+                skip: false
+            }, Some(bypass_headers), false).await?;
             let duration_cached = start.elapsed().as_secs_f64();
 
             assert!(duration >= duration_cached*0.7 || duration <= duration_cached*1.3,
