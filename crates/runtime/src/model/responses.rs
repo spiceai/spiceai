@@ -24,12 +24,23 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Runtime;
+use crate::init::tool;
 use crate::model::ToolUsingResponses;
 use crate::model::params::get_params_spec;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::parameters::Parameters;
+use crate::tools::options::SpiceToolsOptions;
+use crate::tools::utils::get_tools;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
+
+const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
+
+macro_rules! extract_secret {
+    ($params:expr, $key:expr) => {
+        $params.get($key).map(secrecy::ExposeSecret::expose_secret)
+    };
+}
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
 #[allow(clippy::implicit_hasher)]
@@ -60,10 +71,53 @@ pub async fn try_to_responses_model(
         source: e,
     })?;
 
-    construct_model(component, &params_struct)
+    let model = construct_model(component, &params_struct).await?;
+
+    let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
+        extract_secret!(params, "openai_responses_tools").and_then(|v| {
+            Some(
+                v.split(",")
+                    .map(str::trim)
+                    .map(OpenAIResponsesTools::try_from)
+                    .filter_map(Result::ok)
+                    .collect(),
+            )
+        });
+
+    let spice_recursion_limit: Option<usize> = extract_secret!(params, "tool_recursion_limit")
+        .map(|x| {
+            x.parse().map_err(|e| LlmError::FailedToLoadModel {
+                source: format!(
+                    "Invalid value specified for `params.recursion_depth`: {x}. Error: {e}"
+                )
+                .into(),
+            })
+        })
+        .transpose()?
+        // Prevent infinite recursion in case of circular tool calls.
+        .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
+
+    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
+        .or(extract_secret!(params, "spice_tools"))
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
+
+    let tool_model = match spice_tool_opt {
+        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingResponses::new(
+            model,
+            openai_responses_tools.unwrap_or_default(),
+            Arc::clone(&rt),
+            get_tools(Arc::clone(&rt), &opts).await,
+            spice_recursion_limit,
+        )),
+        Some(_) | None => model,
+    };
+
+    Ok(tool_model)
 }
 
-pub fn construct_model(
+pub async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &Parameters,
 ) -> Result<Arc<dyn Responses>, LlmError> {
@@ -80,25 +134,6 @@ pub fn construct_model(
             })?,
         }),
     }?;
-
-    let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
-        params.get("responses_tools").expose().ok().and_then(|v| {
-            Some(
-                v.split(",")
-                    .map(str::trim)
-                    .map(OpenAIResponsesTools::try_from)
-                    .filter_map(Result::ok)
-                    .collect(),
-            )
-        });
-
-    tracing::info!("{:?}", openai_responses_tools);
-
-    let model = if let Some(openai_tools) = openai_responses_tools {
-        Arc::new(ToolUsingResponses::new(model, openai_tools)) as Arc<dyn Responses>
-    } else {
-        model
-    };
 
     Ok(model)
 }

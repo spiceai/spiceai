@@ -44,6 +44,8 @@ impl Runtime {
             .await
             .ok();
 
+        tracing::debug!("{:?}", responses_model.is_some());
+
         if let Some(model) = &completions_model {
             model
                 .health()
@@ -53,13 +55,17 @@ impl Runtime {
                 .context(UnableToInitializeLlmSnafu)?;
         }
 
-        if let Some(model) = responses_model {
-            if model.health().await.is_ok() {
-                responses_model = Some(model);
-            } else {
-                responses_model = None;
+        if let Some(model) = &responses_model {
+            match model.health().await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("Failed to initialize responses model: {e}");
+                    responses_model = None;
+                }
             }
         }
+
+        tracing::debug!("{:?}", responses_model.is_some());
 
         Ok((completions_model, responses_model))
     }
