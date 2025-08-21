@@ -33,13 +33,9 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
 
 fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
-    if *spicepod_model
-        .params
-        .get("supports_responses")
-        .unwrap_or(&Value::Bool(false))
-        == Value::Bool(true)
-    {
-        return true;
+    let responses_api_override = spicepod_model.params.get("responses_api");
+    if let Some(value) = responses_api_override {
+        return value == &Value::String("enabled".to_string());
     }
 
     if spicepod_model.get_source() != Some(ModelSource::OpenAi) {

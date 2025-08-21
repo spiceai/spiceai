@@ -39,7 +39,7 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::component("usage_tier")
         .description("The current usage tier for the OpenAI account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.")
         .default("tier1"),
-    ParameterSpec::runtime("supports_responses")
-        .description("Whether the model provider supports OpenAI's Responses API.")
-        .default("false"),
+    ParameterSpec::runtime("responses_api")
+        .description("Whether to enable use of this model via the Responses API. If `endpoint` is set to OpenAI's API endpoint, this is `enabled` by default. If not, it is `disabled`.")
+        .default("disabled"),
 ];
