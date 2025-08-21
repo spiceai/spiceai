@@ -20,25 +20,22 @@ use async_openai::{
         CompletionTokensDetails, PromptTokensDetails,
         responses::{
             CodeInterpreter, CodeInterpreterContainer, CodeInterpreterContainerKind,
-            CreateResponse, CreateResponseArgs, Function, FunctionCall, Input, InputContent,
-            InputItem, InputMessage, InputMessageType, OutputContent, Response, ResponseStream,
-            Role, ToolChoice, ToolChoiceMode, ToolDefinition, Usage, WebSearchPreview,
+            CreateResponse, Function, FunctionCall, Input, InputContent, InputItem, InputMessage,
+            InputMessageType, OutputContent, Response, ResponseStream, Role, ToolChoice,
+            ToolChoiceMode, ToolDefinition, Usage, WebSearchPreview,
         },
     },
 };
 use async_trait::async_trait;
 use itertools::Itertools;
+use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
-use llms::responses::{Error as ResponsesError, FailedToLoadModelSnafu};
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use snafu::ResultExt;
 use std::sync::Arc;
 use tools::SpiceModelTool;
-use tracing_futures::Instrument;
 
 use crate::{
-    Runtime,
     model::tool_use::{combine_opt_u32, encode_tool_name},
     request::{AsyncMarker, RequestContext},
 };
@@ -49,9 +46,9 @@ pub enum OpenAIResponsesTools {
     WebSearch,
 }
 
-impl Into<ToolDefinition> for OpenAIResponsesTools {
-    fn into(self) -> ToolDefinition {
-        match self {
+impl From<OpenAIResponsesTools> for ToolDefinition {
+    fn from(tool: OpenAIResponsesTools) -> Self {
+        match tool {
             OpenAIResponsesTools::CodeInterpreter => {
                 ToolDefinition::CodeInterpreter(CodeInterpreter {
                     container: CodeInterpreterContainer::Container(
@@ -84,7 +81,6 @@ impl TryFrom<&str> for OpenAIResponsesTools {
 pub struct ToolUsingResponses {
     inner_responses: Arc<dyn Responses>,
     openai_tools: Vec<OpenAIResponsesTools>,
-    rt: Arc<Runtime>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     recursion_limit: Option<usize>,
 }
@@ -94,20 +90,18 @@ impl ToolUsingResponses {
     pub fn new(
         inner_responses: Arc<dyn Responses>,
         openai_tools: Vec<OpenAIResponsesTools>,
-        rt: Arc<Runtime>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
         recursion_limit: Option<usize>,
     ) -> Self {
         Self {
             inner_responses,
             openai_tools,
-            rt,
             tools,
             recursion_limit,
         }
     }
 
-    async fn prepare_req(&self, mut req: CreateResponse) -> Result<CreateResponse, OpenAIError> {
+    fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
         let existing_items = match req.input.clone() {
             Input::Text(input) => vec![InputItem::Message(InputMessage {
                 content: InputContent::TextInput(input),
@@ -127,12 +121,7 @@ impl ToolUsingResponses {
 
         req.input = Input::Items(existing_items);
 
-        tracing::debug!(
-            "Prepared request: {}",
-            serde_json::to_string_pretty(&req).unwrap()
-        );
-
-        Ok(req)
+        req
     }
 
     #[must_use]
@@ -239,7 +228,6 @@ impl ToolUsingResponses {
                     .content(t.arguments.clone())
                     .to_jsonl(),
             );
-            tracing::debug!("{:?}", t);
             let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
         }
@@ -263,7 +251,7 @@ impl ToolUsingResponses {
         }
 
         let mut messages = original_messages.clone();
-        messages.extend(tool_messages.into_iter().map(|msg| InputItem::Custom(msg)));
+        messages.extend(tool_messages.into_iter().map(InputItem::Custom));
 
         if !messages.is_empty() {
             let used_tools = spiced_tools.len();
@@ -352,10 +340,6 @@ impl ToolUsingResponses {
             runtime_tools.dedup_by(|a, b| get_tool_name(a) == get_tool_name(b));
             let mut req = req.clone();
             req.tools = Some(runtime_tools);
-            tracing::debug!(
-                "Added runtime tools to request {}",
-                serde_json::to_string_pretty(&req).unwrap_or_default()
-            );
             req
         }
     }
@@ -369,16 +353,14 @@ impl Responses for ToolUsingResponses {
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
         self.inner_responses
-            .responses_stream(self.prepare_req(req).await?)
+            .responses_stream(self.prepare_req(req))
             .await
     }
 
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
-        let inner_req = self.prepare_req(req).await?;
-        let res = self
-            .responses_request_inner(inner_req, self.recursion_limit)
-            .await?;
-        Ok(res)
+        let inner_req = self.prepare_req(req);
+        self.responses_request_inner(inner_req, self.recursion_limit)
+            .await
     }
 }
 
@@ -439,13 +421,13 @@ pub fn combine_usage(u1: Option<Usage>, u2: Option<Usage>) -> Option<Usage> {
         (Some(u1), Some(u2)) => Some(Usage {
             input_tokens: u1.input_tokens + u2.input_tokens,
             input_tokens_details: combine_token_details(
-                u1.input_tokens_details,
-                u2.input_tokens_details,
+                &u1.input_tokens_details,
+                &u2.input_tokens_details,
             ),
             output_tokens: u1.output_tokens + u2.output_tokens,
             output_tokens_details: combine_completion_token_details(
-                u1.output_tokens_details,
-                u2.output_tokens_details,
+                &u1.output_tokens_details,
+                &u2.output_tokens_details,
             ),
             total_tokens: u1.total_tokens + u2.total_tokens,
         }),
@@ -456,8 +438,8 @@ pub fn combine_usage(u1: Option<Usage>, u2: Option<Usage>) -> Option<Usage> {
 }
 
 pub fn combine_token_details(
-    a: PromptTokensDetails,
-    b: PromptTokensDetails,
+    a: &PromptTokensDetails,
+    b: &PromptTokensDetails,
 ) -> PromptTokensDetails {
     PromptTokensDetails {
         audio_tokens: combine_opt_u32(a.audio_tokens, b.audio_tokens),
@@ -466,8 +448,8 @@ pub fn combine_token_details(
 }
 
 pub fn combine_completion_token_details(
-    a: CompletionTokensDetails,
-    b: CompletionTokensDetails,
+    a: &CompletionTokensDetails,
+    b: &CompletionTokensDetails,
 ) -> CompletionTokensDetails {
     CompletionTokensDetails {
         accepted_prediction_tokens: combine_opt_u32(

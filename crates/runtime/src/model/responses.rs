@@ -24,7 +24,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Runtime;
-use crate::init::tool;
 use crate::model::ToolUsingResponses;
 use crate::model::params::get_params_spec;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
@@ -71,12 +70,12 @@ pub async fn try_to_responses_model(
         source: e,
     })?;
 
-    let model = construct_model(component, &params_struct).await?;
+    let model = construct_model(component, &params_struct)?;
 
     let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
         extract_secret!(params, "openai_responses_tools").and_then(|v| {
             Some(
-                v.split(",")
+                v.split(',')
                     .map(str::trim)
                     .map(OpenAIResponsesTools::try_from)
                     .filter_map(Result::ok)
@@ -107,7 +106,6 @@ pub async fn try_to_responses_model(
         Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingResponses::new(
             model,
             openai_responses_tools.unwrap_or_default(),
-            Arc::clone(&rt),
             get_tools(Arc::clone(&rt), &opts).await,
             spice_recursion_limit,
         )),
@@ -117,7 +115,7 @@ pub async fn try_to_responses_model(
     Ok(tool_model)
 }
 
-pub async fn construct_model(
+fn construct_model(
     component: &spicepod::component::model::Model,
     params: &Parameters,
 ) -> Result<Arc<dyn Responses>, LlmError> {
