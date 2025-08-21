@@ -1,0 +1,59 @@
+version: v1
+kind: Spicepod
+name: mongodb-duckdb[file]
+
+# Define common anchors
+definitions:
+  # Common mongodb parameters
+  - &mongodb_params
+    mongodb_host: ${env:MONGODB_HOST}
+    mongodb_port: 27017
+    mongodb_db: tpch_sf1
+    mongodb_user: root
+    mongodb_pass: ${env:MONGODB_PASSWORD}
+    mongodb_sslmode: disabled
+  - &acceleration
+    enabled: true
+    engine: duckdb
+    mode: file
+
+datasets:
+  - from: mongodb:customer
+    name: customer
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:lineitem
+    name: lineitem
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:nation
+    name: nation
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:orders
+    name: orders
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:part
+    name: part
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:partsupp
+    name: partsupp
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:region
+    name: region
+    params: *mongodb_params
+    acceleration: *acceleration
+
+  - from: mongodb:supplier
+    name: supplier
+    params: *mongodb_params
+    acceleration: *acceleration

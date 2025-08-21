@@ -2839,7 +2839,7 @@
             }
           }
         ],
-        "description": "Controls which (if any) tool is called by the model.\n`none` means the model will not call any tool and instead generates a message.\n`auto` means the model can pick between generating a message or calling one or more tools.\n`required` means the model must call one or more tools.\nSpecifying a particular tool via `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}` forces the model to call that tool.\n\n`none` is the default when no tools are present. `auto` is the default if tools are present.present."
+        "description": "Controls which (if any) tool is called by the model.\n`none` means the model will not call any tool and instead generates a message.\n`auto` means the model can pick between generating a message or calling one or more tools.\n`required` means the model must call one or more tools.\nSpecifying a particular tool via `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}` forces the model to call that tool.\n\n`none` is the default when no tools are present. `auto` is the default if tools are present."
       },
       "ChatCompletionToolType": {
         "type": "string",
@@ -2857,7 +2857,6 @@
               "null"
             ],
             "format": "int32",
-            "description": "Tokens that were accepted in the prediction",
             "minimum": 0
           },
           "audio_tokens": {
@@ -2884,7 +2883,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "When using Predicted Outputs, the number of tokens in the\nprediction that did not appear in the completion. However, like\nreasoning tokens, these tokens are still counted in the total\ncompletion tokens for purposes of billing, output, and context\nwindow limits.",
+            "description": " When using Predicted Outputs, the number of tokens in the\nprediction that did not appear in the completion. However, like\nreasoning tokens, these tokens are still counted in the total\ncompletion tokens for purposes of billing, output, and context\nwindow limits.",
             "minimum": 0
           }
         }
@@ -3067,7 +3066,7 @@
             "description": "A list of messages comprising the conversation so far. Depending on the [model](https://platform.openai.com/docs/models) you use, different message types (modalities) are supported, like [text](https://platform.openai.com/docs/guides/text-generation), [images](https://platform.openai.com/docs/guides/vision), and [audio](https://platform.openai.com/docs/guides/audio)."
           },
           "metadata": {
-            "description": "Developer-defined tags and values used for filtering completions."
+            "description": "Developer-defined tags and values used for filtering completions in the [dashboard](https://platform.openai.com/chat-completions)."
           },
           "modalities": {
             "type": [
@@ -3174,7 +3173,7 @@
               "boolean",
               "null"
             ],
-            "description": "Whether or not to store the output of this chat completion request for use in [model distillation](https://platform.openai.com/docs/guides/distillation) or [evals](https://platform.openai.com/docs/guides/evals) products."
+            "description": "Whether or not to store the output of this chat completion request\n\nfor use in our [model distillation](https://platform.openai.com/docs/guides/distillation) or [evals](https://platform.openai.com/docs/guides/evals) products."
           },
           "stream": {
             "type": [
@@ -3244,6 +3243,17 @@
               "null"
             ],
             "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#end-user-ids)."
+          },
+          "web_search_options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebSearchOptions",
+                "description": "This tool searches the web for relevant results to use in a response.\nLearn more about the [web search tool](https://platform.openai.com/docs/guides/tools-web-search?api-mode=chat)."
+              }
+            ]
           }
         }
       },
@@ -4128,7 +4138,7 @@
       },
       "PromptTokensDetails": {
         "type": "object",
-        "description": "Breakdown of tokens used in a prompt.",
+        "description": "Breakdown of tokens used in a completion.",
         "properties": {
           "audio_tokens": {
             "type": [
@@ -4153,6 +4163,7 @@
       "ReasoningEffort": {
         "type": "string",
         "enum": [
+          "minimal",
           "low",
           "medium",
           "high"
@@ -4424,14 +4435,19 @@
         "type": "string",
         "enum": [
           "auto",
-          "default"
+          "default",
+          "flex",
+          "scale",
+          "priority"
         ]
       },
       "ServiceTierResponse": {
         "type": "string",
         "enum": [
           "scale",
-          "default"
+          "default",
+          "flex",
+          "priority"
         ]
       },
       "Stop": {
@@ -4476,6 +4492,98 @@
             "description": "The token."
           }
         }
+      },
+      "WebSearchContextSize": {
+        "type": "string",
+        "description": "The amount of context window space to use for the search.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "WebSearchLocation": {
+        "type": "object",
+        "description": "Approximate location parameters for the search.",
+        "properties": {
+          "city": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text input for the city of the user, e.g. `San Francisco`."
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The two-letter [ISO country code](https://en.wikipedia.org/wiki/ISO_3166-1) of the user, e.g. `US`."
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text input for the region of the user, e.g. `California`."
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The [IANA timezone](https://timeapi.io/documentation/iana-timezones) of the user, e.g. `America/Los_Angeles`."
+          }
+        }
+      },
+      "WebSearchOptions": {
+        "type": "object",
+        "description": "Options for the web search tool.",
+        "properties": {
+          "search_context_size": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebSearchContextSize",
+                "description": "High level guidance for the amount of context window space to use for the search. One of `low`, `medium`, or `high`. `medium` is the default."
+              }
+            ]
+          },
+          "user_location": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebSearchUserLocation",
+                "description": "Approximate location parameters for the search."
+              }
+            ]
+          }
+        }
+      },
+      "WebSearchUserLocation": {
+        "type": "object",
+        "required": [
+          "type",
+          "approximate"
+        ],
+        "properties": {
+          "approximate": {
+            "$ref": "#/components/schemas/WebSearchLocation"
+          },
+          "type": {
+            "$ref": "#/components/schemas/WebSearchUserLocationType"
+          }
+        }
+      },
+      "WebSearchUserLocationType": {
+        "type": "string",
+        "enum": [
+          "approximate"
+        ]
       }
     }
   },

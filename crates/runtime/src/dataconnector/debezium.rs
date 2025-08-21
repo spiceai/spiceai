@@ -424,7 +424,16 @@ async fn get_metadata_from_kafka(
         }
     };
 
-    let primary_keys = msg.key().get_primary_key();
+    let Some(key) = msg.key() else {
+        return Err(super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "debezium".to_string(),
+            source: "CDC message key is missing. Verify Debezium CDC configuration and try again."
+                .into(),
+            connector_component: ConnectorComponent::from(dataset),
+        });
+    };
+
+    let primary_keys = key.get_primary_key();
 
     let Some(schema_fields) = msg.value().get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {

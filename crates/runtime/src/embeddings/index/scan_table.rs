@@ -121,7 +121,7 @@ impl VectorScanTableProvider {
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
                 embedding_col!(self.index.embedded_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_list(DataType::Float32, true),
                 true,
             )),
         ));
@@ -160,7 +160,7 @@ impl TableProvider for VectorScanTableProvider {
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
                 embedding_col!(self.index.embedded_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_list(DataType::Float32, true),
                 true,
             ))],
         )
