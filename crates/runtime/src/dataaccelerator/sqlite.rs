@@ -36,7 +36,7 @@ use crate::{
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -249,7 +249,7 @@ impl DataAccelerator for SqliteAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Option<PartitionBy>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_none(),
             super::InvalidConfigurationSnafu {
@@ -319,7 +319,7 @@ impl DataAccelerator for SqliteAccelerator {
             read_provider,
         ));
 
-        Ok((table_provider, Behaviors::default()))
+        Ok(table_provider)
     }
 
     fn prefix(&self) -> &'static str {

@@ -27,10 +27,7 @@ use crate::component::dataset::{Dataset, Mode, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{
-    self,
-    behaviors::{Behavior, Behaviors},
-};
+use crate::dataaccelerator::{self};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -897,7 +894,7 @@ impl DataFusion {
             FederatedTable::Deferred(_) => None,
         };
 
-        let (accelerated_table_provider, accelerated_table_behaviors) = self
+        let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
@@ -910,12 +907,6 @@ impl DataFusion {
             )
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
-
-        handle_accelerated_table_behavior(
-            accelerated_table_behaviors,
-            &source_table_provider,
-            &dataset.name.to_string(),
-        )?;
 
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
@@ -1730,30 +1721,6 @@ pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
-#[allow(clippy::result_large_err)]
-pub fn handle_accelerated_table_behavior(
-    accelerated_table_behaviors: Behaviors,
-    federated_table: &FederatedTable,
-    component_name: &str,
-) -> Result<()> {
-    for behavior in accelerated_table_behaviors {
-        match behavior {
-            Behavior::WantsUnderlyingTableProvider(wants_underlying_table_provider) => {
-                if let Some(underlying_provider) = federated_table.try_table_provider_sync() {
-                    wants_underlying_table_provider
-                        .set(underlying_provider)
-                        .map_err(find_datafusion_root)
-                        .context(UnableToSetUnderlyingTableProviderSnafu {
-                            component_name: component_name.to_string(),
-                        })?;
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[must_use]

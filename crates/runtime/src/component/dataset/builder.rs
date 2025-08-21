@@ -87,17 +87,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
-            // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
+            // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
                 tracing::debug!(
-                    "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
+                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
                     dataset.name
                 );
-                acceleration = Some(acceleration::Acceleration {
-                    enabled: true,
-                    engine: Engine::Void,
-                    ..Default::default()
-                });
             }
 
             // Chunking with vector engines is not supported (yet).
