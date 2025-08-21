@@ -35,7 +35,10 @@ static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
 fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
     let responses_api_override = spicepod_model.params.get("responses_api");
     if let Some(value) = responses_api_override {
-        return value == &Value::String("enabled".to_string());
+        if let Value::String(s) = value {
+            return s.to_lowercase() == "enabled";
+        }
+        return false;
     }
 
     if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
