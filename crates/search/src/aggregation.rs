@@ -53,7 +53,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The resulting aggregation result is inconsistent, which is an unexpected error.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "The resulting aggregation result is inconsistent, which is an unexpected error. {source}"
     ))]
     InconsistentAggregationResult {
         source: Box<dyn std::error::Error + Send + Sync>,

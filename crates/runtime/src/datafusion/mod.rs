@@ -180,14 +180,14 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
+    #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
         dataset_name: String,
         source: crate::accelerated_table::Error,
     },
 
     #[snafu(display(
-        "Changing the schema of an accelerated table via the Refresh SQL is not allowed.\nRetry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
+        "Changing the schema of an accelerated table via the Refresh SQL is not allowed. Retry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
     ))]
     RefreshSqlSchemaChangeDisallowed {
         dataset_name: Arc<str>,
@@ -238,7 +238,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-        "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        "Acceleration mode `append` requires `time_column` parameter for source {from}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -246,7 +246,7 @@ pub enum Error {
     UnableToRetrieveTableFromFederation { table_name: String },
 
     #[snafu(display(
-        "Failed to create an accelerated table for the dataset {dataset_name}.\n{source}"
+        "Failed to create an accelerated table for the dataset {dataset_name}. {source}"
     ))]
     UnableToBuildAcceleratedTable {
         dataset_name: String,
@@ -254,7 +254,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for {component_name}.\nError setting the underlying table provider: {source}"
+        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {source}"
     ))]
     UnableToSetUnderlyingTableProvider {
         component_name: String,

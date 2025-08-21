@@ -42,17 +42,17 @@ use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Invalid value for 'debezium_transport': {transport}. Supported values: 'kafka' For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     InvalidTransport { transport: String },
 
     #[snafu(display(
-        "Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Invalid value for 'debezium_message_format': {format}. Supported values: 'json' For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     InvalidMessageFormat { format: String },
 
     #[snafu(display(
-        "Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     MissingKafkaBootstrapServers,
 
@@ -239,7 +239,7 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector requires an accelerated dataset.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

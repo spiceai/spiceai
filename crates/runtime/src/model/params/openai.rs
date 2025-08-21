@@ -23,7 +23,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] =
         COMMON_MODEL_PARAMETERS,
     );
 
-const OPENAI_PARAM_LEN: usize = 6;
+const OPENAI_PARAM_LEN: usize = 7;
 
 pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint")
@@ -42,4 +42,7 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
     ParameterSpec::runtime("responses_api")
         .description("Whether to enable use of this model via the Responses API. If `endpoint` is set to OpenAI's API endpoint, this is `enabled` by default. If not, it is `disabled`.")
         .default("disabled"),
+    ParameterSpec::component("responses_tools")
+        .description("The OpenAI Responses tools to use when calling the model from the Responses API")
+        .default("")
 ];

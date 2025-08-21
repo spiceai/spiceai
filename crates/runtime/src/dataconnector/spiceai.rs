@@ -49,24 +49,24 @@ use data_components::{Read, ReadWrite};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
     ))]
     MissingRequiredParameter { parameter: String },
 
-    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
+    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}". {source} Ensure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: String,
     },
 
-    #[snafu(display("Failed to create flight client.\n{source}"))]
+    #[snafu(display("Failed to create flight client. {source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 
-    #[snafu(display("Failed to get append stream schema.\n{source}"))]
+    #[snafu(display("Failed to get append stream schema. {source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 
     #[snafu(display(
-        "Could not parse <org> or <app> as ASCII: {value}\nEnsure the org and app are valid ASCII strings and retry."
+        "Could not parse <org> or <app> as ASCII: {value} Ensure the org and app are valid ASCII strings and retry."
     ))]
     InvalidMetadataValue {
         value: Arc<str>,
@@ -74,7 +74,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#parameters"
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#parameters"
     ))]
     InvalidParameterValue {
         parameter: String,

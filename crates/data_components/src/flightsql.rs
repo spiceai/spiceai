@@ -61,20 +61,20 @@ pub mod federation;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"
+        "Failed to connect to the Flight server. {source} Verify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"
     ))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
     #[snafu(display(
-        "Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to create SQL query (flightsql). {source} An unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Query execution failed (flightsql).\n{source}"))]
+    #[snafu(display("Query execution failed (flightsql). {source}"))]
     UnableToQueryArrowFlight { source: FlightError },
 
     #[snafu(display(
-        "Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to retrieve table {table_name} schema (flightsql). {source} An internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToRetrieveSchemaFromIpcMessage {
         source: arrow::error::ArrowError,
@@ -82,7 +82,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to detect table '{table_name}' schema (flightsql). {source} Verify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToRetrieveSchemaArrow {
         source: arrow::error::ArrowError,
@@ -90,7 +90,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to detect table '{table_name}' schema (flightsql). {source} Verify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToRetrieveSchemaFlight {
         source: FlightError,
@@ -98,7 +98,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to detect table '{table_name}' schema (flightsql).\nEnsure the table exists and try again."
+        "Failed to detect table '{table_name}' schema (flightsql). Ensure the table exists and try again."
     ))]
     UnableToRetrieveSchema { table_name: String },
 }

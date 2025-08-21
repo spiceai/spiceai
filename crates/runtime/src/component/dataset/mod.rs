@@ -44,7 +44,7 @@ pub mod replication;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column for index '{index}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
+        "Column for index '{index}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
     ))]
     IndexColumnNotFound {
         index: String,
@@ -52,7 +52,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Primary key column '{invalid_column}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
+        "Primary key column '{invalid_column}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
     ))]
     PrimaryKeyColumnNotFound {
         invalid_column: String,
@@ -90,7 +90,7 @@ pub enum Error {
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
     #[snafu(display(
-        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuildDataset {
         dataset: String,
@@ -98,7 +98,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified for a given dataset.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        "Both a 'refresh_cron' and 'refresh_check_interval' were specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     ))]
     MultipleRefreshExpressionSpecified,
 
