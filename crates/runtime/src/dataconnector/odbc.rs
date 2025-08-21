@@ -39,25 +39,25 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to setup the ODBC connection pool.\nVerify the ODBC connection details are valid, and try again.\n{source}"
+        "Failed to setup the ODBC connection pool. Verify the ODBC connection details are valid, and try again. {source}"
     ))]
     UnableToCreateODBCConnectionPool {
         source: db_connection_pool::odbcpool::Error,
     },
     #[snafu(display(
-        "Missing required parameter: {param}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "Missing required parameter: {param}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     MissingParameter { param: String },
     #[snafu(display(
-        "An ODBC parameter is configured incorrectly: {param}.\n{msg}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "An ODBC parameter is configured incorrectly: {param}. {msg} For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     InvalidParameter { param: String, msg: String },
     #[snafu(display(
-        "No ODBC driver was specified in the connection string.\nSpecify an installed driver in the connection string.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "No ODBC driver was specified in the connection string. Specify an installed driver in the connection string. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     NoDriverSpecified,
     #[snafu(display(
-        "Accessing an ODBC driver with a file path is not permitted.\nInstall a driver using the system driver manager, and specify the driver name instead.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "Accessing an ODBC driver with a file path is not permitted. Install a driver using the system driver manager, and specify the driver name instead. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     DirectDriverNotPermitted,
 }

@@ -38,7 +38,7 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open\nSpecify a DuckDB file with the `open` parameter"
+        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
     ))]
     MissingDuckDBFile,
 }

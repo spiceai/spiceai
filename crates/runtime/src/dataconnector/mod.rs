@@ -114,7 +114,7 @@ pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -122,7 +122,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}.\nEnsure that the host and port are correctly configured in the spicepod, and that the host is reachable."
+        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
     ))]
     UnableToConnectInvalidHostOrPort {
         dataconnector: String,
@@ -132,7 +132,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed.\nEnsure that the username and password are correctly configured in the spicepod."
+        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed. Ensure that the username and password are correctly configured in the spicepod."
     ))]
     UnableToConnectInvalidUsernameOrPassword {
         dataconnector: String,
@@ -140,28 +140,28 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred.\nEnsure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
+        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred. Ensure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
     ))]
     UnableToConnectTlsError {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetReadProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetReadWriteProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetCatalogProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -169,7 +169,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The {connector_component} ({dataconnector}) has been rate limited.\n{source}"
+        "The {connector_component} ({dataconnector}) has been rate limited. {source}"
     ))]
     RateLimited {
         dataconnector: String,
@@ -178,7 +178,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfiguration {
         dataconnector: String,
@@ -188,7 +188,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {source}"
     ))]
     InvalidConfigurationSourceOnly {
         dataconnector: String,
@@ -197,7 +197,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
         dataconnector: String,
@@ -206,7 +206,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Cannot setup the {connector_component} ({dataconnector}). The connector '{dataconnector}' is not a valid connector. For details, visit: https://spiceai.org/docs/components/data-connectors"
     ))]
     InvalidConnectorType {
         dataconnector: String,
@@ -214,7 +214,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\n An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid.\n{source}"
+        "Failed to load the {connector_component} ({dataconnector}). An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid. {source}"
     ))]
     InvalidGlobPattern {
         dataconnector: String,
@@ -224,7 +224,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nThe table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
+        "Failed to load the {connector_component} ({dataconnector}). The table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
     ))]
     InvalidTableName {
         dataconnector: String,
@@ -233,7 +233,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nFailed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
+        "Failed to load the {connector_component} ({dataconnector}). Failed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
     ))]
     UnableToGetSchema {
         dataconnector: String,
@@ -242,7 +242,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the {connector_component} ({dataconnector}). An unknown Data Connector Error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalWithSource {
         dataconnector: String,
@@ -251,7 +251,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nAn internal error occurred in the {dataconnector} Data Connector.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
+        "Failed to load the {connector_component} ({dataconnector}). An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
     ))]
     Internal {
         dataconnector: String,
@@ -261,7 +261,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nFailed to infer the table schema.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
+        "Failed to load the {connector_component} ({dataconnector}). Failed to infer the table schema. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
     ))]
     UnableToGetSchemaInternal {
         dataconnector: String,
@@ -270,7 +270,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nUnsupported type action is not enabled for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
+        "Failed to load the {connector_component} ({dataconnector}). Unsupported type action is not enabled for the {dataconnector} Data Connector. Remove the parameter from your dataset configuration."
     ))]
     UnsupportedTypeAction {
         dataconnector: String,
@@ -278,7 +278,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
+        "Failed to load the {connector_component} ({dataconnector}). The field '{field_name}' has an unsupported data type: {data_type}. Skip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
     ))]
     UnsupportedDataType {
         dataconnector: String,
@@ -288,14 +288,14 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "Failed to initialize the {connector_component} (ODBC). The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
 
     #[snafu(display(
-        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled.\nVerify if the remote table schema update is expected and rebuild the acceleration if necessary."
+        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
     SchemaMismatch {
         dataset_name: String,
@@ -303,7 +303,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector.\nChange the name in the Spicepod and try again."
+        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector. Change the name in the Spicepod and try again."
     ))]
     UseOfProtectedKeyword {
         dataconnector: String,

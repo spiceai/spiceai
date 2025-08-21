@@ -46,32 +46,32 @@ static WALLET_INIT: OnceCell<()> = OnceCell::new();
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/oracle"
+        "Missing required parameter: '{parameter}'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/oracle"
     ))]
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "Failed to connect to the Oracle Server.\nVerify your connection configuration, and try again.\n{source}"
+        "Failed to connect to the Oracle Server. Verify your connection configuration, and try again. {source}"
     ))]
     UnableToCreateConnectionPool {
         source: data_components::oracle::Error,
     },
 
     #[snafu(display(
-        "Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/oracle"
+        "Invalid value provided for the 'port' parameter: {port}. Specify a valid port, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/oracle"
     ))]
     FailedToParsePort { port: String },
 
-    #[snafu(display("Failed to create wallet directory: {path}.\n{source}"))]
+    #[snafu(display("Failed to create wallet directory: {path}. {source}"))]
     FailedToCreateWalletDirectory {
         path: String,
         source: std::io::Error,
     },
 
-    #[snafu(display("Failed to decode wallet certificate from base64.\n{source}"))]
+    #[snafu(display("Failed to decode wallet certificate from base64. {source}"))]
     FailedToDecodeWalletCert { source: base64::DecodeError },
 
-    #[snafu(display("Failed to write wallet certificate file: {path}.\n{source}"))]
+    #[snafu(display("Failed to write wallet certificate file: {path}. {source}"))]
     FailedToWriteWalletFile {
         path: String,
         source: std::io::Error,
