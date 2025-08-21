@@ -76,7 +76,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let mut acceleration = dataset
+        let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
