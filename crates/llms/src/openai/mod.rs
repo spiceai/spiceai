@@ -26,6 +26,7 @@ use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
 pub mod embed;
+pub mod responses;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 

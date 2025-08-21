@@ -37,20 +37,20 @@ use futures::StreamExt;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read object from object store.\n{}", source))]
+    #[snafu(display("Failed to read object from object store. {}", source))]
     FailedToReadObject { source: object_store::Error },
 
-    #[snafu(display("Unable to parse the provided Spicepod.\n{}", source))]
+    #[snafu(display("Unable to parse the provided Spicepod. {}", source))]
     FailedToParseSpicepod { source: serde_yaml::Error },
 
-    #[snafu(display("Failed to create zip archive.\n{}", source))]
+    #[snafu(display("Failed to create zip archive. {}", source))]
     FailedToCreateZip { source: zip::result::ZipError },
 
-    #[snafu(display("Failed to write to zip archive.\n{}", source))]
+    #[snafu(display("Failed to write to zip archive. {}", source))]
     FailedToWriteZipFile { source: std::io::Error },
 
     #[snafu(display(
-        "A file referenced by the Spicepod ({}) could not be retrieved.\n{}",
+        "A file referenced by the Spicepod ({}) could not be retrieved. {}",
         linked_file_path.display(),
         source
     ))]
@@ -59,10 +59,10 @@ pub enum Error {
         source: object_store::Error,
     },
 
-    #[snafu(display("A file referenced by the Spicepod is not a valid path.\n{}", source))]
+    #[snafu(display("A file referenced by the Spicepod is not a valid path. {}", source))]
     LinkedFileNotAValidPath { source: object_store::path::Error },
 
-    #[snafu(display("Failed to parse the provided Spicepod component.\n{}", source))]
+    #[snafu(display("Failed to parse the provided Spicepod component. {}", source))]
     UnableToParseSpicepodComponent { source: serde_yaml::Error },
 }
 

@@ -26,7 +26,7 @@ use crate::Runtime;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to build catalog '{catalog}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build catalog '{catalog}': required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuildCatalog {
         catalog: String,

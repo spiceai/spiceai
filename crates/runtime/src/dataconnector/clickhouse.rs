@@ -42,45 +42,45 @@ use crate::parameters::{ParamLookup, ParameterSpec};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to ClickHouse.\nVerify your connection configuration, and try again.\n{source}"
+        "Failed to connect to ClickHouse. Verify your connection configuration, and try again. {source}"
     ))]
     UnableToCreateClickhouseConnectionPool { source: DbConnectionPoolError },
 
     #[snafu(display(
-        "An invalid connection string value was provided.\nVerify the connection string is valid, and try again.\n{source}"
+        "An invalid connection string value was provided. Verify the connection string is valid, and try again. {source}"
     ))]
     InvalidConnectionStringError {
         source: clickhouse_rs::errors::Error,
     },
 
     #[snafu(display(
-        "Failed to connect to ClickHouse over TLS.\nVerify your TLS configuration, and try again.\n{source}"
+        "Failed to connect to ClickHouse over TLS. Verify your TLS configuration, and try again. {source}"
     ))]
     ConnectionTlsError {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
     #[snafu(display(
-        "An invalid connection string value was provided.\nVerify the connection string is valid, and try again.\n{source}"
+        "An invalid connection string value was provided. Verify the connection string is valid, and try again. {source}"
     ))]
     UnableToParseConnectionString { source: url::ParseError },
 
     // from url::Url: If this URL is cannot-be-a-base or does not have a host, do nothing and return Err.
     // so, this error is only possible if the URL is not a valid URL.
     #[snafu(display(
-        "Failed to sanitize the connection string.\nVerify the connection string is valid, and try again."
+        "Failed to sanitize the connection string. Verify the connection string is valid, and try again."
     ))]
     UnableToSanitizeConnectionString,
 
     #[snafu(display(
-        "Failed to authenticate with the ClickHouse.\nEnsure that the username and password are correctly configured.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
+        "Failed to authenticate with the ClickHouse. Ensure that the username and password are correctly configured. For details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
     ))]
     InvalidUsernameOrPasswordError {
         source: clickhouse_rs::errors::Error,
     },
 
     #[snafu(display(
-        "Unable to connect to ClickHouse on {host}:{port}.\nEnsure that the host and port are correctly configured, and that the host is reachable."
+        "Unable to connect to ClickHouse on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."
     ))]
     InvalidHostOrPortError {
         source: Box<dyn std::error::Error + Sync + Send>,
@@ -89,12 +89,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Missing required parameter: '{parameter_name}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
+        "Missing required parameter: '{parameter_name}'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
     ))]
     MissingRequiredParameterForConnection { parameter_name: String },
 
     #[snafu(display(
-        "An invalid value was provided for the parameter '{parameter_name}'.\nSpecify a value of 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
+        "An invalid value was provided for the parameter '{parameter_name}'. Specify a value of 'true' or 'false'. For details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
     ))]
     InvalidSecureParameterValueError {
         parameter_name: String,
@@ -102,7 +102,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "An invalid value was provided for the parameter 'clickhouse_connection_timeout'.\nSpecify a valid integer value.\n{source}"
+        "An invalid value was provided for the parameter 'clickhouse_connection_timeout'. Specify a valid integer value. {source}"
     ))]
     InvalidConnectionTimeoutValue { source: std::num::ParseIntError },
 }

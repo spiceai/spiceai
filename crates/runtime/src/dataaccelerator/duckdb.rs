@@ -51,7 +51,7 @@ use std::{
     sync::{Arc, Once},
 };
 
-use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, DataAccelerator, Error as DataAcceleratorError};
 
 pub(crate) mod settings;
 
@@ -324,7 +324,7 @@ impl DataAccelerator for DuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Option<PartitionBy>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
             cmd.options
                 .insert("open".to_string(), duckdb_file.to_string());
@@ -388,10 +388,7 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok((
-            create_table_provider(&self.duckdb_factory, &cmd).await?,
-            Behaviors::default(),
-        ))
+        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -493,7 +490,7 @@ mod tests {
         };
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
-        let (table, _) = duckdb_accelerator
+        let table = duckdb_accelerator
             .create_external_table(external_table, None, None)
             .await
             .expect("table should be created");

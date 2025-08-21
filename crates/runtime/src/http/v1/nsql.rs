@@ -17,7 +17,7 @@ use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
     http::v1::{ResponseMetadata, ResponseMimeType, run_sql, to_http_response},
-    model::LLMModelStore,
+    model::LLMChatCompletionsModelStore,
     request::{AsyncMarker, RequestContext},
     tools::{
         builtin::{
@@ -244,7 +244,7 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
-    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
 ) -> Response {

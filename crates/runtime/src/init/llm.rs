@@ -17,11 +17,31 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{Result, Runtime, UnableToInitializeLlmSnafu, model::try_to_chat_model};
-use llms::chat::{Chat, try_map_boxed_error_to_box};
+use crate::{
+    Result, Runtime, UnableToInitializeLlmSnafu,
+    model::{try_to_chat_model, try_to_responses_model},
+};
+use llms::{
+    chat::{Chat, try_map_boxed_error_to_box},
+    responses::Responses,
+};
 use secrecy::SecretString;
+use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::Model as SpicepodModel;
+use spicepod::component::model::{Model as SpicepodModel, ModelSource};
+
+static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
+
+fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
+    if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
+        return false;
+    }
+    match spicepod_model.params.get("endpoint") {
+        None => true,
+        Some(Value::String(s)) => s == DEFAULT_OPENAI_ENDPOINT,
+        _ => false,
+    }
+}
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -29,18 +49,36 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<Arc<dyn Chat>> {
-        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+    ) -> Result<(Option<Arc<dyn Chat>>, Option<Arc<dyn Responses>>)> {
+        let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
+            .ok();
 
-        l.health()
-            .await
-            .boxed()
-            .map_err(try_map_boxed_error_to_box)
-            .context(UnableToInitializeLlmSnafu)?;
-        Ok(l)
+        let responses_model = if supports_responses_api(&m) {
+            try_to_responses_model(&m, &params, Arc::new(self.clone()))
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        // Perform only one health check, preferring the Responses API to Chat Completions
+        if let Some(model) = &responses_model {
+            model
+                .health()
+                .await
+                .boxed()
+                .map_err(try_map_boxed_error_to_box)
+                .context(UnableToInitializeLlmSnafu)?;
+        } else if let Some(model) = &completions_model {
+            model
+                .health()
+                .await
+                .boxed()
+                .map_err(try_map_boxed_error_to_box)
+                .context(UnableToInitializeLlmSnafu)?;
+        }
+
+        Ok((completions_model, responses_model))
     }
 }

@@ -119,7 +119,7 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
             let model = RouterModel::new(
                 worker.name.clone(),
                 load_balance.routing.as_slice(),
-                Arc::clone(&rt.llms),
+                Arc::clone(&rt.completion_llms),
             );
             Ok(Arc::new(LoadBalanceWorker::new(
                 Arc::new(model),

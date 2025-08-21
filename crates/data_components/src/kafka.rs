@@ -14,6 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{any::Any, sync::Arc};
+
+use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
+use datafusion::{
+    catalog::Session,
+    datasource::{TableProvider, TableType},
+    error::Result as DataFusionResult,
+    logical_expr::Expr,
+    physical_plan::{ExecutionPlan, empty::EmptyExec},
+};
 use futures::{Stream, StreamExt};
 use rdkafka::{
     ClientConfig, Message, Offset,
@@ -24,8 +34,9 @@ use rdkafka::{
 };
 use serde::de::DeserializeOwned;
 use snafu::prelude::*;
+use tonic::async_trait;
 
-use crate::cdc::{self, CommitChange, CommitError};
+use crate::cdc::{self, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -172,14 +183,17 @@ impl KafkaConsumer {
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
             };
 
-            let key_bytes = msg.key()?;
-            let payload = msg.payload()?;
-
-            let key = match serde_json::from_slice(key_bytes) {
-                Ok(key) => key,
-                Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
+            let key = match msg.key() {
+                Some(key_bytes) => match serde_json::from_slice(key_bytes) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        return Some(Err(Error::UnableToDeserializeJsonMessage { source: e }));
+                    }
+                },
+                None => None,
             };
 
+            let payload = msg.payload()?;
             let value = match serde_json::from_slice(payload) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(Error::UnableToDeserializeJsonMessage { source: e })),
@@ -298,12 +312,17 @@ impl KafkaConsumer {
 pub struct KafkaMessage<'a, K, V> {
     consumer: &'a StreamConsumer,
     msg: BorrowedMessage<'a>,
-    key: K,
+    key: Option<K>,
     value: V,
 }
 
 impl<'a, K, V> KafkaMessage<'a, K, V> {
-    fn new(consumer: &'a StreamConsumer, msg: BorrowedMessage<'a>, key: K, value: V) -> Self {
+    fn new(
+        consumer: &'a StreamConsumer,
+        msg: BorrowedMessage<'a>,
+        key: Option<K>,
+        value: V,
+    ) -> Self {
         Self {
             consumer,
             msg,
@@ -312,8 +331,8 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         }
     }
 
-    pub fn key(&self) -> &K {
-        &self.key
+    pub fn key(&self) -> Option<&K> {
+        self.key.as_ref()
     }
 
     pub fn value(&self) -> &V {
@@ -333,5 +352,89 @@ impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
             .boxed()
             .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
         Ok(())
+    }
+}
+
+pub struct Kafka {
+    schema: SchemaRef,
+    consumer: &'static KafkaConsumer,
+}
+
+impl std::fmt::Debug for Kafka {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kafka")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Kafka {
+    #[must_use]
+    pub fn new(schema: SchemaRef, consumer: KafkaConsumer) -> Self {
+        Self {
+            schema,
+            consumer: Box::leak(Box::new(consumer)),
+        }
+    }
+
+    #[must_use]
+    pub fn stream_changes(&self) -> ChangesStream {
+        let schema = Arc::clone(&self.schema);
+        let stream = self
+            .consumer
+            .stream_json::<serde_json::Value, serde_json::Value>()
+            .map(move |msg| {
+                let schema = Arc::clone(&schema);
+                let Ok(msg) = msg else {
+                    return Err(cdc::StreamError::Kafka(format!(
+                        "Unable to read message: {:?}",
+                        msg.err()
+                    )));
+                };
+
+                // convert JSON string to Arrow record batch
+                let json_str = msg.value().to_string();
+                let rb = ReaderBuilder::new(Arc::clone(&schema))
+                    .build(std::io::Cursor::new(json_str.as_bytes()))
+                    .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
+                    .next()
+                    .transpose()
+                    .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
+                    .ok_or_else(|| {
+                        cdc::StreamError::Arrow("No record batch found in JSON message".to_string())
+                    })?;
+
+                // Wrap the record batch to emulate a change event
+                cdc::wrap_data_as_change_batch(&schema, &rb)
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+            });
+
+        Box::pin(stream)
+    }
+}
+
+#[async_trait]
+impl TableProvider for Kafka {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
     }
 }

@@ -25,11 +25,11 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An endpoint is required to connect to telemetry.\nSupply an endpoint to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "An endpoint is required to connect to telemetry. Supply an endpoint to the telemetry builder. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     MissingEndpoint,
     #[snafu(display(
-        "A service name is required to connect to telemetry.\nSupply a service name to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "A service name is required to connect to telemetry. Supply a service name to the telemetry builder. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     MissingServiceName,
 }

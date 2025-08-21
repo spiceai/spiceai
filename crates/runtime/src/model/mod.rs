@@ -26,11 +26,13 @@ pub(crate) mod eval;
 mod metrics;
 mod model_context;
 pub(crate) mod params;
+mod responses;
 mod tool_use;
+mod tool_use_responses;
 mod util;
 mod wrapper;
 
-pub use chat::{LLMModelStore, try_to_chat_model};
+pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use eval::{
     dataset::{DatasetInput, DatasetOutput},
@@ -47,7 +49,9 @@ pub use eval::{
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };
+pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
+pub use tool_use_responses::ToolUsingResponses;
 
 use crate::DataFusion;
 

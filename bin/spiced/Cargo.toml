@@ -52,6 +52,7 @@ clickhouse = ["runtime/clickhouse"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
+kafka = ["runtime/kafka"]
 default = [
   "duckdb",
   "postgres",
@@ -67,6 +68,7 @@ default = [
   "spark",
   "ftp",
   "debezium",
+  "kafka",
   "anonymous_telemetry",
   "mssql",
   "dynamodb",
