@@ -25,7 +25,7 @@ use async_openai::types::EmbeddingInput;
 use itertools::Itertools;
 use runtime_datafusion_index::Index;
 use serde_json::Value;
-use snafu::{ResultExt, Snafu, ensure};
+use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
 use crate::{
@@ -549,7 +549,7 @@ mod tests {
         // Should fail because no valid embeddings to determine dimension
         assert!(result.is_err());
         assert!(matches!(
-            result.expect_err("Expected error for empty embeddings"),
+            *result.expect_err("Expected error for empty embeddings"),
             Error::CannotDetermineEmbeddingDimension
         ));
     }
