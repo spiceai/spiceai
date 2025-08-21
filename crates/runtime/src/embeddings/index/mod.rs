@@ -46,7 +46,7 @@ use datafusion::{
 use tokio::sync::RwLock;
 
 pub(crate) mod query_table;
-pub(crate) mod retry_client;
+mod retry_client;
 pub mod s3;
 pub(crate) mod scan_table;
 pub use query_table::VectorQueryTableProvider;
