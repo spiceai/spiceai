@@ -159,8 +159,8 @@ impl VectorIndex for S3Vector {
 
     async fn write(
         &self,
-        record: &RecordBatch,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        record: RecordBatch,
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         write::write(self, record).await.boxed()
     }
 
