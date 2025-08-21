@@ -79,6 +79,8 @@ pub mod ftp;
 pub mod github;
 pub mod graphql;
 pub mod https;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 pub mod localpod;
 pub mod memory;
 #[cfg(feature = "mongodb")]
@@ -421,6 +423,8 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
+    #[cfg(feature = "kafka")]
+    register_connector_factory("kafka", kafka::KafkaFactory::new_arc()).await;
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
     #[cfg(feature = "dynamodb")]
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;

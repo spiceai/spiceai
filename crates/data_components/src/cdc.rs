@@ -18,9 +18,10 @@ use std::{fmt::Display, sync::Arc};
 
 use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ListArray, RecordBatch, StringArray, StructArray},
+    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
+use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
@@ -289,5 +290,109 @@ impl ChangeBatch {
         }
 
         Ok(())
+    }
+}
+
+/// Wraps an arbitrary data `RecordBatch` as a `ChangeBatch` with "create" operations.
+pub fn wrap_data_as_change_batch(
+    table_schema: &SchemaRef,
+    data: &RecordBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
+    let num_rows = data.num_rows();
+    let schema = changes_schema(table_schema);
+
+    // 1) op column ("create" operations)
+    let op_array = Arc::new(arrow::array::StringArray::from(vec![
+        "c".to_string();
+        num_rows
+    ]));
+
+    // 2) Dummy primary_keys: List<Utf8> with EMPTY LIST per row
+    // Offsets must be length = num_rows + 1. All zeros => [] for every row.
+    let offsets = vec![0i32; num_rows + 1];
+    let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+    let primary_keys_array: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Utf8, false)),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        None, // no validity bitmap (all non-null lists)
+    ));
+
+    // 3) data: Struct matching the input batch's schema/columns
+    let data_array = Arc::new(StructArray::new(
+        data.schema().fields().clone(),
+        data.columns().to_vec(),
+        None,
+    ));
+
+    let columns = vec![op_array, primary_keys_array, data_array];
+    let record_batch = RecordBatch::try_new(schema.into(), columns).context(ArrowSnafu)?;
+
+    ChangeBatch::try_new(record_batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, StringArray};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_wrap_batch_as_change_batch() {
+        // Create a test schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Create test data
+        let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let name_array = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"]));
+        let data_batch = RecordBatch::try_new(Arc::clone(&schema), vec![id_array, name_array])
+            .expect("to create data batch");
+
+        let change_batch =
+            wrap_data_as_change_batch(&schema, &data_batch).expect("to create change batch");
+
+        let record = &change_batch.record;
+
+        // Verify the schema has the expected fields
+        assert_eq!(record.schema().fields().len(), 3);
+        // Verify the number of rows
+        assert_eq!(record.num_rows(), 3);
+
+        // Verify the op column
+        let op_column = record
+            .column_by_name("op")
+            .expect("op column exists")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("op column is StringArray");
+        for i in 0..3 {
+            assert_eq!(op_column.value(i), "c");
+        }
+
+        // Verify the primary_keys column (should be empty lists)
+        let pk_column = record
+            .column_by_name("primary_keys")
+            .expect("primary_keys column exists")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("primary_keys column is ListArray");
+        assert_eq!(pk_column.len(), 3);
+        for i in 0..3 {
+            assert_eq!(pk_column.value_length(i), 0);
+        }
+
+        // Verify the data column
+        let data_column = record
+            .column_by_name("data")
+            .expect("data column exists")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("data column is StructArray");
+        assert_eq!(data_column.len(), 3);
+        assert_eq!(data_column.num_columns(), 2);
     }
 }

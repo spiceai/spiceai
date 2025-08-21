@@ -91,6 +91,7 @@ rdkafka = { version = "0.38.0", features = ["cmake-build"], optional = true }
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
+kafka = ["dep:rdkafka"]
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
     "dep:duckdb",
