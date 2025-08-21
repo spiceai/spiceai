@@ -24,6 +24,7 @@ use data_components::s3_vectors::{
     MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
     list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
 };
+use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 use search::SEARCH_SCORE_COLUMN_NAME;
@@ -223,10 +224,10 @@ impl Index for S3Vector {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        for rb in &batches {
-            self.write(rb).await.map_err(DataFusionError::External)?;
-        }
-        Ok(batches)
+        let futs = batches
+            .into_iter()
+            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        try_join_all(futs).await
     }
 }
 
