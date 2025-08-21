@@ -838,7 +838,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.29.1"
-source = "git+https://github.com/spiceai/async-openai?rev=0acdec2a0a81c18ea76111b695fdbee4adc552b4#0acdec2a0a81c18ea76111b695fdbee4adc552b4"
+source = "git+https://github.com/spiceai/async-openai?rev=d89ff2391176ad5edd6719bcad000a8fc5f3cc19#d89ff2391176ad5edd6719bcad000a8fc5f3cc19"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -864,7 +864,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/async-openai?rev=0acdec2a0a81c18ea76111b695fdbee4adc552b4#0acdec2a0a81c18ea76111b695fdbee4adc552b4"
+source = "git+https://github.com/spiceai/async-openai?rev=d89ff2391176ad5edd6719bcad000a8fc5f3cc19#d89ff2391176ad5edd6719bcad000a8fc5f3cc19"
 dependencies = [
  "proc-macro2",
  "quote",

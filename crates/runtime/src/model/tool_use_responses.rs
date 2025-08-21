@@ -223,12 +223,6 @@ impl ToolUsingResponses {
             .cloned()
             .collect_vec();
 
-        tracing::debug!(
-            "spiced_tools available: {:?}. Used {:?}",
-            self.tools.iter().map(|t| t.name()).collect_vec(),
-            spiced_tools
-        );
-
         // Return early if no spiced runtime tools used.
         if spiced_tools.is_empty() {
             tracing::debug!("No spiced tools used by chat model, returning early");
@@ -250,11 +244,6 @@ impl ToolUsingResponses {
             tool_and_response_content.push((t, content));
         }
 
-        tracing::debug!(
-            "Ran tools, and retrieved responses: {:?}",
-            tool_and_response_content
-        );
-
         // Tell model the assistant used these tools, and provided result.
         let mut tool_messages: Vec<Value> = vec![];
         for (tool_call, response_content) in &tool_and_response_content {
@@ -272,11 +261,6 @@ impl ToolUsingResponses {
                 "output": serde_json::to_string(&response_content).unwrap_or("Error calling tool.".to_string())
             }));
         }
-
-        tracing::debug!(
-            "Tool messages to be added to chat model: {:?}",
-            tool_messages
-        );
 
         let mut messages = original_messages.clone();
         messages.extend(tool_messages.into_iter().map(|msg| InputItem::Custom(msg)));
@@ -323,7 +307,6 @@ impl ToolUsingResponses {
                 .responses_request(inner_req.clone())
                 .await?;
 
-            tracing::debug!("{:?}", resp);
             let usage = resp.usage.clone();
 
             let tools_used = resp
@@ -348,7 +331,6 @@ impl ToolUsingResponses {
                             recursion_limit.map(|r| r - 1),
                         )
                         .await?;
-                    tracing::debug!("{:?}", resp);
                     resp.usage = combine_usage(usage, resp.usage);
                     Ok(resp)
                 }
@@ -382,21 +364,7 @@ impl ToolUsingResponses {
 #[async_trait]
 impl Responses for ToolUsingResponses {
     async fn health(&self) -> Result<(), ResponsesError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-
-        let mut req = CreateResponseArgs::default()
-            .input("ping")
-            .build()
-            .boxed()
-            .context(FailedToLoadModelSnafu)?;
-
-        req.max_output_tokens = Some(150);
-
-        if let Err(e) = self.responses_request(req).instrument(span.clone()).await {
-            tracing::error!(target: "task_history", parent: &span, "{e}");
-            return Err(ResponsesError::HealthCheckError { source: e.into() });
-        }
-        Ok(())
+        self.inner_responses.health().await
     }
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
@@ -407,11 +375,9 @@ impl Responses for ToolUsingResponses {
 
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
         let inner_req = self.prepare_req(req).await?;
-        tracing::debug!("called 2");
         let res = self
             .responses_request_inner(inner_req, self.recursion_limit)
             .await?;
-        tracing::info!("{:?}", res);
         Ok(res)
     }
 }
