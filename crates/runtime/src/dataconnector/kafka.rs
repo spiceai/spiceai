@@ -24,11 +24,13 @@ use data_components::{
 };
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tonic::async_trait;
 
 use crate::{
     component::dataset::{Dataset, acceleration::RefreshMode},
+    dataaccelerator::spice_sys::kafka::KafkaSys,
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
@@ -40,7 +42,7 @@ use crate::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: 'kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/kafka#parameters"
+        "Missing required parameter: 'kafka_bootstrap_servers'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka#parameters"
     ))]
     MissingKafkaBootstrapServers,
 }
@@ -221,16 +223,10 @@ impl DataConnector for Kafka {
 
         let dataset_name = dataset.name.to_string();
 
-        if !dataset.is_file_accelerated() {
-            tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated. This may result in full message replay from Kafka on restarts. It is recommended to use file acceleration with the Kafka connector for optimal performance. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-            );
-        }
-
         let topic = dataset.path();
 
         let (kafka_consumer, schema) =
-            bootstrap_kafka_consumer(dataset, topic, self.kafka_config.clone()).await?;
+            init_kafka_consumer(dataset, topic, &self.kafka_config).await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
@@ -246,9 +242,16 @@ impl DataConnector for Kafka {
             schema
         };
 
-        let kafka = Arc::new(data_components::kafka::Kafka::new(schema, kafka_consumer));
+        if !dataset.is_file_accelerated() {
+            tracing::warn!(
+                "Dataset {dataset_name} is not file accelerated. This may result in full message replay from Kafka on restarts. It is recommended to use file acceleration with the Kafka connector for optimal performance. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
+            );
+        }
 
-        Ok(kafka)
+        Ok(Arc::new(data_components::kafka::Kafka::new(
+            schema,
+            kafka_consumer,
+        )))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -271,10 +274,70 @@ impl DataConnector for Kafka {
     }
 }
 
-async fn bootstrap_kafka_consumer(
+async fn init_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
-    kafka_config: KafkaConfig,
+    kafka_config: &KafkaConfig,
+) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
+    let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
+        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config).await;
+    };
+
+    ensure!(
+        topic == metadata.topic,
+        super::InvalidConfigurationNoSourceSnafu {
+            dataconnector: "kafka",
+            message: format!(
+                "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
+                metadata.topic
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+        }
+    );
+
+    let kafka_consumer =
+        KafkaConsumer::create_with_existing_group_id(&metadata.consumer_group_id, kafka_config)
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+
+    kafka_consumer
+        .subscribe(topic)
+        .boxed()
+        .context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "kafka",
+            connector_component: ConnectorComponent::from(dataset),
+        })?;
+
+    Ok((kafka_consumer, metadata.schema))
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct KafkaMetadata {
+    pub(crate) consumer_group_id: String,
+    pub(crate) topic: String,
+    pub(crate) schema: SchemaRef,
+}
+
+async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
+    let kafka_sys = KafkaSys::try_new(dataset).await.ok()?;
+    kafka_sys.get()
+}
+
+async fn set_metadata_to_accelerator(
+    dataset: &Dataset,
+    metadata: &KafkaMetadata,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
+    debezium_kafka_sys.upsert(metadata)
+}
+
+async fn bootstrap_new_kafka_consumer(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
@@ -320,7 +383,23 @@ async fn bootstrap_kafka_consumer(
         dataconnector: "kafka".to_string(),
         source: format!("Failed to infer schema from Kafka message: {e}").into(),
         connector_component: ConnectorComponent::from(dataset),
-    })?;
+    })?
+    .into();
+
+    let metadata = KafkaMetadata {
+        consumer_group_id: kafka_consumer.group_id().to_string(),
+        topic: topic.to_string(),
+        schema: Arc::clone(&schema),
+    };
+
+    if dataset.is_file_accelerated() {
+        set_metadata_to_accelerator(dataset, &metadata)
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+    }
 
     // Restart the stream from the beginning
     kafka_consumer
@@ -331,5 +410,5 @@ async fn bootstrap_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    Ok((kafka_consumer, Arc::new(schema)))
+    Ok((kafka_consumer, schema))
 }
