@@ -24,7 +24,7 @@ use spicepod::{
 mod search {
     use crate::{
         configure_test_datafusion,
-        models::{hf::get_huggingface_embeddings, search::item_tpch_dataset_w_embeddings},
+        models::{hf::get_huggingface_embeddings, search::item_tpcds_dataset_w_embeddings},
         utils::verify_env_secret_exists,
     };
     use app::AppBuilder;
@@ -49,7 +49,7 @@ mod search {
 
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        let mut test_dataset = item_tpch_dataset_w_embeddings(
+        let mut test_dataset = item_tpcds_dataset_w_embeddings(
             "item",
             "hf_minilm",
             Some(vec!["i_item_sk".to_string()]),
@@ -194,9 +194,9 @@ mod search {
             let rt = start_app(app).await?;
 
             run_and_snapshot_query(
-            &rt,
-            r#"SELECT "account.account_sid", "message.body", round(score, 1) as score, attempt_count, customer_note FROM vector_search(delivery, 'delivery issue') WHERE "event.id" = 'SM8856d9da23ab4a7c8b26'"#,
-            test_name,
+                &rt,
+                r#"SELECT "account.account_sid", "message.body", round(score, 1) as score, attempt_count, customer_note FROM vector_search(delivery, 'delivery issue') WHERE "event.id" = 'SM8856d9da23ab4a7c8b26'"#,
+                test_name,
             )
             .await?;
         }

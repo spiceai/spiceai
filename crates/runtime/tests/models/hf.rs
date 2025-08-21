@@ -175,7 +175,7 @@ mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
     use crate::models::search::{
-        SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
+        SearchTestCase, catalog_page_tpcds_dataset_w_embeddings, item_tpcds_dataset_w_embeddings,
         run_search,
     };
 
@@ -185,13 +185,13 @@ mod search {
     #[allow(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
         let app = AppBuilder::new("text-to-sql")
-            .with_dataset(item_tpch_dataset_w_embeddings(
+            .with_dataset(item_tpcds_dataset_w_embeddings(
                 "item",
                 "hf_minilm",
                 Some(vec!["i_item_sk".to_string()]),
                 None,
             ))
-            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+            .with_dataset(catalog_page_tpcds_dataset_w_embeddings(
                 "catalog_page_with_chunking",
                 "hf_minilm",
                 Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -202,7 +202,7 @@ mod search {
                     trim_whitespace: false,
                 }),
             ))
-            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+            .with_dataset(catalog_page_tpcds_dataset_w_embeddings(
                 "catalog_page_with_chunking_no_pk",
                 "hf_minilm",
                 None,

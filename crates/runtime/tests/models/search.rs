@@ -149,7 +149,7 @@ fn normalize_search_response(mut json: Value) -> String {
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
-pub(crate) fn item_tpch_dataset_w_embeddings(
+pub(crate) fn item_tpcds_dataset_w_embeddings(
     ds_name: &str,
     model: &str,
     primary_keys: Option<Vec<String>>,
@@ -172,7 +172,7 @@ pub(crate) fn item_tpch_dataset_w_embeddings(
     ds_tpcds_item
 }
 
-pub(crate) fn catalog_page_tpch_dataset_w_embeddings(
+pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
     ds_name: &str,
     model: &str,
     primary_keys: Option<Vec<String>>,
@@ -259,7 +259,7 @@ pub(crate) async fn run_search(
 #[tokio::test]
 #[ignore]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
-    let mut ds = catalog_page_tpch_dataset_w_embeddings(
+    let mut ds = catalog_page_tpcds_dataset_w_embeddings(
         "multi_column_search",
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -400,7 +400,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     let mut chunked =
-        catalog_page_tpch_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
+        catalog_page_tpcds_dataset_w_embeddings("mulit_column_no_pks", "hf_minilm", None, None);
     chunked.columns.push(Column {
         name: "cp_department".to_string(),
         embeddings: vec![ColumnLevelEmbeddingConfig {
@@ -843,7 +843,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
 
     let api_config = start_app(
         AppBuilder::new("search_app")
-            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+            .with_dataset(catalog_page_tpcds_dataset_w_embeddings(
                 "single_column",
                 "hf_minilm",
                 Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -943,7 +943,7 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[ignore]
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
-    let chunked = catalog_page_tpch_dataset_w_embeddings(
+    let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search",
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -1003,7 +1003,7 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[ignore]
 async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
-    let chunked = catalog_page_tpch_dataset_w_embeddings(
+    let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search_bypass",
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
@@ -1067,7 +1067,7 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
-    let ds = catalog_page_tpch_dataset_w_embeddings(
+    let ds = catalog_page_tpcds_dataset_w_embeddings(
         "basic_embedding_search",
         "hf_minilm",
         Some(vec!["cp_catalog_page_sk".to_string()]),
