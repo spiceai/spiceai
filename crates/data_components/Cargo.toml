@@ -126,7 +126,7 @@ test_hadoop_catalog_docker = []
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
-ctor = "0.2.8"
+ctor = "0.5.0"
 iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
 insta = { version = "1.43" }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
