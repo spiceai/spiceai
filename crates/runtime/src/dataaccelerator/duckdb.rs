@@ -490,7 +490,7 @@ mod tests {
         };
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
-        let (table, _) = duckdb_accelerator
+        let table = duckdb_accelerator
             .create_external_table(external_table, None, None)
             .await
             .expect("table should be created");
