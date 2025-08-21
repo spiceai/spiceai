@@ -732,7 +732,7 @@ impl RefreshTask {
             .clone()
             .context(super::FailedToFindLatestTimestampSnafu {
             reason:
-                "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified.",
+                "Failed to get the latest timestamp. The `time_column` parameter must be specified.",
         })?;
 
         let df = self
@@ -753,7 +753,7 @@ impl RefreshTask {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending.\nFailed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
+                reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
 
         if array.is_empty() {
@@ -765,7 +765,7 @@ impl RefreshTask {
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified."
+                reason: "Failed to get the latest timestamp. The `time_column` parameter must be specified."
                     .to_string(),
             });
         };

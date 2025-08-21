@@ -28,25 +28,25 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to load LLM: {name}.\n{source}"))]
+    #[snafu(display("Failed to load LLM: {name}. {source}"))]
     FailedToLoadLLM {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load runnable model: {name}.\n{source}"))]
+    #[snafu(display("Failed to load runnable model: {name}. {source}"))]
     FailedToLoadRunnableModel {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to load model {name} from spicepod.\nUnable to determine model type. Verify the model source and try again.\nFor details, visit https://spiceai.org/docs/components/models",
+        "Failed to load model {name} from spicepod. Unable to determine model type. Verify the model source and try again. For details, visit https://spiceai.org/docs/components/models",
     ))]
     UnableToDetermineModelType { name: String },
 
     #[snafu(display(
-        "Model {name} includes a non-existent path: {path}.\nVerify the model configuration and ensure all paths are correct.\nFor details, visit https://spiceai.org/docs/components/models",
+        "Model {name} includes a non-existent path: {path}. Verify the model configuration and ensure all paths are correct. For details, visit https://spiceai.org/docs/components/models",
     ))]
     ReferencedPathDoesNotExist { name: String, path: String },
 }

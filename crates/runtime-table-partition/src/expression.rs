@@ -36,7 +36,7 @@ use snafu::prelude::*;
 pub enum Error {
     #[snafu(display("Failed to determine data type: {source}"))]
     DataTypeError { source: DataFusionError },
-    #[snafu(display("Expression {expr} does not meet the criteria: {criterion}\n\nExpression Criteria:\n{}", PartitionCriteria.doc()))]
+    #[snafu(display("Expression {expr} does not meet the criteria: {criterion} Expression Criteria: {}", PartitionCriteria.doc()))]
     CriterionFailed { expr: String, criterion: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },

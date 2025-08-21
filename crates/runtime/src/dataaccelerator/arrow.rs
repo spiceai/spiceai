@@ -26,7 +26,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, Behaviors, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator};
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -65,7 +65,7 @@ impl DataAccelerator for ArrowAccelerator {
         cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
         partition_by: Option<PartitionBy>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_none(),
             super::InvalidConfigurationSnafu {
@@ -78,7 +78,7 @@ impl DataAccelerator for ArrowAccelerator {
             .await
             .boxed()?;
 
-        Ok((table_provider, Behaviors::default()))
+        Ok(table_provider)
     }
 
     fn prefix(&self) -> &'static str {
