@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_openai::{
     config::Config,
+    error::OpenAIError,
     types::responses::{CreateResponse, CreateResponseArgs, Response, ResponseStream},
 };
 use async_trait::async_trait;
@@ -24,10 +25,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     openai::Openai,
-    responses::{
-        Error::HealthCheckError, FailedToLoadModelSnafu, InternalSnafu, ResponseSnafu, Responses,
-        Result, StreamSnafu,
-    },
+    responses::{Error::HealthCheckError, FailedToLoadModelSnafu, Responses, Result},
 };
 
 #[async_trait]
@@ -51,7 +49,7 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
         Ok(())
     }
 
-    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream> {
+    async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
 
@@ -59,23 +57,16 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .boxed()
-            .context(InternalSnafu)?;
+            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
 
-        let stream = self
-            .client
-            .responses()
-            .create_stream(inner_req)
-            .await
-            .boxed()
-            .context(StreamSnafu)?;
+        let stream = self.client.responses().create_stream(inner_req).await?;
 
         drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
 
         Ok(Box::pin(stream))
     }
 
-    async fn responses_request(&self, req: CreateResponse) -> Result<Response> {
+    async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -84,16 +75,9 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .boxed()
-            .context(InternalSnafu)?;
+            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
 
-        let mut resp = self
-            .client
-            .responses()
-            .create(inner_req)
-            .await
-            .boxed()
-            .context(ResponseSnafu)?;
+        let mut resp = self.client.responses().create(inner_req).await?;
 
         drop(permit);
 

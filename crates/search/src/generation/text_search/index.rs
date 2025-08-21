@@ -352,3 +352,79 @@ fn parse_json_array(
         .map(|obj| TantivyDocument::from_json_object(schema, obj))
         .collect::<Result<Vec<_>, _>>()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use datafusion::datasource::{MemTable, TableProvider};
+    use runtime_datafusion_index::Index;
+
+    fn create_test_table() -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "test content 1",
+                    "test content 2",
+                    "test content 3",
+                ])),
+            ],
+        )
+        .expect("Failed to create test batch");
+
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("Failed to create test table"))
+    }
+
+    #[tokio::test]
+    async fn test_compute_index_returns_batches_unchanged() {
+        let table = create_test_table();
+        let search_fields = vec!["content".to_string()];
+        let primary_key = Some(vec!["id".to_string()]);
+
+        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key)
+            .await
+            .expect("Failed to create index");
+
+        let input_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("content", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(StringArray::from(vec!["new content 1", "new content 2"])),
+            ],
+        )
+        .expect("Failed to create input batch");
+
+        let input_batches = vec![input_batch.clone()];
+        let result_batches = index
+            .compute_index(input_batches.clone())
+            .await
+            .expect("Failed to compute index");
+
+        assert_eq!(input_batches.len(), result_batches.len());
+
+        for (input, result) in input_batches.iter().zip(result_batches.iter()) {
+            assert_eq!(input.schema(), result.schema());
+            assert_eq!(input.num_rows(), result.num_rows());
+            assert_eq!(input.num_columns(), result.num_columns());
+
+            for col_idx in 0..input.num_columns() {
+                let input_col = input.column(col_idx);
+                let result_col = result.column(col_idx);
+                assert_eq!(input_col, result_col);
+            }
+        }
+    }
+}
