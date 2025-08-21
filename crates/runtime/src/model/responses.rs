@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Runtime;
+use crate::init::tool;
 use crate::model::ToolUsingResponses;
 use crate::model::params::get_params_spec;
 use crate::model::tool_use_responses::OpenAIResponsesTools;

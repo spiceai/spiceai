@@ -283,7 +283,10 @@ impl ToolUsingResponses {
 
         if !messages.is_empty() {
             let used_tools = spiced_tools.len();
-            if used_tools > 0 {}
+            if used_tools > 0 {
+                let context = RequestContext::current(AsyncMarker::new().await);
+                crate::model::add_tools_used(&context, used_tools);
+            }
         }
 
         Ok(Some(messages))
@@ -379,7 +382,21 @@ impl ToolUsingResponses {
 #[async_trait]
 impl Responses for ToolUsingResponses {
     async fn health(&self) -> Result<(), ResponsesError> {
-        self.inner_responses.health().await
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+
+        let mut req = CreateResponseArgs::default()
+            .input("ping")
+            .build()
+            .boxed()
+            .context(FailedToLoadModelSnafu)?;
+
+        req.max_output_tokens = Some(150);
+
+        if let Err(e) = self.responses_request(req).instrument(span.clone()).await {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(ResponsesError::HealthCheckError { source: e.into() });
+        }
+        Ok(())
     }
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
