@@ -37,7 +37,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An internal error occured while connecting to GitHub to download files.\n{source}"
+        "An internal error occured while connecting to GitHub to download files. {source}"
     ))]
     HttpBuilderFailed { source: object_store::Error },
 

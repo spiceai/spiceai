@@ -240,6 +240,10 @@ pub(crate) fn routes(
                 "/v1/chat/completions",
                 post(v1::chat::post).layer(ModelContextLayer),
             )
+            .route(
+                "/v1/responses",
+                post(v1::responses::post).layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
@@ -257,7 +261,8 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.eval_scorers)))
             .layer(Extension(vector_search))
             .layer(Extension(Arc::clone(&rt.embeds)))
-            .layer(Extension(Arc::clone(&rt.workers)));
+            .layer(Extension(Arc::clone(&rt.workers)))
+            .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
 
     #[cfg(feature = "mcp")]

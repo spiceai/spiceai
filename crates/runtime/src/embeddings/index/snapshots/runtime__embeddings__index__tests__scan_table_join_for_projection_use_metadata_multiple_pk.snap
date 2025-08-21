@@ -9,13 +9,12 @@ snapshot_kind: text
 | logical_plan  | Limit: skip=0, fetch=5                                                                                                                                              |
 |               |   TableScan: my_vectored_table projection=[pk1, pk2, pk3, another_column, not_where, body_embedding], fetch=5                                                       |
 | physical_plan | CoalescePartitionsExec: fetch=5                                                                                                                                     |
-|               |   ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, another_column@3 as another_column, not_where@7 as not_where, body_embedding@8 as body_embedding] |
+|               |   ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, another_column@3 as another_column, not_where@4 as not_where, body_embedding@8 as body_embedding] |
 |               |     CoalesceBatchesExec: target_batch_size=8192, fetch=5                                                                                                            |
 |               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                                   |
 |               |         HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk1@0, pk1@0), (pk2@1, pk2@1), (pk3@2, pk3@2)]                                                         |
 |               |           DataSourceExec: partitions=1, partition_sizes=[1], fetch=5                                                                                                |
 |               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                      |
-|               |             ProjectionExec: expr=[pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3, not_where@4 as not_where, body_embedding@3 as body_embedding]                           |
-|               |               ExplainExecutionPlan: projection=["pk1", "pk2", "pk3", "body_embedding", "not_where"] filter=[] limit=None                                            |
+|               |             ExplainExecutionPlan: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=None                                                           |
 |               |                                                                                                                                                                     |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+

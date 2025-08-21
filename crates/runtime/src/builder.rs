@@ -178,7 +178,7 @@ impl RuntimeBuilder {
         {
             crate::in_tracing_context(|| {
                 tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release.\nUse `caching.sql_results` instead.\nFor more information, visit: https://spiceai.org/docs/features/caching"
+                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
                 );
             });
             caching_config.sql_results = Some(results_cache.into());
@@ -314,7 +314,7 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     if memory_limit.is_none() {
         crate::in_tracing_context(|| {
             tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
             );
         });
     }
@@ -322,7 +322,7 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     if memory_limit == Some(0) {
         crate::in_tracing_context(|| {
             tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
             );
         });
         None

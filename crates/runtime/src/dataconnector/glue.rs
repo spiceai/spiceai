@@ -52,47 +52,47 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot retrieve table '{table}' from Glue database '{database}'.\nVerify that the database and table exist and are accessible.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve table '{table}' from Glue database '{database}'. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     GetTable { database: String, table: String },
     #[snafu(display(
-        "Cannot load AWS configuration for Glue data connector.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+        "Cannot load AWS configuration for Glue data connector. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
     AWSConfig { source: aws::Error },
     #[snafu(display(
-        "No schema specified in path '{path}'.\nEnsure the dataset path includes a valid schema."
+        "No schema specified in path '{path}'. Ensure the dataset path includes a valid schema."
     ))]
     MissingSchema { path: String },
     #[snafu(display(
-        "No AWS region specified.\nAdd 'glue_region' to your configuration.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No AWS region specified. Add 'glue_region' to your configuration. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingRegion,
     #[snafu(display(
-        "Cannot retrieve AWS credentials.\nEnsure credentials are configured correctly.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve AWS credentials. Ensure credentials are configured correctly. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingCredentials,
     #[snafu(display(
-        "Invalid AWS credentials provided.\nVerify your credentials and try again.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+        "Invalid AWS credentials provided. Verify your credentials and try again. For help, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
     InvalidCredentials { source: CredentialsError },
     #[snafu(display(
-        "Cannot retrieve metadata location for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{message}"
+        "Cannot retrieve metadata location for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue {message}"
     ))]
     MissingMetadataLocation { table: String, message: String },
     #[snafu(display(
-        "Cannot retrieve input format for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve input format for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingInputFormat { table: String },
     #[snafu(display(
-        "The input format {input_format} for table '{table}' is not supported.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     InvalidInputFormat { input_format: String, table: String },
     #[snafu(display(
-        "No storage descriptor found for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageDescriptor { table: String },
     #[snafu(display(
-        "No storage location specified for table '{table}'.\nEnsure the table has a valid S3 location in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No storage location specified for table '{table}'. Ensure the table has a valid S3 location in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageLocation { table: String },
 }
@@ -406,7 +406,7 @@ async fn create_iceberg_provider(
         super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
-            message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'.\nVerify your AWS Glue configuration and credentials.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+            message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
             source: e.into(),
         }
     })?;
@@ -418,7 +418,7 @@ async fn create_iceberg_provider(
         .map_err(|e| super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
             source: e.into(),
         })?;
 

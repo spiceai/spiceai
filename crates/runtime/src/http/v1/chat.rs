@@ -56,6 +56,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
 
 static SPICE_COMPLETION_PROGRESS_HEADER: &str = "x-spiceai-completion-progress";
+pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 
 /// Create Chat Completion
 ///
@@ -234,7 +235,7 @@ async fn handle_streaming(
 
     create_sse_response(
         Box::pin(ReceiverStream::new(rx)),
-        time::Duration::from_secs(30),
+        time::Duration::from_secs(KEEP_ALIVE_INTERVAL),
         span,
     )
 }

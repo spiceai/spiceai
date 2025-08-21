@@ -40,42 +40,42 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unable to load the model.\n{source}\nVerify that the model is available and accessible."
+        "Unable to load the model. {source} Verify that the model is available and accessible."
     ))]
     UnableToFetchModel { source: reqwest::Error },
 
     #[snafu(display(
-        "Unable to download model file.\nVerify that the model is available and accessible."
+        "Unable to download model file. Verify that the model is available and accessible."
     ))]
     UnableToDownloadModelFile {},
 
     #[snafu(display(
-        "Unable to parse metadata.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Unable to parse metadata. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToParseMetadata {},
 
     #[snafu(display(
-        "Unable to find home directory.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Unable to find home directory. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToFindHomeDir {},
 
     #[snafu(display(
-        "Unable to create model path.\n{source}\nVerify you have the necessary permissions to access the model path."
+        "Unable to create model path. {source} Verify you have the necessary permissions to access the model path."
     ))]
     UnableToCreateModelPath { source: std::io::Error },
 
     #[snafu(display(
-        "Unable to load the configuration.\n{reason}\nVerify the configuration is valid, and try again."
+        "Unable to load the configuration. {reason} Verify the configuration is valid, and try again."
     ))]
     UnableToLoadConfig { reason: String },
 
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
-        "The specified model format, '{model_format}', is not supported.\nSpecify a supported model format and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "The specified model format, '{model_format}', is not supported. Specify a supported model format and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnsupportedModelFormat { model_format: ModelFormat },
 }

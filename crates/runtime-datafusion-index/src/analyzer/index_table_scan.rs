@@ -25,12 +25,13 @@ use std::{
 
 use async_trait::async_trait;
 use datafusion::{
+    arrow::datatypes::Schema,
     common::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::DefaultTableSource,
-    error::Result,
+    error::{DataFusionError, Result},
     execution::{SendableRecordBatchStream, SessionState, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
@@ -41,7 +42,7 @@ use datafusion::{
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
     prelude::Expr,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
 use crate::{Index, IndexedTableProvider};
@@ -349,6 +350,7 @@ impl ExecutionPlan for IndexerExec {
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true; self.children().len()]
     }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -383,26 +385,84 @@ impl ExecutionPlan for IndexerExec {
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.input_exec.schema();
+        let expected_schema = Arc::clone(&schema);
         let indexes = self.indexes.clone();
         let stream = self
             .input_exec
             .execute(partition, Arc::clone(&context))?
-            .then(move |batch| {
+            .and_then(move |batch| {
                 let indexes = indexes.clone();
+                let expected_schema = Arc::clone(&expected_schema);
                 async move {
-                    if let Ok(batch) = batch.as_ref() {
-                        futures::future::try_join_all(
-                            indexes
-                                .iter()
-                                .map(|index| index.compute_index(vec![batch.clone()])),
-                        )
-                        .await?;
+                    let mut b = batch;
+
+                    // Each index consumes the record batch and produces a new record batch with
+                    // the same schema. The indexes are executed in order, with the output of the
+                    // first index becoming the input of the second, etc.
+                    for idx in &indexes {
+                        let mut out = idx.compute_index(vec![b]).await?;
+
+                        match out.len() {
+                            1 => {
+                                b = out
+                                    .pop()
+                                    .unwrap_or_else(|| unreachable!("length is checked"));
+                                if b.schema().as_ref() != expected_schema.as_ref() {
+                                    let exp = schema_signature(expected_schema.as_ref());
+                                    let got = schema_signature(b.schema().as_ref());
+                                    return Err(DataFusionError::Execution(format!(
+                                        "Index {} changed schema.\
+                                        Expected fields ({}): {}\
+                                        Got fields ({}): {}",
+                                        idx.name(),
+                                        expected_schema.fields().len(),
+                                        exp,
+                                        b.schema().fields().len(),
+                                        got,
+                                    )));
+                                }
+                            }
+                            0 => {
+                                return Err(DataFusionError::Execution(format!(
+                                    "Index {} produced no record batch",
+                                    idx.name()
+                                )));
+                            }
+                            _ => {
+                                return Err(DataFusionError::Execution(format!(
+                                    "Index {} produced {} record batches; expected 1",
+                                    idx.name(),
+                                    out.len()
+                                )));
+                            }
+                        }
                     }
-                    batch
+
+                    Ok(b)
                 }
-            });
+            })
+            .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+/// Helper for better diagnostics when schema is mismatched.
+fn schema_signature(s: &Schema) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    for (i, f) in s.fields().iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        let _ = write!(
+            &mut buf,
+            "{}: {:?}{}",
+            f.name(),
+            f.data_type(),
+            if f.is_nullable() { "?" } else { "" }
+        );
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -419,7 +479,7 @@ mod test {
     use datafusion::{
         arrow::{
             self,
-            array::{ArrayRef, RecordBatch},
+            array::{ArrayRef, Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         },
         catalog::{MemTable, TableProvider},
@@ -568,6 +628,32 @@ mod test {
         Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
     }
 
+    #[allow(clippy::expect_used)]
+    fn test_one_row_batch() -> RecordBatch {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        let schema = test_schema();
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let region: ArrayRef = Arc::new(StringArray::from(vec!["A"]));
+        let value: ArrayRef = Arc::new(Int64Array::from(vec![10]));
+        RecordBatch::try_new(schema, vec![id, region, value]).expect("valid batch")
+    }
+
+    #[allow(clippy::expect_used)]
+    fn mem_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
+        let schema = batches[0].schema();
+        Arc::new(MemTable::try_new(schema, vec![batches]).expect("valid table"))
+            as Arc<dyn TableProvider>
+    }
+
+    #[allow(clippy::expect_used)]
+    fn one_row_batch() -> RecordBatch {
+        let schema = test_schema();
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let region: ArrayRef = Arc::new(StringArray::from(vec!["A"]));
+        let value: ArrayRef = Arc::new(Int64Array::from(vec![10]));
+        RecordBatch::try_new(schema, vec![id, region, value]).expect("valid batch")
+    }
+
     #[tokio::test]
     async fn optimizer_rule_happy_path() {
         let ctx = get_ctx();
@@ -617,5 +703,277 @@ mod test {
             "Execution error: Some error while indexing".to_string()
         );
         assert_eq!(1, index.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipelines_multiple_indexes_in_order_and_passes_batch() {
+        let ctx = get_ctx();
+
+        // index #1: set value column to 100
+        let idx1 = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch in");
+                let id = Arc::clone(b.column(0));
+                let region = Arc::clone(b.column(1));
+                let new_value: ArrayRef =
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vec![100]));
+                let out = RecordBatch::try_new(b.schema(), vec![id, region, new_value])
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        // index #2: assert it sees 100, then set to 200
+        let idx2 = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch in");
+                let v = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("valid array")
+                    .value(0);
+                if v != 100 {
+                    return Err(DataFusionError::Execution(format!("expected 100, got {v}")));
+                }
+                let id = Arc::clone(b.column(0));
+                let region = Arc::clone(b.column(1));
+                let new_value: ArrayRef =
+                    Arc::new(datafusion::arrow::array::Int64Array::from(vec![200]));
+                let out = RecordBatch::try_new(b.schema(), vec![id, region, new_value])
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        // table with a single non-empty batch so we can assert data changes
+        let table = mem_table_from_batches(vec![test_one_row_batch()]);
+
+        // build an IndexedTableProvider with *two* indexes, in order
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx1) as Arc<dyn Index + Send + Sync>)
+            .add_index(Arc::clone(&idx2) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "pipeline_idx_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid table");
+
+        let df = ctx.table("pipeline_idx_table").await.expect("valid");
+        let results = df.collect().await.expect("should complete");
+        assert_eq!(results.len(), 1);
+        let out = &results[0];
+
+        // final value should be 200 (idx2 saw 100 from idx1 and set to 200)
+        let out_val = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("valid array")
+            .value(0);
+        assert_eq!(out_val, 200);
+
+        // each index called exactly once
+        assert_eq!(1, idx1.compute_index_calls());
+        assert_eq!(1, idx2.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_errors_when_index_returns_zero_batches() {
+        let ctx = get_ctx();
+
+        // index returns zero batches (violates contract)
+        let bad_idx = Arc::new(TestIndex::new(vec!["id".to_string()], Some(|_| Ok(vec![]))));
+
+        let table = mem_table(); // empty batch is fine; the error is from the index
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "zero_batches_idx_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid table");
+
+        let df = ctx.table("zero_batches_idx_table").await.expect("valid");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should error due to zero batches");
+        assert_eq!(
+            err.to_string(),
+            "Execution error: Index s3_vector_index produced no record batch"
+        );
+        assert_eq!(1, bad_idx.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_errors_when_index_returns_multiple_batches() {
+        let ctx = get_ctx();
+
+        // index returns two batches (violates contract)
+        let bad_idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch in");
+                Ok(vec![b.clone(), b])
+            }),
+        ));
+
+        let table = mem_table(); // any input works
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&bad_idx) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "multi_batches_idx_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid table");
+
+        let df = ctx.table("multi_batches_idx_table").await.expect("valid");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should error due to multiple batches");
+        assert_eq!(
+            err.to_string(),
+            "Execution error: Index s3_vector_index produced 2 record batches; expected 1"
+        );
+        assert_eq!(1, bad_idx.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_stops_when_later_index_errors() {
+        let ctx = get_ctx();
+
+        let pass_through = Arc::new(TestIndex::new(vec!["id".to_string()], None));
+        let failing = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|_| Err(DataFusionError::Execution("boom".to_string()))),
+        ));
+
+        let table = mem_table_from_batches(vec![test_one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&pass_through) as Arc<dyn Index + Send + Sync>)
+            .add_index(Arc::clone(&failing) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "late_fail_idx_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid table");
+
+        let df = ctx.table("late_fail_idx_table").await.expect("valid");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should error from second index");
+        assert_eq!("Execution error: boom", err.to_string());
+
+        // first ran once, second ran once
+        assert_eq!(1, pass_through.compute_index_calls());
+        assert_eq!(1, failing.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_errors_when_index_changes_datatype() {
+        let ctx = get_ctx();
+
+        // Index that changes the type of "value" from Int64 -> Utf8
+        let idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                // reuse id & region; replace value with Utf8
+                let id = Arc::clone(b.column(0));
+                let region = Arc::clone(b.column(1));
+                let new_value: ArrayRef = Arc::new(StringArray::from(vec!["10"]));
+                let new_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("region", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]));
+                let out = RecordBatch::try_new(new_schema, vec![id, region, new_value])
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        ctx.register_table(
+            "schema_change_type",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("schema_change_type").await.expect("valid");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should error due to schema change");
+        let msg = err.to_string();
+
+        assert!(msg.contains("changed schema"));
+        assert!(msg.contains("Expected fields"));
+        assert!(msg.contains("Got fields"));
+        assert!(msg.contains("value: Int64")); // from expected
+        assert!(msg.contains("value: Utf8")); // from got
+
+        assert_eq!(1, idx.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_errors_when_index_adds_or_drops_columns() {
+        let ctx = get_ctx();
+
+        // Index that adds a new column "extra"
+        let idx_add = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                let id = Arc::clone(b.column(0));
+                let region = Arc::clone(b.column(1));
+                let value = Arc::clone(b.column(2));
+                let extra: ArrayRef = Arc::new(Int64Array::from(vec![999]));
+                let new_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("region", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                    Field::new("extra", DataType::Int64, false),
+                ]));
+                let out = RecordBatch::try_new(new_schema, vec![id, region, value, extra])
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx_add) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "schema_change_add",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("schema_change_add").await.expect("valid");
+        let err = df
+            .collect()
+            .await
+            .expect_err("should error due to schema change");
+        let msg = err.to_string();
+
+        assert!(msg.contains("changed schema"));
+        assert!(msg.contains("Expected fields (3)"));
+        assert!(msg.contains("Got fields (4)"));
+        assert!(msg.contains("extra: Int64"));
+
+        assert_eq!(1, idx_add.compute_index_calls());
     }
 }
