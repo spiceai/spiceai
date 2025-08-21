@@ -53,7 +53,7 @@ use tokio::sync::mpsc::Sender;
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
 /// Maximum topK results retrievable by a `QueryVector` operation.
-pub static S3_VECTOR_MAX_TOPK: i64 = 100;
+pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
@@ -211,7 +211,7 @@ impl S3VectorsQueryExec {
             );
             30_i32
         } else {
-            limit as i32
+            i32::try_from(limit).unwrap_or(30_i32) // Should not fail since we check upper bound above.
         };
 
         Self {
