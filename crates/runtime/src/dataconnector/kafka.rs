@@ -40,7 +40,7 @@ use crate::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: 'kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/kafka#parameters"
+        "Missing required parameter: 'kafka_bootstrap_servers'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka#parameters"
     ))]
     MissingKafkaBootstrapServers,
 }
@@ -203,7 +203,7 @@ impl DataConnector for Kafka {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
-                message: "The Kafka data connector requires an accelerated dataset.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
+                message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

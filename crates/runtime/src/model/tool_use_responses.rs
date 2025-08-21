@@ -178,7 +178,7 @@ impl ToolUsingResponses {
                             .to_jsonl(),
                     );
                     Value::String(format!(
-                        "Failed to call the tool {}.\nAn error occurred: {e}",
+                        "Failed to call the tool {}. An error occurred: {e}",
                         t.name()
                     ))
                 }
