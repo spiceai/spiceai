@@ -35,9 +35,7 @@ use datafusion::{
 
 use crate::{
     embedding_col,
-    embeddings::index::{
-        VectorIndex, projection_without_columns, vector_index_table_is_sufficient,
-    },
+    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
 };
 use search::generation::util::append_fields;
 
@@ -401,6 +399,7 @@ mod tests {
         Ok(())
     }
 
+    // [`VectorScanTableProvider`] cannot use metadata column to get data from vector index.
     #[tokio::test]
     pub async fn test_vector_scan_index_metadata() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
@@ -484,6 +483,14 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
             "scan_table_no_join_for_metadata_filter",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, a_number from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_no_embedding_no_join",
         )
         .await?;
 

@@ -16,10 +16,9 @@ snapshot_kind: text
 |               |       FilterExec: another_column@1 != something AND a_number@2 > 0, projection=[pk@0, body_embedding@3]                                          |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                              |
 |               |           CoalesceBatchesExec: target_batch_size=8192                                                                                            |
-|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@0)], projection=[pk@0, another_column@1, a_number@3, body_embedding@4] |
+|               |             HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk@0, pk@0)], projection=[pk@0, another_column@1, a_number@2, body_embedding@4] |
 |               |               DataSourceExec: partitions=1, partition_sizes=[1]                                                                                  |
 |               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                               |
-|               |                 ProjectionExec: expr=[pk@0 as pk, a_number@2 as a_number, body_embedding@1 as body_embedding]                                    |
-|               |                   ExplainExecutionPlan: projection=["pk", "body_embedding", "a_number"] filter=[] limit=None                                     |
+|               |                 ExplainExecutionPlan: projection=["pk", "body_embedding"] filter=[] limit=None                                                   |
 |               |                                                                                                                                                  |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
