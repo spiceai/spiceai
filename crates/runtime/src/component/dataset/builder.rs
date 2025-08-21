@@ -20,7 +20,7 @@ use super::{
     CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
     acceleration, replication, validate_identifier,
 };
-use crate::{Runtime, component::dataset::acceleration::Engine};
+use crate::Runtime;
 use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;

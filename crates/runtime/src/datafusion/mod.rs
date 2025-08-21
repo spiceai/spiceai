@@ -1464,7 +1464,7 @@ impl DataFusion {
         let federated_table =
             FederatedTable::new_unchecked(Arc::new(view_table) as Arc<dyn TableProvider>);
 
-        let (accelerated_table_provider, accelerated_table_behaviors) = self
+        let accelerated_table_provider = self
             .accelerator_engine_registry()
             .create_accelerator_table(
                 table.clone(),
@@ -1479,12 +1479,6 @@ impl DataFusion {
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to create view acceleration: {e}"),
             })?;
-
-        handle_accelerated_table_behavior(
-            accelerated_table_behaviors,
-            &federated_table,
-            &view.name.to_string(),
-        )?;
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
