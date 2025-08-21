@@ -164,7 +164,8 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
 
     // Update the embedding column in the batch with computed embeddings
     let updated_record =
-        update_embedding_column_in_batch(record, &index.embedded_column, &embedding_vectors)?;
+        update_embedding_column_in_batch(record, &index.embedded_column, &embedding_vectors)
+            .map_err(|e| *e)?;
 
     index
         .table
@@ -387,7 +388,7 @@ fn update_embedding_column_in_batch(
     record: RecordBatch,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
-) -> Result<RecordBatch, Error> {
+) -> Result<RecordBatch, Box<Error>> {
     let embedding_column_name = embedding_col!(embedded_column_name);
 
     // Check if the embedding column already exists
@@ -407,7 +408,9 @@ fn update_embedding_column_in_batch(
         columns[idx] = embedding_array;
 
         // Create new RecordBatch with updated column
-        RecordBatch::try_new(schema, columns).context(CannotUpdateEmbeddingColumnSnafu)
+        RecordBatch::try_new(schema, columns)
+            .context(CannotUpdateEmbeddingColumnSnafu)
+            .map_err(Box::from)
     } else {
         // If embedding column doesn't exist, return original batch
         // This shouldn't happen in normal operation since we check for it earlier
@@ -416,7 +419,9 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
-fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<dyn Array>, Error> {
+fn create_embedding_array(
+    embedding_vectors: &[Option<Vec<f32>>],
+) -> Result<Arc<dyn Array>, Box<Error>> {
     // Determine embedding dimension from first non-null embedding
     let dimension = i32::try_from(
         embedding_vectors
@@ -424,9 +429,14 @@ fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<
             .find_map(|opt| opt.as_ref().map(Vec::len))
             .unwrap_or(0),
     )
-    .context(EmbeddingDimensionTooLargeSnafu)?;
+    .context(EmbeddingDimensionTooLargeSnafu)
+    .map_err(Box::from)?;
 
-    ensure!(dimension > 0, CannotDetermineEmbeddingDimensionSnafu);
+    if dimension <= 0 {
+        CannotDetermineEmbeddingDimensionSnafu {}
+            .fail()
+            .map_err(Box::from)?;
+    }
 
     let mut builder = ListBuilder::new(Float32Builder::new());
     let field = Field::new_list_field(DataType::Float32, false);
