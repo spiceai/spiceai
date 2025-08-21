@@ -64,12 +64,12 @@ mod pruning;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to the Delta Lake Table.\nVerify the Delta Lake Table configuration is valid, and try again.\nReceived the following error while connecting: {source}"
+        "Failed to connect to the Delta Lake Table. Verify the Delta Lake Table configuration is valid, and try again. Received the following error while connecting: {source}"
     ))]
     DeltaTableError { source: delta_kernel::Error },
 
     #[snafu(display(
-        "Delta Lake Table checkpoint files are missing or incorrect.\nRecreate the checkpoint for the Delta Lake Table and try again.\n{source}"
+        "Delta Lake Table checkpoint files are missing or incorrect. Recreate the checkpoint for the Delta Lake Table and try again. {source}"
     ))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }

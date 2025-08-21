@@ -71,50 +71,50 @@ pub enum LlmRuntime {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."
+        "Failed to check the status of the model. An error occurred: {source} Verify the model configuration."
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to run the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."
+        "Failed to find the Local model at '{expected_path}'. Verify the model exists, and try again."
     ))]
     LocalModelNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."
+        "Failed to find the Local model config at '{expected_path}'. Verify the model config exists, and try again."
     ))]
     LocalModelConfigNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."
+        "Failed to find the Local tokenizer at '{expected_path}'. Verify the tokenizer exists, and try again."
     ))]
     LocalTokenizerNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"
+        "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."
+        "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
     ))]
     ModelNotFound { model: String, model_source: String },
 
@@ -124,19 +124,19 @@ pub enum Error {
     ModelNotProvided { model_source: String },
 
     #[snafu(display(
-        "Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load model tokenizer. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
-        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+        "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
 
@@ -147,17 +147,17 @@ pub enum Error {
     MissingParamError { param_key: &'static str },
 
     #[snafu(display(
-        "Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."
+        "Failed to find weights for the model. Expected tensors with a file extension of: {extensions}. Verify the model is correctly configured, and try again."
     ))]
     ModelMissingWeights { extensions: String },
 
     #[snafu(display(
-        "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
+        "Failed to load a file specified for the model. Could not find the file: {file_url}. Verify the `files` parameters for the model, and try again."
     ))]
     ModelFileMissing { file_url: String },
 
     #[snafu(display(
-        "Invalid parameters for model '{model}':\n{source}\nVerify the model parameters, and try again."
+        "Invalid parameters for model '{model}': {source} Verify the model parameters, and try again."
     ))]
     ModelParameterFailed {
         model: String,
