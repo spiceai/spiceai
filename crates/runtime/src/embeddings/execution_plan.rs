@@ -481,6 +481,8 @@ async fn get_vectors_with_chunker(
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
+        .collect::<Vec<Option<&str>>>()
+        .into_par_iter()
         // TODO: filter_map doesn't handle nulls
         .map(|s| match s {
             Some(s) if !s.is_empty() => {
@@ -497,10 +499,18 @@ async fn get_vectors_with_chunker(
 
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
 
-    let embedded_data = model
-        .embed(EmbeddingInput::StringArray(chunks.clone()))
-        .await
-        .boxed()?;
+    let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
+        chunks
+            .clone()
+            .into_par_iter()
+            .map(|chunk| model.embed_sync(EmbeddingInput::String(chunk)).map(|e| e[0].clone()))
+            .collect::<Result<Vec<_>, _> >()?
+    } else {
+        model
+            .embed(EmbeddingInput::StringArray(chunks.clone()))
+            .await
+            .boxed()?
+    };
 
     #[allow(clippy::cast_sign_loss)]
     let vector_length = model.size();
