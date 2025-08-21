@@ -52,7 +52,7 @@ use tokio::sync::mpsc::Sender;
 /// The JSON key within a `QueryVector` response that contains the distance to the query vector.
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
-/// Maximum topK results retrievable by a `QueryVector` operation.
+/// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
@@ -204,22 +204,12 @@ impl S3VectorsQueryExec {
             Boundedness::Bounded,
         );
 
-        let limit: i32 = if limit > 30 {
-            // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html
-            tracing::debug!(
-                "Limit provided to 'S3VectorsQueryExec' cannot be > 30. Recieved {limit}. Using 30."
-            );
-            30_i32
-        } else {
-            i32::try_from(limit).unwrap_or(30_i32) // Should not fail since we check upper bound above.
-        };
-
         Self {
             idx: table.table.idx.clone(),
             client: Arc::clone(&table.table.client),
             plan_properties: properties,
             query,
-            limit,
+            limit: i32::try_from(limit).unwrap_or(30_i32),
             filters,
         }
     }
