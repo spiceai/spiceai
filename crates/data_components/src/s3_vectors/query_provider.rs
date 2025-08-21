@@ -164,7 +164,7 @@ struct S3VectorsQueryExec {
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
     query: Vec<f32>,
-    limit: i64,
+    limit: i32,
     filters: Vec<Expr>,
 }
 
@@ -203,6 +203,16 @@ impl S3VectorsQueryExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
+
+        let limit: i32 = if limit > 30 {
+            // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html
+            tracing::debug!(
+                "Limit provided to 'S3VectorsQueryExec' cannot be > 30. Recieved {limit}. Using 30."
+            );
+            30_i32
+        } else {
+            limit as i32
+        };
 
         Self {
             idx: table.table.idx.clone(),
@@ -250,7 +260,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
 
         let client = Arc::clone(&self.client);
         let idx = self.idx.clone();
-        let limit: i32 = self.limit.try_into().unwrap_or(30); // https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html
+        let limit = self.limit;
         let q = self.query.clone();
         let filters = self.filters.clone();
 
