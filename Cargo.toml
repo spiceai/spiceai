@@ -220,11 +220,11 @@ lto = "off"
 
 [patch.crates-io]
 
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "9c4022b340280ada3ee4f87c6e6a389e7812c65a" }            # spiceai-48
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "9c4022b340280ada3ee4f87c6e6a389e7812c65a" }     # spiceai-48
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "9c4022b340280ada3ee4f87c6e6a389e7812c65a" } # spiceai-48
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "9c4022b340280ada3ee4f87c6e6a389e7812c65a" }  # spiceai-48
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "9c4022b340280ada3ee4f87c6e6a389e7812c65a" }       # spiceai-48
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "255a27bbc1566b0f4951d48694649972cf002136" }            # spiceai-48
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "255a27bbc1566b0f4951d48694649972cf002136" }     # spiceai-48
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "255a27bbc1566b0f4951d48694649972cf002136" } # spiceai-48
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "255a27bbc1566b0f4951d48694649972cf002136" }  # spiceai-48
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "255a27bbc1566b0f4951d48694649972cf002136" }       # spiceai-48
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "2da5afe760aec520c03840aac1c517dbf0764ea2" }                      # spiceai-48
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "de6c050447450a5cbd7a632f28af4ab2b65001fa" } # spiceai
