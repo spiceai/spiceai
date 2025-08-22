@@ -19,19 +19,17 @@ use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmb
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use model2vec_rs::model::StaticModel;
-use snafu::ResultExt;
 use std::fmt::{Debug, Formatter};
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
 ///
-/// Model2Vec is a technique that distills embeddings from
+/// `Model2Vec` is a technique that distills embeddings from
 /// transformer models into static word embeddings.
 pub struct Model2Vec {
     pub name: String,
     model: StaticModel,
 
     // Bound on model instantiation
-    hf_token: Option<String>,
     normalize: Option<bool>,
 
     // Bound during each embed call
@@ -43,21 +41,37 @@ pub struct Model2Vec {
 }
 
 impl Model2Vec {
+    /// Creates a new `Model2Vec` instance from the given parameters.
+    ///
+    /// # Arguments
+    /// * `name` - The name/identifier of the model
+    /// * `hf_token` - Optional Hugging Face authentication token
+    /// * `normalize` - Whether to normalize embeddings (defaults to model's setting)
+    /// * `pooling` - Pooling strategy to use
+    /// * `embed_batch_size` - Batch size for embedding operations
+    /// * `embed_custom_batch_size` - Custom batch size override
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The model cannot be loaded or initialized
+    /// - Invalid parameters are provided
+    /// - Network issues occur when downloading the model
+    /// - Authentication fails with the provided HF token
     pub fn from_params(
         name: &str,
-        hf_token: Option<String>,
+        hf_token: Option<&str>,
         normalize: Option<bool>,
+        subfolder: Option<&str>,
         parallelism: Option<usize>,
         embed_max_token_length: Option<usize>,
         embed_custom_batch_size: Option<usize>,
     ) -> Result<Self, super::embeddings::Error> {
-        let model = StaticModel::from_pretrained(&name, None, None, None)
+        let model = StaticModel::from_pretrained(name, hf_token, normalize, subfolder)
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         let model2vec = Self {
             name: name.to_string(),
             model,
-            hf_token,
             normalize,
             parallelism,
             embed_max_token_length,
@@ -138,9 +152,16 @@ mod tests {
     #[tokio::test]
     async fn test_embed() {
         // This embedding is dim 256
-        let model =
-            Model2Vec::from_params("minishlab/potion-base-8M", None, None, None, None, None)
-                .expect("Must instantiate");
+        let model = Model2Vec::from_params(
+            "minishlab/potion-base-8M",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Must instantiate");
 
         let embed_sentence = model
             .embed(EmbeddingInput::String("hello world".to_string()))
@@ -148,7 +169,7 @@ mod tests {
 
         assert!(embed_sentence.is_ok());
 
-        let embed_sentence = embed_sentence.unwrap();
+        let embed_sentence = embed_sentence.expect("Must embed sentence");
         assert_eq!(embed_sentence.len(), 1);
         assert_eq!(embed_sentence[0].len(), 256);
 
@@ -161,7 +182,7 @@ mod tests {
 
         assert!(embed_sentences.is_ok());
 
-        let embed_sentences = embed_sentences.unwrap();
+        let embed_sentences = embed_sentences.expect("Must embed sentences");
         assert_eq!(embed_sentences.len(), 2);
         for embedded_sentence in embed_sentences {
             assert_eq!(embedded_sentence.len(), 256);

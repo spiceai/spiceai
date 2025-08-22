@@ -43,12 +43,9 @@ use std::{any::Any, sync::Arc, thread};
 
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
-use futures::future;
 use rayon::ThreadPool;
 use std::fmt;
-use std::num::NonZero;
 use tokio::sync::RwLock;
-use tokio::task;
 
 use super::table::EmbeddingColumnConfig;
 
@@ -296,7 +293,7 @@ pub(crate) async fn compute_additional_embedding_columns(
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = if model.supports_sync_embeddings() {
-                get_vectors_in_process(arr_iter, Arc::clone(&model), cfg.vector_size)?
+                get_vectors_in_process(arr_iter, &**model, cfg.vector_size)?
             } else {
                 get_vectors(arr_iter, &**model, cfg.vector_size).await?
             };
@@ -414,9 +411,10 @@ pub(super) async fn get_vectors(
 /// Similar to [`get_vectors`] but runs synchronously and processes embeddings in parallel
 /// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 pub(super) fn get_vectors_in_process<'a>(
     arr: impl Iterator<Item = Option<&'a str>>,
-    model: Arc<dyn Embed>,
+    model: &dyn Embed,
     vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     let inputs: Vec<Option<String>> = arr.map(|o| o.map(ToString::to_string)).collect();
@@ -432,7 +430,7 @@ pub(super) fn get_vectors_in_process<'a>(
 
     // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
     // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
-    if inputs.iter().any(|o| o.is_none()) {
+    if inputs.iter().any(Option::is_none) {
         let embeds: Vec<_> = pool.install(|| {
             inputs
                 .into_par_iter()
@@ -445,15 +443,12 @@ pub(super) fn get_vectors_in_process<'a>(
         });
 
         for embed in embeds {
-            match embed {
-                Some(embedding) => {
-                    builder.values().append_slice(&embedding[0]);
-                    builder.append(true);
-                }
-                _ => {
-                    builder.values().append_nulls(vector_length as usize);
-                    builder.append(false);
-                }
+            if let Some(embedding) = embed {
+                builder.values().append_slice(&embedding[0]);
+                builder.append(true);
+            } else {
+                builder.values().append_nulls(vector_length as usize);
+                builder.append(false);
             }
         }
     } else {
@@ -474,7 +469,7 @@ pub(super) fn get_vectors_in_process<'a>(
             builder.values().append_slice(&embed);
             builder.append(true);
         }
-    };
+    }
 
     Ok(builder.finish())
 }
@@ -499,7 +494,11 @@ pub(super) fn get_vectors_in_process<'a>(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -524,7 +523,6 @@ async fn get_vectors_with_chunker(
         .unzip();
 
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
-
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
         let pool = build_embedding_pool(model.parallelism())?;
 
@@ -534,13 +532,10 @@ async fn get_vectors_with_chunker(
                 .into_par_iter()
                 .chunks(32)
                 .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
-                .try_reduce(
-                    || vec![],
-                    |mut acc, chunk| {
-                        acc.extend(chunk);
-                        Ok(acc)
-                    },
-                )
+                .try_reduce(Vec::new, |mut acc, chunk| {
+                    acc.extend(chunk);
+                    Ok(acc)
+                })
         })?
     } else {
         model
@@ -551,7 +546,6 @@ async fn get_vectors_with_chunker(
 
     #[allow(clippy::cast_sign_loss)]
     let vector_length = model.size();
-
     let capacity = chunks_per_row.iter().sum();
 
     #[allow(clippy::cast_sign_loss)]
@@ -639,11 +633,12 @@ async fn get_vectors_with_chunker(
 fn build_embedding_pool(
     model_parallelism: usize,
 ) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
-    let parallelism = match model_parallelism {
-        0 => thread::available_parallelism()
-            .expect("Failed to get available parallelism")
-            .get(),
-        p => p,
+    let sys_parallelism = thread::available_parallelism();
+
+    let parallelism = match (model_parallelism, sys_parallelism) {
+        (0, Ok(p)) => p.get(),
+        (0, _) => unreachable!("Must determine system parallelism"),
+        (p, _) => p,
     };
 
     rayon::ThreadPoolBuilder::new()

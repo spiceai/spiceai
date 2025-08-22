@@ -87,11 +87,11 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
-        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params).await,
+        EmbeddingPrefix::Model2Vec => model2vec(model_id, &params),
     }
 }
 
-async fn model2vec(
+fn model2vec(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
@@ -103,7 +103,11 @@ async fn model2vec(
 
     let hf_token = params
         .get("hf_token")
-        .map(|ss| ss.expose_secret().to_string());
+        .map(secrecy::ExposeSecret::expose_secret);
+
+    let subfolder = params
+        .get("subfolder")
+        .map(secrecy::ExposeSecret::expose_secret);
 
     let normalize = params
         .get("normalize")
@@ -125,6 +129,7 @@ async fn model2vec(
         &model_id,
         hf_token,
         normalize,
+        subfolder,
         parallelism,
         embed_max_token_length,
         embed_custom_batch_size,
