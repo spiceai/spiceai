@@ -701,7 +701,16 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                 .input("Tell me about the movie Ocean's Eleven")
                 .build()?;
 
-            let response = openai_client.responses().create(request).await?;
+            let responses_client = openai_client.responses();
+
+            let response = tokio::select! {
+                resp = responses_client.create(request) => {
+                    resp?
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for OpenAI response"));
+                }
+            };
             let tools = get_tools(
                 Arc::clone(&rt),
                 &runtime::tools::options::SpiceToolsOptions::Auto,
