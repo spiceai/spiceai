@@ -426,29 +426,47 @@ pub(super) fn get_vectors_in_process<'a>(
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
-    // Process embeddings in parallel, yielding None for empty strings or null values
-    let embeds: Vec<_> = inputs
-        .into_par_iter()
-        .map(|o| match o {
-            Some(input) if input.is_empty() => None,
-            Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
-            _ => None,
-        })
-        .collect();
+    // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
+    // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
+    if inputs.iter().any(|o| o.is_none()) {
+        let embeds: Vec<_> = inputs
+            .into_par_iter()
+            .map(|o| match o {
+                Some(input) if input.is_empty() => None,
+                Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
+                _ => None,
+            })
+            .collect();
 
-    // Load arrow FSLA
-    for embed in embeds {
-        match embed {
-            Some(embedding) => {
-                builder.values().append_slice(&embedding[0]);
-                builder.append(true);
-            }
-            _ => {
-                builder.values().append_nulls(vector_length as usize);
-                builder.append(false);
+        for embed in embeds {
+            match embed {
+                Some(embedding) => {
+                    builder.values().append_slice(&embedding[0]);
+                    builder.append(true);
+                }
+                _ => {
+                    builder.values().append_nulls(vector_length as usize);
+                    builder.append(false);
+                }
             }
         }
-    }
+    } else {
+        let embeds: Vec<Vec<f32>> = inputs
+            .into_par_iter()
+            .chunks(32)
+            .flat_map(|chunk| {
+                model.embed_sync(EmbeddingInput::StringArray(
+                    chunk.iter().flatten().cloned().collect(),
+                ))
+            })
+            .flatten()
+            .collect();
+
+        for embed in embeds {
+            builder.values().append_slice(&embed);
+            builder.append(true);
+        }
+    };
 
     Ok(builder.finish())
 }
@@ -503,8 +521,12 @@ async fn get_vectors_with_chunker(
         chunks
             .clone()
             .into_par_iter()
-            .map(|chunk| model.embed_sync(EmbeddingInput::String(chunk)).map(|e| e[0].clone()))
-            .collect::<Result<Vec<_>, _> >()?
+            .map(|chunk| {
+                model
+                    .embed_sync(EmbeddingInput::String(chunk))
+                    .map(|e| e[0].clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         model
             .embed(EmbeddingInput::StringArray(chunks.clone()))
