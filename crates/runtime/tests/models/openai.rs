@@ -187,7 +187,7 @@ mod search {
             vec![
                 SearchTestCase {
                     name: "openai_basic",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
@@ -197,7 +197,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "openai_additional_columns",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
@@ -208,7 +208,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "openai_with_where",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
                         "where": "subject!='math'",
@@ -275,7 +275,7 @@ mod search {
             vec![
                 SearchTestCase {
                     name: "openai_casing_no_chunking",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_no_chunking"],
@@ -285,7 +285,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "openai_casing_chunking",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_chunking"],

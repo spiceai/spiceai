@@ -224,7 +224,7 @@ mod search {
             vec![
                 SearchTestCase {
                     name: "hf_basic",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "new patient",
                         "limit": 2,
                         "datasets": ["item"],
@@ -235,7 +235,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_all_datasets",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "new patient",
                         "limit": 2,
                     })),
@@ -244,7 +244,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking"],
                         "limit": 1,
@@ -254,7 +254,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_with_extra_columns",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking"],
                         "additional_columns": ["cp_department"],
@@ -266,7 +266,7 @@ mod search {
                 // Error occurred in search pipeline: Error occurred retrieving candidate search results: Error occured during search: Failed to execute query: Error during planning: Projections require unique expression names but the expression "catalog_page_with_chunking.cp_catalog_page_sk" at position 0 and "catalog_page_with_chunking.cp_catalog_page_sk" at position 2 have the same name. Consider aliasing ("AS") one of them.
                 SearchTestCase {
                     name: "hf_chunking_with_extra_columns2",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking"],
                         "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
@@ -277,7 +277,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_with_extra_columns_and_where",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking"],
                         "additional_columns": ["cp_department"],
@@ -289,7 +289,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_no_pk",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking_no_pk"],
                         "limit": 1,
@@ -299,7 +299,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_with_extra_column_no_pk",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking_no_pk"],
                         "additional_columns": ["cp_department"],
@@ -310,7 +310,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_with_extra_column_no_pk2",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking_no_pk"],
                         "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
@@ -321,7 +321,7 @@ mod search {
                 },
                 SearchTestCase {
                     name: "hf_chunking_with_extra_columns_and_where_no_pk",
-                    body: SearchTestType::HTTP(json!({
+                    body: SearchTestType::Http(json!({
                         "text": "friends",
                         "datasets": ["catalog_page_with_chunking_no_pk"],
                         "additional_columns": ["cp_department"],
