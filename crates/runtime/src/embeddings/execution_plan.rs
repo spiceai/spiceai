@@ -41,13 +41,13 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc, thread};
 
+use super::table::EmbeddingColumnConfig;
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
+use llms::embeddings;
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;
-
-use super::table::EmbeddingColumnConfig;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -629,14 +629,22 @@ async fn get_vectors_with_chunker(
 }
 
 fn build_embedding_pool(
-    model_parallelism: usize,
+    model_parallelism: Option<usize>,
 ) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
     let sys_parallelism = thread::available_parallelism();
 
     let parallelism = match (model_parallelism, sys_parallelism) {
-        (0, Ok(p)) => p.get(),
-        (0, _) => unreachable!("Must determine system parallelism"),
-        (p, _) => p,
+        (Some(0), Ok(p)) => p.get(),
+        (Some(0), _) => unreachable!("Must determine system parallelism"),
+        (Some(p), _) => p,
+        (None, _) => {
+            return Err(embeddings::Error::FailedToCreateEmbedding {
+                source: Box::<dyn std::error::Error + Send + Sync>::from(
+                    "Model does not support in-process parallelism",
+                ),
+            }
+            .into());
+        }
     };
 
     rayon::ThreadPoolBuilder::new()

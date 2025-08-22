@@ -149,8 +149,10 @@ pub trait Embed: Debug + Sync + Send {
         false
     }
 
-    fn parallelism(&self) -> usize {
-        0
+    /// Configured model parallelism as read by an execution plan.
+    /// `None` if unsupported.
+    fn parallelism(&self) -> Option<usize> {
+        None
     }
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.

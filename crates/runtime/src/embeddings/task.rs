@@ -91,7 +91,7 @@ impl Embed for TaskEmbed {
         self.inner.supports_sync_embeddings()
     }
 
-    fn parallelism(&self) -> usize {
+    fn parallelism(&self) -> Option<usize> {
         self.inner.parallelism()
     }
 
