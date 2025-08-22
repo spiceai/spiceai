@@ -65,32 +65,32 @@ mod synchronized_table;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."
+        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."
+        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."
+        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."
+        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
-    #[snafu(display("Failed to refresh the dataset.\n{source}"))]
+    #[snafu(display("Failed to refresh the dataset. {source}"))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
 
     #[snafu(display(
-        "Manual refresh is not supported for `append` mode.\nOnly `full` refresh mode supports manual refreshes."
+        "Manual refresh is not supported for `append` mode. Only `full` refresh mode supports manual refreshes."
     ))]
     ManualRefreshIsNotSupported {},
 
@@ -100,26 +100,26 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table.\nIs the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table. Is the 'time_column' parameter correct?"
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
 
-    #[snafu(display("Failed to filter update data.\n{source}"))]
+    #[snafu(display("Failed to filter update data. {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into accelerated table.\n{source}"))]
+    #[snafu(display("Failed to write data into accelerated table. {source}"))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
-        "The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators"
+        "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratedTableDoesntSupportDelete {},
 
     #[snafu(display(
-        "Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"
+        "Expected the schema to have field '{field_name}', but it did not. Spice found the schema: {schema} Is the primary key configuration correct?"
     ))]
     PrimaryKeyExpectedSchemaToHaveField {
         field_name: String,
@@ -127,7 +127,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"
+        "Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not. Spice found the schema: {schema} Is the primary key configuration correct?"
     ))]
     PrimaryKeyArrayDataTypeMismatch {
         field_name: String,
@@ -136,7 +136,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The type of the primary key '{data_type}' is not yet supported for change deletion.\nUse a different primary key or change the data type."
+        "The type of the primary key '{data_type}' is not yet supported for change deletion. Use a different primary key or change the data type."
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
@@ -149,17 +149,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Snafu)]
 pub enum AcceleratedTableBuilderError {
     #[snafu(display(
-        "A changes stream is required when `refresh_mode` is set to `changes`.\nFor details, visit: https://spiceai.org/docs/features/cdc"
+        "A changes stream is required when `refresh_mode` is set to `changes`. For details, visit: https://spiceai.org/docs/features/cdc"
     ))]
     ExpectedChangesStream,
 
     #[snafu(display(
-        "An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+        "An append stream is required when `refresh_mode` is set to `append` without a `time_column`. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
     ))]
     AppendStreamRequired,
 
     #[snafu(display(
-        "A synchronized accelerated table requires full refresh mode.\nSet `refresh_mode` to 'full', and try again."
+        "A synchronized accelerated table requires full refresh mode. Set `refresh_mode` to 'full', and try again."
     ))]
     SynchronizedAcceleratedTableRequiresFullRefresh,
 }

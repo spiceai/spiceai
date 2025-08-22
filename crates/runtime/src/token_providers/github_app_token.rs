@@ -34,24 +34,24 @@ pub enum GitHubAppError {
     #[snafu(display("Invalid private key. Verify the GitHub private key parameter."))]
     InvalidPrivateKey { source: jsonwebtoken::errors::Error },
 
-    #[snafu(display("Failed to get system time.\nVerify your system time."))]
+    #[snafu(display("Failed to get system time. Verify your system time."))]
     UnableToGetSystemTime { source: std::time::SystemTimeError },
 
-    #[snafu(display("Invalid system time.\nVerify your system time."))]
+    #[snafu(display("Invalid system time. Verify your system time."))]
     InvalidSystemTime { source: std::num::TryFromIntError },
 
     #[snafu(display(
-        "Failed to generate JWT\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to generate JWT Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGenerateJWT { source: jsonwebtoken::errors::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token body. Verify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 

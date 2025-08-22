@@ -32,14 +32,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
     ))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
     #[snafu(display(
-        "Expected a single SQL statement for the refresh SQL, found {num_statements}.\nRewrite the SQL to only contain a single SELECT statement."
+        "Expected a single SQL statement for the refresh SQL, found {num_statements}. Rewrite the SQL to only contain a single SELECT statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
@@ -47,7 +47,7 @@ pub enum Error {
     InvalidSqlStatement { expected_table: TableReference },
 
     #[snafu(display(
-        "Unexpected '{expr}' in the Refresh SQL statement.\nRewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
+        "Unexpected '{expr}' in the Refresh SQL statement. Rewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
     ))]
     UnexpectedExpression {
         expr: &'static str,
@@ -55,12 +55,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Only column references are allowed in the SELECT clause of the refresh SQL, custom expressions and aliases are not supported.\nChange the SQL to only use columns references, i.e. SELECT col1, col2, col3 FROM {expected_table}"
+        "Only column references are allowed in the SELECT clause of the refresh SQL, custom expressions and aliases are not supported. Change the SQL to only use columns references, i.e. SELECT col1, col2, col3 FROM {expected_table}"
     ))]
     OnlyColumnReferences { expected_table: TableReference },
 
     #[snafu(display(
-        "The column '{column}' is not present in the source table '{expected_table}', valid columns are: {valid_columns}\nRewrite the SQL to only select columns that exist in the source table."
+        "The column '{column}' is not present in the source table '{expected_table}', valid columns are: {valid_columns} Rewrite the SQL to only select columns that exist in the source table."
     ))]
     ColumnNotFoundInSource {
         column: Arc<str>,

@@ -36,11 +36,11 @@ pub struct DatabricksDelta {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."
+        "A storage location for the Databricks table '{table_reference}' must be provided. Specify a storage location, and try again."
     ))]
     TableDoesNotHaveStorageLocation { table_reference: TableReference },
     #[snafu(display(
-        "Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."
+        "Failed to find the Databricks table '{table_reference}'. Verify the table exists, and try again."
     ))]
     TableDoesNotExist { table_reference: TableReference },
 }

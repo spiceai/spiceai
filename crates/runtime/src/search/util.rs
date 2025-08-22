@@ -191,7 +191,7 @@ pub async fn embedding_columns_from_table(
     {
         if let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
         {
-            use crate::embeddings::index::{S3Vector, VectorIndex};
+            use crate::embeddings::index::{VectorIndex, s3::S3Vector};
             if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
                 embedding_columns.insert(s3_vector.embedded_column());
             }

@@ -219,7 +219,6 @@ default = [
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
-    "kafka",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]

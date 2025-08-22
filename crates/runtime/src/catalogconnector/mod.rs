@@ -36,7 +36,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to setup the {connector_component} ({connector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({connector}). {source}"))]
     UnableToGetCatalogProvider {
         connector: String,
         connector_component: ConnectorComponent,
@@ -44,7 +44,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration. {message}"
     ))]
     InvalidConfiguration {
         connector: String,
@@ -54,7 +54,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
         connector: String,
@@ -63,7 +63,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the {connector_component} ({connector}). An unknown Catalog Connector Error occurred: {source}"
     ))]
     InternalWithSource {
         connector: String,
@@ -72,7 +72,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to initiate catalog, app reference cannot be obtained from the runtime\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to initiate catalog, app reference cannot be obtained from the runtime."
     ))]
     FailedToGetAppFromRuntime {},
 }

@@ -44,7 +44,7 @@ pub(crate) mod scorer;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to query evaluation dataset '{dataset_name}'.\n{source}\nEnsure the dataset is available and has the correct schema."
+        "Failed to query evaluation dataset '{dataset_name}'. {source} Ensure the dataset is available and has the correct schema."
     ))]
     FailedToQueryDataset {
         dataset_name: String,
@@ -52,7 +52,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to parse the column '{column}' in evaluation dataset '{dataset}'.\n{source}\nEnsure the column is available and has the correct schema."
+        "Failed to parse the column '{column}' in evaluation dataset '{dataset}'. {source} Ensure the column is available and has the correct schema."
     ))]
     FailedToParseColumn {
         column: String,
@@ -61,7 +61,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to prepare data for evaluation '{eval_name}'\n{source}\nVerify the dataset and model configuration, and try again."
+        "Failed to prepare data for evaluation '{eval_name}' {source} Verify the dataset and model configuration, and try again."
     ))]
     FailedToPrepareData {
         eval_name: String,
@@ -69,7 +69,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to run the model during evaluation '{eval_name}'.\n{source}\nVerify the model configuration and try again."
+        "Failed to run the model during evaluation '{eval_name}'. {source} Verify the model configuration and try again."
     ))]
     FailedToRunModel {
         eval_name: String,
@@ -77,7 +77,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to produce the number of expected rows from the model {model_name}, during evaluation '{eval_name}'.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to produce the number of expected rows from the model {model_name}, during evaluation '{eval_name}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     ModelProducedFewerRows {
         model_name: String,
@@ -85,7 +85,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to acquire the model '{model_name}' during evaluation '{eval_name}'.\nEnsure the model is available and has been successfully loaded."
+        "Failed to acquire the model '{model_name}' during evaluation '{eval_name}'. Ensure the model is available and has been successfully loaded."
     ))]
     FailedToGetModel {
         eval_name: String,
@@ -93,7 +93,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to load the scorer '{scorer_name}' needed for evaluation '{eval_name}'.\nVerify the scorer '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."
+        "Failed to load the scorer '{scorer_name}' needed for evaluation '{eval_name}'. Verify the scorer '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."
     ))]
     EvalScorerUnavailable {
         eval_name: String,
@@ -101,18 +101,18 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create score outputs.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to create score outputs. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToCreateScoreOutputs { source: ArrowError },
 
-    #[snafu(display("Failed to write evaluation results to {} for '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
+    #[snafu(display("Failed to write evaluation results to {} for '{eval_run_id}'. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
     FailedToWriteEvalResults {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to start an evaluation run for {eval_name}.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to start an evaluation run for {eval_name}. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToStartEvalRun {
         eval_name: String,
@@ -120,7 +120,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to update evaluation run table '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to update evaluation run table '{eval_run_id}'. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToUpdateEvalRunTable {
         eval_run_id: EvalRunId,
@@ -128,7 +128,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to start the evaluation run '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to start the evaluation run '{eval_run_id}'. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToOffloadEvalRun {
         eval_run_id: EvalRunId,
@@ -136,7 +136,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to update the status of an evaluation run '{eval_id}' to status '{status}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to update the status of an evaluation run '{eval_id}' to status '{status}'. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToUpdateEvalRunStatus {
         eval_id: EvalRunId,
@@ -145,22 +145,22 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to parse the input column from the evaluation dataset.\n{reason}\nCheck that the values in the input column are of valid evaluation format."
+        "Failed to parse the input column from the evaluation dataset. {reason} Check that the values in the input column are of valid evaluation format."
     ))]
     InvalidInputFormat { reason: String },
 
     #[snafu(display(
-        "Failed to parse the input column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to parse the input column from the evaluation dataset. {reason} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InvalidInputFormatReport { reason: String },
 
     #[snafu(display(
-        "Failed to parse the output column from the evaluation dataset.\n{reason}\nCheck that the values in the output column are of valid evaluation format."
+        "Failed to parse the output column from the evaluation dataset. {reason} Check that the values in the output column are of valid evaluation format."
     ))]
     InvalidOutputFormat { reason: String },
 
     #[snafu(display(
-        "Failed to parse the output column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to parse the output column from the evaluation dataset. {reason} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InvalidOutputFormatReport { reason: String },
 

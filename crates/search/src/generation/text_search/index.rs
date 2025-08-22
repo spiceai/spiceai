@@ -325,6 +325,7 @@ impl FullTextDatabaseIndex {
             schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
         }
         let schema = schema_builder.build();
+
         Ok(Arc::new(RwLock::new(tantivy::Index::create_in_ram(schema))))
     }
 

@@ -240,7 +240,7 @@ impl VectorSearchTableFunc {
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         // TODO: we might actually not want to recurse over accelerated table here.
 
-        use crate::embeddings::index::S3Vector;
+        use crate::embeddings::index::s3::S3Vector;
         let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
             return Ok(None);
         };

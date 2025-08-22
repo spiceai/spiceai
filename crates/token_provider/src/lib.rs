@@ -25,7 +25,7 @@ pub mod registry;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get token.\n{source}"))]
+    #[snafu(display("Failed to get token. {source}"))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
