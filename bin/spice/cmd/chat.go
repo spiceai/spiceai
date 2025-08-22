@@ -222,7 +222,7 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
-		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
+		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true&metadata_fields=supports_responses_api")
 		if err != nil {
 			slog.Error("could not list models", "error", err)
 			os.Exit(1)
@@ -233,10 +233,19 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
+		// Check if responses API should be used
+		useResponsesAPI, err := cmd.Flags().GetBool("responses")
+		if err != nil {
+			slog.Error("could not get responses flag", "error", err)
+			os.Exit(1)
+		}
+
 		availableModels := []string{}
 		for _, model := range models.Data {
 			if model.Status == "Ready" {
-				availableModels = append(availableModels, model.Id)
+				if !useResponsesAPI || model.Metadata.SupportsResponsesAPI {
+					availableModels = append(availableModels, model.Id)
+				}
 			}
 		}
 
@@ -297,13 +306,6 @@ spice chat --model <model> "What is Spice.ai?"
 					model))
 				os.Exit(1)
 			}
-		}
-
-		// Check if responses API should be used
-		useResponsesAPI, err := cmd.Flags().GetBool("responses")
-		if err != nil {
-			slog.Error("could not get responses flag", "error", err)
-			os.Exit(1)
 		}
 
 		// Handler for Responses API - handles non-streaming responses
