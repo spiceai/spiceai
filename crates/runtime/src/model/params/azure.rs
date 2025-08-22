@@ -47,5 +47,5 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         .description(
             "Whether to enable use of this model via the Responses API. `enabled` by default.",
         )
-        .default("disabled"),
+        .default("enabled"),
 ];
