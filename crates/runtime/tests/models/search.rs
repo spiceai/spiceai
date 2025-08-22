@@ -266,7 +266,7 @@ pub(crate) async fn run_search(
                 }
 
                 match ts.body {
-                    SearchTestType::HTTP(ref body) => {
+                    SearchTestType::HTTP(_) => {
                         run_search_test(http_base_url.as_str(), &ts, None, ts.should_fail).await?;
                     }
                     SearchTestType::SQL(sql) => {
@@ -374,9 +374,15 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
+            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
+            // huggingface needs limits for local-CPU embedding performance in these tests
+            // .with_embedding(get_huggingface_embeddings(
+            //     "sentence-transformers/all-MiniLM-L6-v2",
+            //     "hf_minilm",
+            // ))
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-large"),
+                "openai_embeddings_2",
             ))
             .with_embedding(get_openai_embeddings(
                 Some("text-embedding-3-small"),
@@ -387,20 +393,17 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 None,
                 Some(Column {
                     name: "answer".to_string(),
-                    embeddings: vec![
-                        ColumnLevelEmbeddingConfig {
-                            model: "hf_minilm".into(),
-                            chunking: None,
-                            row_ids: Some(vec!["id".to_string()]),
-                            vector_size: None,
-                        },
-                        ColumnLevelEmbeddingConfig {
-                            model: "openai_embeddings".into(),
-                            chunking: None,
-                            row_ids: Some(vec!["id".to_string()]),
-                            vector_size: None,
-                        },
-                    ],
+                    embeddings: vec![ColumnLevelEmbeddingConfig {
+                        model: "openai_embeddings_2".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }, ColumnLevelEmbeddingConfig {
+                        model: "openai_embeddings".into(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }],
                     description: None,
                     full_text_search: None,
                     metadata: HashMap::new(),
@@ -497,16 +500,22 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
+            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
+            // huggingface needs limits for local-CPU embedding performance in these tests
+            // .with_embedding(get_huggingface_embeddings(
+            //     "sentence-transformers/all-MiniLM-L6-v2",
+            //     "hf_minilm",
+            // ))
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 Some(Column {
                     name: "question".to_string(),
                     embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
+                        model: "openai_embeddings".into(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -579,16 +588,22 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
+            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
+            // huggingface needs limits for local-CPU embedding performance in these tests
+            // .with_embedding(get_huggingface_embeddings(
+            //     "sentence-transformers/all-MiniLM-L6-v2",
+            //     "hf_minilm",
+            // ))
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 Some(Column {
                     name: "question".to_string(),
                     embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".into(),
+                        model: "openai_embeddings".into(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -681,6 +696,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
 
 // HTTP error: 500 Internal Server Error - Error occurred in search pipeline: Error occurred aggregating candidate search results: A database error occurred whilst aggregating search candidates: Schema error: No field named table_provider."""cp_department""". Valid fields are candidate_generation.value, candidate_generation.cp_catalog_page_sk, candidate_generation.cp_description, candidate_generation.score, table_provider.cp_description, table_provider.cp_catalog_page_sk, table_provider.cp_department, table_provider.cp_catalog_number.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
