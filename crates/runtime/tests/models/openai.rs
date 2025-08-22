@@ -29,7 +29,9 @@ use crate::{
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::{CreateResponseArgs, OutputContent, ResponseEvent, Status};
+use async_openai::types::responses::{
+    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
+};
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, EmbeddingInput,
@@ -40,11 +42,12 @@ use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
+use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -632,6 +635,129 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
             assert!(!failure);
             // Check that we received more than 1 delta, indicating streaming
             assert!(delta_count > 1);
+
+            Ok(())
+        })
+        .await
+}
+
+fn get_responses_model_with_tools(
+    model: impl Into<String>,
+    name: impl Into<String>,
+    openai_responses_tools: impl Into<String>,
+) -> Model {
+    let mut model = get_openai_model(model, name);
+    model.params.insert(
+        "openai_responses_tools".into(),
+        serde_json::Value::String(openai_responses_tools.into()),
+    );
+    model
+        .params
+        .insert("tools".into(), serde_json::Value::String("auto".into()));
+    model
+}
+
+#[tokio::test]
+async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_responses_model_with_tools(
+                "gpt-4o-mini",
+                "openai_model",
+                "web_search, code_interpreter",
+            );
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Tell me about the movie Ocean's Eleven")
+                .build()?;
+
+            let responses_client = openai_client.responses();
+
+            let response = tokio::select! {
+                resp = responses_client.create(request) => {
+                    resp?
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for OpenAI response"));
+                }
+            };
+            let tools = get_tools(
+                Arc::clone(&rt),
+                &runtime::tools::options::SpiceToolsOptions::Auto,
+            )
+            .await;
+
+            let mut desired_tools = tools
+                .iter()
+                .map(|t| t.name().clone())
+                .collect::<HashSet<_>>();
+            desired_tools.insert(std::borrow::Cow::Borrowed("web_search"));
+            desired_tools.insert(std::borrow::Cow::Borrowed("code_interpreter"));
+
+            assert!(response.tools.is_some());
+
+            let Some(tools) = response.tools.as_ref() else {
+                unreachable!("We just asserted that response.tools is Some");
+            };
+
+            // Validate that the tools provided to the model are of the types we expect
+            assert!(tools.iter().all(|tool| matches!(
+                tool,
+                ToolDefinition::CodeInterpreter(_)
+                    | ToolDefinition::WebSearchPreview(_)
+                    | ToolDefinition::Function(_)
+            )));
+
+            // Validate that the individual tools themselves are correct
+            for tool in tools {
+                match tool {
+                    ToolDefinition::CodeInterpreter(_) => {
+                        assert!(desired_tools.remove("code_interpreter"));
+                    }
+                    ToolDefinition::WebSearchPreview(_) => {
+                        assert!(desired_tools.remove("web_search"));
+                    }
+                    ToolDefinition::Function(Function { name, .. }) => {
+                        assert!(desired_tools.remove(name.as_str()));
+                    }
+                    _ => {}
+                }
+            }
+
+            assert!(
+                desired_tools.is_empty(),
+                "Not all desired tools were found in the response: {desired_tools:?}"
+            );
 
             Ok(())
         })
