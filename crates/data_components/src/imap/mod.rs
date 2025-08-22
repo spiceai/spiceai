@@ -45,9 +45,7 @@ pub enum Error {
     HeaderNotFound,
     #[snafu(display("Failed to parse header: {source}"))]
     FailedToParseHeader { source: mailparse::MailParseError },
-    #[snafu(display(
-        "Failed to login.\nVerify the username and password, and try again.\n{source}"
-    ))]
+    #[snafu(display("Failed to login. Verify the username and password, and try again. {source}"))]
     FailedToLogin { source: imap::Error },
     #[snafu(display("Failed to connect: {source}"))]
     FailedToConnect { source: imap::Error },

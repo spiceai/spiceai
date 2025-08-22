@@ -50,7 +50,7 @@ use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed.\nFor details, visit: https://spiceai.org/docs/components/embeddings",
+        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed. For details, visit: https://spiceai.org/docs/components/embeddings",
     ))]
     InvalidColumnType { column: String, data_type: DataType },
 }

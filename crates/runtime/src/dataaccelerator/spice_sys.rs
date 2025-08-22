@@ -43,6 +43,9 @@ pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
 pub mod debezium_kafka;
 
+#[cfg(feature = "kafka")]
+pub mod kafka;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
@@ -146,6 +149,5 @@ async fn acceleration_connection(
         #[cfg(not(feature = "postgres"))]
         Engine::PostgreSQL => Err("Spice wasn't built with PostgreSQL support enabled".into()),
         Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
-        Engine::Void => Err("Void acceleration not supported for metadata".into()),
     }
 }

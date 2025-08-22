@@ -11,15 +11,14 @@ At a glance, error handling guidelines:
 3. Specify an action to take
 4. Use specific errors
 5. Refer to documentation
-6. Split long lines into new lines
-7. Exclude internal concepts
-8. Exclude debug information
+6. Exclude internal concepts
+7. Exclude debug information
 
 ## Examples
 
 As an example of applying these guidelines to existing error messages, take the previous `DataConnectorError::UnableToGetReadProvider` error message. The error message is `Unable to get read provider for {dataconnector}: {source}`.
 
-Following these guidelines, this existing error message does not follow guidelines 1, 2, or 7:
+Following these guidelines, this existing error message does not follow guidelines 1, 2, or 6:
 
 * The error message does not use simple language (what is a read provider? what does it mean if we failed to get one?)
 * The error message does not refer to the resource which it affects
@@ -141,31 +140,9 @@ Related reading:
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
     ```
 
-6. **Split long lines into new lines**
-
-    Long message lines can be difficult to interpret.
-
-    Typically, the error message, action to take, and any additional context/documentation should be split into separate lines.
-
-    This makes it easier for a user to consume each part of the message, and identify what steps they need to take.
-
-    If you're creating an error message which expects to receive an inner/source error, separate the inner error on a new line.
-
-    *Good:*
-
-    ```bash
-        Error initializing dataset taxi_trips.
-        The `s3_key` parameter cannot be set unless the `s3_auth` parameter is set to `key`.
-        For more information, visit: https://spiceai.org/docs/components/data-connectors/s3#auth
     ```
 
-    *Bad:*
-
-    ```bash
-        Error initializing dataset taxi_trips. The `s3_key` parameter cannot be set unless the `s3_auth` parameter is set to `key`. For more information, visit: https://spiceai.org/docs/components/data-connectors/s3#auth`
-    ```
-
-7. **Do not use internal concepts in error messages**
+6. **Do not use internal concepts in error messages**
 
     Users generally do not care about the fact that the logical plan builder failed to construct - they care about the fact that their query failed.
 
@@ -179,7 +156,7 @@ Related reading:
 
     `Failed to construct logical plan builder: ...`
 
-8. **Don't display debug information in non-debug errors**
+7. **Don't display debug information in non-debug errors**
 
     When outputting non-debug errors, use the `Display` trait instead of the `Debug` trait.
 

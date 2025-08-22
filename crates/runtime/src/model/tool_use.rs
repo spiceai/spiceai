@@ -533,7 +533,7 @@ fn combine_completion_details(
         (None, None) => None,
     }
 }
-fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a + b),
         (Some(a), None) => Some(a),
@@ -755,7 +755,7 @@ fn make_a_stream(
 }
 
 // OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
-fn encode_tool_name(name: &str) -> String {
+pub fn encode_tool_name(name: &str) -> String {
     if name.contains('/') {
         name.replace('_', "__").replace('/', "_")
     } else {

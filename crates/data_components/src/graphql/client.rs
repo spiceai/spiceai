@@ -1016,12 +1016,12 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         return match status {
             StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
-                    "The API failed with status code {status}.\nVerify the provided credentials are correct."
+                    "The API failed with status code {status}. Verify the provided credentials are correct."
                 ),
             }),
             StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
-                    "The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions."
+                    "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
             }),
             _ => Err(Error::InvalidReqwestStatus { status, message }),
@@ -1058,14 +1058,14 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             if error_type.to_lowercase() == "forbidden" {
                 return Err(Error::InvalidCredentialsOrPermissions {
                     message: format!(
-                        "The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}"
+                        "The API returned a 'FORBIDDEN' error. Verify the credentials have the necessary permissions. {message}"
                     ),
                 });
             }
             if error_type.to_lowercase() == "not_found" {
                 return Err(Error::ResourceNotFound {
                     message: format!(
-                        "The API returned a 'NOT_FOUND' error.\nVerify the requsted resource exists and is accessible.\n{message}"
+                        "The API returned a 'NOT_FOUND' error. Verify the requsted resource exists and is accessible. {message}"
                     ),
                 });
             }

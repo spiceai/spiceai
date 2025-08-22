@@ -31,7 +31,7 @@ const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication.\n{source}"
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,

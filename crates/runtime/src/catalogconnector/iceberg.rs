@@ -72,7 +72,7 @@ pub enum Error {
     UrlParseNoSource,
 
     #[snafu(display(
-        "Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."
+        "Failed to connect to the S3 endpoint at '{url}'. Verify the S3 endpoint is accessible and try again."
     ))]
     FailedToConnectS3Endpoint { url: String },
 
@@ -252,7 +252,7 @@ impl CatalogConnector for IcebergCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "iceberg".into(),
-                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
+                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -326,7 +326,7 @@ impl CatalogConnector for IcebergCatalog {
                 return Err(super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
                     message: format!(
-                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"
+                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from {e}"
                     ),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
