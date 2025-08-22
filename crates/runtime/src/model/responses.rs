@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
+use crate::model::ToolUsingResponses;
+use crate::model::params::get_params_spec;
+use crate::model::tool_use_responses::OpenAIResponsesTools;
+use crate::parameters::Parameters;
+use crate::tools::options::SpiceToolsOptions;
+use crate::tools::utils::get_tools;
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
@@ -22,14 +29,6 @@ use spicepod::component::model::{Model, ModelSource};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-
-use crate::Runtime;
-use crate::model::ToolUsingResponses;
-use crate::model::params::get_params_spec;
-use crate::model::tool_use_responses::OpenAIResponsesTools;
-use crate::parameters::Parameters;
-use crate::tools::options::SpiceToolsOptions;
-use crate::tools::utils::get_tools;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 
@@ -126,6 +125,7 @@ fn construct_model(
 
     let model = match prefix {
         ModelSource::OpenAi => openai(model_id, params),
+        ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         _ => Err(LlmError::ResponsesNotSupported {
             from: component.get_source().ok_or(LlmError::UnknownModelSource {
                 from: component.from.clone(),
@@ -178,5 +178,59 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Respo
         org_id,
         project_id,
         usage_tier,
+    )) as Arc<dyn Responses>)
+}
+
+fn azure(
+    model_id: Option<String>,
+    model_name: &str,
+    params: &Parameters,
+) -> Result<Arc<dyn Responses>, LlmError> {
+    let Some(model_name) = model_id else {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
+).into(),
+        });
+    };
+    let api_base = params.get("endpoint").expose().ok();
+    let api_version = params.get("api_version").expose().ok();
+    let deployment_name = params.get("deployment_name").expose().ok();
+    let api_key = params.get("api_key").expose().ok();
+    let entra_token = params.get("entra_token").expose().ok();
+
+    if api_base.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
+).into(),
+        });
+    }
+
+    if api_key.is_some() && entra_token.is_some() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
+            )
+            .into(),
+        });
+    }
+
+    if api_key.is_none() && entra_token.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
+            )
+            .into(),
+        });
+    }
+
+    Ok(Arc::new(llms::openai::new_azure_client(
+        model_name,
+        api_base,
+        api_version,
+        deployment_name,
+        entra_token,
+        api_key,
     )) as Arc<dyn Responses>)
 }

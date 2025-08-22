@@ -42,7 +42,10 @@ fn supports_responses_api(
             .eq_ignore_ascii_case("enabled");
     }
 
-    if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
+    if !matches!(
+        spicepod_model.get_source(),
+        Some(ModelSource::OpenAi | ModelSource::Azure)
+    ) {
         return false;
     }
     match spicepod_model.params.get("endpoint") {
