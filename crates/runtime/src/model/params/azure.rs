@@ -40,10 +40,12 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         .description("The Azure Entra token for authentication."),
     ParameterSpec::component("openai_responses_tools")
         .description(
-            "The OpenAI Responses tools to use when calling the model from the Responses API",
+            "The OpenAI Responses hosted tools to allow when calling the model from the Responses API",
         )
         .default(""),
     ParameterSpec::runtime("responses_api")
-        .description("Whether to enable use of this model via the Responses API. If `endpoint` is set to OpenAI's API endpoint, this is `enabled` by default. If not, it is `disabled`.")
+        .description(
+            "Whether to enable use of this model via the Responses API. `enabled` by default.",
+        )
         .default("disabled"),
 ];
