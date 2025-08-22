@@ -253,7 +253,6 @@ fn table_with_projection(
 
 /// For a given data type, determine the variant within the JSON `Union(_, Sparse)` that would be populated from the associated [`datafusion_functions_json::udfs::json_get_udf`].
 fn data_type_to_union_variant(dt: &DataType) -> &str {
-    // TODO Handle: "array", "object".
     match dt {
         DataType::Null => "null",
         DataType::Boolean => "bool",
@@ -267,6 +266,7 @@ fn data_type_to_union_variant(dt: &DataType) -> &str {
         | DataType::UInt64 => "int",
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "float",
         DataType::BinaryView | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "str",
+        DataType::LargeList(_) | DataType::List(_) => "array",
         _ => "",
     }
 }
