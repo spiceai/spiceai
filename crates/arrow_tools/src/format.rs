@@ -236,21 +236,15 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
         .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
         .collect();
 
-    let new_child_array = Arc::new(concat(
-        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-    )?);
+    let new_child_array = concat(&sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
 
     let nulls = new_child_array.nulls().cloned();
 
     ListArray::try_new(
-        Arc::new(Field::new_list(
+        Arc::new(Field::new(
             "item",
-            Field::new(
-                "item",
-                child_array.data_type().clone(),
-                child_array.is_nullable(),
-            ),
-            list_array.is_nullable(),
+            list_array.values().data_type().clone(),
+            list_array.values().is_nullable(),
         )),
         OffsetBuffer::from_lengths(new_lengths),
         new_child_array,
@@ -351,12 +345,12 @@ mod tests {
             Some(
                 "Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
-Sed do eiusmod tempor aliqua. 
+Sed do eiusmod tempor aliqua.
 
 reprehenderit nulla pariatur.",
             ),
             Some(
-                "Lorem ipsum dolor adipiscing elit. 
+                "Lorem ipsum dolor adipiscing elit.
 Cras venenatis euismod malesuada.",
             ),
         ]);
