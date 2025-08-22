@@ -185,38 +185,32 @@ mod search {
                 ))
                 .build(),
             vec![
-                SearchTestCase {
-                    name: "openai_basic",
-                    body: SearchTestType::Http(json!({
+                SearchTestCase::new(
+                    "openai_basic",
+                    SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
                     })),
-                    should_fail: false,
-                    skip: false,
-                },
-                SearchTestCase {
-                    name: "openai_additional_columns",
-                    body: SearchTestType::Http(json!({
+                ),
+                SearchTestCase::new(
+                    "openai_additional_columns",
+                    SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
                         "additional_columns": ["question"],
                     })),
-                    should_fail: false,
-                    skip: false,
-                },
-                SearchTestCase {
-                    name: "openai_with_where",
-                    body: SearchTestType::Http(json!({
+                ),
+                SearchTestCase::new(
+                    "openai_with_where",
+                    SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
                         "where": "subject!='math'",
                         "limit": 4,
                     })),
-                    should_fail: false,
-                    skip: false,
-                },
+                ),
             ],
         )
         .await
@@ -273,26 +267,22 @@ mod search {
         run_search(
             app,
             vec![
-                SearchTestCase {
-                    name: "openai_casing_no_chunking",
-                    body: SearchTestType::Http(json!({
+                SearchTestCase::new(
+                    "openai_casing_no_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_no_chunking"],
                     })),
-                    should_fail: false,
-                    skip: false,
-                },
-                SearchTestCase {
-                    name: "openai_casing_chunking",
-                    body: SearchTestType::Http(json!({
+                ),
+                SearchTestCase::new(
+                    "openai_casing_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_chunking"],
                     })),
-                    should_fail: false,
-                    skip: false,
-                },
+                ),
             ],
         )
         .await
