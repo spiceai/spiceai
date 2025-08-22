@@ -430,7 +430,10 @@ pub(super) fn get_vectors_in_process<'a>(
 
     // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
     // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
-    if inputs.iter().any(Option::is_none) {
+    if inputs
+        .iter()
+        .any(|o| !matches!(o, Some(s) if !s.is_empty()))
+    {
         let embeds: Vec<_> = pool.install(|| {
             inputs
                 .into_par_iter()
