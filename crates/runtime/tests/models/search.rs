@@ -757,6 +757,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 should_fail: false,
                 skip: false
             },
+            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
             SearchTestCase {
                 name: "text_search_sql_text_search_basic",
                 body: SearchTestType::Sql(
@@ -765,6 +766,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 should_fail: false,
                 skip: false
             },
+            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
             SearchTestCase {
                 name: "text_search_sql_text_search_projection",
                 body: SearchTestType::Sql(
