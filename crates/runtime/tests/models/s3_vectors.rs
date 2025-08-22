@@ -173,7 +173,7 @@ mod search {
               "event.id",
               round(score, 1)
             FROM vector_search(delivery, 'wrong location')
-            WHERE account.tier = 'BUSINESS'
+            WHERE "account.tier" = 'BUSINESS'
             ORDER BY "event.id" desc, score DESC
             LIMIT 10;
             "#,
