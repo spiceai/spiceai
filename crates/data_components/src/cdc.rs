@@ -331,6 +331,38 @@ pub fn wrap_data_as_change_batch(
     ChangeBatch::try_new(record_batch)
 }
 
+pub fn replace_change_batch_data(
+    new_data: &RecordBatch,
+    change: &ChangeBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
+    let schema = changes_schema(&new_data.schema());
+
+    let cols = change
+        .record
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "data" {
+                Arc::new(StructArray::new(
+                    new_data.schema().fields().clone(),
+                    new_data.columns().to_vec(),
+                    None,
+                )) as Arc<dyn Array>
+            } else {
+                match change.record.column_by_name(f.name()) {
+                    Some(column) => Arc::clone(column),
+                    None => unreachable!("Column {} must exist", f.name()),
+                }
+            }
+        })
+        .collect();
+
+    RecordBatch::try_new(schema.into(), cols)
+        .map_err(|source| ChangeBatchError::Arrow { source })
+        .and_then(ChangeBatch::try_new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
