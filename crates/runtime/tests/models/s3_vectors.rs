@@ -125,7 +125,7 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
-            SELECT 
+            SELECT
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
@@ -142,7 +142,7 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
-            explain SELECT 
+            explain SELECT
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
@@ -153,6 +153,22 @@ mod search {
             LIMIT 10;
             "#,
             "filters_pushdown_explain",
+        )
+        .await?;
+
+        // WHERE clause on non-filterable column should not pushdown filter to S3vector.
+        run_and_snapshot_query(
+            &rt,
+            r#"
+            explain SELECT
+              "event.id",
+              round(score, 1)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE account.tier = 'BUSINESS'
+            ORDER BY "event.id" desc, score DESC
+            LIMIT 10;
+            "#,
+            "non_filters_pushdown_explain",
         )
         .await?;
 
@@ -321,7 +337,7 @@ pub fn get_package_delivery_dataset(
         }]),
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),
-        vectors_filterable_col("account.tier"),
+        vectors_nonfilterable_col("account.tier"),
         vectors_filterable_col("account.account_sid"),
         vectors_filterable_col("package_weight_kg"),
         vectors_filterable_col("attempt_count"),
@@ -335,6 +351,16 @@ fn vectors_filterable_col(name: &str) -> Column {
         [(
             "vectors".to_string(),
             serde_json::Value::String("filterable".to_string()),
+        )]
+        .into(),
+    )
+}
+
+fn vectors_nonfilterable_col(name: &str) -> Column {
+    Column::new(name).with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
         )]
         .into(),
     )
