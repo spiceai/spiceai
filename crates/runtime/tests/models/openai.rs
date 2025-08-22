@@ -42,8 +42,6 @@ use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
-use rmcp::model::Tool;
-use runtime::component::dataset::Dataset;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
@@ -723,22 +721,28 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                 unreachable!("We just asserted that response.tools is Some");
             };
 
-            // Validate that the tools provided to the model are the ones we expect
+            // Validate that the tools provided to the model are of the types we expect
+            assert!(tools.iter().all(|tool| matches!(
+                tool,
+                ToolDefinition::CodeInterpreter(_)
+                    | ToolDefinition::WebSearchPreview(_)
+                    | ToolDefinition::Function(_)
+            )));
+
+            // Validate that the individual tools themselves are correct
             for tool in tools {
                 match tool {
                     ToolDefinition::CodeInterpreter(_) => {
-                        assert!(desired_tools.remove("code_interpreter"))
+                        assert!(desired_tools.remove("code_interpreter"));
                     }
                     ToolDefinition::WebSearchPreview(_) => {
-                        assert!(desired_tools.remove("web_search"))
+                        assert!(desired_tools.remove("web_search"));
                     }
                     ToolDefinition::Function(Function { name, .. }) => {
                         assert!(desired_tools.remove(name.as_str()));
                     }
-                    _ => {
-                        assert!(false, "Unexpected tool type: {tool:?}");
-                    }
-                };
+                    _ => {}
+                }
             }
 
             assert!(
