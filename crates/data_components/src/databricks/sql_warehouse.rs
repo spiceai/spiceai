@@ -91,7 +91,7 @@ pub enum Error {
     ParseError { reason: String },
 
     #[snafu(display(
-        "Failed to execute the query.\n{message}\nVerify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
+        "Failed to execute the query. {message} Verify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
     ))]
     QueryFailure { message: String },
 }

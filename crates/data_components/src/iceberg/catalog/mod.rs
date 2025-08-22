@@ -22,17 +22,17 @@ pub mod rest;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An unknown error occurred while interacting with the Iceberg catalog.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
+        "An unknown error occurred while interacting with the Iceberg catalog. Report an issue at https://github.com/spiceai/spiceai/issues {source}"
     ))]
     Unknown { source: iceberg::Error },
 
     #[snafu(display(
-        "The data in the Iceberg table is invalid. The table may be corrupted or incomplete.\n{source}"
+        "The data in the Iceberg table is invalid. The table may be corrupted or incomplete. {source}"
     ))]
     DataInvalid { source: iceberg::Error },
 
     #[snafu(display(
-        "This Iceberg feature is not yet supported.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
+        "This Iceberg feature is not yet supported. Report an issue at https://github.com/spiceai/spiceai/issues {source}"
     ))]
     FeatureUnsupported { source: iceberg::Error },
 

@@ -48,7 +48,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to fetch table information.\nError: {source}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
+        "Failed to fetch table information. Error: {source} Verify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/dynamodb"
     ))]
     DescribeTableError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -396,7 +396,7 @@ where
     // This happens when the request failed during dispatch. An HTTP response was not received, thus no error code or message is available.
     if let Some(conn_error) = source.downcast_ref::<aws_sdk_dynamodb::error::ConnectorError>() {
         return format!(
-            "Connection error. This may indicate an invalid region setting, connectivity, or access issue.\nDetails: {conn_error:?}"
+            "Connection error. This may indicate an invalid region setting, connectivity, or access issue. Details: {conn_error:?}"
         ).into();
     }
 

@@ -187,6 +187,8 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
@@ -246,6 +248,8 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}

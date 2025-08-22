@@ -20,7 +20,7 @@ use super::{
     CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
     acceleration, replication, validate_identifier,
 };
-use crate::{Runtime, component::dataset::acceleration::Engine};
+use crate::Runtime;
 use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
@@ -76,7 +76,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let mut acceleration = dataset
+        let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
@@ -87,17 +87,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
-            // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
+            // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
                 tracing::debug!(
-                    "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
+                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
                     dataset.name
                 );
-                acceleration = Some(acceleration::Acceleration {
-                    enabled: true,
-                    engine: Engine::Void,
-                    ..Default::default()
-                });
             }
 
             // Chunking with vector engines is not supported (yet).

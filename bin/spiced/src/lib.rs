@@ -89,11 +89,11 @@ pub enum Error {
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 
-    #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`.\n{reason}"))]
+    #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`. {reason}"))]
     FailedToApplyOverridesGeneric { reason: String },
 
     #[snafu(display(
-        "Failed to apply the runtime override from `--set-runtime {path}={value}`.\n{reason}"
+        "Failed to apply the runtime override from `--set-runtime {path}={value}`. {reason}"
     ))]
     FailedToApplyOverride {
         path: String,
@@ -371,7 +371,7 @@ fn apply_overrides(
         Ok(yaml) => yaml,
         Err(e) => {
             return FailedToApplyOverridesGenericSnafu {
-                reason: format!("Runtime configuration is invalid YAML.\n{e}"),
+                reason: format!("Runtime configuration is invalid YAML. {e}"),
             }
             .fail();
         }
@@ -398,7 +398,7 @@ fn apply_overrides(
         Err(e) => {
             FailedToApplyOverridesGenericSnafu {
                 reason: format!(
-                    "The runtime configuration after applying the overrides from `--set-runtime` is invalid.\n{e}"
+                    "The runtime configuration after applying the overrides from `--set-runtime` is invalid. {e}"
                 ),
             }
             .fail()

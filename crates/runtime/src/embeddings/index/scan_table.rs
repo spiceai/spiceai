@@ -35,9 +35,7 @@ use datafusion::{
 
 use crate::{
     embedding_col,
-    embeddings::index::{
-        VectorIndex, projection_without_columns, vector_index_table_is_sufficient,
-    },
+    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
 };
 use search::generation::util::append_fields;
 
@@ -190,23 +188,6 @@ impl TableProvider for VectorScanTableProvider {
                 .await;
         }
 
-        // Do not use [`VectorIndex::embedded_column`] from index.
-        // [`VectorScanTableProvider`] is used to populate RecordBatch in
-        // [`runtime_datafusion_index::Index::compute_index`]. On initial indexing into the index,
-        // we would get NULL values from [`VectorIndex`], we must use underlying instead.
-        let embedding_column = self.index.embedded_column();
-        let metadata_columns_from_index: Vec<_> = self
-            .index
-            .metadata_columns()
-            .iter()
-            .filter_map(|c| {
-                if c.name() == embedding_column {
-                    None
-                } else {
-                    Some(c.name().to_string())
-                }
-            })
-            .collect();
         let mut proj = self
             .index
             .primary_fields()
@@ -218,12 +199,6 @@ impl TableProvider for VectorScanTableProvider {
                 ))
             })
             .collect::<Vec<_>>();
-        proj.extend(metadata_columns_from_index.iter().map(|c| {
-            Expr::Column(Column::new(
-                Some(TableReference::parse_str("vector_index")),
-                c.clone(),
-            ))
-        }));
         proj.push(Expr::Column(Column::new(
             Some(TableReference::parse_str("vector_index")),
             embedding_col!(self.index.embedded_column()),
@@ -258,14 +233,8 @@ impl TableProvider for VectorScanTableProvider {
                 vector_table_scan
             }
         } else {
-            let underlying_table_scan = LogicalPlan::TableScan(self.underlying_table_scan(
-                Some(&projection_without_columns(
-                    self.schema().fields(),
-                    &metadata_columns_from_index,
-                    projection,
-                )),
-                filters,
-            )?);
+            let underlying_table_scan =
+                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
 
             let join_schema = vector_table_scan
                 .schema()
@@ -430,6 +399,7 @@ mod tests {
         Ok(())
     }
 
+    // [`VectorScanTableProvider`] cannot use metadata column to get data from vector index.
     #[tokio::test]
     pub async fn test_vector_scan_index_metadata() -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
@@ -513,6 +483,14 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
             "scan_table_no_join_for_metadata_filter",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, a_number from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_no_embedding_no_join",
         )
         .await?;
 

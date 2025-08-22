@@ -98,9 +98,10 @@ impl DebeziumKafka {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();
                 let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(
-                        "Unable to read message".to_string(),
-                    ));
+                    return Err(cdc::StreamError::Kafka(format!(
+                        "Unable to read message: {:?}",
+                        msg.err()
+                    )));
                 };
 
                 let val = msg.value();

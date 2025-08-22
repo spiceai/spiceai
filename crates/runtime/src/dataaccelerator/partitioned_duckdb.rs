@@ -51,7 +51,6 @@ use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
     AccelerationSource, DataAccelerator, Error as DataAcceleratorError,
-    behaviors::Behaviors,
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
@@ -242,7 +241,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Option<PartitionBy>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let partition_by = partition_by.context(PartitionByRequiredSnafu)?;
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
@@ -269,10 +268,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         *table_provider_guard = Some(Arc::clone(&table_provider));
         self.is_initialized.store(true, Ordering::Release);
 
-        Ok((
-            table_provider as Arc<dyn TableProvider>,
-            Behaviors::default(),
-        ))
+        Ok(table_provider as Arc<dyn TableProvider>)
     }
 
     fn prefix(&self) -> &'static str {
