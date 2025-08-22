@@ -205,7 +205,7 @@ impl DataConnector for Kafka {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
-                message: "The Kafka data connector requires an accelerated dataset.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
+                message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

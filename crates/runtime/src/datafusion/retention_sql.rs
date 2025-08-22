@@ -34,14 +34,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Retention SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
+        "The provided Retention SQL could not be parsed. {source} Check the SQL for syntax errors."
     ))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
     #[snafu(display(
-        "Expected a single SQL statement for the retention SQL, found {num_statements}.\nRewrite the SQL to only contain a single DELETE FROM statement."
+        "Expected a single SQL statement for the retention SQL, found {num_statements}. Rewrite the SQL to only contain a single DELETE FROM statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
@@ -49,17 +49,17 @@ pub enum Error {
     InvalidSqlStatement { expected_table: TableReference },
 
     #[snafu(display(
-        "DELETE statement must have a WHERE clause for retention SQL.\nRewrite the SQL to include a WHERE clause, i.e. DELETE FROM {expected_table} WHERE column = 'value'"
+        "DELETE statement must have a WHERE clause for retention SQL. Rewrite the SQL to include a WHERE clause, i.e. DELETE FROM {expected_table} WHERE column = 'value'"
     ))]
     MissingWhereClause { expected_table: TableReference },
 
     #[snafu(display(
-        "Only DELETE statements are allowed in retention SQL.\nRewrite the SQL to use DELETE FROM {expected_table} WHERE <condition>"
+        "Only DELETE statements are allowed in retention SQL. Rewrite the SQL to use DELETE FROM {expected_table} WHERE <condition>"
     ))]
     OnlyDeleteStatements { expected_table: TableReference },
 
     #[snafu(display(
-        "The table '{table_name}' in the retention SQL does not match the expected table '{expected_table}'.\nRewrite the SQL to use the correct table name."
+        "The table '{table_name}' in the retention SQL does not match the expected table '{expected_table}'. Rewrite the SQL to use the correct table name."
     ))]
     TableMismatch {
         table_name: String,

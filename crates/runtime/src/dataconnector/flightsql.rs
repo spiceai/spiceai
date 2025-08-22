@@ -34,18 +34,18 @@ use std::{future::Future, sync::Arc};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
     ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]
+    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred. {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
-    #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
+    #[snafu(display("Failed to connect to the Flight server. {source}"))]
     UnableToPerformHandshake { source: arrow::error::ArrowError },
 
     #[snafu(display(
-        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
     ))]
     InvalidParameterValue {
         parameter: String,
