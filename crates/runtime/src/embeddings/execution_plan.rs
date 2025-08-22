@@ -44,7 +44,9 @@ use std::{any::Any, sync::Arc, thread};
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 use futures::future;
+use rayon::ThreadPool;
 use std::fmt;
+use std::num::NonZero;
 use tokio::sync::RwLock;
 use tokio::task;
 
@@ -426,17 +428,21 @@ pub(super) fn get_vectors_in_process<'a>(
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
+    let pool = build_embedding_pool(model.parallelism())?;
+
     // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
     // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
     if inputs.iter().any(|o| o.is_none()) {
-        let embeds: Vec<_> = inputs
-            .into_par_iter()
-            .map(|o| match o {
-                Some(input) if input.is_empty() => None,
-                Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
-                _ => None,
-            })
-            .collect();
+        let embeds: Vec<_> = pool.install(|| {
+            inputs
+                .into_par_iter()
+                .map(|o| match o {
+                    Some(input) if input.is_empty() => None,
+                    Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
+                    _ => None,
+                })
+                .collect()
+        });
 
         for embed in embeds {
             match embed {
@@ -451,16 +457,18 @@ pub(super) fn get_vectors_in_process<'a>(
             }
         }
     } else {
-        let embeds: Vec<Vec<f32>> = inputs
-            .into_par_iter()
-            .chunks(32)
-            .flat_map(|chunk| {
-                model.embed_sync(EmbeddingInput::StringArray(
-                    chunk.iter().flatten().cloned().collect(),
-                ))
-            })
-            .flatten()
-            .collect();
+        let embeds: Vec<Vec<f32>> = pool.install(|| {
+            inputs
+                .into_par_iter()
+                .chunks(32)
+                .flat_map(|chunk| {
+                    model.embed_sync(EmbeddingInput::StringArray(
+                        chunk.iter().flatten().cloned().collect(),
+                    ))
+                })
+                .flatten()
+                .collect()
+        });
 
         for embed in embeds {
             builder.values().append_slice(&embed);
@@ -518,15 +526,22 @@ async fn get_vectors_with_chunker(
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
 
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
-        chunks
-            .clone()
-            .into_par_iter()
-            .map(|chunk| {
-                model
-                    .embed_sync(EmbeddingInput::String(chunk))
-                    .map(|e| e[0].clone())
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        let pool = build_embedding_pool(model.parallelism())?;
+
+        pool.install(|| {
+            chunks
+                .clone()
+                .into_par_iter()
+                .chunks(32)
+                .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
+                .try_reduce(
+                    || vec![],
+                    |mut acc, chunk| {
+                        acc.extend(chunk);
+                        Ok(acc)
+                    },
+                )
+        })?
     } else {
         model
             .embed(EmbeddingInput::StringArray(chunks.clone()))
@@ -619,6 +634,22 @@ async fn get_vectors_with_chunker(
     .boxed()?;
 
     Ok((vectors, content_offsets))
+}
+
+fn build_embedding_pool(
+    model_parallelism: usize,
+) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
+    let parallelism = match model_parallelism {
+        0 => thread::available_parallelism()
+            .expect("Failed to get available parallelism")
+            .get(),
+        p => p,
+    };
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .build()
+        .map_err(Into::into)
 }
 
 #[allow(clippy::float_cmp)]

@@ -25,6 +25,7 @@ use super::{
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -37,7 +38,7 @@ pub struct Embeddings {
     pub files: Vec<ModelFile>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, String>,
+    pub params: HashMap<String, Value>,
 
     #[serde(rename = "datasets", default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<String>,

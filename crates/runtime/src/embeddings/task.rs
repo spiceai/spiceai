@@ -91,6 +91,10 @@ impl Embed for TaskEmbed {
         self.inner.supports_sync_embeddings()
     }
 
+    fn parallelism(&self) -> usize {
+        self.inner.parallelism()
+    }
+
     fn embed_sync(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         self.inner.embed_sync(input)
     }

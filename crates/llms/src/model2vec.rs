@@ -29,24 +29,61 @@ use std::fmt::{Debug, Formatter};
 pub struct Model2Vec {
     pub name: String,
     model: StaticModel,
+
+    // Bound on model instantiation
+    hf_token: Option<String>,
+    normalize: Option<bool>,
+
+    // Bound during each embed call
+    embed_max_token_length: Option<usize>,
+    embed_custom_batch_size: Option<usize>,
+
+    // Spice-specific concurrency limits
+    parallelism: Option<usize>,
 }
 
 impl Model2Vec {
-    pub fn from_name(name: &str) -> Result<Self, super::embeddings::Error> {
+    pub fn from_params(
+        name: &str,
+        hf_token: Option<String>,
+        normalize: Option<bool>,
+        parallelism: Option<usize>,
+        embed_max_token_length: Option<usize>,
+        embed_custom_batch_size: Option<usize>,
+    ) -> Result<Self, super::embeddings::Error> {
         let model = StaticModel::from_pretrained(&name, None, None, None)
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
-        tracing::trace!("Model2Vec::from_name {}", name);
-        Ok(Self {
+        let model2vec = Self {
             name: name.to_string(),
             model,
-        })
+            hf_token,
+            normalize,
+            parallelism,
+            embed_max_token_length,
+            embed_custom_batch_size,
+        };
+
+        tracing::trace!("Model2Vec::from_params: {model2vec:?}");
+
+        Ok(model2vec)
     }
 }
 
 impl Debug for Model2Vec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Model2Vec {}", self.name)
+        let Self {
+            name,
+            normalize,
+            parallelism,
+            embed_max_token_length,
+            embed_custom_batch_size,
+            ..
+        } = self;
+        write!(
+            f,
+            "Model2Vec: {name}, normalize: {normalize:?}, parallelism: {parallelism:?}, embed_max_token_length: {embed_max_token_length:?}, embed_custom_batch_size: {embed_custom_batch_size:?}"
+        )
     }
 }
 
@@ -60,18 +97,31 @@ impl Embed for Model2Vec {
     }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
-        match input {
-            EmbeddingInput::String(s) => Ok(vec![self.model.encode_single(&s)]),
-            EmbeddingInput::StringArray(sentences) => Ok(self.model.encode(&sentences)),
-            _ => Err(UnsupportedEmbeddingInput {
-                model: self.name.clone(),
-                message: "Model2Vec models only support strings or vectors of strings".to_string(),
-            }),
-        }
+        let embedding_input = match input {
+            EmbeddingInput::String(s) => vec![s],
+            EmbeddingInput::StringArray(sentences) => sentences,
+            _ => {
+                return Err(UnsupportedEmbeddingInput {
+                    model: self.name.clone(),
+                    message: "Model2Vec models only support strings or vectors of strings"
+                        .to_string(),
+                });
+            }
+        };
+
+        Ok(self.model.encode_with_args(
+            &embedding_input,
+            self.embed_max_token_length,
+            self.embed_custom_batch_size.unwrap_or(1024),
+        ))
     }
 
     fn supports_sync_embeddings(&self) -> bool {
         true
+    }
+
+    fn parallelism(&self) -> usize {
+        self.parallelism.unwrap_or(0)
     }
 
     fn size(&self) -> i32 {
@@ -88,7 +138,9 @@ mod tests {
     #[tokio::test]
     async fn test_embed() {
         // This embedding is dim 256
-        let model = Model2Vec::from_name("minishlab/potion-base-8M").expect("Must instantiate");
+        let model =
+            Model2Vec::from_params("minishlab/potion-base-8M", None, None, None, None, None)
+                .expect("Must instantiate");
 
         let embed_sentence = model
             .embed(EmbeddingInput::String("hello world".to_string()))

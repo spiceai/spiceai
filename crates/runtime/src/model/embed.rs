@@ -59,7 +59,13 @@ pub async fn try_to_embedding(
     secrets: Arc<RwLock<Secrets>>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
-    let params = get_params_with_secrets(Arc::clone(&secrets), &component.params).await;
+    let string_params: HashMap<String, String> = component
+        .params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
+
+    let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
     let model_id = component.get_model_id();
     let prefix = component
         .get_prefix()
@@ -87,7 +93,7 @@ pub async fn try_to_embedding(
 
 async fn model2vec(
     model_id: Option<String>,
-    _params: &HashMap<String, SecretString>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_id) = model_id else {
         return Err(EmbedError::ModelNotProvided {
@@ -95,11 +101,38 @@ async fn model2vec(
         });
     };
 
-    Model2Vec::from_name(&model_id)
-        .map(|m| Arc::new(m) as Arc<dyn Embed>)
-        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-            source: Box::new(e),
-        })
+    let hf_token = params
+        .get("hf_token")
+        .map(|ss| ss.expose_secret().to_string());
+
+    let normalize = params
+        .get("normalize")
+        .and_then(|ss| ss.expose_secret().parse::<bool>().ok());
+
+    let parallelism = params
+        .get("parallelism")
+        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+
+    let embed_max_token_length = params
+        .get("embed_max_token_length")
+        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+
+    let embed_custom_batch_size = params
+        .get("embed_custom_batch_size")
+        .and_then(|ss| ss.expose_secret().parse::<usize>().ok());
+
+    Model2Vec::from_params(
+        &model_id,
+        hf_token,
+        normalize,
+        parallelism,
+        embed_max_token_length,
+        embed_custom_batch_size,
+    )
+    .map(|m| Arc::new(m) as Arc<dyn Embed>)
+    .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+        source: Box::new(e),
+    })
 }
 
 #[cfg(feature = "bedrock")]

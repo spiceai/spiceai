@@ -149,6 +149,10 @@ pub trait Embed: Debug + Sync + Send {
         false
     }
 
+    fn parallelism(&self) -> usize {
+        0
+    }
+
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].
     async fn health(&self) -> Result<()> {
