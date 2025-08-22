@@ -467,7 +467,7 @@ async fn get_vectors_with_chunker(
         2,
         capacity,
     )
-    .with_field(Arc::new(Field::new("item", DataType::Int32, false)));
+    .with_field(Arc::new(Field::new("item", DataType::Int32, true)));
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
@@ -523,7 +523,7 @@ async fn get_vectors_with_chunker(
     let content_offsets = ListArray::try_new(
         Arc::new(Field::new_fixed_size_list(
             "item",
-            Arc::new(Field::new("item", DataType::Int32, false)),
+            Arc::new(Field::new("item", DataType::Int32, true)),
             2,
             false,
         )),
