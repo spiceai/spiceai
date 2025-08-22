@@ -47,7 +47,8 @@ impl Model2Vec {
     /// * `name` - The name/identifier of the model
     /// * `hf_token` - Optional Hugging Face authentication token
     /// * `normalize` - Whether to normalize embeddings (defaults to model's setting)
-    /// * `pooling` - Pooling strategy to use
+    /// * `subfolder` - When using a huggingface model, it may reside in a subfolder of the repo
+    /// * `parallelism` - Spice-specific parallelism control (how many threads to embed on)
     /// * `embed_batch_size` - Batch size for embedding operations
     /// * `embed_custom_batch_size` - Custom batch size override
     ///

@@ -452,21 +452,20 @@ pub(super) fn get_vectors_in_process<'a>(
             }
         }
     } else {
-        let embeds: Vec<Vec<f32>> = pool.install(|| {
+        let embeds: Vec<_> = pool.install(|| {
             inputs
                 .into_par_iter()
                 .chunks(32)
-                .flat_map(|chunk| {
+                .map(|chunk| {
                     model.embed_sync(EmbeddingInput::StringArray(
                         chunk.iter().flatten().cloned().collect(),
                     ))
                 })
-                .flatten()
-                .collect()
-        });
+                .collect::<Result<Vec<_>, _>>()
+        })?;
 
-        for embed in embeds {
-            builder.values().append_slice(&embed);
+        for embed in embeds.iter().flatten() {
+            builder.values().append_slice(embed);
             builder.append(true);
         }
     }
@@ -506,8 +505,6 @@ async fn get_vectors_with_chunker(
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
-        .collect::<Vec<Option<&str>>>()
-        .into_par_iter()
         // TODO: filter_map doesn't handle nulls
         .map(|s| match s {
             Some(s) if !s.is_empty() => {
@@ -525,18 +522,16 @@ async fn get_vectors_with_chunker(
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
         let pool = build_embedding_pool(model.parallelism())?;
-
-        pool.install(|| {
+        let batches: Vec<_> = pool.install(|| {
             chunks
                 .clone()
                 .into_par_iter()
                 .chunks(32)
                 .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
-                .try_reduce(Vec::new, |mut acc, chunk| {
-                    acc.extend(chunk);
-                    Ok(acc)
-                })
-        })?
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        batches.into_iter().flatten().collect()
     } else {
         model
             .embed(EmbeddingInput::StringArray(chunks.clone()))
