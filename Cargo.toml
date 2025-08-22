@@ -71,7 +71,7 @@ arrow-ipc = "55.1"
 arrow-json = "55.1"
 arrow-odbc = "16"
 arrow-schema = "55.1"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "d89ff2391176ad5edd6719bcad000a8fc5f3cc19", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "0001d1237b46269740d2a4a50402a7880ee8f917", features = [
     "byot",
 ] }
 async-stream = "0.3.5"
