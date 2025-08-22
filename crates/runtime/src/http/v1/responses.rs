@@ -47,9 +47,9 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     operation_id = "post_chat_responses",
     tag = "AI",
     request_body(
-        description = "Create an Open AI Responses API using a language model.",
+        description = "Create an Open AI Responses API request using a language model.",
         content((
-            serde::Value = "application/json",
+            CreateResponse = "application/json",
             example = json!({
                 "model": "gpt-4o",
                 "input": "You are a helpful assistant.",
@@ -59,7 +59,7 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     ),
     responses(
         (status = 200, description = "Response generated successfully", content((
-            serde::Value = "application/json",
+            OpenAIResponse = "application/json",
             example = json!({
                 "created_at": 1_755_639_134,
                 "id": "resp_68a4ed5e2258819485ece563a803bbf2075163a5e5b1c982",
