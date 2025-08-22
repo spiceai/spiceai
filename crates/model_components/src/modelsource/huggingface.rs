@@ -69,7 +69,7 @@ impl ModelSource for Huggingface {
         let Some(caps) = HUGGINGFACE_PATH_REGEX.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: format!(
-                    "The 'from' parameter is invalid for a huggingface source: {remote_path}.\nFor details, visit: https://spiceai.org/docs/components/models/huggingface#from-format"
+                    "The 'from' parameter is invalid for a huggingface source: {remote_path}. For details, visit: https://spiceai.org/docs/components/models/huggingface#from-format"
                 ),
             }
             .build());

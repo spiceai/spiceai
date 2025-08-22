@@ -56,20 +56,20 @@ pub mod write;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Query execution failed. {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Failed to query Arrow Flight.\n{source}"))]
+    #[snafu(display("Failed to query Arrow Flight. {source}"))]
     Flight { source: flight_client::Error },
 
-    #[snafu(display("Failed to get schema from Arrow Flight for table {table}.\n{source}"))]
+    #[snafu(display("Failed to get schema from Arrow Flight for table {table}. {source}"))]
     UnableToGetSchema {
         source: flight_client::Error,
         table: String,
     },
 
-    #[snafu(display("Query execution failed.\n{source}\nVerify the configuration and try again."))]
+    #[snafu(display("Query execution failed. {source} Verify the configuration and try again."))]
     ArrowFlight {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

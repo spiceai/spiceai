@@ -24,10 +24,10 @@ use super::{LazyLock, Meter, global};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Internal error. Report an issue at https://github.com/spiceai/spiceai/issues.\nMetric callback not implemented for metric {} with type {:?}", metric.name, metric.metric_type))]
+    #[snafu(display("Internal error. Report an issue at https://github.com/spiceai/spiceai/issues. Metric callback not implemented for metric {} with type {:?}", metric.name, metric.metric_type))]
     MetricCallbackNotImplemented { metric: MetricSpec },
 
-    #[snafu(display("Internal error. Report an issue at https://github.com/spiceai/spiceai/issues.\nMetric {} callback has wrong type. Expected {}, got {}", metric.name, expected_type, actual_type))]
+    #[snafu(display("Internal error. Report an issue at https://github.com/spiceai/spiceai/issues. Metric {} callback has wrong type. Expected {}, got {}", metric.name, expected_type, actual_type))]
     MetricCallbackWrongType {
         metric: MetricSpec,
         expected_type: &'static str,

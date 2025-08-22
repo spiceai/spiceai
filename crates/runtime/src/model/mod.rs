@@ -28,6 +28,7 @@ mod model_context;
 pub(crate) mod params;
 mod responses;
 mod tool_use;
+mod tool_use_responses;
 mod util;
 mod wrapper;
 
@@ -50,6 +51,7 @@ pub use model_context::{
 };
 pub use responses::{LLMResponsesModelStore, try_to_responses_model};
 pub use tool_use::ToolUsingChat;
+pub use tool_use_responses::ToolUsingResponses;
 
 use crate::DataFusion;
 

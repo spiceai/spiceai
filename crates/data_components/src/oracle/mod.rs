@@ -153,7 +153,7 @@ impl OracleTableProvider {
             ),
         };
 
-        tracing::debug!("Executing schema query for dataset {table}:\n{columns_meta_query}");
+        tracing::debug!("Executing schema query for dataset {table}: {columns_meta_query}");
 
         let conn = conn.get().await?;
 

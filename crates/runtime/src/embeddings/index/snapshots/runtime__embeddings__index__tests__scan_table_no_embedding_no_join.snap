@@ -1,0 +1,14 @@
+---
+source: crates/runtime/src/embeddings/index/mod.rs
+expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------+
+| plan_type     | plan                                                                     |
++---------------+--------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                     |
+|               |   TableScan: my_vectored_table projection=[pk, a_number]                 |
+| physical_plan | SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[false] |
+|               |   DataSourceExec: partitions=1, partition_sizes=[1]                      |
+|               |                                                                          |
++---------------+--------------------------------------------------------------------------+

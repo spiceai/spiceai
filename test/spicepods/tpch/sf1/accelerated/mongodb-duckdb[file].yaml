@@ -8,6 +8,7 @@ definitions:
   - &mongodb_params
     mongodb_host: ${env:MONGODB_HOST}
     mongodb_port: 27017
+    mongodb_auth_source: admin
     mongodb_db: tpch_sf1
     mongodb_user: root
     mongodb_pass: ${env:MONGODB_PASSWORD}

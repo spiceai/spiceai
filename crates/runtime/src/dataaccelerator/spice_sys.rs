@@ -43,6 +43,9 @@ pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
 pub mod debezium_kafka;
 
+#[cfg(feature = "kafka")]
+pub mod kafka;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),

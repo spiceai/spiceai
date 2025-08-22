@@ -62,9 +62,7 @@ pub enum Error {
         table_name: Arc<str>,
     },
 
-    #[snafu(display(
-        "Cache invalidation failed with error: {source}.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Cache invalidation failed with error: {source}."))]
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 }
 

@@ -151,7 +151,7 @@ mod search {
 
     use crate::models::{
         get_mega_science_dataset, get_small_clickbench_dataset,
-        search::{SearchTestCase, run_search},
+        search::{SearchTestCase, SearchTestType, run_search},
     };
 
     use super::*;
@@ -185,34 +185,33 @@ mod search {
                 ))
                 .build(),
             vec![
-                SearchTestCase {
-                    name: "openai_basic",
-                    body: json!({
+                SearchTestCase::new(
+                    "openai_basic",
+                    SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_additional_columns",
-                    body: json!({
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_additional_columns",
+                    SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
                         "additional_columns": ["question"],
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_with_where",
-                    body: json!({
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_with_where",
+                    SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
                         "where": "subject!='math'",
                         "limit": 4,
-                    }),
-                },
+                    })),
+                ),
             ],
-            vec![],
         )
         .await
     }
@@ -268,24 +267,23 @@ mod search {
         run_search(
             app,
             vec![
-                SearchTestCase {
-                    name: "openai_casing_no_chunking",
-                    body: json!({
+                SearchTestCase::new(
+                    "openai_casing_no_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_no_chunking"],
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_casing_chunking",
-                    body: json!({
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_casing_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_chunking"],
-                    }),
-                },
+                    })),
+                ),
             ],
-            vec![],
         )
         .await
     }

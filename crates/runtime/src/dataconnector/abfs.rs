@@ -34,7 +34,7 @@ use url::Url;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\n{source}"
+        "The specified URL is not valid: {url}. Ensure the URL is valid and try again. {source}"
     ))]
     UnableToParseURL {
         url: String,
@@ -42,17 +42,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Multiple authentication methods were provided.\nSpecify only one of the following: access key, bearer token, or client credentials.\nUse skip_signature to disable all authentication."
+        "Multiple authentication methods were provided. Specify only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
     ))]
     InvalidKeyAuthCombination,
 
     #[snafu(display(
-        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nSpecify a valid HTTP/S URL."
+        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided. Specify a valid HTTP/S URL."
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
@@ -258,7 +258,7 @@ impl ListingTableConnector for AzureBlobFS {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

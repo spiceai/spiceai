@@ -32,8 +32,20 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
 static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
 
-fn supports_responses_api(spicepod_model: &SpicepodModel) -> bool {
-    if spicepod_model.get_source() != Some(ModelSource::OpenAi) {
+fn supports_responses_api(
+    spicepod_model: &SpicepodModel,
+    params: &HashMap<String, SecretString>,
+) -> bool {
+    if let Some(value) = params.get("responses_api") {
+        return secrecy::ExposeSecret::expose_secret(value)
+            .trim()
+            .eq_ignore_ascii_case("enabled");
+    }
+
+    if !matches!(
+        spicepod_model.get_source(),
+        Some(ModelSource::OpenAi | ModelSource::Azure)
+    ) {
         return false;
     }
     match spicepod_model.params.get("endpoint") {
@@ -54,7 +66,7 @@ impl Runtime {
             .await
             .ok();
 
-        let responses_model = if supports_responses_api(&m) {
+        let responses_model = if supports_responses_api(&m, &params) {
             try_to_responses_model(&m, &params, Arc::new(self.clone()))
                 .await
                 .ok()

@@ -136,7 +136,7 @@ impl ListingTableConnector for File {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "file".to_string(),
-                message: format!("The specified file path {path} created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file"),
+                message: format!("The specified file path {path} created an invalid URL. Check your file path and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/file"),
                 connector_component: ConnectorComponent::from(dataset),
             })
     }

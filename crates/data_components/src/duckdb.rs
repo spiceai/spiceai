@@ -50,7 +50,7 @@ pub enum Error {
     UnableToBeginTransaction { source: duckdb::Error },
 
     #[snafu(display(
-        "Unable to delete data from the duckdb table.\nAn internal table and base table exist for the same table.\nManually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
+        "Unable to delete data from the duckdb table. An internal table and base table exist for the same table. Manually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
     ))]
     UnableToDeleteDataInternalTable {
         internal_table: String,

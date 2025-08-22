@@ -49,14 +49,14 @@ pub enum Error {
     NoReadWriteProvider {},
 
     #[snafu(display(
-        "Unable to create data connector: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Unable to create data connector: {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
     #[snafu(display(
-        "Unable to create data accelerator: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Unable to create data accelerator: {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToCreateDataAcceleratorTable {
         source: Box<dyn std::error::Error + Sync + Send>,
