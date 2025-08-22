@@ -40,7 +40,7 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         .description("The Azure Entra token for authentication."),
     ParameterSpec::component("openai_responses_tools")
         .description(
-            "The OpenAI Responses hosted tools to allow when calling the model from the Responses API",
+            "Comma-separated list of OpenAI-hosted tools exposed via the Responses API for this model.",
         )
         .default(""),
     ParameterSpec::runtime("responses_api")
