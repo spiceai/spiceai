@@ -44,44 +44,44 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidUsessl { value: String },
 
     #[snafu(display(
-        "Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Failed to connect to Databricks Spark. {source} Verify the connector configuration, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to connect to Databricks SQL Warehouse.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Failed to connect to Databricks SQL Warehouse. {source} Verify the connector configuration, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToConstructDatabricksSqlWarehouse { source: sql_warehouse::Error },
 
     #[snafu(display(
-        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidMode { value: String },
 
     #[snafu(display(
-        "Invalid configuration: {message}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid configuration: {message}. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidConfiguration { message: String },
 
     #[snafu(display(
-        "Failed to build Databricks connector: required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build Databricks connector: required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication.\n{source}"
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,

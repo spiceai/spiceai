@@ -1,0 +1,23 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+      },
+      "score": 6.33
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+      },
+      "score": 6.19
+    }
+  ]
+}

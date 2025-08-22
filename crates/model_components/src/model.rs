@@ -46,9 +46,7 @@ pub enum Error {
     #[snafu(display("{source}"))]
     UnableToRunModel { source: ModelRuntimeError },
 
-    #[snafu(display(
-        "Unable to load required secrets.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Unable to load required secrets."))]
     UnableToLoadRequiredSecrets {},
 }
 

@@ -22,20 +22,18 @@ use task::TaskRequest;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "A cancellation token is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "A cancellation token is required. This is likely an internal error, if builtin task request triggers are used."
     ))]
     CancellationTokenRequired,
     #[snafu(display(
-        "A notification channel is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "A notification channel is required. This is likely an internal error, if builtin task request triggers are used."
     ))]
     NotificationChannelRequired,
     #[snafu(display(
-        "A submission channel is required.\nThis is likely an internal error, if builtin task request triggers are used.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "A submission channel is required. This is likely an internal error, if builtin task request triggers are used."
     ))]
     SubmissionChannelRequired,
-    #[snafu(display(
-        "A channel send error occurred.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("A channel send error occurred. {source}"))]
     ChannelSendError {
         source: tokio::sync::mpsc::error::SendError<Arc<TaskRequest>>,
     },
@@ -46,18 +44,18 @@ pub enum Error {
     #[snafu(display("No schedules were specified for the scheduler '{name}'"))]
     NoSchedulesSpecified { name: String },
     #[snafu(display(
-        "Failed to parse cron expression.\n{source}\nConfirm the cron expression is valid, and try again."
+        "Failed to parse cron expression. {source} Confirm the cron expression is valid, and try again."
     ))]
     FailedToParseCron { source: croner::errors::CronError },
     #[snafu(display(
-        "Failed to determine next cron expression run time.\n{source}\nConfirm the cron expression is valid, and try again."
+        "Failed to determine next cron expression run time. {source} Confirm the cron expression is valid, and try again."
     ))]
     FailedToDetermineNextCronRunTime { source: croner::errors::CronError },
     #[snafu(display(
-        "The specified schedule '{name}' does not exist in the scheduler.\nEnsure the schedule is defined, and try again."
+        "The specified schedule '{name}' does not exist in the scheduler. Ensure the schedule is defined, and try again."
     ))]
     ScheduleNotFound { name: String },
-    #[snafu(display("An error occurred while executing the scheduled task.\n{source}"))]
+    #[snafu(display("An error occurred while executing the scheduled task. {source}"))]
     RefreshTaskFailure {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

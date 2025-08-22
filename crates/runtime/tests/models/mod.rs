@@ -207,7 +207,7 @@ pub fn get_mega_science_dataset(
         // Can use this to run efficiently, locally:
         // "file:../../data/mega-science-small.jsonl",
         "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
-        spice_name.unwrap_or("mega-science"),
+        spice_name.unwrap_or("megascience"),
     );
     dataset.params = Some(Params::from_string_map(
         vec![("client_timeout".to_string(), "120s".to_string())]

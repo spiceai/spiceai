@@ -43,12 +43,12 @@ use std::{any::Any, fmt};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot connect to AWS Glue to retrieve databases.\nVerify your AWS credentials and region are configured correctly.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot connect to AWS Glue to retrieve databases. Verify your AWS credentials and region are configured correctly. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue  {source}"
     ))]
     GetDatabases { source: SdkError<GetDatabasesError> },
 
     #[snafu(display(
-        "Cannot retrieve tables from Glue database '{database}'.\nVerify the database exists and you have permissions to access it.\n{source}"
+        "Cannot retrieve tables from Glue database '{database}'. Verify the database exists and you have permissions to access it. {source}"
     ))]
     GetTables {
         database: String,
@@ -56,7 +56,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot create dataset for table `{dataset}`.\nVerify the table configuration and format are supported.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot create dataset for table `{dataset}`. Verify the table configuration and format are supported. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}"
     ))]
     CreatingDataset {
         dataset: String,
@@ -64,7 +64,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot load AWS configuration for Glue catalog.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot load AWS configuration for Glue catalog. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}"
     ))]
     ConfigurationLoadingFailed {
         #[snafu(source)]
@@ -72,7 +72,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid AWS configuration for Glue catalog.\nVerify your region, credentials, and other AWS parameters are correct.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}",
+        "Invalid AWS configuration for Glue catalog. Verify your region, credentials, and other AWS parameters are correct. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}",
     ))]
     ParameterValidation {
         #[snafu(source)]

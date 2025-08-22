@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, str::FromStr, sync::Arc};
+use std::{any::Any, collections::HashMap, num::TryFromIntError, str::FromStr, sync::Arc};
 
 use arrow::{
-    array::{LargeStringArray, RecordBatch, StringArray, StringViewArray},
-    datatypes::SchemaRef,
+    array::{
+        Array, Float32Builder, LargeStringArray, ListBuilder, RecordBatch, StringArray,
+        StringViewArray,
+    },
+    datatypes::{Field, SchemaRef},
 };
 use arrow_json::{EncoderOptions, writer::make_encoder};
-use arrow_schema::Field;
+use arrow_schema::DataType;
 use async_openai::types::EmbeddingInput;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
@@ -43,6 +46,7 @@ use tokio::sync::RwLock;
 use crate::{
     convert_string_arrow_to_iterator,
     dataconnector::parameters::aws::load_config,
+    embedding_col,
     embeddings::index::{IndexEmbeddingConfig, S3Vector, retry_client::S3VectorRetryClientBuilder},
     get_params_with_secrets,
     model::EmbeddingModelStore,
@@ -83,8 +87,19 @@ pub enum Error {
     #[snafu(display("Cannot write to '{index}' index: {source}"))]
     CannotWriteIndex {
         index: String,
-        source: data_components::s3_vectors::Error,
+        source: Box<data_components::s3_vectors::Error>,
     },
+
+    #[snafu(display(
+        "Cannot create embedding array: no valid embeddings found to determine dimension"
+    ))]
+    CannotDetermineEmbeddingDimension,
+
+    #[snafu(display("Embedding dimension is too large to fit into an i32"))]
+    EmbeddingDimensionTooLarge { source: TryFromIntError },
+
+    #[snafu(display("Cannot update embedding column in record batch: {source}"))]
+    CannotUpdateEmbeddingColumn { source: arrow::error::ArrowError },
 }
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
@@ -116,8 +131,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 pub async fn write(
     index: &S3VectorIndex,
     cfg: &IndexEmbeddingConfig,
-    record: &RecordBatch,
-) -> Result<(), Error> {
+    record: RecordBatch,
+) -> Result<RecordBatch, Error> {
     let schema = record.schema();
     let Some((embedded_column_idx, _)) = record
         .schema()
@@ -128,11 +143,11 @@ pub async fn write(
             index.name(),
             index.embedded_column
         );
-        return Ok(());
+        return Ok(record);
     };
 
     let embedding_vectors = match embed_column(
-        record,
+        &record,
         embedded_column_idx,
         cfg.model_name.as_str(),
         Arc::clone(&cfg.embedding_models),
@@ -243,24 +258,29 @@ pub async fn write(
     // Currently, we only support when there is one primary key column.
     if primary_keys.len() > 1 {
         tracing::debug!("primary_keys.len() > 1");
-        return Ok(());
+        return Ok(record);
     }
     if primary_keys.is_empty() {
         tracing::debug!("primary_keys.is_empty()");
-        return Ok(());
+        return Ok(record);
     }
 
     let Some(pk_field) = index.primary_key.first() else {
         tracing::debug!("primary_keys.is_empty()");
-        return Ok(());
+        return Ok(record);
     };
+
+    // Update the embedding column in the batch with computed embeddings
+    let updated_record =
+        update_embedding_column_in_batch(record, &index.embedded_column, &embedding_vectors)?;
+
     if let Some(key) = primary_keys.remove(pk_field.name()) {
         if let Err(e) = index
             .table
             .write_data(embedding_vectors, key, metadata)
             .await
         {
-            return Err(e).context(CannotWriteIndexSnafu {
+            return Err(Box::new(e)).context(CannotWriteIndexSnafu {
                 index: index.name().to_string(),
             });
         }
@@ -271,7 +291,72 @@ pub async fn write(
         );
     }
 
-    Ok(())
+    Ok(updated_record)
+}
+
+/// Update the embedding column in the `RecordBatch` with the computed embeddings.
+fn update_embedding_column_in_batch(
+    record: RecordBatch,
+    embedded_column_name: &str,
+    embedding_vectors: &[Option<Vec<f32>>],
+) -> Result<RecordBatch, Error> {
+    let embedding_column_name = embedding_col!(embedded_column_name);
+
+    // Check if the embedding column already exists
+    let schema = record.schema();
+    let embedding_column_idx = schema
+        .column_with_name(&embedding_column_name)
+        .map(|(idx, _)| idx);
+
+    if let Some(idx) = embedding_column_idx {
+        // Update existing embedding column
+        let mut columns: Vec<Arc<dyn Array>> = (0..record.num_columns())
+            .map(|i| Arc::clone(record.column(i)))
+            .collect();
+
+        // Create new embedding array
+        let embedding_array = create_embedding_array(embedding_vectors)?;
+        columns[idx] = embedding_array;
+
+        // Create new RecordBatch with updated column
+        RecordBatch::try_new(schema, columns).context(CannotUpdateEmbeddingColumnSnafu)
+    } else {
+        // If embedding column doesn't exist, return original batch
+        // This shouldn't happen in normal operation since we check for it earlier
+        Ok(record)
+    }
+}
+
+/// Create an Arrow array from embedding vectors.
+fn create_embedding_array(embedding_vectors: &[Option<Vec<f32>>]) -> Result<Arc<dyn Array>, Error> {
+    // Determine embedding dimension from first non-null embedding
+    let dimension = i32::try_from(
+        embedding_vectors
+            .iter()
+            .find_map(|opt| opt.as_ref().map(Vec::len))
+            .unwrap_or(0),
+    )
+    .context(EmbeddingDimensionTooLargeSnafu)?;
+
+    ensure!(dimension > 0, CannotDetermineEmbeddingDimensionSnafu);
+
+    let mut builder = ListBuilder::new(Float32Builder::new());
+    let field = Field::new_list_field(DataType::Float32, false);
+    builder = builder.with_field(field);
+
+    for embedding_opt in embedding_vectors {
+        if let Some(embedding) = embedding_opt {
+            let float_builder = builder.values();
+            for &value in embedding {
+                float_builder.append_value(value);
+            }
+            builder.append(true);
+        } else {
+            builder.append(false);
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
 }
 
 fn to_string_vec<'a, I>(iter: I) -> Vec<Option<String>>
@@ -601,5 +686,150 @@ impl Index for S3VectorIndex {
         pks.extend(self.metadata_columns.iter().map(|c| c.name().to_string()));
 
         pks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float32Array, Float32Builder, ListArray, ListBuilder, StringArray};
+    use arrow::datatypes::{DataType, Schema};
+
+    // Helper function to create a test RecordBatch with text and embedding columns
+    fn create_test_record_batch_with_embeddings(
+        texts: Vec<Option<&str>>,
+        embeddings: Vec<Option<Vec<f32>>>,
+    ) -> RecordBatch {
+        let text_array = StringArray::from(texts);
+
+        // Create embedding array
+        let mut builder = ListBuilder::new(Float32Builder::new());
+        let field = Field::new_list_field(DataType::Float32, false);
+        builder = builder.with_field(field);
+        for embedding_opt in embeddings {
+            if let Some(embedding) = embedding_opt {
+                let float_builder = builder.values();
+                for &value in &embedding {
+                    float_builder.append_value(value);
+                }
+                builder.append(true);
+            } else {
+                builder.append(false);
+            }
+        }
+        let embedding_array = builder.finish();
+
+        let schema = Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new(
+                "text_embedding",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+                true,
+            ),
+        ]);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(text_array), Arc::new(embedding_array)],
+        )
+        .expect("Failed to create test RecordBatch")
+    }
+
+    // Helper function to create a test RecordBatch with only text column
+    fn create_test_record_batch_text_only(texts: Vec<Option<&str>>) -> RecordBatch {
+        let text_array = StringArray::from(texts);
+        let schema = Schema::new(vec![Field::new("text", DataType::Utf8, true)]);
+
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(text_array)])
+            .expect("Failed to create test RecordBatch with text only")
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_create_embedding_array_valid_embeddings() {
+        let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
+
+        let result = create_embedding_array(&embeddings).expect("Failed to create embedding array");
+
+        let list_array = result
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("Result should be ListArray");
+
+        assert_eq!(list_array.len(), 3);
+        assert!(!list_array.is_null(0));
+        assert!(list_array.is_null(1));
+        assert!(!list_array.is_null(2));
+
+        // Check first embedding values
+        let first_values = list_array.value(0);
+        let first_floats = first_values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Values should be Float32Array");
+        assert_eq!(first_floats.value(0), 0.1);
+        assert_eq!(first_floats.value(1), 0.2);
+        assert_eq!(first_floats.value(2), 0.3);
+    }
+
+    #[test]
+    fn test_create_embedding_array_empty_embeddings() {
+        let embeddings: Vec<Option<Vec<f32>>> = vec![None, None];
+
+        let result = create_embedding_array(&embeddings);
+
+        // Should fail because no valid embeddings to determine dimension
+        assert!(result.is_err());
+        assert!(matches!(
+            result.expect_err("Expected error for empty embeddings"),
+            Error::CannotDetermineEmbeddingDimension
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_update_embedding_column_in_batch_with_existing_column() {
+        let record = create_test_record_batch_with_embeddings(
+            vec![Some("hello"), Some("world")],
+            vec![None, None], // Existing embeddings are null
+        );
+
+        let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
+
+        let result = update_embedding_column_in_batch(record, "text", &new_embeddings)
+            .expect("Failed to update embedding column");
+
+        // Verify the updated batch has the new embeddings
+        let embedding_column = result.column(1);
+        let list_array = embedding_column
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("Embedding column should be ListArray");
+
+        assert!(!list_array.is_null(0));
+        assert!(!list_array.is_null(1));
+
+        let first_values = list_array.value(0);
+        let first_floats = first_values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Values should be Float32Array");
+        assert_eq!(first_floats.value(0), 0.1);
+        assert_eq!(first_floats.value(1), 0.2);
+        assert_eq!(first_floats.value(2), 0.3);
+    }
+
+    #[test]
+    fn test_update_embedding_column_in_batch_without_existing_column() {
+        let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
+
+        let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
+
+        let result = update_embedding_column_in_batch(record.clone(), "text", &new_embeddings)
+            .expect("Failed to handle missing embedding column");
+
+        // Should return original batch when embedding column doesn't exist
+        assert_eq!(result.num_columns(), record.num_columns());
+        assert_eq!(result.num_rows(), record.num_rows());
     }
 }
