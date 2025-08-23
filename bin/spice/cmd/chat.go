@@ -132,9 +132,8 @@ type ResponseOutput struct {
 }
 
 type ResponseContentBlock struct {
-	Type        string   `json:"type"`
-	Text        string   `json:"text"`
-	Annotations []string `json:"annotations"`
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type ResponseUsage struct {
