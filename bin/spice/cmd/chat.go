@@ -131,29 +131,20 @@ type ResponseOutput struct {
 	Content []ResponseContentBlock `json:"content"`
 }
 
-// ResponseContentBlock represents individual content blocks
 type ResponseContentBlock struct {
 	Type        string   `json:"type"`
 	Text        string   `json:"text"`
 	Annotations []string `json:"annotations"`
 }
 
-// ResponseUsageDetails represents detailed token usage information
-type ResponseUsageDetails struct {
-	CachedTokens    int `json:"cached_tokens"`
-	ReasoningTokens int `json:"reasoning_tokens"`
-}
-
-// ResponseUsage represents usage statistics
 type ResponseUsage struct {
-	InputTokens         int                   `json:"input_tokens"`
-	InputTokensDetails  *ResponseUsageDetails `json:"input_tokens_details"`
-	OutputTokens        int                   `json:"output_tokens"`
-	OutputTokensDetails *ResponseUsageDetails `json:"output_tokens_details"`
-	TotalTokens         int                   `json:"total_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	InputTokensDetails  any `json:"input_tokens_details"`
+	OutputTokens        int `json:"output_tokens"`
+	OutputTokensDetails any `json:"output_tokens_details"`
+	TotalTokens         int `json:"total_tokens"`
 }
 
-// ResponsesAPIResponse represents the complete response from the Responses API
 type ResponsesAPIResponse struct {
 	ID        string           `json:"id"`
 	Object    string           `json:"object"`
@@ -310,7 +301,6 @@ spice chat --model <model> "What is Spice.ai?"
 
 		// Handler for Responses API - handles non-streaming responses
 		handleResponsesAPI := func(messages []Message, useSpinner bool) ([]Message, error) {
-			// Convert message history to input string for Responses API
 			input := messagesToInput(messages)
 
 			// Show spinner if requested

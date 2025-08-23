@@ -66,7 +66,6 @@ pub(crate) struct Metadata {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) enum MetadataKeys {
     SupportsResponsesAPI,
 }
