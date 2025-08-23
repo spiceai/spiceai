@@ -25,7 +25,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] =
         { AZURE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
     >(AZURE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const AZURE_PARAM_LEN: usize = 5;
+const AZURE_PARAM_LEN: usize = 7;
 
 pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint").description(
@@ -38,4 +38,14 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         .description("The Azure OpenAI API key from the models deployment page."),
     ParameterSpec::component("entra_token")
         .description("The Azure Entra token for authentication."),
+    ParameterSpec::component("openai_responses_tools")
+        .description(
+            "Comma-separated list of OpenAI-hosted tools exposed via the Responses API for this model.",
+        )
+        .default(""),
+    ParameterSpec::runtime("responses_api")
+        .description(
+            "Whether to enable use of this model via the Responses API. `enabled` by default.",
+        )
+        .default("enabled"),
 ];

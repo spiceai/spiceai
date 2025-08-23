@@ -134,6 +134,23 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
+            explain SELECT
+                "message.body",
+                attempt_count, "message.status",
+                package_weight_kg,
+                round(score, 1)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
+            ORDER BY package_weight_kg desc, score DESC
+            LIMIT 10;
+            "#,
+            "filters_pushdown_explain",
+        )
+        .await?;
+
+        run_and_snapshot_query(
+            &rt,
+            r#"
             SELECT
               "message.body",
               attempt_count, "message.status",
@@ -145,23 +162,6 @@ mod search {
             LIMIT 10;
             "#,
             "filters_pushdown",
-        )
-        .await?;
-
-        run_and_snapshot_query(
-            &rt,
-            r#"
-            explain SELECT
-              "message.body",
-              attempt_count, "message.status",
-              package_weight_kg,
-              round(score, 1)
-            FROM vector_search(delivery, 'wrong location')
-            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
-            ORDER BY package_weight_kg desc, score DESC
-            LIMIT 10;
-            "#,
-            "filters_pushdown_explain",
         )
         .await?;
 
