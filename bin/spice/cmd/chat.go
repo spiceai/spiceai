@@ -323,7 +323,11 @@ spice chat --model <model> "What is Spice.ai?"
 				slog.Error("failed to send responses request to spiced", "error", err)
 				return messages, fmt.Errorf("failed to send responses request: %w", err)
 			}
-			defer response.Body.Close()
+			defer func() {
+				if err := response.Body.Close(); err != nil {
+					slog.Error("failed to close response body", "error", err)
+				}
+			}()
 
 			if useSpinner {
 				done <- true

@@ -27,11 +27,10 @@ use axum::{
 };
 use csv::Writer;
 use http::StatusCode;
-use llms::responses::Responses;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Runtime, status::ComponentStatus};
+use crate::{Runtime, model::LLMResponsesModelStore, status::ComponentStatus};
 
 use super::Format;
 
@@ -76,7 +75,7 @@ impl TryFrom<&str> for MetadataKeys {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "supports_responses_api" => Ok(MetadataKeys::SupportsResponsesAPI),
-            _ => Err(format!("Invalid metadata key: {}", value)),
+            _ => Err(format!("Invalid metadata key: {value}")),
         }
     }
 }
@@ -113,7 +112,7 @@ fn get_metadata_keys(params: &ModelsQueryParams) -> Result<Vec<MetadataKeys>, St
 }
 
 fn generate_metadata(
-    model_name: String,
+    model_name: &str,
     metadata_keys: &Vec<MetadataKeys>,
     responses_models: &HashSet<String>,
 ) -> Option<Metadata> {
@@ -125,9 +124,9 @@ fn generate_metadata(
     for key in metadata_keys {
         match key {
             MetadataKeys::SupportsResponsesAPI => {
-                metadata.supports_responses_api = responses_models.contains(&model_name);
+                metadata.supports_responses_api = responses_models.contains(model_name);
             }
-        };
+        }
     }
     Some(metadata)
 }
@@ -182,7 +181,7 @@ text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",r
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
-    Extension(responses_models): Extension<Arc<RwLock<HashMap<String, Arc<dyn Responses>>>>>,
+    Extension(responses_models): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
     let statuses = if params.status {
@@ -221,7 +220,7 @@ pub(crate) async fn get(
                     owned_by: m.from.clone(),
                     datasets: d,
                     status: statuses.get(&m.name).copied(),
-                    metadata: generate_metadata(m.name.clone(), &metadata_keys, &responses_models),
+                    metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
                 }
             })
             .collect::<Vec<OpenAIModel>>(),
@@ -250,7 +249,7 @@ pub(crate) async fn get(
                 owned_by: "spiceai".to_string(),
                 datasets: None,
                 status: worker_statuses.get(name).copied(),
-                metadata: generate_metadata(name.clone(), &metadata_keys, &responses_models),
+                metadata: generate_metadata(name, &metadata_keys, &responses_models),
             })
         })
         .collect::<Vec<OpenAIModel>>();
