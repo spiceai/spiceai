@@ -23,6 +23,6 @@ expression: formatted
 |               |                   ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]               |
 |               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                          |
 |               |                       BytesProcessedExec                                                                                          |
-|               |                         S3VectorsQueryExec: limit=100                                                                             |
+|               |                         S3VectorsQueryExec: limit=30                                                                              |
 |               |                                                                                                                                   |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------+
