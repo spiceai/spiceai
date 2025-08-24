@@ -29,15 +29,21 @@ mod search {
     use crate::{
         configure_test_datafusion,
         models::{
-            hf::get_huggingface_embeddings, s3_vectors::delete_index,
-            search::item_tpcds_dataset_w_embeddings,
+            get_mega_science_dataset,
+            hf::get_huggingface_embeddings,
+            s3_vectors::delete_index,
+            search::{SearchTestCase, SearchTestType, item_tpcds_dataset_w_embeddings, run_search},
         },
         utils::verify_env_secret_exists,
     };
 
     use app::AppBuilder;
-    use spicepod::vector::VectorStore;
-    use std::sync::Arc;
+    use serde_json::json;
+    use spicepod::{
+        semantic::{Column, ColumnLevelEmbeddingConfig},
+        vector::VectorStore,
+    };
+    use std::{collections::HashMap, sync::Arc};
 
     use app::App;
     use futures::StreamExt;
@@ -48,77 +54,107 @@ mod search {
     use crate::utils::runtime_ready_check;
 
     #[tokio::test]
-    async fn s3_vectors_basic() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
-        let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
-
-        let mut test_dataset = item_tpcds_dataset_w_embeddings(
-            "item",
-            "hf_minilm",
-            Some(vec!["i_item_sk".to_string()]),
-            None,
-        );
-
-        // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
-
-        test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-tests-s3-vectors-basic",
-            &index_name,
-        ));
-
-        let app = AppBuilder::new("search_app")
-            .with_dataset(test_dataset)
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
-            ))
-            .build();
-
-        let rt = start_app(app).await?;
-
-        run_and_snapshot_query(
-            &rt,
-            "SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
-            "basic",
+    #[allow(clippy::too_many_lines)]
+    async fn basic_functionality() -> Result<(), anyhow::Error> {
+        run_search(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(get_mega_science_dataset(
+                    Some("qs"),
+                    None,
+                    Some(Column {
+                        name: "answer".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "hf_minilm".to_string(),
+                            row_ids: Some(vec!["_id".to_string()]),
+                            chunking: None,
+                            vector_size: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
+                        metadata: HashMap::new(),
+                    }),
+                ))
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_basic",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_projection",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_no_score",
+                    SearchTestType::Sql(
+                        "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_random",
+                    SearchTestType::Sql(
+                        "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_vectors",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, array_length(answer_embedding), round(score, 1), FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+                    ))
+            ],
         )
-        .await?;
-
-        run_and_snapshot_query(
-            &rt,
-            "SELECT i_item_sk, i_item_desc, array_length(i_item_desc_embedding), round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
-            "basic_with_vectors",
-        )
-        .await?;
-
-        Ok(())
+        .await
     }
 
     #[tokio::test]
     async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
-        let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
-
-        // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
         let bucket_name = "spice-ci-tests-s3-vectors-filters-pushdown";
-        test_dataset.vectors = Some(new_s3_vector_store(bucket_name, &index_name));
+        let vector_store = init_vector_store(bucket_name, true).await?;
 
-        delete_index(bucket_name, index_name.as_str())
-            .await
-            .expect("failed to delete index {} before test. ");
+        let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
+        test_dataset.vectors = Some(vector_store);
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
@@ -170,29 +206,19 @@ mod search {
 
     #[tokio::test]
     async fn s3_vectors_data_update() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
         // Generate a unique index name so the same test can be run in parallel
         let bucket_name = "spice-ci-tests-s3-vectors-overwrite";
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
 
         for (data_path, test_name) in [
             ("update/data_v1.json", "data_v1"),
             ("update/data_v2.json", "data_v2"),
         ] {
+            let vector_store = init_vector_store(bucket_name, true).await?;
+
             let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
-
-            ds.vectors = Some(new_s3_vector_store(bucket_name, &index_name));
-
-            delete_index(bucket_name, index_name.as_str())
-                .await
-                .expect("failed to delete index {} before test. ");
+            ds.vectors = Some(vector_store);
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
@@ -215,8 +241,27 @@ mod search {
         Ok(())
     }
 
-    /// Creates a new S3 `VectorStore`.
-    fn new_s3_vector_store(bucket_name: &str, index_name: &str) -> VectorStore {
+    async fn init_vector_store(
+        bucket_name: &str,
+        predelete_index: bool,
+    ) -> Result<VectorStore, anyhow::Error> {
+        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+            verify_env_secret_exists(env_var)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+        if predelete_index {
+            delete_index(bucket_name, index_name.as_str())
+                .await
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "failed to delete index {index_name} before test: {e}"
+                    ))
+                })?;
+        }
+
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -235,11 +280,11 @@ mod search {
             .collect(),
         );
 
-        VectorStore {
+        Ok(VectorStore {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
-        }
+        })
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
