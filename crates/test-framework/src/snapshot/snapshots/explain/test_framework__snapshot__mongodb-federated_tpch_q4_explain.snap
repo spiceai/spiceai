@@ -10,15 +10,15 @@ description: "Query: tpch_q4"
 |               |     Aggregate: groupBy=[[orders.o_orderpriority]], aggr=[[count(Int64(1))]]                                                           |
 |               |       Projection: orders.o_orderpriority                                                                                              |
 |               |         LeftSemi Join: orders.o_orderkey = __correlated_sq_1.l_orderkey                                                               |
-|               |           Projection: orders.o_orderkey, orders.o_orderpriority                                                                       |
+|               |           Projection: orders.o_orderpriority, orders.o_orderkey                                                                       |
 |               |             BytesProcessedNode                                                                                                        |
 |               |               Filter: orders.o_orderdate >= Date32("1993-07-01") AND orders.o_orderdate < Date32("1993-10-01")                        |
-|               |                 TableScan: orders projection=[o_orderkey, o_orderdate, o_orderpriority]                                               |
+|               |                 TableScan: orders projection=[o_orderdate, o_orderpriority, o_orderkey]                                               |
 |               |           SubqueryAlias: __correlated_sq_1                                                                                            |
 |               |             Projection: lineitem.l_orderkey                                                                                           |
 |               |               BytesProcessedNode                                                                                                      |
 |               |                 Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                |
-|               |                   TableScan: lineitem projection=[l_orderkey, l_commitdate, l_receiptdate]                                            |
+|               |                   TableScan: lineitem projection=[l_commitdate, l_orderkey, l_receiptdate]                                            |
 | physical_plan | SortPreservingMergeExec: [o_orderpriority@0 ASC NULLS LAST]                                                                           |
 |               |   SortExec: expr=[o_orderpriority@0 ASC NULLS LAST], preserve_partitioning=[true]                                                     |
 |               |     ProjectionExec: expr=[o_orderpriority@0 as o_orderpriority, count(Int64(1))@1 as order_count]                                     |
@@ -27,22 +27,22 @@ description: "Query: tpch_q4"
 |               |           RepartitionExec: partitioning=Hash([o_orderpriority@0], 16), input_partitions=16                                            |
 |               |             AggregateExec: mode=Partial, gby=[o_orderpriority@0 as o_orderpriority], aggr=[count(Int64(1))]                           |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                             |
-|               |                 HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_orderpriority@1] |
+|               |                 HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(o_orderkey@1, l_orderkey@0)], projection=[o_orderpriority@0] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
-|               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                       |
-|               |                       ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_orderpriority@2 as o_orderpriority]                         |
+|               |                     RepartitionExec: partitioning=Hash([o_orderkey@1], 16), input_partitions=16                                       |
+|               |                       ProjectionExec: expr=[o_orderpriority@1 as o_orderpriority, o_orderkey@2 as o_orderkey]                         |
 |               |                         BytesProcessedExec                                                                                            |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
-|               |                             FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01                                    |
+|               |                             FilterExec: o_orderdate@0 >= 1993-07-01 AND o_orderdate@0 < 1993-10-01                                    |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 MongoDBExec projection=[o_orderkey, o_orderdate, o_orderpriority] filters=[{}]                        |
+|               |                                 MongoDBExec projection=[o_orderdate, o_orderpriority, o_orderkey] filters=[{}]                        |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                       |
-|               |                       ProjectionExec: expr=[l_orderkey@0 as l_orderkey]                                                               |
+|               |                       ProjectionExec: expr=[l_orderkey@1 as l_orderkey]                                                               |
 |               |                         BytesProcessedExec                                                                                            |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
-|               |                             FilterExec: l_receiptdate@2 > l_commitdate@1                                                              |
+|               |                             FilterExec: l_receiptdate@2 > l_commitdate@0                                                              |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 MongoDBExec projection=[l_orderkey, l_commitdate, l_receiptdate] filters=[{}]                         |
+|               |                                 MongoDBExec projection=[l_commitdate, l_orderkey, l_receiptdate] filters=[{}]                         |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+
