@@ -588,9 +588,11 @@ version = "1.6.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
+ "arrow-json",
  "arrow-schema",
  "datafusion",
  "insta",
+ "serde_json",
  "snafu",
 ]
 
