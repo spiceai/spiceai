@@ -31,8 +31,8 @@ mod search {
         models::{
             get_mega_science_dataset,
             hf::get_huggingface_embeddings,
-            s3_vectors::delete_index,
-            search::{SearchTestCase, SearchTestType, item_tpcds_dataset_w_embeddings, run_search},
+            s3_vectors::{delete_index, vectors_filterable_col, vectors_non_filterable_col},
+            search::{SearchTestCase, SearchTestType, run_search},
         },
         utils::verify_env_secret_exists,
     };
@@ -54,7 +54,6 @@ mod search {
     use crate::utils::runtime_ready_check;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn basic_functionality() -> Result<(), anyhow::Error> {
         run_search(
             AppBuilder::new("search_app")
@@ -141,6 +140,123 @@ mod search {
                     SearchTestType::Sql(
                         "SELECT id, answer, array_length(answer_embedding), round(score, 1), FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
                     ))
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn metadata_columns() -> Result<(), anyhow::Error> {
+        // Metadata columns: question, subject (filterable), answer
+        // Base columns:     reference_answer,source
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: [(
+                    "vectors".to_string(),
+                    serde_json::Value::String("non-filterable".to_string()),
+                )]
+                .into(),
+            }),
+        );
+        ds.columns.extend([
+            vectors_non_filterable_col("question"),
+            vectors_filterable_col("subject"),
+        ]);
+
+        run_search(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "additional_columns_metadata",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "additional_columns_metadata",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["reference_answer", "source"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "source='textbook_reasoning'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "with_where_metadata",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_basic",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_projection",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, reference_answer, source, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_projection_metadata",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_filters_metadata",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where source='textbook_reasoning' order by score desc LIMIT 4",
+                    ),
+                ),
             ],
         )
         .await
@@ -421,6 +537,16 @@ fn vectors_filterable_col(name: &str) -> Column {
         [(
             "vectors".to_string(),
             serde_json::Value::String("filterable".to_string()),
+        )]
+        .into(),
+    )
+}
+
+fn vectors_non_filterable_col(name: &str) -> Column {
+    Column::new(name).with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
         )]
         .into(),
     )
