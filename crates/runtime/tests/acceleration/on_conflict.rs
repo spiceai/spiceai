@@ -80,7 +80,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 .expect("inserted data");
 
             let pg_on_conflict_upsert = create_postgres_test_dataset(
-                OnConflictBehavior::Upsert,
+                OnConflictBehavior::Upsert(UpsertOptions::default()),
                 "postgres:event_logs",
                 "pg_on_conflict_upsert",
                 port,
