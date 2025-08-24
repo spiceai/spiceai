@@ -438,7 +438,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("just asserted this is an error")
                 .to_string()
                 .contains("preinsert can only be used with upsert mode")
         );
@@ -454,7 +454,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("just asserted this is an error")
                 .to_string()
                 .contains("unknown variant `invalid`")
         );
@@ -473,7 +473,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("just asserted this is an error")
                 .to_string()
                 .contains("missing field `mode`")
         );
@@ -491,7 +491,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("just asserted this is an error")
                 .to_string()
                 .contains("unknown field `unknown_field`")
         );
@@ -508,7 +508,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("just asserted this is an error")
                 .to_string()
                 .contains("unknown variant `invalid_mode`")
         );
