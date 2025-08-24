@@ -110,17 +110,25 @@ impl Display for IndexType {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
+pub struct PreinsertOptions {
+    pub deduplicate: bool,
+    pub last_write_wins: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
-    Upsert,
+    Upsert(PreinsertOptions),
 }
 
 impl Display for OnConflictBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert => write!(f, "upsert"),
+            OnConflictBehavior::Upsert(_) => write!(f, "upsert"),
         }
     }
 }
@@ -250,5 +258,33 @@ impl Default for Acceleration {
             metrics: None,
             partition_by: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_string() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert
+            ";
+        let _: Acceleration = serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_preinsert_options() {
+        let yaml = r"
+                on_conflict:
+                  foo:
+                    mode: upsert
+                    preinsert:
+                      deduplicate: true
+                      last_write_wins: true
+            ";
+        let _: Acceleration = serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
     }
 }
