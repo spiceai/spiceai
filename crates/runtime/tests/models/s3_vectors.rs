@@ -32,7 +32,7 @@ mod search {
             get_mega_science_dataset,
             hf::get_huggingface_embeddings,
             s3_vectors::{delete_index, vectors_filterable_col, vectors_non_filterable_col},
-            search::{SearchTestCase, SearchTestType, run_search},
+            search::{_run_search, SearchTestCase, SearchTestType},
         },
         utils::verify_env_secret_exists,
     };
@@ -55,28 +55,33 @@ mod search {
 
     #[tokio::test]
     async fn basic_functionality() -> Result<(), anyhow::Error> {
-        run_search(
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["_id".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-basic";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        _run_search(
             AppBuilder::new("search_app")
                 .with_embedding(get_huggingface_embeddings(
                     "sentence-transformers/all-MiniLM-L6-v2",
                     "hf_minilm",
                 ))
-                .with_dataset(get_mega_science_dataset(
-                    Some("qs"),
-                    None,
-                    Some(Column {
-                        name: "answer".to_string(),
-                        embeddings: vec![ColumnLevelEmbeddingConfig {
-                            model: "hf_minilm".to_string(),
-                            row_ids: Some(vec!["_id".to_string()]),
-                            chunking: None,
-                            vector_size: None,
-                        }],
-                        description: None,
-                        full_text_search: None,
-                        metadata: HashMap::new(),
-                    }),
-                ))
+                .with_dataset(ds)
                 .build(),
             vec![
                 SearchTestCase::new(
@@ -141,6 +146,7 @@ mod search {
                         "SELECT id, answer, array_length(answer_embedding), round(score, 1), FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
                     ))
             ],
+            true
         )
         .await
     }
@@ -173,8 +179,11 @@ mod search {
             vectors_non_filterable_col("question"),
             vectors_filterable_col("subject"),
         ]);
+        let bucket_name = "spice-ci-tests-s3-vectors-metadata-columns";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
 
-        run_search(
+        _run_search(
             AppBuilder::new("search_app")
                 .with_embedding(get_huggingface_embeddings(
                     "sentence-transformers/all-MiniLM-L6-v2",
@@ -258,6 +267,7 @@ mod search {
                     ),
                 ),
             ],
+            true
         )
         .await
     }
@@ -369,14 +379,12 @@ mod search {
 
         let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
         if predelete_index {
-            delete_index(bucket_name, index_name.as_str())
+            let _ = delete_index(bucket_name, index_name.as_str())
                 .await
-                .map_err(|e| {
-                    anyhow::Error::msg(format!(
-                        "failed to delete index {index_name} before test: {e}"
-                    ))
-                })?;
-        }
+                .inspect_err(|e| {
+                    tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+                });
+        };
 
         let params = spicepod::param::Params::from_string_map(
             vec![

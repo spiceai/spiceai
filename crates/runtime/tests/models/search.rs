@@ -274,6 +274,15 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
+    _run_search(app, test_cases, false).await
+}
+
+// if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
+pub(crate) async fn _run_search(
+    app: App,
+    test_cases: Vec<SearchTestCase>,
+    explain_sql: bool,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
@@ -309,6 +318,16 @@ pub(crate) async fn run_search(
                         }
 
                         insta::assert_json_snapshot!(ts.name, resp?);
+
+                        if explain_sql {
+                            let explain_resp =
+                                http_sql(http_base_url.as_str(), format!("EXPLAIN {sql}").as_str())
+                                    .await;
+                            insta::assert_json_snapshot!(
+                                format!("{}_explain", ts.name),
+                                explain_resp?
+                            );
+                        }
                     }
                 }
             }
