@@ -85,7 +85,7 @@ mod search {
                 .build(),
             vec![
                 SearchTestCase::new(
-                    "basic",
+                    "basic_basic",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -93,7 +93,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "additional_columns",
+                    "basic_additional_columns",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -102,7 +102,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "with_where",
+                    "basic_with_where",
                     SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
@@ -111,37 +111,37 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_basic",
+                    "basic_vector_search_sql_basic",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_projection",
+                    "basic_vector_search_sql_projection",
                     SearchTestType::Sql(
                         "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_filters",
+                    "basic_vector_search_sql_filters",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_no_score",
+                    "basic_vector_search_sql_no_score",
                     SearchTestType::Sql(
                         "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_random",
+                    "basic_vector_search_sql_random",
                     SearchTestType::Sql(
                         "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_vectors",
+                    "basic_vector_search_sql_vectors",
                     SearchTestType::Sql(
                         "SELECT id, answer, array_length(answer_embedding), round(score, 1), FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
                     ))
@@ -183,7 +183,7 @@ mod search {
                 .build(),
             vec![
                 SearchTestCase::new(
-                    "basic",
+                    "composite_basic",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -191,7 +191,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "additional_columns",
+                    "composite_additional_columns",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -200,7 +200,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "with_where",
+                    "composite_with_where",
                     SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
@@ -209,19 +209,19 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_single_column",
+                    "composite_vector_search_sql_single_column",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_composite_key",
+                    "composite_vector_search_sql_composite_key",
                     SearchTestType::Sql(
                         "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_filters",
+                    "composite_vector_search_sql_filters",
                     SearchTestType::Sql(
                         "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4",
                     ),
@@ -274,7 +274,7 @@ mod search {
                 .build(),
             vec![
                 SearchTestCase::new(
-                    "basic",
+                    "metadata_basic",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -282,7 +282,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "additional_columns_metadata",
+                    "metadata_additional_columns_metadata",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -291,7 +291,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "additional_columns_metadata",
+                    "metadata_additional_columns_metadata",
                     SearchTestType::Http(json!({
                         "text": "second",
                         "limit": 4,
@@ -300,7 +300,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "with_where",
+                    "metadata_with_where",
                     SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
@@ -309,7 +309,7 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "with_where_metadata",
+                    "metadata_with_where_metadata",
                     SearchTestType::Http(json!({
                         "text": "secondary",
                         "datasets": ["qs"],
@@ -318,31 +318,31 @@ mod search {
                     })),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_basic",
+                    "metadata_vector_search_sql_basic",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_projection",
+                    "metadata_vector_search_sql_projection",
                     SearchTestType::Sql(
                         "SELECT id, answer, reference_answer, source, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_projection_metadata",
+                    "metadata_vector_search_sql_projection_metadata",
                     SearchTestType::Sql(
                         "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_filters_metadata",
+                    "metadata_vector_search_sql_filters_metadata",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
-                    "vector_search_sql_filters",
+                    "metadata_vector_search_sql_filters",
                     SearchTestType::Sql(
                         "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where source='textbook_reasoning' order by score desc LIMIT 4",
                     ),

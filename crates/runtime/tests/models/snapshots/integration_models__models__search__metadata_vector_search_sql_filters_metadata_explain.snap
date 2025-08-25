@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: explain_resp?
+snapshot_kind: text
+---
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Sort: score DESC NULLS FIRST, fetch=4\n  Projection: vector_search().id, vector_search().answer, trunc(vector_search().score, Int64(3)) AS score\n    BytesProcessedNode\n      TableScan: vector_search() projection=[id, answer, score], full_filters=[vector_search().subject != Utf8(\"math\")]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "SortPreservingMergeExec: [score@2 DESC], fetch=4\n  SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]\n    ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as score]\n      BytesProcessedExec\n        ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]\n          BytesProcessedExec\n            ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]\n              RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1\n                BytesProcessedExec\n                  S3VectorsQueryExec: filter={subject:{$ne:\"math\"}} limit=100\n"
+  }
+]
