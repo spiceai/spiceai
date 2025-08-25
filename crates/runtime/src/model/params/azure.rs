@@ -45,7 +45,7 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         .default(""),
     ParameterSpec::runtime("responses_api")
         .description(
-            "Whether to enable use of this model via the Responses API. `enabled` by default.",
+            "Whether to enable use of this model via the Responses API. `disabled` by default.",
         )
-        .default("enabled"),
+        .default("disabled"),
 ];
