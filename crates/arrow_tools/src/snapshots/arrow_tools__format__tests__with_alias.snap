@@ -10,7 +10,7 @@ column: content
 ---
 Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
-Sed do eiusmod tempor aliqua. 
+Sed do eiusmod tempor aliqua.
 
 reprehenderit nulla pariatur.
 
@@ -19,5 +19,5 @@ location: path/to/folder/file_67890.txt
 dist: 0.123456
 column: content
 ---
-Lorem ipsum dolor adipiscing elit. 
+Lorem ipsum dolor adipiscing elit.
 Cras venenatis euismod malesuada.
