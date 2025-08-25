@@ -3657,6 +3657,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "base64 0.22.1",
