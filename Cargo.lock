@@ -4331,7 +4331,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f29051403dc5692ff78d300efdeb1b708797cee8#f29051403dc5692ff78d300efdeb1b708797cee8"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=aff86e7a2a4634653d979e9f5076e80fe8196fcf#aff86e7a2a4634653d979e9f5076e80fe8196fcf"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -12032,6 +12032,7 @@ dependencies = [
  "strsim 0.11.1",
  "tantivy",
  "telemetry",
+ "tempfile",
  "tera",
  "test-framework",
  "tiberius",

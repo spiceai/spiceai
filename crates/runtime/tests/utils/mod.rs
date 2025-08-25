@@ -52,6 +52,18 @@ pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Dur
     assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
 }
 
+#[allow(dead_code)]
+pub(crate) async fn runtime_ready_check_with_timeout_err(
+    rt: &Runtime,
+    duration: Duration,
+) -> Result<(), ()> {
+    if wait_until_true(duration, || async { rt.status().is_ready() }).await {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 pub(crate) async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
