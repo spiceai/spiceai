@@ -48,6 +48,7 @@ use llms::embeddings;
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;
+use tokio::task;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -230,11 +231,11 @@ pub(crate) fn construct_record_batch(
 /// For columns that are in the base table, no additional columns are calculated.
 ///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
-pub(crate) async fn compute_additional_embedding_columns(
-    rb: &RecordBatch,
-    embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
+pub(crate) async fn compute_additional_embedding_columns<'a>(
+    rb: &'a RecordBatch,
+    embedded_columns: &'a HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync + 'a>> {
     let additional_embedding_columns: HashMap<_, _> = embedded_columns
         .iter()
         .filter(|(_, cfg)| !cfg.in_base_table)
@@ -293,7 +294,13 @@ pub(crate) async fn compute_additional_embedding_columns(
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = if model.supports_sync_embeddings() {
-                get_vectors_in_process(arr_iter, &**model, cfg.vector_size)?
+                let task_model = Arc::clone(model);
+                let batch: Vec<_> = arr_iter.map(|o| o.map(str::to_string)).collect();
+                let vector_size = cfg.vector_size;
+
+                task::spawn_blocking(move || {
+                    get_vectors_in_process(batch, task_model, vector_size)
+                }).await??
             } else {
                 get_vectors(arr_iter, &**model, cfg.vector_size).await?
             };
@@ -413,16 +420,14 @@ pub(super) async fn get_vectors(
 /// where each [`String`] gets embedded into a single [`f32`] vector.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 pub(super) fn get_vectors_in_process<'a>(
-    arr: impl Iterator<Item = Option<&'a str>>,
-    model: &dyn Embed,
+    arr: Vec<Option<String>>,
+    model: Arc<dyn Embed>,
     vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-    let inputs: Vec<Option<String>> = arr.map(|o| o.map(ToString::to_string)).collect();
-
     let mut builder = FixedSizeListBuilder::with_capacity(
-        PrimitiveBuilder::<Float32Type>::with_capacity(inputs.len() * (vector_length as usize)),
+        PrimitiveBuilder::<Float32Type>::with_capacity(arr.len() * (vector_length as usize)),
         vector_length,
-        inputs.len(),
+        arr.len(),
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
@@ -430,12 +435,12 @@ pub(super) fn get_vectors_in_process<'a>(
 
     // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
     // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
-    if inputs
+    if arr
         .iter()
         .any(|o| !matches!(o, Some(s) if !s.is_empty()))
     {
         let embeds: Vec<_> = pool.install(|| {
-            inputs
+            arr
                 .into_par_iter()
                 .map(|o| match o {
                     Some(input) if input.is_empty() => None,
@@ -456,7 +461,7 @@ pub(super) fn get_vectors_in_process<'a>(
         }
     } else {
         let embeds: Vec<_> = pool.install(|| {
-            inputs
+            arr
                 .into_par_iter()
                 .chunks(32)
                 .map(|chunk| {
