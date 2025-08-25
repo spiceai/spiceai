@@ -168,6 +168,193 @@ type OpenAIErrorResponse struct {
 	Error OpenAIError `json:"error"`
 }
 
+// handleResponsesAPI handles non-streaming responses using the Responses API
+func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+	input := messagesToInput(messages)
+
+	// Show spinner if requested
+	var done chan bool
+	if useSpinner {
+		done = make(chan bool)
+		go func() {
+			util.ShowSpinner(done)
+		}()
+	}
+
+	body := NewResponsesRequestBody(model, input, false) // No streaming for responses API
+
+	startTime := time.Now()
+	response, err := sendResponsesRequest(rtcontext, body)
+	if err != nil {
+		if useSpinner {
+			done <- true
+		}
+		slog.Error("failed to send responses request to spiced", "error", err)
+		return messages, fmt.Errorf("failed to send responses request: %w", err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("failed to close response body", "error", err)
+		}
+	}()
+
+	if useSpinner {
+		done <- true
+	}
+
+	// Parse the non-streaming response
+	var responsesResponse ResponsesAPIResponse
+	decoder := json.NewDecoder(response.Body)
+	err = decoder.Decode(&responsesResponse)
+	if err != nil {
+		slog.Error("failed to decode responses response", "error", err)
+		return messages, fmt.Errorf("failed to decode responses response: %w", err)
+	}
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+
+	// Extract text from the response output
+	var responseMessage string
+	for _, output := range responsesResponse.Output {
+		for _, content := range output.Content {
+			if content.Type == "output_text" {
+				responseMessage += content.Text
+			}
+		}
+	}
+
+	// Print the response
+	cmd.Printf("%s", responseMessage)
+
+	if responseMessage != "" {
+		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+	}
+
+	// Show usage information
+	if responsesResponse.Usage != nil {
+		cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
+			responsesResponse.Usage,
+			duration,
+		))
+	} else {
+		cmd.Print("\n\n")
+	}
+
+	return messages, nil
+}
+
+// handleChatCompletions handles streaming responses using the Chat Completions API
+func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+	// Only create these variables if using spinner
+	var done chan bool
+	var doneLoading bool
+
+	if useSpinner {
+		done = make(chan bool)
+		doneLoading = false
+		go func() {
+			util.ShowSpinner(done)
+		}()
+	}
+
+	body := NewChatRequestBody(messages, model, true, &StreamOptions{
+		IncludeUsage: true,
+	})
+	body, _ = ApplyChatOptions(body, cmd)
+
+	var timeAtCompletion time.Time
+	var timeAtFirstToken time.Time
+	startTime := time.Now()
+	response, err := sendChatRequest(rtcontext, body)
+	if err != nil {
+		slog.Error("failed to send chat request to spiced", "error", err)
+		return messages, fmt.Errorf("failed to send chat request: %w", err)
+	}
+
+	scanner := bufio.NewScanner(response.Body)
+	var responseMessage = ""
+
+	/// Usage for the entire stream, and related timing.
+	var usage Usage
+
+	if useSpinner {
+		doneLoading = false
+	}
+
+	for scanner.Scan() {
+		chunk := scanner.Text()
+		if timeAtFirstToken.IsZero() {
+			timeAtFirstToken = time.Now()
+		}
+
+		errorEvent, err := maybeErrorEvent(chunk, scanner)
+
+		if err != nil {
+			slog.Error("failed to decode error event", "error", err)
+			continue
+		}
+
+		if errorEvent != nil {
+			slog.Error("chat request failed", "error", errorEvent.Message)
+			break
+		}
+
+		if !strings.HasPrefix(chunk, "data: ") {
+			continue
+		}
+		chunk = strings.TrimPrefix(chunk, "data: ")
+
+		var chatResponse = ChatCompletion{}
+		err = json.Unmarshal([]byte(chunk), &chatResponse)
+		if err != nil {
+			slog.Error("failed to unmarshal chat response", "error", err)
+			continue
+		}
+
+		if useSpinner && !doneLoading {
+			done <- true
+			doneLoading = true
+		}
+
+		if chatResponse.Usage != nil {
+			usage = *chatResponse.Usage
+			timeAtCompletion = time.Now()
+		}
+
+		if len(chatResponse.Choices) == 0 {
+			continue
+		}
+
+		token := chatResponse.Choices[0].Delta.Content
+		cmd.Printf("%s", token)
+		responseMessage = responseMessage + token
+	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("error occurred while processing the response stream", "error", err)
+	}
+
+	if useSpinner && !doneLoading {
+		done <- true
+	}
+
+	if responseMessage != "" {
+		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+	}
+	if usage != (Usage{}) {
+		cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+			&usage,
+			timeAtFirstToken.Sub(startTime).Abs(),
+			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+		))
+	} else {
+		cmd.Print("\n\n")
+	}
+
+	return messages, nil
+}
+
 var chatCmd = &cobra.Command{
 	Use:   "chat [flags] [message]",
 	Short: "Chat with the Spice.ai LLM agent",
@@ -298,199 +485,16 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 		}
 
-		// Handler for Responses API - handles non-streaming responses
-		handleResponsesAPI := func(messages []Message, useSpinner bool) ([]Message, error) {
-			input := messagesToInput(messages)
+		// Handler for Responses API - handled by standalone function
 
-			// Show spinner if requested
-			var done chan bool
-			if useSpinner {
-				done = make(chan bool)
-				go func() {
-					util.ShowSpinner(done)
-				}()
-			}
-
-			body := NewResponsesRequestBody(model, input, false) // No streaming for responses API
-
-			startTime := time.Now()
-			response, err := sendResponsesRequest(rtcontext, body)
-			if err != nil {
-				if useSpinner {
-					done <- true
-				}
-				slog.Error("failed to send responses request to spiced", "error", err)
-				return messages, fmt.Errorf("failed to send responses request: %w", err)
-			}
-			defer func() {
-				if err := response.Body.Close(); err != nil {
-					slog.Error("failed to close response body", "error", err)
-				}
-			}()
-
-			if useSpinner {
-				done <- true
-			}
-
-			// Parse the non-streaming response
-			var responsesResponse ResponsesAPIResponse
-			decoder := json.NewDecoder(response.Body)
-			err = decoder.Decode(&responsesResponse)
-			if err != nil {
-				slog.Error("failed to decode responses response", "error", err)
-				return messages, fmt.Errorf("failed to decode responses response: %w", err)
-			}
-
-			endTime := time.Now()
-			duration := endTime.Sub(startTime)
-
-			// Extract text from the response output
-			var responseMessage string
-			for _, output := range responsesResponse.Output {
-				for _, content := range output.Content {
-					if content.Type == "output_text" {
-						responseMessage += content.Text
-					}
-				}
-			}
-
-			// Print the response
-			cmd.Printf("%s", responseMessage)
-
-			if responseMessage != "" {
-				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
-			}
-
-			// Show usage information
-			if responsesResponse.Usage != nil {
-				cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
-					responsesResponse.Usage,
-					duration,
-				))
-			} else {
-				cmd.Print("\n\n")
-			}
-
-			return messages, nil
-		}
-
-		// Handler for Chat Completions API - handles streaming responses
-		handleChatCompletions := func(messages []Message, useSpinner bool) ([]Message, error) {
-			// Only create these variables if using spinner
-			var done chan bool
-			var doneLoading bool
-
-			if useSpinner {
-				done = make(chan bool)
-				doneLoading = false
-				go func() {
-					util.ShowSpinner(done)
-				}()
-			}
-
-			body := NewChatRequestBody(messages, model, true, &StreamOptions{
-				IncludeUsage: true,
-			})
-			body, _ = ApplyChatOptions(body, cmd)
-
-			var timeAtCompletion time.Time
-			var timeAtFirstToken time.Time
-			startTime := time.Now()
-			response, err := sendChatRequest(rtcontext, body)
-			if err != nil {
-				slog.Error("failed to send chat request to spiced", "error", err)
-				return messages, fmt.Errorf("failed to send chat request: %w", err)
-			}
-
-			scanner := bufio.NewScanner(response.Body)
-			var responseMessage = ""
-
-			/// Usage for the entire stream, and related timing.
-			var usage Usage
-
-			if useSpinner {
-				doneLoading = false
-			}
-
-			for scanner.Scan() {
-				chunk := scanner.Text()
-				if timeAtFirstToken.IsZero() {
-					timeAtFirstToken = time.Now()
-				}
-
-				errorEvent, err := maybeErrorEvent(chunk, scanner)
-
-				if err != nil {
-					slog.Error("failed to decode error event", "error", err)
-					continue
-				}
-
-				if errorEvent != nil {
-					slog.Error("chat request failed", "error", errorEvent.Message)
-					break
-				}
-
-				if !strings.HasPrefix(chunk, "data: ") {
-					continue
-				}
-				chunk = strings.TrimPrefix(chunk, "data: ")
-
-				var chatResponse = ChatCompletion{}
-				err = json.Unmarshal([]byte(chunk), &chatResponse)
-				if err != nil {
-					slog.Error("failed to unmarshal chat response", "error", err)
-					continue
-				}
-
-				if useSpinner && !doneLoading {
-					done <- true
-					doneLoading = true
-				}
-
-				if chatResponse.Usage != nil {
-					usage = *chatResponse.Usage
-					timeAtCompletion = time.Now()
-				}
-
-				if len(chatResponse.Choices) == 0 {
-					continue
-				}
-
-				token := chatResponse.Choices[0].Delta.Content
-				cmd.Printf("%s", token)
-				responseMessage = responseMessage + token
-			}
-
-			if err := scanner.Err(); err != nil {
-				slog.Error("error occurred while processing the response stream", "error", err)
-			}
-
-			if useSpinner && !doneLoading {
-				done <- true
-			}
-
-			if responseMessage != "" {
-				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
-			}
-			if usage != (Usage{}) {
-				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-					&usage,
-					timeAtFirstToken.Sub(startTime).Abs(),
-					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-				))
-			} else {
-				cmd.Print("\n\n")
-			}
-
-			return messages, nil
-		}
+		// Handler for Chat Completions API - handled by standalone function
 
 		// Main message handler that delegates to the appropriate API handler
 		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
 			if useResponsesAPI {
-				return handleResponsesAPI(messages, useSpinner)
+				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner)
 			}
-			return handleChatCompletions(messages, useSpinner)
+			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner)
 		}
 
 		if len(args) > 0 {
