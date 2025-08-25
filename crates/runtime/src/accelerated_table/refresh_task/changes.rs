@@ -74,7 +74,7 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
 
-        // The DataConnector's `append_stream(&mut self, append_stream: ChangesStream)` implementation is based on this same `start_changes_stream`
+        // The DataConnector's `append_stream(&mut self, append_stream: ChangesStream)` implementation is based on the same `start_changes_stream`
         // method, as both rely on the ChangesStream. The `is_append_mode_stream` flag can be used to differentiate between append and changes/CDC-specific logic.
         let is_append_mode_stream = matches!(refresh.read().await.mode, RefreshMode::Append);
 
