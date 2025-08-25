@@ -448,7 +448,7 @@ impl EmbeddingTable {
                     offset_col!(field.name()),
                     Field::new_fixed_size_list(
                         "item",
-                        Field::new("item", DataType::Int32, true),
+                        Field::new("item", DataType::Int32, false),
                         2,
                         false,
                     ),
