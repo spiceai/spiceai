@@ -126,9 +126,22 @@ impl TextSearchIndexProvider {
             .column_with_name(SEARCH_SCORE_COLUMN_NAME)
             .map(|(idx, _)| idx);
 
-        projection
+        // find the projection indexes for the primary key columns
+        let row_id_projections = self
+            .index
+            .primary_key
+            .iter()
+            .filter_map(|pk| self.schema().column_with_name(pk).map(|(idx, _)| idx))
+            .collect::<Vec<_>>();
+
+        // join the underlying projection with the required row_id projections. Ensure they are de-duplicated
+        // if projection is supplied but doesn't include the row_id, the later table join will fail
+        let projection: HashSet<usize> = projection
             .cloned()
-            .unwrap_or((0..self.schema().fields().len()).collect())
+            .map(|proj| proj.into_iter().chain(row_id_projections).collect())
+            .unwrap_or((0..self.schema().fields().len()).collect()); // if not projection is supplied, we default to every column anyway
+
+        projection
             .into_iter()
             .filter(|&idx| {
                 !(search_column_idx.is_some_and(|i| i == idx)
@@ -143,6 +156,7 @@ impl TextSearchIndexProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
     ) -> Result<LogicalPlan, DataFusionError> {
+        tracing::trace!("Projection for underlying: {projection:?}");
         let underlying_table_scan = LogicalPlan::TableScan(TableScan::try_new(
             "base_table",
             Arc::new(DefaultTableSource::new(
@@ -277,12 +291,14 @@ impl TableProvider for TextSearchIndexProvider {
             .map_err(|e| DataFusionError::ArrowError(e, None))?
         {
             // Let DataFusion handle pushing filters.
+            tracing::trace!("Index table is sufficient");
             if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
                 LogicalPlan::Filter(Filter::try_new(filter, index_table_scan.into())?)
             } else {
                 index_table_scan
             }
         } else {
+            tracing::trace!("Index table is insufficient");
             self.construct_join(index_table_scan, projection, filters)?
         };
 
