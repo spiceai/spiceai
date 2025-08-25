@@ -152,6 +152,87 @@ mod search {
     }
 
     #[tokio::test]
+    async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string(), "question".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-compose-pk";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        _run_search(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_single_column",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_composite_key",
+                    SearchTestType::Sql(
+                        "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4",
+                    ),
+                ),
+            ],
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         // Metadata columns: question, subject (filterable), answer
         // Base columns:     reference_answer,source
