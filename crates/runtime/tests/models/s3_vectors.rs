@@ -196,7 +196,7 @@ mod search {
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
-                        "additional_columns": ["question"],
+                        "additional_columns": ["subject"],
                     })),
                 ),
                 SearchTestCase::new(
@@ -214,6 +214,7 @@ mod search {
                         "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
                     ),
                 ),
+
                 SearchTestCase::new(
                     "s3vector_composite_vector_search_sql_composite_key",
                     SearchTestType::Sql(

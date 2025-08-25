@@ -295,13 +295,8 @@ pub(crate) async fn run_search_w_explain(
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
                 .build()
                 .await
-                .expect(
-                    format!(
-                        "Failed to build Spice client with flight address: 'http://{}'",
-                        api_config.flight_bind_address
-                    )
-                    .as_str(),
-                );
+                .unwrap_or_else(|_| panic!("Failed to build Spice client with flight address: 'http://{}'",
+                        api_config.flight_bind_address));
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -349,7 +344,7 @@ pub(crate) async fn run_search_w_explain(
                                 format!("{}_explain", ts.name),
                                 arrow::util::pretty::pretty_format_batches(&c)
                                     .expect("failed to format RecordBatch for explain plan")
-                            )
+                            );
                             });
                         }
                     }
