@@ -129,7 +129,10 @@ pub async fn run_search_test(
         return Ok(());
     }
 
-    let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
+    let resp = anyhow::Context::context(
+        serde_json::from_str(&resp?),
+        "Failed to parse HTTP response",
+    )?;
     insta::assert_snapshot!(
         format!("{}_response", ts.name),
         normalize_search_response(resp)
@@ -295,8 +298,12 @@ pub(crate) async fn run_search_w_explain(
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
                 .build()
                 .await
-                .unwrap_or_else(|_| panic!("Failed to build Spice client with flight address: 'http://{}'",
-                        api_config.flight_bind_address));
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to build Spice client with flight address: 'http://{}'",
+                        api_config.flight_bind_address
+                    )
+                });
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -330,22 +337,16 @@ pub(crate) async fn run_search_w_explain(
                         if explain_sql {
                             let c = client
                                 .query(format!("EXPLAIN {sql}").as_str())
-                                .await
-                                .expect("failed to run SQL query: 'EXPLAIN {sql}'")
+                                .await?
                                 .try_collect::<Vec<RecordBatch>>()
-                                .await
-                                .expect("failed to created RecordBatch");
+                                .await?;
+
+                            let disp = arrow::util::pretty::pretty_format_batches(&c)?;
 
                             insta::with_settings!({
                                 omit_expression => true,
                                 description => sql
-                            }, {
-                            insta::assert_snapshot!(
-                                format!("{}_explain", ts.name),
-                                arrow::util::pretty::pretty_format_batches(&c)
-                                    .expect("failed to format RecordBatch for explain plan")
-                            );
-                            });
+                            }, {insta::assert_snapshot!(format!("{}_explain", ts.name), disp)});
                         }
                     }
                 }
