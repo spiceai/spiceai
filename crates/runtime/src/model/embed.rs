@@ -62,7 +62,15 @@ pub async fn try_to_embedding(
     let string_params: HashMap<String, String> = component
         .params
         .iter()
-        .map(|(k, v)| (k.clone(), v.to_string()))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                },
+            )
+        })
         .collect();
 
     let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
