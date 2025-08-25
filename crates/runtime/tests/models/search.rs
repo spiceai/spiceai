@@ -733,16 +733,12 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "limit": 4,
                 })),
             ),
-            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-            // https://github.com/spiceai/spiceai/issues/6821
             SearchTestCase::new(
                 "text_search_sql_text_search_basic",
                 SearchTestType::Sql(
                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
             ),
-            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-            // https://github.com/spiceai/spiceai/issues/6821
             SearchTestCase::new(
                 "text_search_sql_text_search_projection",
                 SearchTestType::Sql(
@@ -760,13 +756,13 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 SearchTestType::Sql(
                     "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 "text_search_sql_text_search_random",
                 SearchTestType::Sql(
                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
-            ).skip(),
+            ),
         ],
     )
     .await
@@ -928,11 +924,9 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 SearchTestType::Sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
             ),
             SearchTestCase::new(
-                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-                // https://github.com/spiceai/spiceai/issues/6820
                 "multi_text_column_sql_text_search_random",
                 SearchTestType::Sql("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
         ],
     )
     .await
