@@ -16,7 +16,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorBuildSnafu,
+    MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    S3VectorBuildSnafu,
 };
 
 use super::{Error, Result, S3VectorIdentifier};
@@ -293,10 +294,31 @@ impl S3VectorsTable {
         }
     }
 
+    pub(crate) fn is_filterable_column(&self, column: &str) -> bool {
+        let Ok(f) = self.schema.field_with_name(column) else {
+            return false;
+        };
+        f.metadata().get("filterable").eq(&Some(&true.to_string()))
+    }
+
     fn compute_schema(columns: MetadataColumns) -> SchemaRef {
         Arc::new(Schema::new(
             [
-                columns.into_iter().map(|c| c.field()).collect(),
+                columns
+                    .into_iter()
+                    .map(|c| {
+                        let f = c.field();
+                        Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable())
+                            .with_metadata(
+                                [(
+                                    "filterable".to_string(),
+                                    (matches!(c, MetadataColumn::Filterable(_))).to_string(),
+                                )]
+                                .into(),
+                            )
+                            .into()
+                    })
+                    .collect(),
                 vec![
                     Arc::new(Field::new_list(
                         S3_VECTOR_EMBEDDING_NAME,

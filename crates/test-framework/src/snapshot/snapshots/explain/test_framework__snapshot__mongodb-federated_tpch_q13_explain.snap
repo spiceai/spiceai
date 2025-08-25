@@ -18,7 +18,7 @@ description: "Query: tpch_q13"
 |               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                             |
 |               |                   BytesProcessedNode                                                                                                        |
 |               |                     Filter: orders.o_comment NOT LIKE Utf8("%special%requests%")                                                            |
-|               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                       |
+|               |                       TableScan: orders projection=[o_comment, o_orderkey, o_custkey]                                                       |
 | physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                  |
 |               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                            |
 |               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                              |
@@ -37,11 +37,11 @@ description: "Query: tpch_q13"
 |               |                               MongoDBExec projection=[c_custkey] filters=[{}]                                                               |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                          |
-|               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                       |
+|               |                           ProjectionExec: expr=[o_orderkey@1 as o_orderkey, o_custkey@2 as o_custkey]                                       |
 |               |                             BytesProcessedExec                                                                                              |
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                   |
-|               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                         |
+|               |                                 FilterExec: o_comment@0 NOT LIKE %special%requests%                                                         |
 |               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                     |
-|               |                                     MongoDBExec projection=[o_orderkey, o_custkey, o_comment] filters=[{}]                                  |
+|               |                                     MongoDBExec projection=[o_comment, o_orderkey, o_custkey] filters=[{}]                                  |
 |               |                                                                                                                                             |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
