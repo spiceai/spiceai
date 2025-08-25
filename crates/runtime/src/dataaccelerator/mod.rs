@@ -28,6 +28,7 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -210,8 +211,10 @@ impl AcceleratorEngineRegistry {
                 external_table_builder = external_table_builder.constraints(constraints.clone());
                 let primary_keys: Vec<String> =
                     get_primary_keys_from_constraints(constraints, &schema);
-                external_table_builder = external_table_builder
-                    .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+                external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
+                    ColumnReference::new(primary_keys),
+                    UpsertOptions::default(),
+                ));
             }
         }
 

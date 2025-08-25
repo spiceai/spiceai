@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, constraints::UpsertOptions,
+};
 use serde::{Deserialize, Serialize};
 use spicepod::{acceleration as spicepod_acceleration, param::Params};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
@@ -202,18 +204,26 @@ impl Display for IndexType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
-    Upsert,
+    Upsert(UpsertOptions),
 }
 
 impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
     fn from(index_type: spicepod_acceleration::OnConflictBehavior) -> Self {
         match index_type {
             spicepod_acceleration::OnConflictBehavior::Drop => OnConflictBehavior::Drop,
-            spicepod_acceleration::OnConflictBehavior::Upsert => OnConflictBehavior::Upsert,
+            spicepod_acceleration::OnConflictBehavior::Upsert => {
+                OnConflictBehavior::Upsert(UpsertOptions::default())
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_remove_duplicates(true))
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_last_write_wins(true))
+            }
         }
     }
 }
@@ -221,7 +231,7 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
 impl From<&str> for OnConflictBehavior {
     fn from(index_type: &str) -> Self {
         match index_type.to_lowercase().as_str() {
-            "upsert" => OnConflictBehavior::Upsert,
+            "upsert" => OnConflictBehavior::Upsert(UpsertOptions::default()),
             _ => OnConflictBehavior::Drop,
         }
     }
@@ -231,7 +241,7 @@ impl Display for OnConflictBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert => write!(f, "upsert"),
+            OnConflictBehavior::Upsert(_options) => write!(f, "upsert"),
         }
     }
 }
