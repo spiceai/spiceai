@@ -18,6 +18,7 @@ use crate::Runtime;
 use crate::model::ToolUsingResponses;
 use crate::model::params::get_params_spec;
 use crate::model::tool_use_responses::OpenAIResponsesTools;
+use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
 use crate::tools::utils::get_tools;
@@ -25,6 +26,7 @@ use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
 use secrecy::SecretString;
+use serde_json::Value;
 use spicepod::component::model::{Model, ModelSource};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -133,7 +135,22 @@ fn construct_model(
         }),
     }?;
 
-    Ok(model)
+    let system_prompt = match component.params.get("system_prompt") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(v) => {
+            return Err(LlmError::InvalidParamValueError {
+                param: "system_prompt".to_string(),
+                message: format!("Expected a string, got: {v:?}"),
+            });
+        }
+        None => None,
+    };
+
+    Ok(Arc::new(ResponsesWrapper::new(
+        model,
+        component.name.as_str(),
+        system_prompt,
+    )))
 }
 
 fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {

@@ -79,6 +79,9 @@ pub enum Error {
         "S3 vector does not exist, and cannot be created from an S3 vector ARN. Specify a s3 vector bucket and index name."
     ))]
     CreateIndexUsingArn,
+
+    #[snafu(display("Failed to load AWS credentials. {message}"))]
+    UnableToLoadCredentials { message: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

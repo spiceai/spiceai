@@ -31,7 +31,7 @@ mod search {
         models::{
             get_mega_science_dataset,
             hf::get_huggingface_embeddings,
-            s3_vectors::{delete_index, vectors_filterable_col, vectors_non_filterable_col},
+            s3_vectors::{delete_index, vectors_filterable_col, vectors_nonfilterable_col},
             search::{_run_search, SearchTestCase, SearchTestType},
         },
         utils::verify_env_secret_exists,
@@ -257,7 +257,7 @@ mod search {
             }),
         );
         ds.columns.extend([
-            vectors_non_filterable_col("question"),
+            vectors_nonfilterable_col("question"),
             vectors_filterable_col("subject"),
         ]);
         let bucket_name = "spice-ci-tests-s3-vectors-metadata-columns";
@@ -377,6 +377,23 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
+            explain SELECT
+                "message.body",
+                attempt_count, "message.status",
+                package_weight_kg,
+                round(score, 1)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
+            ORDER BY package_weight_kg desc, score DESC
+            LIMIT 10;
+            "#,
+            "filters_pushdown_explain",
+        )
+        .await?;
+
+        run_and_snapshot_query(
+            &rt,
+            r#"
             SELECT
               "message.body",
               attempt_count, "message.status",
@@ -391,20 +408,19 @@ mod search {
         )
         .await?;
 
+        // WHERE clause on non-filterable column should not pushdown filter to S3vector.
         run_and_snapshot_query(
             &rt,
             r#"
             explain SELECT
-              "message.body",
-              attempt_count, "message.status",
-              package_weight_kg,
+              "event.id",
               round(score, 1)
             FROM vector_search(delivery, 'wrong location')
-            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
-            ORDER BY package_weight_kg desc, score DESC
+            WHERE "account.tier" = 'BUSINESS'
+            ORDER BY "event.id" desc, score DESC
             LIMIT 10;
             "#,
-            "filters_pushdown_explain",
+            "non_filters_pushdown_explain",
         )
         .await?;
 
@@ -582,7 +598,7 @@ pub fn get_package_delivery_dataset(
         }]),
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),
-        vectors_filterable_col("account.tier"),
+        vectors_nonfilterable_col("account.tier"),
         vectors_filterable_col("account.account_sid"),
         vectors_filterable_col("package_weight_kg"),
         vectors_filterable_col("attempt_count"),
@@ -631,7 +647,7 @@ fn vectors_filterable_col(name: &str) -> Column {
     )
 }
 
-fn vectors_non_filterable_col(name: &str) -> Column {
+fn vectors_nonfilterable_col(name: &str) -> Column {
     Column::new(name).with_metadata(
         [(
             "vectors".to_string(),

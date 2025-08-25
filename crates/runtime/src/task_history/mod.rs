@@ -28,6 +28,7 @@ use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
@@ -106,7 +107,7 @@ impl TaskSpan {
         let acceleration_settings = Acceleration::default().with_on_conflict(
             [(
                 ColumnReference::new(vec!["span_id".to_string()]),
-                OnConflictBehavior::Upsert,
+                OnConflictBehavior::Upsert(UpsertOptions::default()),
             )]
             .into(),
         );

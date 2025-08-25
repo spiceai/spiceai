@@ -12,6 +12,7 @@ on:
           - "all"
           - "gpt-4o"
           - "gpt-4o-mini"
+          - "gpt-5"
           - "o1"
           - "o3_mini"
           - "llama3-3B-Instruct"
@@ -101,6 +102,7 @@ jobs:
             const matrix = [
               { name: "gpt-4o" },
               { name: "gpt-4o-mini" },
+              { name: "gpt-5" },
               { name: "o1" },
               { name: "o3_mini" },
               { name: "llama3-3B-Instruct" },

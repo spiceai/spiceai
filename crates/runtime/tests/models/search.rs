@@ -752,16 +752,12 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     "limit": 4,
                 })),
             ),
-            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-            // https://github.com/spiceai/spiceai/issues/6821
             SearchTestCase::new(
                 "text_search_sql_text_search_basic",
                 SearchTestType::Sql(
                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
             ),
-            // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-            // https://github.com/spiceai/spiceai/issues/6821
             SearchTestCase::new(
                 "text_search_sql_text_search_projection",
                 SearchTestType::Sql(
@@ -779,13 +775,13 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                 SearchTestType::Sql(
                     "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
-            ).skip(),
+            ),
             SearchTestCase::new(
                 "text_search_sql_text_search_random",
                 SearchTestType::Sql(
                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
                 ),
-            ).skip(),
+            ),
         ],
     )
     .await
@@ -824,6 +820,46 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
                 SearchTestType::Sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
             ),
         ]
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<(), anyhow::Error> {
+    run_search(
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["answer".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["answer".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
+        vec![SearchTestCase::new(
+            "test_text_search_where_rowid_is_search_column_multi_column",
+            SearchTestType::Http(json!({
+                "text": "second",
+                "limit": 4,
+                "datasets": ["qs"],
+            })),
+        )],
     )
     .await
 }
@@ -947,11 +983,9 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                 SearchTestType::Sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
             ),
             SearchTestCase::new(
-                // HTTP error: 400 Bad Request - Failed to execute query: Schema error: No field named id. Valid fields are base_table.subject.
-                // https://github.com/spiceai/spiceai/issues/6820
                 "multi_text_column_sql_text_search_random",
                 SearchTestType::Sql("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ).skip(),
+            ),
         ],
     )
     .await
