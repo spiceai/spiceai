@@ -12011,6 +12011,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spice-cloud",
+ "spiceai",
  "spicepod",
  "strsim 0.11.1",
  "tantivy",
