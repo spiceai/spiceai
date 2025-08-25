@@ -111,6 +111,7 @@ impl TableProvider for S3VectorsQueryTable {
             .fields()
             .iter()
             .map(|f| f.name().clone())
+            .filter(|c| self.table.is_filterable_column(c.as_str()))
             .collect();
 
         Ok(filters
