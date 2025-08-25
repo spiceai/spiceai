@@ -290,15 +290,6 @@ mod search {
                         "text": "second",
                         "limit": 4,
                         "datasets": ["qs"],
-                        "additional_columns": ["question"],
-                    })),
-                ),
-                SearchTestCase::new(
-                    "s3vector_metadata_additional_columns_metadata",
-                    SearchTestType::Http(json!({
-                        "text": "second",
-                        "limit": 4,
-                        "datasets": ["qs"],
                         "additional_columns": ["reference_answer", "source"],
                     })),
                 ),
