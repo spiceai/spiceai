@@ -261,6 +261,7 @@ mod search {
             vectors_nonfilterable_col("question"),
             vectors_filterable_col("subject"),
         ]);
+
         let bucket_name = "spice-ci-tests-s3-vectors-metadata-columns";
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
@@ -482,7 +483,7 @@ mod search {
                 .inspect_err(|e| {
                     tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
                 });
-        };
+        }
 
         let params = spicepod::param::Params::from_string_map(
             vec![

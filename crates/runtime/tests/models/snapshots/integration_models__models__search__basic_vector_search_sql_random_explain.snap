@@ -1,15 +1,37 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: explain_resp?
+expression: "arrow::util::pretty::pretty_format_batches(&c).expect(\"failed to format RecordBatch for explain plan\")"
 snapshot_kind: text
 ---
-[
-  {
-    "plan_type": "logical_plan",
-    "plan": "Projection: vector_search().subject\n  Sort: vector_search().score DESC NULLS FIRST, fetch=4\n    BytesProcessedNode\n      TableScan: vector_search() projection=[subject, score]"
-  },
-  {
-    "plan_type": "physical_plan",
-    "plan": "ProjectionExec: expr=[subject@0 as subject]\n  SortPreservingMergeExec: [score@1 DESC], fetch=4\n    SortExec: TopK(fetch=4), expr=[score@1 DESC], preserve_partitioning=[true]\n      BytesProcessedExec\n        ProjectionExec: expr=[subject@1 as subject, score@0 as score]\n          CoalesceBatchesExec: target_batch_size=8192\n            CoalesceBatchesExec: target_batch_size=8192\n              HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[score@1, subject@3]\n                CoalesceBatchesExec: target_batch_size=8192\n                  RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10\n                    CoalesceBatchesExec: target_batch_size=8192\n                      BytesProcessedExec\n                        ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]\n                          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1\n                            BytesProcessedExec\n                              S3VectorsQueryExec: limit=100\n                CoalesceBatchesExec: target_batch_size=8192\n                  RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10\n                    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1\n                      CoalesceBatchesExec: target_batch_size=8192\n                        BytesProcessedExec\n                          SchemaCastScanExec\n                            DataSourceExec: partitions=1, partition_sizes=[10]\n"
-  }
-]
++---------------+------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                             |
++---------------+------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search().subject                                                                              |
+|               |   Sort: vector_search().score DESC NULLS FIRST, fetch=4                                                          |
+|               |     BytesProcessedNode                                                                                           |
+|               |       TableScan: vector_search() projection=[subject, score]                                                     |
+| physical_plan | ProjectionExec: expr=[subject@0 as subject]                                                                      |
+|               |   SortPreservingMergeExec: [score@1 DESC], fetch=4                                                               |
+|               |     SortExec: TopK(fetch=4), expr=[score@1 DESC], preserve_partitioning=[true]                                   |
+|               |       BytesProcessedExec                                                                                         |
+|               |         ProjectionExec: expr=[subject@1 as subject, score@0 as score]                                            |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                            |
+|               |             CoalesceBatchesExec: target_batch_size=8192                                                          |
+|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[score@1, subject@3] |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                      |
+|               |                   RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10                            |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                  |
+|               |                       BytesProcessedExec                                                                         |
+|               |                         ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]               |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                  |
+|               |                             BytesProcessedExec                                                                   |
+|               |                               S3VectorsQueryExec: limit=30                                                       |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                      |
+|               |                   RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10                            |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                        |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                |
+|               |                         BytesProcessedExec                                                                       |
+|               |                           SchemaCastScanExec                                                                     |
+|               |                             DataSourceExec: partitions=1, partition_sizes=[10]                                   |
+|               |                                                                                                                  |
++---------------+------------------------------------------------------------------------------------------------------------------+
