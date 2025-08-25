@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/models/search.rs
+assertion_line: 326
+expression: explain_resp?
+---
+[
+  {
+    "plan_type": "logical_plan",
+    "plan": "Sort: score DESC NULLS FIRST, fetch=4\n  Projection: vector_search().id, vector_search().answer, trunc(vector_search().score, Int64(3)) AS score\n    BytesProcessedNode\n      Filter: vector_search().subject != Utf8(\"math\")\n        TableScan: vector_search() projection=[id, answer, subject, score]"
+  },
+  {
+    "plan_type": "physical_plan",
+    "plan": "SortPreservingMergeExec: [score@2 DESC], fetch=4\n  SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]\n    ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@3, 3) as score]\n      BytesProcessedExec\n        CoalesceBatchesExec: target_batch_size=8192\n          FilterExec: subject@2 != math\n            ProjectionExec: expr=[id@0 as id, answer@2 as answer, subject@3 as subject, score@1 as score]\n              CoalesceBatchesExec: target_batch_size=8192\n                CoalesceBatchesExec: target_batch_size=8192\n                  HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@3, subject@4]\n                    CoalesceBatchesExec: target_batch_size=8192\n                      RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10\n                        CoalesceBatchesExec: target_batch_size=8192\n                          BytesProcessedExec\n                            ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]\n                              RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1\n                                BytesProcessedExec\n                                  S3VectorsQueryExec: limit=100\n                    CoalesceBatchesExec: target_batch_size=8192\n                      RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10\n                        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1\n                          CoalesceBatchesExec: target_batch_size=8192\n                            BytesProcessedExec\n                              SchemaCastScanExec\n                                DataSourceExec: partitions=1, partition_sizes=[10]\n"
+  }
+]

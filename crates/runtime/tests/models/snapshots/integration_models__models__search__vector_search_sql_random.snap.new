@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/models/search.rs
+assertion_line: 320
+expression: resp?
+---
+[
+  {
+    "subject": "economics"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "medicine"
+  }
+]

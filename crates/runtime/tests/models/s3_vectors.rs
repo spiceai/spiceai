@@ -62,7 +62,7 @@ mod search {
                 name: "answer".to_string(),
                 embeddings: vec![ColumnLevelEmbeddingConfig {
                     model: "hf_minilm".to_string(),
-                    row_ids: Some(vec!["_id".to_string()]),
+                    row_ids: Some(vec!["id".to_string()]),
                     chunking: None,
                     vector_size: None,
                 }],
