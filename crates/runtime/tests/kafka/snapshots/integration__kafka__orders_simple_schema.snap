@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/kafka/mod.rs
+expression: formatted
+---
++-------------+-----------------------------------------------------------------------------------------------------------------+-------------+
+| column_name | data_type                                                                                                       | is_nullable |
++-------------+-----------------------------------------------------------------------------------------------------------------+-------------+
+| order_id    | Utf8                                                                                                            | YES         |
+| custkey     | Int64                                                                                                           | YES         |
+| partkey     | Int64                                                                                                           | YES         |
+| suppkey     | Int64                                                                                                           | YES         |
+| quantity    | Int64                                                                                                           | YES         |
+| unit_price  | Float64                                                                                                         | YES         |
+| order_date  | Utf8                                                                                                            | YES         |
+| order_ts    | Utf8                                                                                                            | YES         |
+| shipped     | Boolean                                                                                                         | YES         |
+| tags        | List(Field { name: "item", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) | YES         |
++-------------+-----------------------------------------------------------------------------------------------------------------+-------------+
