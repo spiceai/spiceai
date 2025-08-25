@@ -287,7 +287,7 @@ pub(crate) async fn compute_additional_embedding_columns<'a>(
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
-                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), &**model).await?;
+                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(model)).await?;
             tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
@@ -299,8 +299,9 @@ pub(crate) async fn compute_additional_embedding_columns<'a>(
                 let vector_size = cfg.vector_size;
 
                 task::spawn_blocking(move || {
-                    get_vectors_in_process(batch, task_model, vector_size)
-                }).await??
+                    get_vectors_in_process(batch, &task_model, vector_size)
+                })
+                .await??
             } else {
                 get_vectors(arr_iter, &**model, cfg.vector_size).await?
             };
@@ -419,9 +420,9 @@ pub(super) async fn get_vectors(
 /// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-pub(super) fn get_vectors_in_process<'a>(
+pub(super) fn get_vectors_in_process(
     arr: Vec<Option<String>>,
-    model: Arc<dyn Embed>,
+    model: &Arc<dyn Embed>,
     vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     let mut builder = FixedSizeListBuilder::with_capacity(
@@ -435,13 +436,9 @@ pub(super) fn get_vectors_in_process<'a>(
 
     // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
     // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
-    if arr
-        .iter()
-        .any(|o| !matches!(o, Some(s) if !s.is_empty()))
-    {
+    if arr.iter().any(|o| !matches!(o, Some(s) if !s.is_empty())) {
         let embeds: Vec<_> = pool.install(|| {
-            arr
-                .into_par_iter()
+            arr.into_par_iter()
                 .map(|o| match o {
                     Some(input) if input.is_empty() => None,
                     Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
@@ -461,8 +458,7 @@ pub(super) fn get_vectors_in_process<'a>(
         }
     } else {
         let embeds: Vec<_> = pool.install(|| {
-            arr
-                .into_par_iter()
+            arr.into_par_iter()
                 .chunks(32)
                 .map(|chunk| {
                     model.embed_sync(EmbeddingInput::StringArray(
@@ -509,7 +505,7 @@ pub(super) fn get_vectors_in_process<'a>(
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
-    model: &dyn Embed,
+    model: Arc<dyn Embed>,
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
@@ -530,14 +526,19 @@ async fn get_vectors_with_chunker(
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
     let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
         let pool = build_embedding_pool(model.parallelism())?;
-        let batches: Vec<_> = pool.install(|| {
-            chunks
-                .clone()
-                .into_par_iter()
-                .chunks(32)
-                .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+        let model = Arc::clone(&model);
+        let sync_embed_chunks = chunks.clone();
+
+        let batches = task::spawn_blocking(move || {
+            pool.install(|| {
+                sync_embed_chunks
+                    .into_par_iter()
+                    .chunks(32)
+                    .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+        })
+        .await??;
 
         batches.into_iter().flatten().collect()
     } else {
