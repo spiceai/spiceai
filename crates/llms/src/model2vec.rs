@@ -136,7 +136,7 @@ impl Embed for Model2Vec {
     }
 
     fn parallelism(&self) -> Option<usize> {
-        self.parallelism.or(Some(0))
+        self.parallelism
     }
 
     fn size(&self) -> i32 {

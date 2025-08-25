@@ -44,7 +44,6 @@ use std::{any::Any, sync::Arc, thread};
 use super::table::EmbeddingColumnConfig;
 use crate::model::EmbeddingModelStore;
 use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
-use llms::embeddings;
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;
@@ -231,11 +230,11 @@ pub(crate) fn construct_record_batch(
 /// For columns that are in the base table, no additional columns are calculated.
 ///
 /// The additional columns returned here should match those specified in [`super::table::EmbeddingTable::embedding_fields`]
-pub(crate) async fn compute_additional_embedding_columns<'a>(
-    rb: &'a RecordBatch,
-    embedded_columns: &'a HashMap<String, EmbeddingColumnConfig>,
+pub(crate) async fn compute_additional_embedding_columns(
+    rb: &RecordBatch,
+    embedded_columns: &HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
-) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync + 'a>> {
+) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
     let additional_embedding_columns: HashMap<_, _> = embedded_columns
         .iter()
         .filter(|(_, cfg)| !cfg.in_base_table)
@@ -637,25 +636,15 @@ async fn get_vectors_with_chunker(
 fn build_embedding_pool(
     model_parallelism: Option<usize>,
 ) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
-    let sys_parallelism = thread::available_parallelism();
-
-    let parallelism = match (model_parallelism, sys_parallelism) {
-        (Some(0), Ok(p)) => p.get(),
-        (Some(0), Err(e)) => {
+    let parallelism = match (model_parallelism, thread::available_parallelism()) {
+        (Some(p), _) => p,
+        (None, Ok(host_parallelism)) => host_parallelism.get(),
+        (_, Err(e)) => {
             let default_parallelism = 2;
             tracing::trace!(
                 "Defaulting to parallelism {default_parallelism}, error determining host parallelism: {e} "
             );
             default_parallelism
-        }
-        (Some(p), _) => p,
-        (None, _) => {
-            return Err(embeddings::Error::FailedToCreateEmbedding {
-                source: Box::<dyn std::error::Error + Send + Sync>::from(
-                    "Model does not support in-process parallelism",
-                ),
-            }
-            .into());
         }
     };
 
