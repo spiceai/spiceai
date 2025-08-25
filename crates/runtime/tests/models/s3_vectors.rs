@@ -32,7 +32,7 @@ mod search {
             get_mega_science_dataset,
             hf::get_huggingface_embeddings,
             s3_vectors::{delete_index, vectors_filterable_col, vectors_nonfilterable_col},
-            search::{_run_search, SearchTestCase, SearchTestType},
+            search::{SearchTestCase, SearchTestType, run_search_w_explain},
         },
         utils::verify_env_secret_exists,
     };
@@ -75,7 +75,7 @@ mod search {
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
 
-        _run_search(
+        run_search_w_explain(
             AppBuilder::new("search_app")
                 .with_embedding(get_huggingface_embeddings(
                     "sentence-transformers/all-MiniLM-L6-v2",
@@ -173,7 +173,7 @@ mod search {
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
 
-        _run_search(
+        run_search_w_explain(
             AppBuilder::new("search_app")
                 .with_embedding(get_huggingface_embeddings(
                     "sentence-transformers/all-MiniLM-L6-v2",
@@ -233,6 +233,7 @@ mod search {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         // Metadata columns: question, subject (filterable), answer
         // Base columns:     reference_answer,source
@@ -264,7 +265,7 @@ mod search {
         let vector_store = init_vector_store(bucket_name, true).await?;
         ds.vectors = Some(vector_store);
 
-        _run_search(
+        run_search_w_explain(
             AppBuilder::new("search_app")
                 .with_embedding(get_huggingface_embeddings(
                     "sentence-transformers/all-MiniLM-L6-v2",

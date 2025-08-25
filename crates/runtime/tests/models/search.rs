@@ -274,11 +274,11 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
-    _run_search(app, test_cases, false).await
+    run_search_w_explain(app, test_cases, false).await
 }
 
 // if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
-pub(crate) async fn _run_search(
+pub(crate) async fn run_search_w_explain(
     app: App,
     test_cases: Vec<SearchTestCase>,
     explain_sql: bool,
