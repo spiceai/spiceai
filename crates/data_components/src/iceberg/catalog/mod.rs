@@ -42,7 +42,7 @@ pub enum Error {
     NamespaceDoesNotExist { namespace: String },
 
     #[snafu(display(
-        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."
+        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again. Connection failure caused by: {source:?}"
     ))]
     FailedToConnect { url: String, source: iceberg::Error },
 
