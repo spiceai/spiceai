@@ -174,6 +174,8 @@ mod tests {
         assert_eq!(embed_sentence.len(), 1);
         assert_eq!(embed_sentence[0].len(), 256);
 
+        insta::assert_debug_snapshot!("model2vec_single_embedding", embed_sentence);
+
         let embed_sentences = model
             .embed(EmbeddingInput::StringArray(vec![
                 "i can eat glass".to_string(),
@@ -185,9 +187,11 @@ mod tests {
 
         let embed_sentences = embed_sentences.expect("Must embed sentences");
         assert_eq!(embed_sentences.len(), 2);
-        for embedded_sentence in embed_sentences {
+        for embedded_sentence in &embed_sentences {
             assert_eq!(embedded_sentence.len(), 256);
         }
+
+        insta::assert_debug_snapshot!("model2vec_multiple_embeddings", embed_sentences);
 
         let embed_ints = model.embed(EmbeddingInput::IntegerArray(vec![1])).await;
 
