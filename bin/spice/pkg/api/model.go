@@ -16,11 +16,16 @@ limitations under the License.
 
 package api
 
+type Metadata struct {
+	SupportsResponsesAPI bool `json:"supports_responses_api,omitempty" csv:"supports_responses_api" yaml:"supports_responses_api,omitempty"`
+}
+
 type Model struct {
-	Id      string `json:"id,omitempty" csv:"id" yaml:"id,omitempty"`
-	Object  string `json:"object,omitempty" csv:"object" yaml:"object,omitempty"`
-	OwnedBy string `json:"owned_by,omitempty" csv:"owned_by" yaml:"owned_by,omitempty"`
-	Status  string `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+	Id       string   `json:"id,omitempty" csv:"id" yaml:"id,omitempty"`
+	Object   string   `json:"object,omitempty" csv:"object" yaml:"object,omitempty"`
+	OwnedBy  string   `json:"owned_by,omitempty" csv:"owned_by" yaml:"owned_by,omitempty"`
+	Status   string   `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+	Metadata Metadata `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
 }
 
 type ModelResponse struct {
