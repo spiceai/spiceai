@@ -466,6 +466,14 @@ impl CandidateGeneration for FullTextSearchFieldIndex {
             }
         }
 
+        for pk in &self.primary_key {
+            // keep the field if it is part of the primary key
+            if pk == &self.field {
+                keep_search_field = true;
+                break;
+            }
+        }
+
         let strm = make_stream(self.clone(), query, keep_search_field, limit);
         let mut strm = Box::pin(strm.peekable());
         let schema = match strm.as_mut().peek().await {
@@ -477,6 +485,7 @@ impl CandidateGeneration for FullTextSearchFieldIndex {
                 ));
             }
         };
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 

@@ -810,6 +810,46 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
 }
 
 #[tokio::test]
+async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<(), anyhow::Error> {
+    run_search(
+        AppBuilder::new("search_app")
+            .with_dataset(get_mega_science_dataset(
+                Some("qs"),
+                Some(Column {
+                    name: "question".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["answer".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+                Some(Column {
+                    name: "answer".to_string(),
+                    embeddings: vec![],
+                    description: None,
+                    full_text_search: Some(FullTextSearchConfig {
+                        enabled: true,
+                        row_ids: Some(vec!["answer".to_string()]),
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            ))
+            .build(),
+        vec![SearchTestCase::new(
+            "test_text_search_where_rowid_is_search_column_multi_column",
+            SearchTestType::Http(json!({
+                "text": "second",
+                "limit": 4,
+                "datasets": ["qs"],
+            })),
+        )],
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
