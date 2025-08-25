@@ -7,6 +7,9 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "data": {
+        "question": "What is created by making a choice?"
+      },
       "dataset": "qs",
       "matches": {
         "answer": "Choices create costs and benefits."
@@ -14,9 +17,12 @@ snapshot_kind: text
       "primary_key": {
         "id": 863
       },
-      "score": 0.94
+      "score": 0.89
     },
     {
+      "data": {
+        "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\)."
+      },
       "dataset": "qs",
       "matches": {
         "answer": "\\(\\boxed{2a + 4b}\\)"
@@ -24,9 +30,12 @@ snapshot_kind: text
       "primary_key": {
         "id": 1316
       },
-      "score": 0.92
+      "score": 0.84
     },
     {
+      "data": {
+        "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\)."
+      },
       "dataset": "qs",
       "matches": {
         "answer": "\\(\\boxed{x = A + E}\\)"
@@ -34,9 +43,12 @@ snapshot_kind: text
       "primary_key": {
         "id": 590
       },
-      "score": 0.91
+      "score": 0.83
     },
     {
+      "data": {
+        "question": "<refined question>"
+      },
       "dataset": "qs",
       "matches": {
         "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
@@ -44,7 +56,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 6
       },
-      "score": 0.91
+      "score": 0.83
     }
   ]
 }

@@ -341,11 +341,16 @@ pub(crate) async fn run_search_w_explain(
                                 .await
                                 .expect("failed to created RecordBatch");
 
+                            insta::with_settings!({
+                                omit_expression => true,
+                                description => sql
+                            }, {
                             insta::assert_snapshot!(
                                 format!("{}_explain", ts.name),
                                 arrow::util::pretty::pretty_format_batches(&c)
                                     .expect("failed to format RecordBatch for explain plan")
-                            );
+                            )
+                            });
                         }
                     }
                 }

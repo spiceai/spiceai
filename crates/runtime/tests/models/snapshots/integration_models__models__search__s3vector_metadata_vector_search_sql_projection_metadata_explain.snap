@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "arrow::util::pretty::pretty_format_batches(&c).expect(\"failed to format RecordBatch for explain plan\")"
+description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4"
 snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
