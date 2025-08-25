@@ -430,7 +430,7 @@ pub(super) fn get_vectors_in_process(
         vector_length,
         arr.len(),
     )
-    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
     let pool = build_embedding_pool(model.parallelism())?;
 
