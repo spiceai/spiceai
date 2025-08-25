@@ -9,11 +9,32 @@ assignees: ''
 
 This issue tracks the process of upgrading Spice OSS to a new major version of DataFusion to maintain a version that is one major release version behind the [latest](https://github.com/apache/datafusion/tags). Because many internal crates and forked dependencies rely on DataFusion, they all need to be upgraded in lockstep.
 
+```mermaid
+graph TD
+    A[spice] --> B[datafusion-table-providers]
+    A --> C[datafusion-federation]
+    A --> D[datafusion]
+    A -.-> E[arrow-rs]
+    
+    B --> C
+    B --> D
+    B -.-> E
+    
+    C --> D
+    C -.-> E
+    
+    D -.-> E
+
+    F[snowflake-rs] -.-> E
+    G[delta-kernel-rs] -.-> E
+    H[duckdb-rs] -.-> E
+```
+
 ## Pre-upgrade Tasks
 
 - [ ]  Read the DataFusion [changelog](https://github.com/apache/datafusion/tree/branch-49/dev/changelog) of the new version to identify breaking changes and new features.
-- [ ]  Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading.html ).
 - [ ]  Read the DataFusion [blog](https://datafusion.apache.org/blog/) for the latest release.
+- [ ]  Read the DataFusion [upgrade guides](https://datafusion.apache.org/library-user-guide/upgrading.html).
 
 ## Upgrade DataFusion Fork
 - [ ]  Sync the forked main branch with the upstream repository.
@@ -21,8 +42,7 @@ This issue tracks the process of upgrading Spice OSS to a new major version of D
 - [ ]  Run `cargo test` to confirm that all upstream tests pass, or make note of which tests fail for reference.
 - [ ]  View the previous branch (i.e. `spice-<X-1>`) commit history. For every commit after the upstream (previous) release commit:
   - Confirm the commit has been merged upstream and is in the new release **OR**
-  - Cherry-pick the commit onto the new `spice-X` branch. This may involve resolving merge conflicts.
-- [ ]  Rerun `cargo test` confirming there are no new failed tests.
+  - Cherry-pick the commit onto the new `spice-X` branch. This may involve resolving merge conflicts. Rerun `cargo test` confirming there are no new failed tests. If there are failed tests, fix them and amend the cherry-picked commit so that the fixes live with the patch.
 - [ ]  If there are no commits that need to be cherry-picked, the upstream repository can be used directly.
 
 ## Forked Dependency Upgrades
