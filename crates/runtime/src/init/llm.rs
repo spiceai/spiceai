@@ -30,12 +30,12 @@ use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
 
 fn supports_responses_api(params: &HashMap<String, SecretString>) -> bool {
-    return params
+    params
         .get("responses_api")
         .map(secrecy::ExposeSecret::expose_secret)
         .unwrap_or_default()
         .trim()
-        .eq_ignore_ascii_case("enabled");
+        .eq_ignore_ascii_case("enabled")
 }
 
 impl Runtime {
