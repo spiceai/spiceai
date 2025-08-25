@@ -401,7 +401,7 @@ Cras venenatis euismod malesuada.",
     }
 
     #[test]
-    fn test_truncate_list_array() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_truncate_list_array() {
         let test_cases: Vec<(&str, usize, ListArray)> = vec![
             (
                 "truncate_list_array_basic",
@@ -439,12 +439,10 @@ Cras venenatis euismod malesuada.",
                 write_to_json_value(output).expect("could not write ListArray to JSON")
             );
         }
-
-        Ok(())
     }
 
     #[test]
-    fn test_truncate_fixed_size_list_array() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_truncate_fixed_size_list_array() {
         let test_cases: Vec<(&str, usize, FixedSizeListArray)> = vec![
             (
                 "truncate_fixed_size_list_array_basic",
@@ -481,8 +479,6 @@ Cras venenatis euismod malesuada.",
                 write_to_json_value(output).expect("could not write FixedSizeListArray to JSON")
             );
         }
-
-        Ok(())
     }
 
     pub fn write_to_json_value(
