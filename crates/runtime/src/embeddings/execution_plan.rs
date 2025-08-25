@@ -641,7 +641,13 @@ fn build_embedding_pool(
 
     let parallelism = match (model_parallelism, sys_parallelism) {
         (Some(0), Ok(p)) => p.get(),
-        (Some(0), _) => unreachable!("Must determine system parallelism"),
+        (Some(0), Err(e)) => {
+            let default_parallelism = 2;
+            tracing::trace!(
+                "Defaulting to parallelism {default_parallelism}, error determining host parallelism: {e} "
+            );
+            default_parallelism
+        }
         (Some(p), _) => p,
         (None, _) => {
             return Err(embeddings::Error::FailedToCreateEmbedding {
