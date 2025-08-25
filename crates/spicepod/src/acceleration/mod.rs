@@ -109,99 +109,13 @@ impl Display for IndexType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase", default)]
-pub struct PreinsertOptions {
-    pub deduplicate: bool,
-    pub last_write_wins: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
-    Upsert(PreinsertOptions),
-}
-
-impl<'de> Deserialize<'de> for OnConflictBehavior {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{self, MapAccess, Visitor};
-
-        struct OnConflictBehaviorVisitor;
-
-        impl<'de> Visitor<'de> for OnConflictBehaviorVisitor {
-            type Value = OnConflictBehavior;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str(
-                    "a string 'drop' or 'upsert', or an object with mode and preinsert fields",
-                )
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<OnConflictBehavior, E>
-            where
-                E: de::Error,
-            {
-                match value {
-                    "drop" => Ok(OnConflictBehavior::Drop),
-                    "upsert" => Ok(OnConflictBehavior::Upsert(PreinsertOptions::default())),
-                    _ => Err(de::Error::unknown_variant(value, &["drop", "upsert"])),
-                }
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<OnConflictBehavior, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut mode: Option<String> = None;
-                let mut preinsert: Option<PreinsertOptions> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "mode" => {
-                            mode = Some(map.next_value()?);
-                        }
-                        "preinsert" => {
-                            preinsert = Some(map.next_value()?);
-                        }
-                        _ => {
-                            return Err(de::Error::unknown_field(&key, &["mode", "preinsert"]));
-                        }
-                    }
-                }
-
-                match mode.as_deref() {
-                    Some("drop") => {
-                        if preinsert.is_some() {
-                            Err(de::Error::custom(
-                                "preinsert can only be used with upsert mode",
-                            ))
-                        } else {
-                            Ok(OnConflictBehavior::Drop)
-                        }
-                    }
-                    Some("upsert") => Ok(OnConflictBehavior::Upsert(preinsert.unwrap_or_default())),
-                    Some(other) => Err(de::Error::unknown_variant(other, &["drop", "upsert"])),
-                    None => Err(de::Error::missing_field("mode")),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(OnConflictBehaviorVisitor)
-    }
-}
-
-impl Display for OnConflictBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert(_) => write!(f, "upsert"),
-        }
-    }
+    Upsert,
+    UpsertDedup,
+    UpsertDedupByRowId,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -343,20 +257,40 @@ mod tests {
                 on_conflict:
                   foo: upsert
             ";
-        let _: Acceleration = serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::Upsert)
+        );
     }
 
     #[test]
-    fn test_deserialize_acceleration_on_conflict_preinsert_options() {
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup() {
         let yaml = r"
                 on_conflict:
-                  foo:
-                    mode: upsert
-                    preinsert:
-                      deduplicate: true
-                      last_write_wins: true
+                  foo: upsert_dedup
             ";
-        let _: Acceleration = serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedup)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup_by_row_id() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup_by_row_id
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedupByRowId)
+        );
     }
 
     #[test]
@@ -370,147 +304,6 @@ mod tests {
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_drop_object() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: drop
-            ";
-        let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
-        assert_eq!(
-            acceleration.on_conflict.get("foo"),
-            Some(&OnConflictBehavior::Drop)
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_upsert_partial_preinsert() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: upsert
-                    preinsert:
-                      deduplicate: true
-            ";
-        let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
-        let expected_preinsert = PreinsertOptions {
-            deduplicate: true,
-            last_write_wins: false,
-        };
-        assert_eq!(
-            acceleration.on_conflict.get("foo"),
-            Some(&OnConflictBehavior::Upsert(expected_preinsert))
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_upsert_no_preinsert() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: upsert
-            ";
-        let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
-        assert_eq!(
-            acceleration.on_conflict.get("foo"),
-            Some(&OnConflictBehavior::Upsert(PreinsertOptions::default()))
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_drop_with_preinsert_should_fail() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: drop
-                    preinsert:
-                      deduplicate: true
-                      last_write_wins: false
-            ";
-        let result: Result<Acceleration, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("just asserted this is an error")
-                .to_string()
-                .contains("preinsert can only be used with upsert mode")
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_invalid_string() {
-        let yaml = r"
-                on_conflict:
-                  foo: invalid
-            ";
-        let result: Result<Acceleration, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("just asserted this is an error")
-                .to_string()
-                .contains("unknown variant `invalid`")
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_missing_mode() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    preinsert:
-                      deduplicate: true
-                      last_write_wins: false
-            ";
-        let result: Result<Acceleration, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("just asserted this is an error")
-                .to_string()
-                .contains("missing field `mode`")
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_unknown_field() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: upsert
-                    unknown_field: value
-            ";
-        let result: Result<Acceleration, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("just asserted this is an error")
-                .to_string()
-                .contains("unknown field `unknown_field`")
-        );
-    }
-
-    #[test]
-    fn test_deserialize_acceleration_on_conflict_invalid_mode() {
-        let yaml = r"
-                on_conflict:
-                  foo:
-                    mode: invalid_mode
-            ";
-        let result: Result<Acceleration, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        assert!(
-            result
-                .expect_err("just asserted this is an error")
-                .to_string()
-                .contains("unknown variant `invalid_mode`")
         );
     }
 }

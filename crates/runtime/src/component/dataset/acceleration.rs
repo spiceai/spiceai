@@ -215,12 +215,14 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
     fn from(index_type: spicepod_acceleration::OnConflictBehavior) -> Self {
         match index_type {
             spicepod_acceleration::OnConflictBehavior::Drop => OnConflictBehavior::Drop,
-            spicepod_acceleration::OnConflictBehavior::Upsert(options) => {
-                OnConflictBehavior::Upsert(
-                    UpsertOptions::default()
-                        .with_last_write_wins(options.last_write_wins)
-                        .with_remove_duplicates(options.deduplicate),
-                )
+            spicepod_acceleration::OnConflictBehavior::Upsert => {
+                OnConflictBehavior::Upsert(UpsertOptions::default())
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_remove_duplicates(true))
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_last_write_wins(true))
             }
         }
     }
