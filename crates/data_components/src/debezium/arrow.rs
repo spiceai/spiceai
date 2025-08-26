@@ -30,10 +30,10 @@ use arrow::{
 };
 use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
-use snafu::prelude::*;
-use std::sync::Arc;
 use serde_json::Value as Json;
+use snafu::prelude::*;
 use std::cmp::Ordering::*;
+use std::sync::Arc;
 
 pub mod changes;
 
@@ -199,9 +199,7 @@ fn append_field_value_to_builder(
         }
         DataType::Decimal128(_, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            decimal_builder.append_value(
-                convert_json_to_decimal(field_value, *scale)?,
-            );
+            decimal_builder.append_value(convert_json_to_decimal(field_value, *scale)?);
         }
         DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
             (TimeUnit::Microsecond, None) => {
@@ -443,16 +441,18 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
         Equal => Ok(unscaled),
         Less => {
             let diff = dst_scale - src_scale;
-            let mul = pow10_i128(diff)
-                .context(InvalidDecimalJsonSnafu { reason: format!("overflow computing 10^{}", diff) })?;
-            unscaled.checked_mul(mul).context(
-                InvalidDecimalJsonSnafu { reason: "overflow during rescale (multiply)".to_string() }
-            )
+            let mul = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
+                reason: format!("overflow computing 10^{}", diff),
+            })?;
+            unscaled.checked_mul(mul).context(InvalidDecimalJsonSnafu {
+                reason: "overflow during rescale (multiply)".to_string(),
+            })
         }
         Greater => {
             let diff = src_scale - dst_scale;
-            let div = pow10_i128(diff)
-                .context(InvalidDecimalJsonSnafu { reason: format!("overflow computing 10^{}", diff) })?;
+            let div = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
+                reason: format!("overflow computing 10^{}", diff),
+            })?;
             Ok(unscaled / div)
         }
     }
@@ -463,26 +463,33 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
 /// - JSON string: base64-encoded
 /// - JSON object: {"scale": <int>, "value": <base64>}
 pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
-    if target_scale < 0 || target_scale > 38 {
-        return InvalidDecimalJsonSnafu { reason: "target_scale must be in 0..=38".to_string() }.fail();
+    if !(0..=38).contains(&target_scale) {
+        return InvalidDecimalJsonSnafu {
+            reason: "target_scale must be in 0..=38".to_string(),
+        }
+        .fail();
     }
 
     match v {
-        Json::String(s) => {
-            convert_string_to_decimal(s)
-        }
+        Json::String(s) => convert_string_to_decimal(s),
 
         Json::Object(m) => {
             let src_scale = m
                 .get("scale")
-                .context(InvalidDecimalJsonSnafu { reason: "missing 'scale'".to_string() })?
+                .context(InvalidDecimalJsonSnafu {
+                    reason: "missing 'scale'".to_string(),
+                })?
                 .as_i64()
-                .context(InvalidDecimalJsonSnafu { reason: "'scale' must be integer".to_string() })? as i8;
+                .context(InvalidDecimalJsonSnafu {
+                    reason: "'scale' must be integer".to_string(),
+                })? as i8;
 
-            let value = m
-                .get("value")
-                .and_then(|x| x.as_str())
-                .context(InvalidDecimalJsonSnafu { reason: "missing string field 'value'".to_string() })?;
+            let value =
+                m.get("value")
+                    .and_then(|x| x.as_str())
+                    .context(InvalidDecimalJsonSnafu {
+                        reason: "missing string field 'value'".to_string(),
+                    })?;
 
             let unscaled = convert_string_to_decimal(value)?;
             let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
@@ -490,7 +497,10 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
             Ok(normalized)
         }
 
-        _ => InvalidDecimalJsonSnafu { reason: "expected string or object".to_string() }.fail(),
+        _ => InvalidDecimalJsonSnafu {
+            reason: "expected string or object".to_string(),
+        }
+        .fail(),
     }
 }
 
@@ -568,7 +578,7 @@ fn convert_to_arrow_data_type(field: &ChangeEventField) -> Result<DataType> {
                 _ => DebeziumFieldNotSupportedSnafu {
                     field_type: field.field_type.clone(),
                 }
-                .fail()?
+                .fail()?,
             }
         }
         _ => DebeziumFieldNotSupportedSnafu {
