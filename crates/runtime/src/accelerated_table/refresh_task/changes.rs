@@ -16,7 +16,6 @@ limitations under the License.
 
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
-use crate::component::dataset::acceleration::RefreshMode;
 use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
@@ -74,10 +73,6 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
 
-        // The DataConnector's `append_stream(&mut self, append_stream: ChangesStream)` implementation is based on the same `start_changes_stream`
-        // method, as both rely on the ChangesStream. The `is_append_mode_stream` flag can be used to differentiate between append and changes/CDC-specific logic.
-        let is_append_mode_stream = matches!(refresh.read().await.mode, RefreshMode::Append);
-
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
@@ -94,11 +89,9 @@ impl RefreshTask {
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            // In Append mode, mark the dataset as ready immediately after the first message is received
-                            if is_append_mode_stream {
-                                self.update_component_status(status::ComponentStatus::Ready)
-                                    .await;
-                            }
+                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
+                            self.update_component_status(status::ComponentStatus::Ready)
+                                .await;
 
                             if let Err(e) = change_envelope.commit() {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");
