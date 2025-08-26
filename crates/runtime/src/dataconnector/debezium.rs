@@ -425,10 +425,18 @@ async fn get_metadata_from_kafka(
     };
 
     let Some(key) = msg.key() else {
+
+        let src = &msg.value().clone().payload.source;
+        let table_name = format!("{}.{}", src.db, src.table);
+
         return Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "debezium".to_string(),
-            source: "CDC message key is missing. Verify Debezium CDC configuration and try again."
-                .into(),
+            source: format!(
+                "CDC message key is missing. \
+         Most likely, table \"{}\" doesn't have a configured primary key. \
+         Verify Debezium CDC configuration and try again.",
+                table_name
+            ).into(),
             connector_component: ConnectorComponent::from(dataset),
         });
     };
