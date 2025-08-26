@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{cmp::Ordering, sync::Arc};
 
-use arrow_schema::Schema;
+use arrow_schema::{Field, Schema};
 use datafusion::{
     common::{
         Column, ToDFSchema as _,
@@ -57,8 +57,10 @@ fn collect_conditions(
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(lit))
-                | (Expr::Literal(lit), Expr::Column(col)) => Some((col.clone(), vec![lit.clone()])),
+                (Expr::Column(col), Expr::Literal(lit, _))
+                | (Expr::Literal(lit, _), Expr::Column(col)) => {
+                    Some((col.clone(), vec![lit.clone()]))
+                }
                 _ => None,
             }
         }
@@ -78,7 +80,7 @@ fn transform_and_evaluate(
         .transform(|e| {
             Ok(match e {
                 Expr::Column(expr_col) if expr_col.name() == col.name() => {
-                    Transformed::yes(Expr::Literal(filter_value.clone()))
+                    Transformed::yes(Expr::Literal(filter_value.clone(), None))
                 }
                 _ => Transformed::no(e),
             })
@@ -109,7 +111,7 @@ fn evaluate_expr(
 
     let simplified_expr = simplifier.simplify(expr.clone())?;
 
-    if let Expr::Literal(lit) = simplified_expr {
+    if let Expr::Literal(lit, _) = simplified_expr {
         return Ok(lit);
     }
 
@@ -117,7 +119,7 @@ fn evaluate_expr(
     // An example of this occurs in `test_prune_partition_case` because regex_match
     // function is used and the Simplifier cannot simplify to a literal
     match &simplified_expr {
-        Expr::Literal(lit) => Ok(lit.clone()),
+        Expr::Literal(lit, _) => Ok(lit.clone()),
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             let args = args
                 .iter()
@@ -196,8 +198,8 @@ pub(crate) fn prune_partition(
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 match (left.as_ref(), op, right.as_ref()) {
-                    (Expr::Column(col), Operator::Eq, Expr::Literal(lit))
-                    | (Expr::Literal(lit), Operator::Eq, Expr::Column(col)) => {
+                    (Expr::Column(col), Operator::Eq, Expr::Literal(lit, _))
+                    | (Expr::Literal(lit, _), Operator::Eq, Expr::Column(col)) => {
                         if !filter_or_udf_value_matches(
                             col,
                             partition_by,
@@ -211,10 +213,10 @@ pub(crate) fn prune_partition(
                     (
                         Expr::Column(col),
                         op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
-                        Expr::Literal(lit),
+                        Expr::Literal(lit, _),
                     )
                     | (
-                        Expr::Literal(lit),
+                        Expr::Literal(lit, _),
                         op @ (Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq),
                         Expr::Column(col),
                     ) => {
@@ -274,7 +276,7 @@ pub(crate) fn prune_partition(
                 if let Expr::Column(col) = expr.as_ref() {
                     let mut any_matches = false;
                     for lit in list {
-                        if let Expr::Literal(lit_val) = lit {
+                        if let Expr::Literal(lit_val, _) = lit {
                             let is_match = filter_or_udf_value_matches(
                                 col,
                                 partition_by,
@@ -351,7 +353,7 @@ fn evaluate_function_filter(
     let evaluated_args = args
         .iter()
         .map(|arg| match arg {
-            Expr::Literal(lit) => Ok(lit.clone()),
+            Expr::Literal(lit, _) => Ok(lit.clone()),
             Expr::Column(col) => transform_and_evaluate(partition_by, col, partition_value, schema),
             _ => Err(DataFusionError::Plan(
                 "Unsupported argument type".to_string(),
@@ -365,13 +367,16 @@ fn evaluate_function_filter(
 
 fn call(f: &ScalarUDF, args: Vec<ScalarValue>) -> Result<ScalarValue, DataFusionError> {
     let arg_types = args.iter().map(ScalarValue::data_type).collect::<Vec<_>>();
-    let return_type = &f.return_type(&arg_types)?;
+    let return_type = f.return_type(&arg_types)?;
     let args = args.into_iter().map(ColumnarValue::Scalar).collect();
+
+    let return_field = Arc::new(Field::new("ignored_name", return_type, false));
 
     let args = ScalarFunctionArgs {
         args,
+        arg_fields: vec![],
         number_rows: 1,
-        return_type,
+        return_field,
     };
 
     let ColumnarValue::Scalar(bucket_value) = f.invoke_with_args(args)? else {

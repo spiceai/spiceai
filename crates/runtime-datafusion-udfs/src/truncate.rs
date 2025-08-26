@@ -318,6 +318,7 @@ mod tests {
         Array as _, BinaryArray, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
         StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
+    use arrow_schema::Field;
     use datafusion::arrow::datatypes::DataType;
 
     #[test]
@@ -329,7 +330,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int8Array::from(vec![101, -1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int8, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -355,7 +357,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int16Array::from(vec![1234, -567, 99]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int16,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int16, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -389,7 +392,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int32Array::from(vec![101, -1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int32,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -415,7 +419,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int64Array::from(vec![1234, -5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -449,7 +454,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt8Array::from(vec![101, 1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt8, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -475,7 +481,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt16Array::from(vec![1234, 567, 99]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt16,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt16, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -505,7 +512,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt32Array::from(vec![1234, 5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt32,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt32, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -539,7 +547,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt64Array::from(vec![1234, 5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt64, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -575,7 +584,12 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Decimal128(10, 2),
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new(
+                "ignored_name",
+                DataType::Decimal128(10, 2),
+                false,
+            )),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -608,7 +622,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(StringArray::from(vec!["iceberg", "spark"]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Utf8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Utf8, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -644,7 +659,8 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Binary,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Binary, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -677,7 +693,8 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int64Array::from(vec![None, Some(101), None]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -705,7 +722,8 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
         };
         let result = udf.invoke_with_args(args);
         assert!(

@@ -775,7 +775,9 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
             let field_names = vec![col.name.as_str()];
             Some(Expression::column(field_names))
         }
-        Expr::Literal(value) => Some(Expression::literal(to_delta_kernel_scalar(value.clone())?)),
+        Expr::Literal(value, _) => {
+            Some(Expression::literal(to_delta_kernel_scalar(value.clone())?))
+        }
         Expr::IsNull(expr) => {
             let expr = to_delta_kernel_expr(expr)?;
             Some(Expression::is_null(expr).into())
