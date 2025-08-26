@@ -129,6 +129,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
+            INSTALL_ORACLE_ODPIC=true
 
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@v4
