@@ -32,7 +32,7 @@ use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use serde_json::Value as Json;
 use snafu::prelude::*;
-use std::cmp::Ordering::*;
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::Arc;
 
 pub mod changes;
@@ -442,7 +442,7 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
         Less => {
             let diff = dst_scale - src_scale;
             let mul = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
-                reason: format!("overflow computing 10^{}", diff),
+                reason: format!("overflow computing 10^{diff}"),
             })?;
             unscaled.checked_mul(mul).context(InvalidDecimalJsonSnafu {
                 reason: "overflow during rescale (multiply)".to_string(),
@@ -451,7 +451,7 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
         Greater => {
             let diff = src_scale - dst_scale;
             let div = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
-                reason: format!("overflow computing 10^{}", diff),
+                reason: format!("overflow computing 10^{diff}"),
             })?;
             Ok(unscaled / div)
         }
@@ -474,6 +474,7 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
         Json::String(s) => convert_string_to_decimal(s),
 
         Json::Object(m) => {
+            #[allow(clippy::cast_possible_truncation)]
             let src_scale = m
                 .get("scale")
                 .context(InvalidDecimalJsonSnafu {
@@ -605,7 +606,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.unwrap(), n);
+        assert_eq!(result.expect("Parse decimal"), n);
     }
 
     #[test]
@@ -613,7 +614,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.unwrap(), 12_345);
+        assert_eq!(result.expect("Parse decimal"), 12_345);
     }
 
     #[test]
@@ -621,7 +622,7 @@ mod tests {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 4);
-        assert_eq!(result.unwrap(), 1_234_500);
+        assert_eq!(result.expect("Parse decimal"), 1_234_500);
     }
 
     #[test]
@@ -629,7 +630,7 @@ mod tests {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.unwrap(), 12_345);
+        assert_eq!(result.expect("Parse decimal"), 12_345);
     }
 
     #[test]
