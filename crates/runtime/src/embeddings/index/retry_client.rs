@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::error::Error;
+
 use async_trait::async_trait;
+use aws_credential_types::provider::error::CredentialsError;
 use s3_vectors::{
     Client, CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
     CreateVectorBucketInput, CreateVectorBucketOutput, DeleteIndexError, DeleteIndexInput,
@@ -114,7 +117,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | CreateIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -149,7 +166,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | CreateVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -184,7 +215,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -219,7 +264,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -254,7 +313,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -294,7 +367,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -330,7 +417,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -365,7 +466,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -400,7 +515,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -443,7 +572,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -482,7 +625,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | ListIndexesError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -517,7 +674,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | ListVectorBucketsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -559,7 +730,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | ListVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -595,7 +780,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | PutVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -636,7 +835,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | PutVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }
@@ -681,7 +894,21 @@ impl S3Vectors for S3VectorRetryClient {
                         | QueryVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
-                    SdkError::DispatchFailure(_) => Err(RetryError::transient(e)),
+                    SdkError::DispatchFailure(d) => {
+                        let credentials_not_loaded = d
+                            .as_connector_error()
+                            .and_then(|e| e.source())
+                            .and_then(|s| s.downcast_ref::<CredentialsError>())
+                            .is_some_and(|ce| {
+                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                            });
+
+                        if credentials_not_loaded {
+                            Err(RetryError::permanent(e))
+                        } else {
+                            Err(RetryError::transient(e))
+                        }
+                    }
                     _ => Err(RetryError::permanent(e)),
                 },
             }

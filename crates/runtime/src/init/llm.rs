@@ -26,33 +26,16 @@ use llms::{
     responses::Responses,
 };
 use secrecy::SecretString;
-use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::{Model as SpicepodModel, ModelSource};
+use spicepod::component::model::Model as SpicepodModel;
 
-static DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
-
-fn supports_responses_api(
-    spicepod_model: &SpicepodModel,
-    params: &HashMap<String, SecretString>,
-) -> bool {
-    if let Some(value) = params.get("responses_api") {
-        return secrecy::ExposeSecret::expose_secret(value)
-            .trim()
-            .eq_ignore_ascii_case("enabled");
-    }
-
-    if !matches!(
-        spicepod_model.get_source(),
-        Some(ModelSource::OpenAi | ModelSource::Azure)
-    ) {
-        return false;
-    }
-    match spicepod_model.params.get("endpoint") {
-        None => true,
-        Some(Value::String(s)) => s == DEFAULT_OPENAI_ENDPOINT,
-        _ => false,
-    }
+fn supports_responses_api(params: &HashMap<String, SecretString>) -> bool {
+    params
+        .get("responses_api")
+        .map(secrecy::ExposeSecret::expose_secret)
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("enabled")
 }
 
 impl Runtime {
@@ -61,12 +44,21 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<(Option<Arc<dyn Chat>>, Option<Arc<dyn Responses>>)> {
+    ) -> Result<(Arc<dyn Chat>, Option<Arc<dyn Responses>>)> {
         let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
-            .ok();
+            .boxed()
+            .map_err(try_map_boxed_error_to_box)
+            .context(UnableToInitializeLlmSnafu)?;
 
-        let responses_model = if supports_responses_api(&m, &params) {
+        completions_model
+            .health()
+            .await
+            .boxed()
+            .map_err(try_map_boxed_error_to_box)
+            .context(UnableToInitializeLlmSnafu)?;
+
+        let mut responses_model = if supports_responses_api(&params) {
             try_to_responses_model(&m, &params, Arc::new(self.clone()))
                 .await
                 .ok()
@@ -74,21 +66,14 @@ impl Runtime {
             None
         };
 
-        // Perform only one health check, preferring the Responses API to Chat Completions
         if let Some(model) = &responses_model {
-            model
-                .health()
-                .await
-                .boxed()
-                .map_err(try_map_boxed_error_to_box)
-                .context(UnableToInitializeLlmSnafu)?;
-        } else if let Some(model) = &completions_model {
-            model
-                .health()
-                .await
-                .boxed()
-                .map_err(try_map_boxed_error_to_box)
-                .context(UnableToInitializeLlmSnafu)?;
+            if model.health().await.is_err() {
+                tracing::warn!(
+                    "Failed to load Responses API endpoint for model '{}'. Verify the Spicepod configuration and try again.",
+                    m.name.clone()
+                );
+                responses_model = None;
+            }
         }
 
         Ok((completions_model, responses_model))

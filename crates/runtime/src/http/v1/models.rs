@@ -13,7 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use app::App;
 use axum::{
@@ -23,10 +26,11 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use csv::Writer;
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Runtime, status::ComponentStatus};
+use crate::{Runtime, model::LLMResponsesModelStore, status::ComponentStatus};
 
 use super::Format;
 
@@ -40,6 +44,10 @@ pub struct ModelsQueryParams {
     /// If true, includes the status of each model in the response.
     #[serde(default)]
     pub status: bool,
+
+    /// A comma-separated list of metadata fields to include in the response (e.g., `supports_responses_api`)
+    #[serde(default)]
+    pub metadata_fields: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,6 +56,28 @@ pub struct ModelsQueryParams {
 pub(crate) struct OpenAIModelResponse {
     object: String,
     data: Vec<OpenAIModel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct Metadata {
+    pub supports_responses_api: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) enum MetadataKeys {
+    SupportsResponsesAPI,
+}
+
+impl TryFrom<&str> for MetadataKeys {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "supports_responses_api" => Ok(MetadataKeys::SupportsResponsesAPI),
+            _ => Err(format!("Invalid metadata key: {value}")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +98,37 @@ pub(crate) struct OpenAIModel {
 
     /// The status of the model (e.g., `ready`, `initializing`, `error`)
     status: Option<ComponentStatus>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Metadata>,
+}
+
+fn get_metadata_keys(params: &ModelsQueryParams) -> Result<Vec<MetadataKeys>, String> {
+    let mut keys = Vec::new();
+    for field in params.metadata_fields.split(',') {
+        keys.push(MetadataKeys::try_from(field.trim())?);
+    }
+    Ok(keys)
+}
+
+fn generate_metadata(
+    model_name: &str,
+    metadata_keys: &Vec<MetadataKeys>,
+    responses_models: &HashSet<String>,
+) -> Option<Metadata> {
+    if metadata_keys.is_empty() {
+        return None;
+    }
+
+    let mut metadata = Metadata::default();
+    for key in metadata_keys {
+        match key {
+            MetadataKeys::SupportsResponsesAPI => {
+                metadata.supports_responses_api = responses_models.contains(model_name);
+            }
+        }
+    }
+    Some(metadata)
 }
 
 /// List Models
@@ -120,6 +181,7 @@ text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",r
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
+    Extension(responses_models): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
     let statuses = if params.status {
@@ -127,7 +189,22 @@ pub(crate) async fn get(
     } else {
         HashMap::default()
     };
-    let models = match app.read().await.as_ref() {
+
+    let metadata_keys = match get_metadata_keys(&params) {
+        Ok(keys) => keys,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+    };
+
+    let responses_models = if metadata_keys.contains(&MetadataKeys::SupportsResponsesAPI) {
+        let guard = responses_models.read().await;
+        guard.keys().cloned().collect::<HashSet<String>>()
+    } else {
+        HashSet::default()
+    };
+
+    let mut models = match app.read().await.as_ref() {
         Some(a) => a
             .models
             .iter()
@@ -143,6 +220,7 @@ pub(crate) async fn get(
                     owned_by: m.from.clone(),
                     datasets: d,
                     status: statuses.get(&m.name).copied(),
+                    metadata: generate_metadata(&m.name, &metadata_keys, &responses_models),
                 }
             })
             .collect::<Vec<OpenAIModel>>(),
@@ -171,11 +249,11 @@ pub(crate) async fn get(
                 owned_by: "spiceai".to_string(),
                 datasets: None,
                 status: worker_statuses.get(name).copied(),
+                metadata: generate_metadata(name, &metadata_keys, &responses_models),
             })
         })
         .collect::<Vec<OpenAIModel>>();
-
-    let models = [workers, models].concat().clone();
+    models.extend(workers.into_iter());
 
     match params.format {
         Format::Json => (

@@ -812,6 +812,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "metadata_fields",
+            "in": "query",
+            "description": "A comma-separated list of metadata fields to include in the response (e.g., `supports_responses_api`)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3939,6 +3948,17 @@
           }
         }
       },
+      "Metadata": {
+        "type": "object",
+        "required": [
+          "supports_responses_api"
+        ],
+        "properties": {
+          "supports_responses_api": {
+            "type": "boolean"
+          }
+        }
+      },
       "Namespace": {
         "type": "object",
         "required": [
@@ -3988,6 +4008,16 @@
           "id": {
             "type": "string",
             "description": "The name of the model"
+          },
+          "metadata": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Metadata"
+              }
+            ]
           },
           "object": {
             "type": "string",
