@@ -77,7 +77,7 @@ jobs:
                 target_arch_go: "amd64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                builder: "macos-14",
+                builder: "spiceai-macos",
                 runner: "macos-14",
                 target_os: "darwin",
                 target_arch: "aarch64",

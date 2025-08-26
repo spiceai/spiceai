@@ -2,48 +2,46 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_q13"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                        |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                          |
-|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                 |
-|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                       |
-|               |       SubqueryAlias: c_orders                                                                                                               |
-|               |         Projection: count(orders.o_orderkey) AS c_count                                                                                     |
-|               |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                                                      |
-|               |             Projection: customer.c_custkey, orders.o_orderkey                                                                               |
-|               |               Left Join: customer.c_custkey = orders.o_custkey                                                                              |
-|               |                 BytesProcessedNode                                                                                                          |
-|               |                   TableScan: customer projection=[c_custkey]                                                                                |
-|               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                             |
-|               |                   BytesProcessedNode                                                                                                        |
-|               |                     Filter: orders.o_comment NOT LIKE LargeUtf8("%special%requests%")                                                       |
-|               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                       |
-| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                  |
-|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                            |
-|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                              |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                              |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                         |
-|               |           RepartitionExec: partitioning=Hash([c_count@0], 16), input_partitions=16                                                          |
-|               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                 |
-|               |               ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]                                                                  |
-|               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]                      |
-|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                               |
-|               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1] |
-|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
-|               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 16), input_partitions=16                                          |
-|               |                           BytesProcessedExec                                                                                                |
-|               |                             SchemaCastScanExec                                                                                              |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                         |
-|               |                                 DataSourceExec: partitions=1, partition_sizes=[19]                                                          |
-|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
-|               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                          |
-|               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                       |
-|               |                             BytesProcessedExec                                                                                              |
-|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                   |
-|               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                         |
-|               |                                   SchemaCastScanExec                                                                                        |
-|               |                                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                       DataSourceExec: partitions=1, partition_sizes=[184]                                                   |
-|               |                                                                                                                                             |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                                  |
+|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                         |
+|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                               |
+|               |       SubqueryAlias: c_orders                                                                                                                       |
+|               |         Projection: count(orders.o_orderkey) AS c_count                                                                                             |
+|               |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                                                              |
+|               |             Projection: customer.c_custkey, orders.o_orderkey                                                                                       |
+|               |               Left Join: customer.c_custkey = orders.o_custkey                                                                                      |
+|               |                 BytesProcessedNode                                                                                                                  |
+|               |                   TableScan: customer projection=[c_custkey]                                                                                        |
+|               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                                     |
+|               |                   BytesProcessedNode                                                                                                                |
+|               |                     Filter: orders.o_comment NOT LIKE LargeUtf8("%special%requests%")                                                               |
+|               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                               |
+| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                          |
+|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                                    |
+|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                      |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                      |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
+|               |           RepartitionExec: partitioning=Hash([c_count@0], 16), input_partitions=16                                                                  |
+|               |             AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                         |
+|               |               ProjectionExec: expr=[count(orders.o_orderkey)@1 as c_count]                                                                          |
+|               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]                              |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                       |
+|               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]         |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                   |
+|               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 16), input_partitions=16                                                  |
+|               |                           BytesProcessedExec                                                                                                        |
+|               |                             SchemaCastScanExec                                                                                                      |
+|               |                               DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                       |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                   |
+|               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 16), input_partitions=16                                                  |
+|               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                               |
+|               |                             BytesProcessedExec                                                                                                      |
+|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                           |
+|               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                                 |
+|               |                                   SchemaCastScanExec                                                                                                |
+|               |                                     DataSourceExec: partitions=16, partition_sizes=[12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11] |
+|               |                                                                                                                                                     |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------+

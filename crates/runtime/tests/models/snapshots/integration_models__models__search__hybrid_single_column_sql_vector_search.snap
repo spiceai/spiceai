@@ -1,27 +1,26 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: resp
-snapshot_kind: text
+expression: resp?
 ---
 [
   {
+    "id": 1002,
+    "question": "What is the next term in the sequence 3, 12, 48, 192, 768?",
+    "trunc(vector_search().score,Int64(3))": 0.652
+  },
+  {
     "id": 6,
     "question": "<refined question>",
-    "trunc(vector_search().score,Int64(3))": 0.97
+    "trunc(vector_search().score,Int64(3))": 0.651
   },
   {
-    "id": 863,
-    "question": "What is created by making a choice?",
-    "trunc(vector_search().score,Int64(3))": 0.954
+    "id": 151,
+    "question": "Evaluate \\(2^{1/2}\\).",
+    "trunc(vector_search().score,Int64(3))": 0.643
   },
   {
-    "id": 370,
-    "question": "Find the product of 2 and 7.",
-    "trunc(vector_search().score,Int64(3))": 0.953
-  },
-  {
-    "id": 1326,
-    "question": "Écrire 7 en base 2.",
-    "trunc(vector_search().score,Int64(3))": 0.952
+    "id": 989,
+    "question": "What is the mode of the following data: 70 (10 times), 55 (5 times)?",
+    "trunc(vector_search().score,Int64(3))": 0.637
   }
 ]

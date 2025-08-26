@@ -41,6 +41,13 @@ models:
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: *model_system_prompt
 
+  - name: gpt-5
+    from: openai:gpt-5-2025-08-07
+    params:
+      tools: list_datasets, table_schema, document_similarity
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
   - name: o1
     from: openai:o1-2024-12-17
     params:

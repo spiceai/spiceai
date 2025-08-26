@@ -18,6 +18,7 @@ limitations under the License.
 pub(crate) mod embeddings {
     use super::super::embedding::{EmbeddingTestCase, run_embedding_tests};
     use async_openai::types::EmbeddingInput;
+    use serde_json::Value;
     use spicepod::component::embeddings::Embeddings;
     use std::collections::HashMap;
 
@@ -32,9 +33,12 @@ pub(crate) mod embeddings {
     #[must_use]
     pub fn create_titan_v1_embedding() -> Embeddings {
         let mut params = HashMap::new();
-        params.insert("aws_region".to_string(), "us-east-1".to_string());
-        params.insert("normalize".to_string(), "true".to_string());
-        params.insert("dimensions".to_string(), "1024".to_string());
+        params.insert(
+            "aws_region".to_string(),
+            Value::String("us-east-1".to_string()),
+        );
+        params.insert("normalize".to_string(), Value::String("true".to_string()));
+        params.insert("dimensions".to_string(), Value::String("1024".to_string()));
 
         Embeddings {
             from: "bedrock:amazon.titan-embed-text-v1".to_string(),
@@ -50,9 +54,12 @@ pub(crate) mod embeddings {
     #[must_use]
     pub fn create_titan_v2_embedding() -> Embeddings {
         let mut params = HashMap::new();
-        params.insert("aws_region".to_string(), "us-east-1".to_string());
-        params.insert("normalize".to_string(), "true".to_string());
-        params.insert("dimensions".to_string(), "512".to_string());
+        params.insert(
+            "aws_region".to_string(),
+            Value::String("us-east-1".to_string()),
+        );
+        params.insert("normalize".to_string(), Value::String("true".to_string()));
+        params.insert("dimensions".to_string(), Value::String("512".to_string()));
 
         Embeddings {
             from: "bedrock:amazon.titan-embed-text-v2:0".to_string(),
@@ -68,9 +75,15 @@ pub(crate) mod embeddings {
     #[must_use]
     pub fn create_cohere_english_embedding() -> Embeddings {
         let mut params = HashMap::new();
-        params.insert("aws_region".to_string(), "us-east-1".to_string());
-        params.insert("input_type".to_string(), "search_document".to_string());
-        params.insert("truncate".to_string(), "END".to_string());
+        params.insert(
+            "aws_region".to_string(),
+            Value::String("us-east-1".to_string()),
+        );
+        params.insert(
+            "input_type".to_string(),
+            Value::String("search_document".to_string()),
+        );
+        params.insert("truncate".to_string(), Value::String("END".to_string()));
 
         Embeddings {
             from: "bedrock:cohere.embed-english-v3".to_string(),
@@ -86,9 +99,15 @@ pub(crate) mod embeddings {
     #[must_use]
     pub fn create_cohere_multilingual_embedding() -> Embeddings {
         let mut params = HashMap::new();
-        params.insert("aws_region".to_string(), "us-east-1".to_string());
-        params.insert("input_type".to_string(), "classification".to_string());
-        params.insert("truncate".to_string(), "NONE".to_string());
+        params.insert(
+            "aws_region".to_string(),
+            Value::String("us-east-1".to_string()),
+        );
+        params.insert(
+            "input_type".to_string(),
+            Value::String("classification".to_string()),
+        );
+        params.insert("truncate".to_string(), Value::String("NONE".to_string()));
 
         Embeddings {
             from: "bedrock:cohere.embed-multilingual-v3".to_string(),
@@ -101,14 +120,14 @@ pub(crate) mod embeddings {
         }
     }
 
-    fn with_auth(mut params: HashMap<String, String>) -> HashMap<String, String> {
+    fn with_auth(mut params: HashMap<String, Value>) -> HashMap<String, Value> {
         params.insert(
             "aws_access_key_id".to_string(),
-            "${env:AWS_BEDROCK_KEY}".to_string(),
+            Value::String("${env:AWS_BEDROCK_KEY}".to_string()),
         );
         params.insert(
             "aws_secret_access_key".to_string(),
-            "${env:AWS_BEDROCK_SECRET}".to_string(),
+            Value::String("${env:AWS_BEDROCK_SECRET}".to_string()),
         );
         params
     }
@@ -374,19 +393,19 @@ pub(crate) mod embeddings {
         titan_256.name = "titan-256".to_string();
         titan_256
             .params
-            .insert("dimensions".to_string(), "256".to_string());
+            .insert("dimensions".to_string(), Value::String("256".to_string()));
 
         let mut titan_512 = create_titan_v1_embedding();
         titan_512.name = "titan-512".to_string();
         titan_512
             .params
-            .insert("dimensions".to_string(), "512".to_string());
+            .insert("dimensions".to_string(), Value::String("512".to_string()));
 
         let mut titan_1024 = create_titan_v1_embedding();
         titan_1024.name = "titan-1024".to_string();
         titan_1024
             .params
-            .insert("dimensions".to_string(), "1024".to_string());
+            .insert("dimensions".to_string(), Value::String("1024".to_string()));
 
         let models = vec![titan_256, titan_512, titan_1024];
         let tests = vec![

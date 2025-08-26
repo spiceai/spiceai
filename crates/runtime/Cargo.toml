@@ -44,6 +44,7 @@ data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
@@ -112,6 +113,7 @@ prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
 rand.workspace = true
+rayon = "1.11.0"
 regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
@@ -193,6 +195,7 @@ scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
 test-framework = { path = "../test-framework" }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -219,7 +222,6 @@ default = [
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
-    "kafka",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]

@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -14,17 +13,27 @@ snapshot_kind: text
       "primary_key": {
         "id": 6
       },
-      "score": 0.95
+      "score": 0.65
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is created by making a choice?"
+        "question": "What are consequential late effects?"
       },
       "primary_key": {
-        "id": 863
+        "id": 810
       },
-      "score": 0.94
+      "score": 0.62
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "In the prescription label \"Sig: gtt ii OS TID,\" what does \"OS\" mean?"
+      },
+      "primary_key": {
+        "id": 537
+      },
+      "score": 0.62
     }
   ]
 }

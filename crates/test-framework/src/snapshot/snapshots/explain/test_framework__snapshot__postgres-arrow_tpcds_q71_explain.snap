@@ -80,8 +80,7 @@ description: "Query: tpcds_q71"
 |               |                                           RepartitionExec: partitioning=Hash([ws_sold_date_sk@0], 16), input_partitions=16                                                                       |
 |               |                                             BytesProcessedExec                                                                                                                                   |
 |               |                                               SchemaCastScanExec                                                                                                                                 |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                            |
-|               |                                                   DataSourceExec: partitions=1, partition_sizes=[180]                                                                                            |
+|               |                                                 DataSourceExec: partitions=16, partition_sizes=[12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11]                                  |
 |               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                                           RepartitionExec: partitioning=Hash([d_date_sk@0], 16), input_partitions=16                                                                             |
 |               |                                             ProjectionExec: expr=[d_date_sk@0 as d_date_sk]                                                                                                      |
@@ -89,8 +88,7 @@ description: "Query: tpcds_q71"
 |               |                                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                                                   FilterExec: d_moy@2 = 11 AND d_year@1 = 2001                                                                                                   |
 |               |                                                     SchemaCastScanExec                                                                                                                           |
-|               |                                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                      |
-|               |                                                         DataSourceExec: partitions=1, partition_sizes=[19]                                                                                       |
+|               |                                                       DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                                            |
 |               |                                   ProjectionExec: expr=[cs_ext_sales_price@2 as ext_price, cs_item_sk@1 as sold_item_sk, cs_sold_time_sk@0 as time_sk]                                           |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
 |               |                                       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(cs_sold_date_sk@0, d_date_sk@0)], projection=[cs_sold_time_sk@1, cs_item_sk@2, cs_ext_sales_price@3] |
@@ -98,8 +96,7 @@ description: "Query: tpcds_q71"
 |               |                                           RepartitionExec: partitioning=Hash([cs_sold_date_sk@0], 16), input_partitions=16                                                                       |
 |               |                                             BytesProcessedExec                                                                                                                                   |
 |               |                                               SchemaCastScanExec                                                                                                                                 |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                            |
-|               |                                                   DataSourceExec: partitions=1, partition_sizes=[361]                                                                                            |
+|               |                                                 DataSourceExec: partitions=16, partition_sizes=[23, 23, 23, 23, 23, 23, 23, 23, 23, 22, 22, 22, 22, 22, 22, 22]                                  |
 |               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                                           RepartitionExec: partitioning=Hash([d_date_sk@0], 16), input_partitions=16                                                                             |
 |               |                                             ProjectionExec: expr=[d_date_sk@0 as d_date_sk]                                                                                                      |
@@ -107,8 +104,7 @@ description: "Query: tpcds_q71"
 |               |                                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                                                   FilterExec: d_moy@2 = 11 AND d_year@1 = 2001                                                                                                   |
 |               |                                                     SchemaCastScanExec                                                                                                                           |
-|               |                                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                      |
-|               |                                                         DataSourceExec: partitions=1, partition_sizes=[19]                                                                                       |
+|               |                                                       DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                                            |
 |               |                                   ProjectionExec: expr=[ss_ext_sales_price@2 as ext_price, ss_item_sk@1 as sold_item_sk, ss_sold_time_sk@0 as time_sk]                                           |
 |               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
 |               |                                       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_sold_date_sk@0, d_date_sk@0)], projection=[ss_sold_time_sk@1, ss_item_sk@2, ss_ext_sales_price@3] |
@@ -116,8 +112,7 @@ description: "Query: tpcds_q71"
 |               |                                           RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 16), input_partitions=16                                                                       |
 |               |                                             BytesProcessedExec                                                                                                                                   |
 |               |                                               SchemaCastScanExec                                                                                                                                 |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                            |
-|               |                                                   DataSourceExec: partitions=1, partition_sizes=[721]                                                                                            |
+|               |                                                 DataSourceExec: partitions=16, partition_sizes=[46, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45]                                  |
 |               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                                           RepartitionExec: partitioning=Hash([d_date_sk@0], 16), input_partitions=16                                                                             |
 |               |                                             ProjectionExec: expr=[d_date_sk@0 as d_date_sk]                                                                                                      |
@@ -125,8 +120,7 @@ description: "Query: tpcds_q71"
 |               |                                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
 |               |                                                   FilterExec: d_moy@2 = 11 AND d_year@1 = 2001                                                                                                   |
 |               |                                                     SchemaCastScanExec                                                                                                                           |
-|               |                                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                      |
-|               |                                                         DataSourceExec: partitions=1, partition_sizes=[19]                                                                                       |
+|               |                                                       DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                                            |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                                  |
 |               |                       RepartitionExec: partitioning=Hash([t_time_sk@0], 16), input_partitions=16                                                                                                 |
 |               |                         ProjectionExec: expr=[t_time_sk@0 as t_time_sk, t_hour@1 as t_hour, t_minute@2 as t_minute]                                                                              |
@@ -134,7 +128,6 @@ description: "Query: tpcds_q71"
 |               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
 |               |                               FilterExec: t_meal_time@3 = breakfast OR t_meal_time@3 = dinner                                                                                                    |
 |               |                                 SchemaCastScanExec                                                                                                                                               |
-|               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                          |
-|               |                                     DataSourceExec: partitions=1, partition_sizes=[22]                                                                                                           |
+|               |                                   DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                                                                |
 |               |                                                                                                                                                                                                  |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

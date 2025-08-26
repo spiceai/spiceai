@@ -278,7 +278,7 @@ impl DataConnector for Debezium {
             Some(metadata) => {
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
-                    self.kafka_config.clone(),
+                    &self.kafka_config,
                 )
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
@@ -316,7 +316,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
+            None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
 
         let refresh_sql = dataset.refresh_sql();
@@ -386,7 +386,7 @@ async fn set_metadata_to_accelerator(
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
-    kafka_config: KafkaConfig,
+    kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
