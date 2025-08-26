@@ -425,7 +425,7 @@ async fn get_metadata_from_kafka(
     };
 
     let Some(key) = msg.key() else {
-        let src = &msg.value().clone().payload.source;
+        let src = &msg.value().payload.source;
         let table_name = format!("{}.{}", src.db, src.table);
 
         return Err(super::DataConnectorError::UnableToGetReadProvider {
