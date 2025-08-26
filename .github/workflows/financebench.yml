@@ -12,6 +12,7 @@ on:
           - "all"
           - "gpt-4o"
           - "gpt-4.1"
+          - "gpt-5"
           - "o1"
           - "o3-mini"
           - "o4-mini"
@@ -109,6 +110,7 @@ jobs:
             const matrix = [
               { name: "gpt-4o", run_on_schedule: false },
               { name: "gpt-4.1", run_on_schedule: true },
+              { name: "gpt-5", run_on_schedule: true },
               { name: "o1", run_on_schedule: false },
               { name: "o3-mini", run_on_schedule: false },
               { name: "o4-mini", run_on_schedule: true }

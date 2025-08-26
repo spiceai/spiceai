@@ -102,7 +102,7 @@ impl VectorQueryTableProvider {
             while let Some(Ok(rb)) = strm.next().await {
                 if let Some(arr) = rb.column_by_name(primary_key_column.name()) {
                     for i in 0..arr.len() {
-                        expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?));
+                        expr.push(Expr::Literal(ScalarValue::try_from_array(arr, i)?, None));
                     }
                 }
             }
@@ -148,7 +148,7 @@ impl VectorQueryTableProvider {
                         ScalarValue::try_from_array(arr, i)?,
                     ));
                 }
-                struct_exprs.push(Expr::Literal(field_values.into()));
+                struct_exprs.push(Expr::Literal(field_values.into(), None));
             }
         }
 

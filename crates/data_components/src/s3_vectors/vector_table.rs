@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -22,6 +22,7 @@ use crate::s3_vectors::{
 
 use super::{Error, Result, S3VectorIdentifier};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
@@ -259,9 +260,26 @@ impl S3VectorsTable {
             {
                 Ok(false)
             }
-            Err(e) => Err(Error::S3VectorGetBucketError {
-                source: e.into_service_error(),
-            }),
+            Err(e) => match &e {
+                SdkError::DispatchFailure(d) => {
+                    if let Some(credentials_error) = d
+                        .as_connector_error()
+                        .and_then(|e| e.source())
+                        .and_then(|s| s.downcast_ref::<CredentialsError>())
+                        .map(ToString::to_string)
+                    {
+                        return Err(Error::UnableToLoadCredentials {
+                            message: credentials_error,
+                        });
+                    }
+                    Err(Error::S3VectorGetBucketError {
+                        source: e.into_service_error(),
+                    })
+                }
+                _ => Err(Error::S3VectorGetBucketError {
+                    source: e.into_service_error(),
+                }),
+            },
         }
     }
 

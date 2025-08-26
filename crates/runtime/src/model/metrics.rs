@@ -18,6 +18,7 @@ use std::{sync::LazyLock, time::Duration};
 
 use async_openai::types::{
     ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+    responses::CreateResponse,
 };
 use opentelemetry::{
     Key, KeyValue, StringValue, Value, global,
@@ -85,6 +86,38 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
         labels.push(KeyValue::new(
             Key::new("metadata"),
             Value::String(metadata.to_string().into()),
+        ));
+    }
+
+    labels
+}
+
+pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
+    #[allow(clippy::cast_possible_wrap)]
+    let mut labels = vec![
+        KeyValue::new(
+            Key::new("stream"),
+            Value::Bool(req.stream.unwrap_or_default()),
+        ),
+        KeyValue::new(
+            Key::new("request_level_tools"),
+            Value::I64(req.tools.as_deref().unwrap_or_default().len() as i64),
+        ),
+        KeyValue::new(Key::new("model"), Value::String(req.model.clone().into())),
+        KeyValue::new(Key::new("responses_api"), Value::Bool(true)),
+    ];
+
+    if let Some(ref metadata) = req.metadata {
+        labels.push(KeyValue::new(
+            Key::new("metadata"),
+            Value::String(format!("{metadata:?}").into()),
+        ));
+    }
+
+    if let Some(ref instructions) = req.instructions {
+        labels.push(KeyValue::new(
+            Key::new("instructions"),
+            Value::String(instructions.clone().into()),
         ));
     }
 

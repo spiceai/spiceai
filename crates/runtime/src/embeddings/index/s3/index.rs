@@ -306,17 +306,21 @@ pub fn s3_vectors_primary_key_cast(primary_key: &[Field]) -> Vec<Expr> {
                                                 Expr::Column(Column::new_unqualified(
                                                     S3_VECTOR_PRIMARY_KEY_NAME,
                                                 )),
-                                                Expr::Literal(ScalarValue::Utf8(Some(
-                                                    col_name.clone(),
-                                                ))),
+                                                Expr::Literal(
+                                                    ScalarValue::Utf8(Some(col_name.clone())),
+                                                    None,
+                                                ),
                                             ],
                                         }),
-                                        Expr::Literal(ScalarValue::Utf8(Some(
-                                            data_type_to_union_variant(&data_type).to_string(),
-                                        ))),
+                                        Expr::Literal(
+                                            ScalarValue::Utf8(Some(
+                                                data_type_to_union_variant(&data_type).to_string(),
+                                            )),
+                                            None,
+                                        ),
                                     ],
                                 }),
-                                Expr::Literal(ScalarValue::Utf8(Some(data_type.to_string()))),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type.to_string())), None),
                             ],
                         })),
                         data_type,

@@ -143,19 +143,23 @@ impl VectorSearchTableFunc {
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
         let mut expr = vec![
             Expr::Column(to_column_expr(&args.tbl)),
-            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone()))),
+            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
         ];
 
         if let Some(col) = args.column.as_ref() {
             expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(ScalarValue::Int64(Some(
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            ))));
+            expr.push(Expr::Literal(
+                ScalarValue::Int64(Some(i64::try_from(limit).unwrap_or(i64::MAX))),
+                None,
+            ));
         }
         if let Some(include_score) = args.include_score {
-            expr.push(Expr::Literal(ScalarValue::Boolean(Some(include_score))));
+            expr.push(Expr::Literal(
+                ScalarValue::Boolean(Some(include_score)),
+                None,
+            ));
         }
         expr
     }
@@ -172,7 +176,7 @@ impl VectorSearchTableFunc {
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
-        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
+        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) = query else {
             return Err(DataFusionError::Plan(format!(
                 "Second argument must be a query string, but got {query:?}."
             )));
@@ -186,35 +190,35 @@ impl VectorSearchTableFunc {
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::Int64(Some(limit)))), None, None) => {
+            (Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)), None, None) => {
                 (None, Some(*limit), Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))), None, None) => {
+            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)), None, None) => {
                 (None, None, Some(*include_score))
             }
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
             (
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
             ) => (None, Some(*limit), Some(*include_score)),
 
             // All three arguments provided
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)))),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
 
             // Invalid argument combinations
@@ -463,7 +467,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 Box::new(Expr::ScalarFunction(ScalarFunction {
                     func: cosine_distance_udf,
                     args: vec![
-                        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(query_vector))),
+                        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(query_vector)), None),
                         Expr::Column(Column::from_name(embedding_col!(col))),
                     ],
                 })),
