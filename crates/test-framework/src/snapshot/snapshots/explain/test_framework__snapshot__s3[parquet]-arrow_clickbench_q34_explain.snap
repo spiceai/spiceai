@@ -2,24 +2,23 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q34"
 ---
-+---------------+-----------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                    |
-+---------------+-----------------------------------------------------------------------------------------+
-| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                      |
-|               |   Projection: hits.URL, count(Int64(1)) AS c                                            |
-|               |     Aggregate: groupBy=[[hits.URL]], aggr=[[count(Int64(1))]]                           |
-|               |       BytesProcessedNode                                                                |
-|               |         TableScan: hits projection=[URL]                                                |
-| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                           |
-|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]               |
-|               |     ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as c]                         |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]  |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                     |
-|               |           RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16          |
-|               |             AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]     |
-|               |               BytesProcessedExec                                                        |
-|               |                 SchemaCastScanExec                                                      |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |                     DataSourceExec: partitions=1, partition_sizes=[6109]                |
-|               |                                                                                         |
-+---------------+-----------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                |
+|               |   Projection: hits.URL, count(Int64(1)) AS c                                                                                                      |
+|               |     Aggregate: groupBy=[[hits.URL]], aggr=[[count(Int64(1))]]                                                                                     |
+|               |       BytesProcessedNode                                                                                                                          |
+|               |         TableScan: hits projection=[URL]                                                                                                          |
+| physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                                                                     |
+|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                                                                         |
+|               |     ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as c]                                                                                   |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]                                                            |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                               |
+|               |           RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16                                                                    |
+|               |             AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]                                                               |
+|               |               BytesProcessedExec                                                                                                                  |
+|               |                 SchemaCastScanExec                                                                                                                |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[382, 382, 382, 382, 382, 382, 382, 382, 381, 381, 381, 381, 381, 381, 381, 386] |
+|               |                                                                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
