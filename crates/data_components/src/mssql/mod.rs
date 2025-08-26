@@ -238,7 +238,7 @@ fn is_time_related_expr(expr: &Expr) -> bool {
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }
-        Expr::Literal(literal) => {
+        Expr::Literal(literal, _) => {
             matches!(
                 literal.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)

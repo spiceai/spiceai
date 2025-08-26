@@ -127,7 +127,7 @@ impl TextSearchTableFunc {
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
-        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)))) = query else {
+        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) = query else {
             return Err(DataFusionError::Plan(format!(
                 "Second argument must be a query string, but got {query:?}."
             )));
@@ -141,35 +141,35 @@ impl TextSearchTableFunc {
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))), None, None) => {
+            (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)), None, None) => {
                 (None, Some(*limit), Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))), None, None) => {
+            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)), None, None) => {
                 (None, None, Some(*include_score))
             }
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
             (
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
             ) => (None, Some(*limit), Some(*include_score)),
 
             // All three arguments provided
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)))),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)))),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
 
             // Invalid argument combinations
