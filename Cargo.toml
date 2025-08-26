@@ -71,7 +71,7 @@ arrow-ipc = "55.1"
 arrow-json = "55.1"
 arrow-odbc = "16"
 arrow-schema = "55.1"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "0001d1237b46269740d2a4a50402a7880ee8f917", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "a87204bf60ecb06553095b5f5f1d8c3c1c76c6f5", features = [
     "byot",
 ] }
 async-stream = "0.3.5"
@@ -238,8 +238,8 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }              # spiceai-0.5.2
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
 iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
 iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
 
