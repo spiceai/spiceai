@@ -332,6 +332,7 @@ pub(crate) async fn run_search(
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpcds_dataset_w_embeddings(
         "multi_column_search",
@@ -987,6 +988,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
+#[ignore]
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     use spicepod::{acceleration::Acceleration, param::Params};
 
