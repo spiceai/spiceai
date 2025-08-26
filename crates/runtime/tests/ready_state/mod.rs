@@ -35,7 +35,6 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::array::Int32Array,
     catalog::Session,
-    common::Statistics,
     datasource::{MemTable, TableProvider, memory::MemorySourceConfig},
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -307,10 +306,6 @@ impl ExecutionPlan for DelayedExecutionPlan {
         );
 
         Ok(Box::pin(record_batch_stream))
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
-        self.inner.statistics()
     }
 }
 

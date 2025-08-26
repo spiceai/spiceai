@@ -61,7 +61,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{ResolvedTableReference, TableReference, sqlparser};
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
@@ -119,9 +119,7 @@ pub enum Error {
     UnableToDeleteTable { reason: String },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
-    UnableToParseSql {
-        source: sqlparser::parser::ParserError,
-    },
+    UnableToParseSql { source: DataFusionError },
 
     #[snafu(display("{source}"))]
     RefreshSql { source: refresh_sql::Error },

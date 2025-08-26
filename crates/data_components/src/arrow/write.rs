@@ -1269,7 +1269,7 @@ mod tests {
         )));
 
         let plan = table
-            .delete_from(&state, &vec![filter])
+            .delete_from(&state, &[filter])
             .await
             .expect("deletion should be successful");
 
