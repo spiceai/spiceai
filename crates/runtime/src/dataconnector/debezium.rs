@@ -432,9 +432,8 @@ async fn get_metadata_from_kafka(
             dataconnector: "debezium".to_string(),
             source: format!(
                 "CDC message key is missing. \
-         Most likely, table \"{}\" doesn't have a configured primary key. \
-         Verify Debezium CDC configuration and try again.",
-                table_name
+         Most likely, table \"{table_name}\" doesn't have a configured primary key. \
+         Verify Debezium CDC configuration and try again."
             )
             .into(),
             connector_component: ConnectorComponent::from(dataset),
