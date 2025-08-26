@@ -36,17 +36,18 @@ use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use llms::chunking::Chunker;
 use llms::embeddings::Embed;
+use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
-
-use std::fmt;
-use tokio::sync::RwLock;
-
-use crate::model::EmbeddingModelStore;
-use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
+use std::{any::Any, sync::Arc, thread};
 
 use super::table::EmbeddingColumnConfig;
+use crate::model::EmbeddingModelStore;
+use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
+use rayon::ThreadPool;
+use std::fmt;
+use tokio::sync::RwLock;
+use tokio::task;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -261,6 +262,7 @@ pub(crate) async fn compute_additional_embedding_columns(
         } = cfg;
         tracing::trace!("Embedding column '{col}' with model {model_name}");
         let read_guard = embedding_models.read().await;
+
         let Some(model) = read_guard.get(model_name) else {
             tracing::debug!(
                 "When embedding col='{col}', model {model_name} expected, but not found"
@@ -284,13 +286,25 @@ pub(crate) async fn compute_additional_embedding_columns(
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
-                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), &**model).await?;
+                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(model)).await?;
             tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
-            let fixed_size_array = get_vectors(arr_iter, &**model, cfg.vector_size).await?;
+            let fixed_size_array = if model.supports_sync_embeddings() {
+                let task_model = Arc::clone(model);
+                let batch: Vec<_> = arr_iter.map(|o| o.map(str::to_string)).collect();
+                let vector_size = cfg.vector_size;
+
+                task::spawn_blocking(move || {
+                    get_vectors_in_process(batch, &task_model, vector_size)
+                })
+                .await??
+            } else {
+                get_vectors(arr_iter, &**model, cfg.vector_size).await?
+            };
+
             tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
@@ -400,6 +414,68 @@ pub(super) async fn get_vectors(
     Ok(builder.finish())
 }
 
+/// Embed a [`StringArray`] using the provided [`Embed`] model with parallel processing.
+/// Similar to [`get_vectors`] but runs synchronously and processes embeddings in parallel
+/// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
+/// where each [`String`] gets embedded into a single [`f32`] vector.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+pub(super) fn get_vectors_in_process(
+    arr: Vec<Option<String>>,
+    model: &Arc<dyn Embed>,
+    vector_length: i32,
+) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(arr.len() * (vector_length as usize)),
+        vector_length,
+        arr.len(),
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+
+    let pool = build_embedding_pool(model.parallelism())?;
+
+    // Check for null rows: embed 'string-at-a-time' if there are any, otherwise
+    // chunk embedding tasks into batches and use [`EmbeddingInput::StringArray`]
+    if arr.iter().any(|o| !matches!(o, Some(s) if !s.is_empty())) {
+        let embeds: Vec<_> = pool.install(|| {
+            arr.into_par_iter()
+                .map(|o| match o {
+                    Some(input) if input.is_empty() => None,
+                    Some(input) => model.embed_sync(EmbeddingInput::String(input)).ok(),
+                    _ => None,
+                })
+                .collect()
+        });
+
+        for embed in embeds {
+            if let Some(embedding) = embed {
+                builder.values().append_slice(&embedding[0]);
+                builder.append(true);
+            } else {
+                builder.values().append_nulls(vector_length as usize);
+                builder.append(false);
+            }
+        }
+    } else {
+        let embeds: Vec<_> = pool.install(|| {
+            arr.into_par_iter()
+                .chunks(32)
+                .map(|chunk| {
+                    model.embed_sync(EmbeddingInput::StringArray(
+                        chunk.iter().flatten().cloned().collect(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        for embed in embeds.iter().flatten() {
+            builder.values().append_slice(embed);
+            builder.append(true);
+        }
+    }
+
+    Ok(builder.finish())
+}
+
 /// Embed a [`StringArray`] using the provided [`Embed`] model and [`Chunker`]. The output is a [`ListArray`],
 /// where each input [`String`] gets chunked and embedded into a [`FixedSizeListArray`].
 ///
@@ -420,11 +496,15 @@ pub(super) async fn get_vectors(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
-    model: &dyn Embed,
+    model: Arc<dyn Embed>,
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
@@ -443,15 +523,32 @@ async fn get_vectors_with_chunker(
         .unzip();
 
     let (chunk_offsets, chunks): (Vec<_>, Vec<_>) = chunks_in_row.into_iter().flatten().unzip();
+    let embedded_data: Vec<Vec<f32>> = if model.supports_sync_embeddings() {
+        let pool = build_embedding_pool(model.parallelism())?;
+        let model = Arc::clone(&model);
+        let sync_embed_chunks = chunks.clone();
 
-    let embedded_data = model
-        .embed(EmbeddingInput::StringArray(chunks.clone()))
-        .await
-        .boxed()?;
+        let batches = task::spawn_blocking(move || {
+            pool.install(|| {
+                sync_embed_chunks
+                    .into_par_iter()
+                    .chunks(32)
+                    .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+        })
+        .await??;
+
+        batches.into_iter().flatten().collect()
+    } else {
+        model
+            .embed(EmbeddingInput::StringArray(chunks.clone()))
+            .await
+            .boxed()?
+    };
 
     #[allow(clippy::cast_sign_loss)]
     let vector_length = model.size();
-
     let capacity = chunks_per_row.iter().sum();
 
     #[allow(clippy::cast_sign_loss)]
@@ -536,10 +633,30 @@ async fn get_vectors_with_chunker(
     Ok((vectors, content_offsets))
 }
 
+fn build_embedding_pool(
+    model_parallelism: Option<usize>,
+) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
+    let parallelism = match (model_parallelism, thread::available_parallelism()) {
+        (Some(p), _) => p,
+        (None, Ok(host_parallelism)) => host_parallelism.get(),
+        (_, Err(e)) => {
+            let default_parallelism = 2;
+            tracing::trace!(
+                "Defaulting to parallelism {default_parallelism}, error determining host parallelism: {e} "
+            );
+            default_parallelism
+        }
+    };
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .build()
+        .map_err(Into::into)
+}
+
 #[allow(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
-
     use crate::embeddings::execution_plan::get_vectors;
     use arrow::{
         array::{Array, AsArray},

@@ -109,20 +109,13 @@ impl Display for IndexType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
     Upsert,
-}
-
-impl Display for OnConflictBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert => write!(f, "upsert"),
-        }
-    }
+    UpsertDedup,
+    UpsertDedupByRowId,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -250,5 +243,67 @@ impl Default for Acceleration {
             metrics: None,
             partition_by: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_string() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::Upsert)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedup)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup_by_row_id() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup_by_row_id
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedupByRowId)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_drop_string() {
+        let yaml = r"
+                on_conflict:
+                  foo: drop
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::Drop)
+        );
     }
 }

@@ -13,14 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use crate::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorBuildSnafu,
+    MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    S3VectorBuildSnafu,
 };
 
 use super::{Error, Result, S3VectorIdentifier};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
@@ -258,9 +260,26 @@ impl S3VectorsTable {
             {
                 Ok(false)
             }
-            Err(e) => Err(Error::S3VectorGetBucketError {
-                source: e.into_service_error(),
-            }),
+            Err(e) => match &e {
+                SdkError::DispatchFailure(d) => {
+                    if let Some(credentials_error) = d
+                        .as_connector_error()
+                        .and_then(|e| e.source())
+                        .and_then(|s| s.downcast_ref::<CredentialsError>())
+                        .map(ToString::to_string)
+                    {
+                        return Err(Error::UnableToLoadCredentials {
+                            message: credentials_error,
+                        });
+                    }
+                    Err(Error::S3VectorGetBucketError {
+                        source: e.into_service_error(),
+                    })
+                }
+                _ => Err(Error::S3VectorGetBucketError {
+                    source: e.into_service_error(),
+                }),
+            },
         }
     }
 
@@ -293,10 +312,31 @@ impl S3VectorsTable {
         }
     }
 
+    pub(crate) fn is_filterable_column(&self, column: &str) -> bool {
+        let Ok(f) = self.schema.field_with_name(column) else {
+            return false;
+        };
+        f.metadata().get("filterable").eq(&Some(&true.to_string()))
+    }
+
     fn compute_schema(columns: MetadataColumns) -> SchemaRef {
         Arc::new(Schema::new(
             [
-                columns.into_iter().map(|c| c.field()).collect(),
+                columns
+                    .into_iter()
+                    .map(|c| {
+                        let f = c.field();
+                        Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable())
+                            .with_metadata(
+                                [(
+                                    "filterable".to_string(),
+                                    (matches!(c, MetadataColumn::Filterable(_))).to_string(),
+                                )]
+                                .into(),
+                            )
+                            .into()
+                    })
+                    .collect(),
                 vec![
                     Arc::new(Field::new_list(
                         S3_VECTOR_EMBEDDING_NAME,

@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -47,14 +46,14 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "Find the product of 2 and 7."
+        "question": "Evaluate \\(2^{1/2}\\)."
       },
       "dataset": "qs",
       "matches": {
-        "question": "Find the product of 2 and 7."
+        "question": "Evaluate \\(2^{1/2}\\)."
       },
       "primary_key": {
-        "id": 370
+        "id": 151
       },
       "score": 0.01
     }

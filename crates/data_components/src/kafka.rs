@@ -142,14 +142,14 @@ pub struct KafkaConsumer {
 impl KafkaConsumer {
     pub fn create_with_existing_group_id(
         group_id: impl Into<String>,
-        kafka_config: KafkaConfig,
+        kafka_config: &KafkaConfig,
     ) -> Result<Self> {
         Self::create(group_id.into(), kafka_config)
     }
 
     pub fn create_with_generated_group_id(
         dataset: &str,
-        kafka_config: KafkaConfig,
+        kafka_config: &KafkaConfig,
     ) -> Result<Self> {
         Self::create(Self::generate_group_id(dataset), kafka_config)
     }
@@ -255,14 +255,14 @@ impl KafkaConsumer {
         Ok(())
     }
 
-    fn create(group_id: String, kafka_config: KafkaConfig) -> Result<Self> {
+    fn create(group_id: String, kafka_config: &KafkaConfig) -> Result<Self> {
         let (_, version) = get_rdkafka_version();
         tracing::debug!("rd_kafka_version: {}", version);
 
         let mut config = ClientConfig::new();
         config
             .set("group.id", group_id.clone())
-            .set("bootstrap.servers", kafka_config.brokers)
+            .set("bootstrap.servers", &kafka_config.brokers)
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
             // Commit offsets automatically
@@ -272,16 +272,16 @@ impl KafkaConsumer {
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
-            .set("security.protocol", kafka_config.security_protocol)
-            .set("sasl.mechanism", kafka_config.sasl_mechanism);
+            .set("security.protocol", &kafka_config.security_protocol)
+            .set("sasl.mechanism", &kafka_config.sasl_mechanism);
 
-        if let Some(sasl_username) = kafka_config.sasl_username {
+        if let Some(sasl_username) = &kafka_config.sasl_username {
             config.set("sasl.username", sasl_username);
         }
-        if let Some(sasl_password) = kafka_config.sasl_password {
+        if let Some(sasl_password) = &kafka_config.sasl_password {
             config.set("sasl.password", sasl_password);
         }
-        if let Some(ssl_ca_location) = kafka_config.ssl_ca_location {
+        if let Some(ssl_ca_location) = &kafka_config.ssl_ca_location {
             config.set("ssl.ca.location", ssl_ca_location);
         }
         if kafka_config.enable_ssl_certificate_verification {

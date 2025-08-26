@@ -71,6 +71,12 @@ models:
       spice_tools: auto
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       system_prompt: *system_prompt
+  - name: gpt-5
+    from: openai:gpt-5
+    params:
+      spice_tools: auto
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      system_prompt: *system_prompt
   - name: claude-3-5-sonnet
     from: anthropic:claude-3-5-sonnet-20240620
     params:

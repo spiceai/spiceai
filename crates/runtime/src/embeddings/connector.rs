@@ -30,8 +30,7 @@ use async_trait::async_trait;
 use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
-#[cfg(feature = "debezium")]
-use data_components::debezium::arrow::changes::replace_change_batch_data;
+use data_components::cdc::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -250,7 +249,6 @@ impl EmbeddingConnector {
         }
     }
 
-    #[cfg(feature = "debezium")]
     async fn embed_change_envelope(
         maybe_envelope: Result<ChangeEnvelope, StreamError>,
         embedding_table: Arc<EmbeddingTable>,
@@ -357,17 +355,37 @@ impl DataConnector for EmbeddingConnector {
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
 
-        #[cfg(feature = "debezium")]
         let stream = self
             .inner_connector
             .changes_stream(underlying_federated_table)?
             .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
             .boxed();
 
-        #[cfg(not(feature = "debezium"))]
+        Some(stream)
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        self.inner_connector.supports_append_stream()
+    }
+
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let embedding_table = Arc::new(
+            table_provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()?
+                .clone(),
+        );
+        let underlying_table = Arc::clone(&embedding_table.base_table);
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+        let _ = underlying_federated_table.schema();
+
         let stream = self
             .inner_connector
-            .changes_stream(underlying_federated_table)?;
+            .append_stream(underlying_federated_table)?
+            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
+            .boxed();
 
         Some(stream)
     }

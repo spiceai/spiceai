@@ -31,6 +31,8 @@ mod cron;
 mod file_watcher;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(feature = "duckdb")]
+mod on_conflict_options;
 mod query_push_down;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
