@@ -2589,7 +2589,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_distr 0.5.1",
  "rayon",
- "safetensors",
+ "safetensors 0.4.5",
  "thiserror 1.0.69",
  "yoke 0.7.5",
  "zip 1.1.4",
@@ -2613,7 +2613,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_distr 0.5.1",
  "rayon",
- "safetensors",
+ "safetensors 0.4.5",
  "thiserror 1.0.69",
  "ug",
  "ug-cuda",
@@ -2704,7 +2704,7 @@ dependencies = [
  "metal 0.27.0",
  "num-traits",
  "rayon",
- "safetensors",
+ "safetensors 0.4.5",
  "serde",
  "thiserror 1.0.69",
 ]
@@ -2721,7 +2721,7 @@ dependencies = [
  "metal 0.27.0",
  "num-traits",
  "rayon",
- "safetensors",
+ "safetensors 0.4.5",
  "serde",
  "thiserror 1.0.69",
 ]
@@ -7871,6 +7871,7 @@ dependencies = [
  "jsonpath-rust",
  "mistralrs",
  "mistralrs-core",
+ "model2vec-rs",
  "paste",
  "pulldown-cmark 0.13.0",
  "rand 0.9.2",
@@ -8518,7 +8519,7 @@ dependencies = [
  "rust-mcp-schema",
  "rustc-hash 2.1.1",
  "rustfft",
- "safetensors",
+ "safetensors 0.4.5",
  "schemars 0.8.22",
  "scraper",
  "serde",
@@ -8602,7 +8603,7 @@ dependencies = [
  "paste",
  "rayon",
  "regex",
- "safetensors",
+ "safetensors 0.4.5",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
@@ -8619,6 +8620,22 @@ dependencies = [
  "candle-core 0.8.0",
  "image 0.25.6",
  "rayon",
+]
+
+[[package]]
+name = "model2vec-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "000ddd55d80e4217a14e32623eefd21a0a3f72064f1dc99997bc6f02401ca9f6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "hf-hub",
+ "ndarray 0.15.6",
+ "safetensors 0.5.3",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]
@@ -11270,9 +11287,9 @@ checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 
 [[package]]
 name = "rayon"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b418a60154510ca1a002a752ca9714984e21e4241e804d32555251faf8b78ffa"
+checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
 dependencies = [
  "either",
  "rayon-core",
@@ -11291,9 +11308,9 @@ dependencies = [
 
 [[package]]
 name = "rayon-core"
-version = "1.12.1"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1465873a3dfdaa8ae7cb14b4383657caab0b3e8a0aa9ae8e04b044854c8dfce2"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
@@ -11990,6 +12007,7 @@ dependencies = [
  "prometheus-parse",
  "prost 0.13.5",
  "rand 0.9.2",
+ "rayon",
  "regex",
  "reqwest",
  "rmcp",
@@ -12513,6 +12531,16 @@ name = "safetensors"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "safetensors"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc0cdb7198d738a111f6df8fef42cb175412c311d0c4ac9126ff4e550ad1a0e8"
 dependencies = [
  "serde",
  "serde_json",
@@ -14424,7 +14452,7 @@ dependencies = [
  "candle-transformers",
  "memmap2",
  "nohash-hasher",
- "safetensors",
+ "safetensors 0.4.5",
  "serde",
  "serde_json",
  "text-embeddings-backend-core",
