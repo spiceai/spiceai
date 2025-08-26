@@ -69,6 +69,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=release
+            INSTALL_ORACLE_ODPIC=true
 
       - name: odbc
         run: |
@@ -165,6 +166,7 @@ jobs:
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             RUST_PROFILE=release
+            INSTALL_ORACLE_ODPIC=true
 
       - name: odbc
         run: |
