@@ -114,6 +114,21 @@ pub enum Error {
 
     #[snafu(display("Invalid decimal JSON: {reason}"))]
     InvalidDecimalJson { reason: String },
+
+    #[snafu(display("Overflow during decimal parsing"))]
+    VariableScaleDecimalParsingOverflow,
+
+    #[snafu(display("Missing the `scale` parameter for VariableScaleDecimal"))]
+    MissingScaleForVariableScaleDecimal,
+
+    #[snafu(display("Missing the `value` parameter for VariableScaleDecimal"))]
+    MissingValueForVariableScaleDecimal,
+
+    #[snafu(display("VariableScaleDecimal expects either string or object"))]
+    UnsupportedTypeForVariableScaleDecimal,
+
+    #[snafu(display("scale must be integer"))]
+    NonIntegerScaleForVariableScaleDecimal,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -441,18 +456,14 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
         Equal => Ok(unscaled),
         Less => {
             let diff = dst_scale - src_scale;
-            let mul = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
-                reason: format!("overflow computing 10^{diff}"),
-            })?;
-            unscaled.checked_mul(mul).context(InvalidDecimalJsonSnafu {
-                reason: "overflow during rescale (multiply)".to_string(),
-            })
+            let mul = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
+            unscaled
+                .checked_mul(mul)
+                .context(VariableScaleDecimalParsingOverflowSnafu)
         }
         Greater => {
             let diff = src_scale - dst_scale;
-            let div = pow10_i128(diff).context(InvalidDecimalJsonSnafu {
-                reason: format!("overflow computing 10^{diff}"),
-            })?;
+            let div = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
             Ok(unscaled / div)
         }
     }
@@ -475,33 +486,23 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
 
         Json::Object(m) => {
             #[allow(clippy::cast_possible_truncation)]
-            let src_scale = m
-                .get("scale")
-                .context(InvalidDecimalJsonSnafu {
-                    reason: "missing 'scale'".to_string(),
-                })?
-                .as_i64()
-                .context(InvalidDecimalJsonSnafu {
-                    reason: "'scale' must be integer".to_string(),
-                })? as i8;
+            let src_scale =
+                m.get("scale")
+                    .context(MissingScaleForVariableScaleDecimalSnafu)?
+                    .as_i64()
+                    .context(NonIntegerScaleForVariableScaleDecimalSnafu)? as i8;
 
-            let value =
-                m.get("value")
-                    .and_then(|x| x.as_str())
-                    .context(InvalidDecimalJsonSnafu {
-                        reason: "missing string field 'value'".to_string(),
-                    })?;
+            let value = m
+                .get("value")
+                .and_then(|x| x.as_str())
+                .context(MissingValueForVariableScaleDecimalSnafu)?;
 
             let unscaled = convert_string_to_decimal(value)?;
             let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
-            // ensure_precision(normalized, precision)?;
             Ok(normalized)
         }
 
-        _ => InvalidDecimalJsonSnafu {
-            reason: "expected string or object".to_string(),
-        }
-        .fail(),
+        _ => UnsupportedTypeForVariableScaleDecimalSnafu.fail(),
     }
 }
 
