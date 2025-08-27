@@ -443,9 +443,9 @@ fn make_responses_stream(
     tokio::spawn(
         request_context
             .scope(async move {
-                let function_call_states: Arc<Mutex<HashMap<String, FunctionCall>>> =
+                let function_call_builders: Arc<Mutex<HashMap<String, FunctionCall>>> =
                     Arc::new(Mutex::new(HashMap::new()));
-                let completed_function_calls: Arc<Mutex<Vec<FunctionCall>>> =
+                let ready_to_call_functions: Arc<Mutex<Vec<FunctionCall>>> =
                     Arc::new(Mutex::new(Vec::new()));
 
                 let mut captured_output = String::new();
@@ -456,7 +456,10 @@ fn make_responses_stream(
                         Err(e) => {
                             if let Err(e) = sender_clone.send(Err(e)).await {
                                 if !sender_clone.is_closed() {
-                                    tracing::error!("Unable to send error to response stream: {}", e);
+                                    tracing::error!(
+                                        "Unable to send error to response stream: {}",
+                                        e
+                                    );
                                 }
                             }
                             return;
@@ -472,38 +475,41 @@ fn make_responses_stream(
                         }
                         ResponseEvent::ResponseOutputItemAdded(item_added) => {
                             if let OutputItem::FunctionCall(function_call) = &item_added.item {
-                                let function_call_states_clone = Arc::clone(&function_call_states);
-                                let Ok(mut states_lock) = function_call_states_clone.lock() else {
+                                let function_call_builders_clone =
+                                    Arc::clone(&function_call_builders);
+                                let Ok(mut builders_lock) = function_call_builders_clone.lock()
+                                else {
                                     return;
                                 };
 
-                                states_lock.insert(function_call.id.clone(), function_call.clone());
+                                builders_lock
+                                    .insert(function_call.id.clone(), function_call.clone());
                                 should_forward = false;
                             }
                         }
                         ResponseEvent::ResponseFunctionCallArgumentsDelta(delta) => {
-                            let function_call_states_clone = Arc::clone(&function_call_states);
-                            let Ok(mut states_lock) = function_call_states_clone.lock() else {
+                            let function_call_builders_clone = Arc::clone(&function_call_builders);
+                            let Ok(mut builders_lock) = function_call_builders_clone.lock() else {
                                 return;
                             };
 
-                            if let Some(state) = states_lock.get_mut(&delta.item_id) {
+                            if let Some(state) = builders_lock.get_mut(&delta.item_id) {
                                 state.arguments.push_str(&delta.delta);
                             }
                         }
                         ResponseEvent::ResponseFunctionCallArgumentsDone(done) => {
-                            let function_call_states_clone = Arc::clone(&function_call_states);
-                            let Ok(states_lock) = function_call_states_clone.lock() else {
+                            let function_call_builders_clone = Arc::clone(&function_call_builders);
+                            let Ok(builders_lock) = function_call_builders_clone.lock() else {
                                 return;
                             };
 
-                            if let Some(function_call) = states_lock.get(&done.item_id) {
-                                // Move completed function call to the completed list
-                                let completed_calls_clone = Arc::clone(&completed_function_calls);
-                                let Ok(mut completed_lock) = completed_calls_clone.lock() else {
+                            if let Some(function_call) = builders_lock.get(&done.item_id) {
+                                // Move function call to the ready to call list
+                                let ready_to_call = Arc::clone(&ready_to_call_functions);
+                                let Ok(mut ready_to_call_lock) = ready_to_call.lock() else {
                                     return;
                                 };
-                                completed_lock.push(function_call.clone());
+                                ready_to_call_lock.push(function_call.clone());
                             }
                         }
                         ResponseEvent::ResponseOutputItemDone(item_done) => {
@@ -512,13 +518,13 @@ fn make_responses_stream(
                             if let OutputItem::FunctionCall(function_call) = &item_done.item {
                                 // Don't forward individual function call completion events for Spice tools
                                 // We'll handle them when the entire response completes
-                                let completed_calls_clone = Arc::clone(&completed_function_calls);
+                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
                                 let spice_tool_found = {
-                                    let Ok(completed_lock) = completed_calls_clone.lock() else {
+                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
                                         return;
                                     };
 
-                                    completed_lock
+                                    ready_to_call_lock
                                         .iter()
                                         .find(|call| call.id == function_call.id)
                                         .is_some_and(|call| model.as_spiced_tool(call).is_some())
@@ -535,13 +541,13 @@ fn make_responses_stream(
                         | ResponseEvent::ResponseIncomplete(_) => {
                             // Only process tools if we haven't already done so and there are spice tools
                             if !should_process_tools {
-                                let completed_calls_clone = Arc::clone(&completed_function_calls);
+                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
                                 let has_spice_tools = {
-                                    let Ok(completed_lock) = completed_calls_clone.lock() else {
+                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
                                         return;
                                     };
 
-                                    completed_lock
+                                    ready_to_call_lock
                                         .iter()
                                         .any(|call| model.as_spiced_tool(call).is_some())
                                 };
@@ -557,13 +563,13 @@ fn make_responses_stream(
 
                     // Process completed spiced tool calls when response is complete
                     if should_process_tools {
-                        let completed_calls_clone = Arc::clone(&completed_function_calls);
+                        let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
                         let spice_tools: Vec<FunctionCall> = {
-                            let Ok(completed_lock) = completed_calls_clone.lock() else {
+                            let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
                                 return;
                             };
 
-                            completed_lock
+                            ready_to_call_lock
                                 .iter()
                                 .filter(|call| model.as_spiced_tool(call).is_some())
                                 .cloned()
