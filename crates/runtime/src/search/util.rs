@@ -224,7 +224,7 @@ pub async fn full_text_search_candidates(
     };
 
     Some(
-        as_candidate_generations(&fts.with_new_base(table_provider))
+        as_candidate_generations(&fts.with_new_base(table_provider), Arc::clone(&df.ctx))
             .await
             .context(SearchGenerationSnafu),
     )
