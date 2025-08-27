@@ -117,10 +117,10 @@ fn convert_to_expr(
                     DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 ),
                 op,
-                Expr::Literal(ScalarValue::TimestampNanosecond(
-                    Some(timestamp_in_nanos as i64),
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
                     None,
-                )),
+                ),
             )
         }
         ExprTimeFormat::Timestamptz(tz) => binary_expr(
@@ -129,10 +129,10 @@ fn convert_to_expr(
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
             ),
             op,
-            Expr::Literal(ScalarValue::TimestampNanosecond(
-                Some(timestamp_in_nanos as i64),
-                tz.to_owned(),
-            )),
+            Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz.to_owned()),
+                None,
+            ),
         ),
     }
 }

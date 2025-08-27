@@ -864,16 +864,16 @@ fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
             match (*binary_expr.left.clone(), *binary_expr.right.clone()) {
-                (Expr::Column(column), Expr::Literal(value))
-                | (Expr::Literal(value), Expr::Column(column)) => {
+                (Expr::Column(column), Expr::Literal(value, _))
+                | (Expr::Literal(value, _), Expr::Column(column)) => {
                     Some((column, value, binary_expr.op))
                 }
                 _ => None,
             }
         }
         Expr::Like(like_expr) => match (*like_expr.expr.clone(), *like_expr.pattern.clone()) {
-            (Expr::Column(column), Expr::Literal(value))
-            | (Expr::Literal(value), Expr::Column(column)) => {
+            (Expr::Column(column), Expr::Literal(value, _))
+            | (Expr::Literal(value, _), Expr::Column(column)) => {
                 let op = match (like_expr.negated, like_expr.case_insensitive) {
                     (false, false) => Operator::LikeMatch,
                     (true, false) => Operator::NotLikeMatch,
@@ -890,8 +890,8 @@ fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
                 None
             } else {
                 match (func.args[0].clone(), func.args[1].clone()) {
-                    (Expr::Column(column), Expr::Literal(value))
-                    | (Expr::Literal(value), Expr::Column(column)) => {
+                    (Expr::Column(column), Expr::Literal(value, _))
+                    | (Expr::Literal(value, _), Expr::Column(column)) => {
                         Some((column, value, Operator::LikeMatch))
                     }
                     _ => None,

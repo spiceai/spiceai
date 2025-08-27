@@ -20,11 +20,9 @@ description: "Query: tpch_simple_q2"
 |               |         AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                      |
 |               |           BytesProcessedExec                                                                                                        |
 |               |             SchemaCastScanExec                                                                                                      |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                 |
-|               |                 DataSourceExec: partitions=1, partition_sizes=[733]                                                                 |
+|               |               DataSourceExec: partitions=16, partition_sizes=[46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 45, 45, 45]       |
 |               |     BytesProcessedExec                                                                                                              |
 |               |       SchemaCastScanExec                                                                                                            |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                       |
-|               |           DataSourceExec: partitions=1, partition_sizes=[733]                                                                       |
+|               |         DataSourceExec: partitions=16, partition_sizes=[46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 45, 45, 45]             |
 |               |                                                                                                                                     |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------+
