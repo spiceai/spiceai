@@ -456,7 +456,7 @@ fn make_responses_stream(
                         Err(e) => {
                             if let Err(e) = sender_clone.send(Err(e)).await {
                                 if !sender_clone.is_closed() {
-                                    tracing::error!("Error sending error: {}", e);
+                                    tracing::error!("Unable to send error to response stream: {}", e);
                                 }
                             }
                             return;

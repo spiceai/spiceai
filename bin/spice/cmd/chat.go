@@ -186,7 +186,7 @@ type ResponseStreamEvent struct {
 func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
 	input := messagesToInput(messages)
 
-	// Only create these variables if using spinner
+	// Show spinner if requested
 	var done chan bool
 	var doneLoading bool
 
