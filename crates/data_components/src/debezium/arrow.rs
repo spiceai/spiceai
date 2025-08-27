@@ -30,7 +30,9 @@ use arrow::{
 };
 use base64::prelude::*;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
+use serde_json::Value as Json;
 use snafu::prelude::*;
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::Arc;
 
 pub mod changes;
@@ -109,6 +111,24 @@ pub enum Error {
 
     #[snafu(display("A deletion change was received without a 'before' field."))]
     DeleteOpWithoutBeforeField,
+
+    #[snafu(display("Invalid decimal JSON: {reason}"))]
+    InvalidDecimalJson { reason: String },
+
+    #[snafu(display("Overflow during decimal parsing"))]
+    VariableScaleDecimalParsingOverflow,
+
+    #[snafu(display("Missing the `scale` parameter for VariableScaleDecimal"))]
+    MissingScaleForVariableScaleDecimal,
+
+    #[snafu(display("Missing the `value` parameter for VariableScaleDecimal"))]
+    MissingValueForVariableScaleDecimal,
+
+    #[snafu(display("VariableScaleDecimal expects either string or object"))]
+    UnsupportedTypeForVariableScaleDecimal,
+
+    #[snafu(display("scale must be integer"))]
+    NonIntegerScaleForVariableScaleDecimal,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -192,14 +212,9 @@ fn append_field_value_to_builder(
             let bool_builder = downcast_builder::<BooleanBuilder>(builder)?;
             bool_builder.append_option(field_value.as_bool());
         }
-        DataType::Decimal128(_, _) => {
+        DataType::Decimal128(_, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            decimal_builder.append_option(
-                field_value
-                    .as_str()
-                    .map(convert_string_to_decimal)
-                    .transpose()?,
-            );
+            decimal_builder.append_value(convert_json_to_decimal(field_value, *scale)?);
         }
         DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
             (TimeUnit::Microsecond, None) => {
@@ -427,6 +442,70 @@ fn convert_string_to_decimal(field_value: &str) -> Result<i128> {
     Ok(decimal_i128)
 }
 
+#[inline]
+fn pow10_i128(exp: i8) -> Option<i128> {
+    let mut acc: i128 = 1;
+    for _ in 0..exp {
+        acc = acc.checked_mul(10)?;
+    }
+    Some(acc)
+}
+
+fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
+    match src_scale.cmp(&dst_scale) {
+        Equal => Ok(unscaled),
+        Less => {
+            let diff = dst_scale - src_scale;
+            let mul = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
+            unscaled
+                .checked_mul(mul)
+                .context(VariableScaleDecimalParsingOverflowSnafu)
+        }
+        Greater => {
+            let diff = src_scale - dst_scale;
+            let div = pow10_i128(diff).context(VariableScaleDecimalParsingOverflowSnafu)?;
+            Ok(unscaled / div)
+        }
+    }
+}
+
+/// Parse a decimal from JSON.
+/// Supported inputs:
+/// - JSON string: base64-encoded
+/// - JSON object: {"scale": <int>, "value": <base64>}
+pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
+    if !(0..=38).contains(&target_scale) {
+        return InvalidDecimalJsonSnafu {
+            reason: "target_scale must be in 0..=38".to_string(),
+        }
+        .fail();
+    }
+
+    match v {
+        Json::String(s) => convert_string_to_decimal(s),
+
+        Json::Object(m) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let src_scale =
+                m.get("scale")
+                    .context(MissingScaleForVariableScaleDecimalSnafu)?
+                    .as_i64()
+                    .context(NonIntegerScaleForVariableScaleDecimalSnafu)? as i8;
+
+            let value = m
+                .get("value")
+                .and_then(|x| x.as_str())
+                .context(MissingValueForVariableScaleDecimalSnafu)?;
+
+            let unscaled = convert_string_to_decimal(value)?;
+            let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
+            Ok(normalized)
+        }
+
+        _ => UnsupportedTypeForVariableScaleDecimalSnafu.fail(),
+    }
+}
+
 fn convert_to_arrow_field(field: &ChangeEventField) -> Result<Field> {
     Ok(Field::new(
         field.field.as_deref().context(MissingFieldNameSnafu)?,
@@ -491,6 +570,19 @@ fn convert_to_arrow_data_type(field: &ChangeEventField) -> Result<DataType> {
             let item_type = convert_to_arrow_data_type(items)?;
             DataType::List(Arc::new(Field::new("item", item_type, items.optional)))
         }
+        "struct" => {
+            match field.name.as_deref() {
+                Some("io.debezium.data.VariableScaleDecimal") => {
+                    // Variable length decimals where each value has its own scale.
+                    // We picked these numbers to match with oracle and postgres default values.
+                    DataType::Decimal128(38, 20)
+                }
+                _ => DebeziumFieldNotSupportedSnafu {
+                    field_type: field.field_type.clone(),
+                }
+                .fail()?,
+            }
+        }
         _ => DebeziumFieldNotSupportedSnafu {
             field_type: field.field_type.clone(),
         }
@@ -498,4 +590,94 @@ fn convert_to_arrow_data_type(field: &ChangeEventField) -> Result<DataType> {
     };
 
     Ok(data_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn i128_to_base64(n: i128) -> String {
+        let bytes = n.to_be_bytes();
+        BASE64_STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn test_string_valid_no_scale() {
+        let n: i128 = 12_345;
+        let input = json!(i128_to_base64(n));
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.expect("Parse decimal"), n);
+    }
+
+    #[test]
+    fn test_object_valid_same_scale() {
+        let n: i128 = 12_345;
+        let input = json!({"scale": 2, "value": i128_to_base64(n)});
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.expect("Parse decimal"), 12_345);
+    }
+
+    #[test]
+    fn test_object_rescale_up() {
+        let n: i128 = 12345;
+        let input = json!({"scale": 2, "value": i128_to_base64(n)});
+        let result = convert_json_to_decimal(&input, 4);
+        assert_eq!(result.expect("Parse decimal"), 1_234_500);
+    }
+
+    #[test]
+    fn test_object_rescale_down() {
+        let n: i128 = 1_234_500;
+        let input = json!({"scale": 4, "value": i128_to_base64(n)});
+        let result = convert_json_to_decimal(&input, 2);
+        assert_eq!(result.expect("Parse decimal"), 12_345);
+    }
+
+    #[test]
+    fn test_target_scale_too_low() {
+        let n: i128 = 1;
+        let input = json!(i128_to_base64(n));
+        let result = convert_json_to_decimal(&input, -1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_target_scale_too_high() {
+        let n: i128 = 1;
+        let input = json!(i128_to_base64(n));
+        let result = convert_json_to_decimal(&input, 39);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_object_missing_scale() {
+        let n: i128 = 12_345;
+        let input = json!({"value": i128_to_base64(n)});
+        let result = convert_json_to_decimal(&input, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_object_scale_not_integer() {
+        let n: i128 = 12_345;
+        let input = json!({"scale": "abc", "value": i128_to_base64(n)});
+        let result = convert_json_to_decimal(&input, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_object_missing_value() {
+        let input = json!({"scale": 2});
+        let result = convert_json_to_decimal(&input, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrong_json_type() {
+        let n: i128 = 12345;
+        let input = json!(n); // Not a string or object
+        let result = convert_json_to_decimal(&input, 2);
+        assert!(result.is_err());
+    }
 }
