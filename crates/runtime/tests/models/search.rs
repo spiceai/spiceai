@@ -129,10 +129,7 @@ pub async fn run_search_test(
         return Ok(());
     }
 
-    let resp = anyhow::Context::context(
-        serde_json::from_str(&resp?),
-        "Failed to parse HTTP response",
-    )?;
+    let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     insta::assert_snapshot!(
         format!("{}_response", ts.name),
         normalize_search_response(resp)

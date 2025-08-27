@@ -143,7 +143,7 @@ mod search {
                 SearchTestCase::new(
                     "s3vectors_basic_vector_search_sql_vectors",
                     SearchTestType::Sql(
-                        "SELECT id, answer, array_length(answer_embedding), round(score, 1), FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+                        "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
                     ))
             ],
             true
