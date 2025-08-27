@@ -33,10 +33,10 @@ use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
 
-/// An S3 Vector index.
+/// An S3 Vector index or bucket.
 #[derive(Clone)]
 pub struct S3VectorsTable {
-    pub(super) idx: S3VectorIdentifier,
+    pub(super) identifier: S3VectorIdentifier,
     pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -53,7 +53,7 @@ impl std::fmt::Debug for S3VectorsTable {
         f.debug_struct("S3VectorsListTable")
             .field("schema", &self.schema)
             .field("constraints", &self.constraints)
-            .field("index_identifier", &self.idx)
+            .field("identifier", &self.identifier)
             .finish_non_exhaustive()
     }
 }
@@ -104,7 +104,7 @@ impl S3VectorsTable {
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
         Ok(S3VectorTableResult::Table(Self {
-            idx: id,
+            identifier: id,
             client,
             schema,
             constraints,
@@ -159,13 +159,13 @@ impl S3VectorsTable {
 
     #[must_use]
     pub fn new(
-        index: S3VectorIdentifier,
+        identifier: S3VectorIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
         schema: SchemaRef,
     ) -> Self {
         let constraints = Self::primary_key(&schema);
         Self {
-            idx: index,
+            identifier,
             client,
             schema,
             constraints,
@@ -220,9 +220,12 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<()> {
-        let S3VectorIdentifier::Index { bucket_name, .. } = id else {
-            return Err(Error::CreateIndexUsingArn);
+        let bucket_name = match id {
+            S3VectorIdentifier::Index { bucket_name, .. }
+            | S3VectorIdentifier::Bucket { name: bucket_name } => bucket_name,
+            _ => return Err(Error::CreateIndexUsingArn),
         };
+
         client
             .create_vector_bucket(
                 CreateVectorBucketInput::builder()
@@ -286,10 +289,10 @@ impl S3VectorsTable {
 
     /// Returns whether the index exists.
     async fn check_if_index_exists(
-        index: &S3VectorIdentifier,
+        identifier: &S3VectorIdentifier,
         client: &Arc<dyn S3Vectors + Send + Sync>,
     ) -> Result<bool> {
-        let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
+        let (index_arn, vector_bucket_name, index_name) = identifier.index_identifier_variables();
         match client
             .get_index(
                 GetIndexInput::builder()
@@ -412,7 +415,8 @@ impl S3VectorsTable {
             })
             .collect();
 
-        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+        let (index_arn, vector_bucket_name, index_name) =
+            self.identifier.index_identifier_variables();
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
             self.client
