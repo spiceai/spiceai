@@ -952,9 +952,7 @@
         },
         "params": {
           "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
+          "additionalProperties": true
         }
       },
       "required": [
@@ -1249,7 +1247,9 @@
       "type": "string",
       "enum": [
         "drop",
-        "upsert"
+        "upsert",
+        "upsert_dedup",
+        "upsert_dedup_by_row_id"
       ]
     },
     "ParamValue": {
