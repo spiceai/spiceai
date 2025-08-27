@@ -20,7 +20,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
 };
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::catalog::TableProvider;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
 use search::generation::util::get_primary_keys;
@@ -73,7 +73,6 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 /// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_from_dataset(
-    ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
@@ -105,9 +104,6 @@ pub async fn try_from_dataset(
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
-        format!("{}-{}-{}", ds_name, column, config.model)
-            .replace('_', "-")
-            .as_str(),
         Arc::clone(&embedding_models),
         config.model.as_str(),
     )
@@ -140,7 +136,6 @@ async fn embedding_vector_size(
 async fn try_vector_table(
     columns: MetadataColumns,
     params: Parameters,
-    default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
@@ -155,9 +150,8 @@ async fn try_vector_table(
             bucket_name: bucket.to_string(),
             index_name: index.to_string(),
         }),
-        (None, Some(bucket), None) => Ok(S3VectorIdentifier::Index {
-            bucket_name: bucket.to_string(),
-            index_name: default_s3_index_name.to_string(),
+        (None, Some(bucket), None) => Ok(S3VectorIdentifier::Bucket {
+            name: bucket.to_string(),
         }),
         (None, None, Some(_)) => Err("'s3_vectors_index' provided without associated 's3_vectors_bucket'.".to_string()),
         (Some(_), None, Some(_)) | (Some(_), Some(_), None) => {
