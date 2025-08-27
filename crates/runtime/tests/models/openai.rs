@@ -44,6 +44,7 @@ use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
+use serde_json::Value;
 use serde_json::json;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
@@ -516,7 +517,12 @@ async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let model = get_openai_model("gpt-4o-mini", "openai_model");
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -566,7 +572,11 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let model = get_openai_model("gpt-4o-mini", "openai_model");
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
 
             let app = AppBuilder::new("responses_api").with_model(model).build();
 
@@ -636,6 +646,164 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
             // Check that we received more than 1 delta, indicating streaming
             assert!(delta_count > 1);
 
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+            model
+                .params
+                .insert("tools".to_string(), Value::String("auto".to_string()));
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            let app = AppBuilder::new("responses_api")
+                .with_model(model)
+                .with_dataset(get_taxi_trips_dataset())
+                .build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("What datasets do you have access to? Use the list datasets tool.")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+            let mut failure = false;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseEvent::ResponseCompleted(_) => {
+                            break;
+                        }
+                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                            failure = true;
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            // Check that the model used the tool, indicating the tool was injected correctly
+            assert!(final_response.contains("taxi_trips"));
+            // Check that we didn't fail at any point while streaming
+            assert!(!failure);
+            // Check that we received more than 1 delta, indicating streaming
+            assert!(delta_count > 1);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_with_tools_non_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            model
+                .params
+                .insert("tools".to_string(), Value::String("auto".to_string()));
+
+            let app = AppBuilder::new("responses_api")
+                .with_model(model)
+                .with_dataset(get_taxi_trips_dataset())
+                .build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("What datasets do I have access to?")
+                .build()?;
+
+            let response = openai_client.responses().create(request).await?;
+            let text = extract_text(&response);
+            assert_eq!(response.model, "openai_model".to_string());
+            assert!(text.is_some_and(|s| s.contains("taxi_trips")));
+            assert_eq!(response.status, Status::Completed);
             Ok(())
         })
         .await
