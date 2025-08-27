@@ -285,6 +285,7 @@ version = "1.6.0-unstable"
 dependencies = [
  "snafu",
  "spicepod",
+ "tracing",
 ]
 
 [[package]]

@@ -373,6 +373,18 @@ impl AppBuilder {
                 workers.push(worker.clone());
             }
 
+            if dependent_spicepod.runtime != Runtime::default() {
+                tracing::warn!(
+                    "Spicepod dependency '{dependency}' has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. '{dependency}' runtime configuration will be ignored."
+                );
+            }
+
+            if dependent_spicepod.management.is_some() {
+                tracing::warn!(
+                    "Spicepod dependency '{dependency}' has 'management' field(s) defined. Management configuration must be set in primary spicepod. '{dependency}' management configuration will be ignored."
+                );
+            }
+
             spicepods.push(dependent_spicepod);
         }
 
