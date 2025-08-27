@@ -15,12 +15,18 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
+use datafusion::{
+    execution::runtime_env::RuntimeEnvBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
 use search::generation::{
     CandidateGeneration,
     post_apply::PostApplyCandidateGeneration,
     text_search::{FullTextSearchCandidate, index::FullTextDatabaseIndex},
 };
+use snafu::ResultExt;
+
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 
 pub mod connector;
 pub mod udtf;
@@ -30,7 +36,6 @@ pub mod udtf;
 /// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::generation::text_search::udtf::TextSearchIndexProvider`].
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
-    session_context: Arc<SessionContext>,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
     let mut generators = vec![];
     for search_field in database_index.search_fields.as_slice() {
@@ -46,7 +51,16 @@ pub async fn as_candidate_generations(
             Arc::new(candidate),
             database_index.primary_key.clone(),
         )
-        .with_ctx(Arc::clone(&session_context));
+        .with_ctx(Arc::new(SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::new(
+                RuntimeEnvBuilder::default()
+                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+                    .build()
+                    .boxed()
+                    .map_err(|source| search::generation::Error::InternalError { source })?,
+            ),
+        )));
         generators.push(Arc::new(post_apply) as Arc<dyn CandidateGeneration>);
     }
 
