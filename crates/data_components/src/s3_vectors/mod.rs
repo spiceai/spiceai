@@ -80,7 +80,9 @@ pub enum Error {
     ))]
     CreateIndexUsingArn,
 
-    #[snafu(display("Failed to load AWS credentials. {message}"))]
+    #[snafu(display(
+        "Failed to load AWS credentials to connect to S3 Vectors. Verify the AWS credentials are available in the environment. For help configuring AWS authentication visit https://spiceai.org/docs/components/vectors/s3_vectors#authentication"
+    ))]
     UnableToLoadCredentials { message: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
