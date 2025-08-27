@@ -122,7 +122,6 @@ func NewResponsesRequestBody(model string, input string, stream bool) *Responses
 	}
 }
 
-// ResponseOutput represents the main output structure
 type ResponseOutput struct {
 	Type    string                 `json:"type"`
 	ID      string                 `json:"id"`
@@ -168,21 +167,41 @@ type OpenAIErrorResponse struct {
 	Error OpenAIError `json:"error"`
 }
 
-// handleResponsesAPI handles non-streaming responses using the Responses API
+type ResponsesAPIErrorResponse struct {
+	Type  string      `json:"type"`
+	Error OpenAIError `json:"error"`
+}
+
+type ResponseStreamEvent struct {
+	Type           string                `json:"type"`
+	ItemID         string                `json:"item_id,omitempty"`
+	OutputIndex    int                   `json:"output_index,omitempty"`
+	ContentIndex   int                   `json:"content_index,omitempty"`
+	Delta          string                `json:"delta,omitempty"`
+	SequenceNumber int                   `json:"sequence_number,omitempty"`
+	Usage          *ResponseUsage        `json:"usage,omitempty"`
+	Response       *ResponsesAPIResponse `json:"response,omitempty"`
+}
+
 func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
 	input := messagesToInput(messages)
 
 	// Show spinner if requested
 	var done chan bool
+	var doneLoading bool
+
 	if useSpinner {
 		done = make(chan bool)
+		doneLoading = false
 		go func() {
 			util.ShowSpinner(done)
 		}()
 	}
 
-	body := NewResponsesRequestBody(model, input, false) // No streaming for responses API
+	body := NewResponsesRequestBody(model, input, true)
 
+	var timeAtCompletion time.Time
+	var timeAtFirstToken time.Time
 	startTime := time.Now()
 	response, err := sendResponsesRequest(rtcontext, body)
 	if err != nil {
@@ -198,44 +217,100 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 		}
 	}()
 
+	scanner := bufio.NewScanner(response.Body)
+	var responseMessage = ""
+
+	var usage ResponseUsage
+
 	if useSpinner {
-		done <- true
+		doneLoading = false
 	}
 
-	// Parse the non-streaming response
-	var responsesResponse ResponsesAPIResponse
-	decoder := json.NewDecoder(response.Body)
-	err = decoder.Decode(&responsesResponse)
-	if err != nil {
-		slog.Error("failed to decode responses response", "error", err)
-		return messages, fmt.Errorf("failed to decode responses response: %w", err)
-	}
+	for scanner.Scan() {
+		chunk := scanner.Text()
+		if timeAtFirstToken.IsZero() {
+			timeAtFirstToken = time.Now()
+		}
 
-	endTime := time.Now()
-	duration := endTime.Sub(startTime)
+		if !strings.HasPrefix(chunk, "data: ") {
+			continue
+		}
+		chunk = strings.TrimPrefix(chunk, "data: ")
 
-	// Extract text from the response output
-	var responseMessage string
-	for _, output := range responsesResponse.Output {
-		for _, content := range output.Content {
-			if content.Type == "output_text" {
-				responseMessage += content.Text
+		if isEndOfStream(chunk) {
+			break
+		}
+
+		responsesAPIError, err := maybeResponsesAPIErrorEvent(chunk)
+		if err != nil {
+			slog.Error("failed to decode responses API error event", "error", err)
+			continue
+		}
+
+		if responsesAPIError != nil {
+			slog.Error("responses request failed", "message", responsesAPIError.Error.Message)
+			break
+		}
+
+		var streamEvent = ResponseStreamEvent{}
+		err = json.Unmarshal([]byte(chunk), &streamEvent)
+		if err != nil {
+			slog.Error("failed to unmarshal responses stream event", "error", err)
+			continue
+		}
+
+		if streamEvent.Usage != nil {
+			usage = *streamEvent.Usage
+			timeAtCompletion = time.Now()
+		}
+
+		if streamEvent.Type == "response.output_text.delta" {
+			token := streamEvent.Delta
+
+			// Stop spinner on first non-empty text delta
+			if useSpinner && !doneLoading && token != "" {
+				done <- true
+				doneLoading = true
 			}
+
+			cmd.Printf("%s", token)
+			responseMessage = responseMessage + token
+		}
+
+		if streamEvent.Type == "response.completed" && streamEvent.Response != nil {
+			if streamEvent.Response.Usage != nil {
+				usage = *streamEvent.Response.Usage
+				timeAtCompletion = time.Now()
+			}
+		}
+
+		if streamEvent.Type == "response.done" {
+			break
 		}
 	}
 
-	// Print the response
-	cmd.Printf("%s", responseMessage)
+	if err := scanner.Err(); err != nil {
+		slog.Error("error occurred while processing the response stream", "error", err)
+	}
+
+	if useSpinner && !doneLoading {
+		done <- true
+	}
 
 	if responseMessage != "" {
 		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 	}
 
 	// Show usage information
-	if responsesResponse.Usage != nil {
+	if usage != (ResponseUsage{}) {
+		// If timeAtCompletion wasn't set, use current time
+		if timeAtCompletion.IsZero() {
+			timeAtCompletion = time.Now()
+		}
 		cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
-			responsesResponse.Usage,
-			duration,
+			&usage,
+			timeAtFirstToken.Sub(startTime).Abs(),
+			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
 		))
 	} else {
 		cmd.Print("\n\n")
@@ -596,13 +671,14 @@ func messagesToInput(messages []Message) string {
 }
 
 // generateResponsesUsageMessage generates a usage message for Responses API statistics
-func generateResponsesUsageMessage(u *ResponseUsage, totalTime time.Duration) string {
-	times := fmt.Sprintf("Time: %.2fs.", totalTime.Seconds())
+func generateResponsesUsageMessage(u *ResponseUsage, timeToFirst time.Duration, streamDuration time.Duration) string {
+	totalTime := (streamDuration + timeToFirst)
+	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
 	if u == nil {
 		return times
 	}
 
-	tps := float64(u.OutputTokens) / totalTime.Seconds()
+	tps := float64(u.OutputTokens) / streamDuration.Seconds()
 	return fmt.Sprintf(
 		"%s Tokens: %d. Input: %d. Output: %d (%.2f/s).", times, u.TotalTokens, u.InputTokens, u.OutputTokens, tps,
 	)
@@ -624,6 +700,49 @@ func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error)
 	}
 
 	return nil, nil
+}
+
+func maybeResponsesAPIErrorEvent(chunk string) (*ResponsesAPIErrorResponse, error) {
+	var streamEvent ResponseStreamEvent
+	err := json.Unmarshal([]byte(chunk), &streamEvent)
+	if err != nil {
+		return nil, err
+	}
+
+	if streamEvent.Type == "error" {
+		var errorEvent ResponsesAPIErrorResponse
+		err := json.Unmarshal([]byte(chunk), &errorEvent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal responses API error: %w", err)
+		}
+		return &errorEvent, nil
+	}
+
+	return nil, nil
+}
+
+// End of Stream in the Responses API is indicated by an error event with text "stream ended" contained within it
+func isEndOfStream(chunk string) bool {
+	var streamEvent ResponseStreamEvent
+	err := json.Unmarshal([]byte(chunk), &streamEvent)
+	if err != nil {
+		return false
+	}
+
+	if streamEvent.Type == "error" {
+		var errorEvent ResponsesAPIErrorResponse
+		err := json.Unmarshal([]byte(chunk), &errorEvent)
+		if err != nil {
+			return false
+		}
+
+		if strings.Contains(strings.ToLower(errorEvent.Error.Message), "stream ended") {
+			return true
+		}
+
+	}
+
+	return false
 }
 
 func init() {

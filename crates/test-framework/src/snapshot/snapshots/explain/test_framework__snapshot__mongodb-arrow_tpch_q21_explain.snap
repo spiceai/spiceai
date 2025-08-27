@@ -18,12 +18,12 @@ description: "Query: tpch_q21"
 |               |                     Projection: supplier.s_name, supplier.s_nationkey, l1.l_orderkey, l1.l_suppkey                                                                                            |
 |               |                       Inner Join: supplier.s_suppkey = l1.l_suppkey                                                                                                                           |
 |               |                         BytesProcessedNode                                                                                                                                                    |
-|               |                           TableScan: supplier projection=[s_name, s_nationkey, s_suppkey]                                                                                                     |
+|               |                           TableScan: supplier projection=[s_suppkey, s_name, s_nationkey]                                                                                                     |
 |               |                         SubqueryAlias: l1                                                                                                                                                     |
 |               |                           Projection: lineitem.l_orderkey, lineitem.l_suppkey                                                                                                                 |
 |               |                             BytesProcessedNode                                                                                                                                                |
 |               |                               Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                                                          |
-|               |                                 TableScan: lineitem projection=[l_commitdate, l_orderkey, l_suppkey, l_receiptdate]                                                                           |
+|               |                                 TableScan: lineitem projection=[l_receiptdate, l_commitdate, l_orderkey, l_suppkey]                                                                           |
 |               |                     Projection: orders.o_orderkey                                                                                                                                             |
 |               |                       BytesProcessedNode                                                                                                                                                      |
 |               |                         Filter: orders.o_orderstatus = Utf8("F")                                                                                                                              |
@@ -31,7 +31,7 @@ description: "Query: tpch_q21"
 |               |                 Projection: nation.n_nationkey                                                                                                                                                |
 |               |                   BytesProcessedNode                                                                                                                                                          |
 |               |                     Filter: nation.n_name = Utf8("SAUDI ARABIA")                                                                                                                              |
-|               |                       TableScan: nation projection=[n_name, n_nationkey]                                                                                                                      |
+|               |                       TableScan: nation projection=[n_nationkey, n_name]                                                                                                                      |
 |               |             SubqueryAlias: __correlated_sq_1                                                                                                                                                  |
 |               |               SubqueryAlias: l2                                                                                                                                                               |
 |               |                 BytesProcessedNode                                                                                                                                                            |
@@ -41,7 +41,7 @@ description: "Query: tpch_q21"
 |               |               Projection: lineitem.l_orderkey, lineitem.l_suppkey                                                                                                                             |
 |               |                 BytesProcessedNode                                                                                                                                                            |
 |               |                   Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                                                                      |
-|               |                     TableScan: lineitem projection=[l_commitdate, l_orderkey, l_suppkey, l_receiptdate]                                                                                       |
+|               |                     TableScan: lineitem projection=[l_receiptdate, l_commitdate, l_orderkey, l_suppkey]                                                                                       |
 | physical_plan | SortPreservingMergeExec: [numwait@1 DESC, s_name@0 ASC NULLS LAST], fetch=100                                                                                                                 |
 |               |   SortExec: TopK(fetch=100), expr=[numwait@1 DESC, s_name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                     |
 |               |     ProjectionExec: expr=[s_name@0 as s_name, count(Int64(1))@1 as numwait]                                                                                                                   |
@@ -64,19 +64,19 @@ description: "Query: tpch_q21"
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
 |               |                                         RepartitionExec: partitioning=Hash([l_orderkey@2], 16), input_partitions=16                                                                           |
 |               |                                           CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
-|               |                                             HashJoinExec: mode=Partitioned, join_type=Inner, on=[(s_suppkey@2, l_suppkey@1)], projection=[s_name@0, s_nationkey@1, l_orderkey@3, l_suppkey@4] |
+|               |                                             HashJoinExec: mode=Partitioned, join_type=Inner, on=[(s_suppkey@0, l_suppkey@1)], projection=[s_name@1, s_nationkey@2, l_orderkey@3, l_suppkey@4] |
 |               |                                               CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
-|               |                                                 RepartitionExec: partitioning=Hash([s_suppkey@2], 16), input_partitions=16                                                                    |
+|               |                                                 RepartitionExec: partitioning=Hash([s_suppkey@0], 16), input_partitions=16                                                                    |
 |               |                                                   BytesProcessedExec                                                                                                                          |
 |               |                                                     SchemaCastScanExec                                                                                                                        |
 |               |                                                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                   |
 |               |                                                         DataSourceExec: partitions=1, partition_sizes=[3]                                                                                     |
 |               |                                               CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
 |               |                                                 RepartitionExec: partitioning=Hash([l_suppkey@1], 16), input_partitions=16                                                                    |
-|               |                                                   ProjectionExec: expr=[l_orderkey@1 as l_orderkey, l_suppkey@2 as l_suppkey]                                                                 |
+|               |                                                   ProjectionExec: expr=[l_orderkey@2 as l_orderkey, l_suppkey@3 as l_suppkey]                                                                 |
 |               |                                                     BytesProcessedExec                                                                                                                        |
 |               |                                                       CoalesceBatchesExec: target_batch_size=8192                                                                                             |
-|               |                                                         FilterExec: l_receiptdate@3 > l_commitdate@0                                                                                          |
+|               |                                                         FilterExec: l_receiptdate@0 > l_commitdate@1                                                                                          |
 |               |                                                           SchemaCastScanExec                                                                                                                  |
 |               |                                                             DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93]                   |
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
@@ -89,10 +89,10 @@ description: "Query: tpch_q21"
 |               |                                                     DataSourceExec: partitions=16, partition_sizes=[24, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 23, 23, 23, 23, 23]                           |
 |               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
 |               |                                 RepartitionExec: partitioning=Hash([n_nationkey@0], 16), input_partitions=16                                                                                  |
-|               |                                   ProjectionExec: expr=[n_nationkey@1 as n_nationkey]                                                                                                         |
+|               |                                   ProjectionExec: expr=[n_nationkey@0 as n_nationkey]                                                                                                         |
 |               |                                     BytesProcessedExec                                                                                                                                        |
 |               |                                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
-|               |                                         FilterExec: n_name@0 = SAUDI ARABIA                                                                                                                   |
+|               |                                         FilterExec: n_name@1 = SAUDI ARABIA                                                                                                                   |
 |               |                                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                               |
 |               |                                             SchemaCastScanExec                                                                                                                                |
 |               |                                               DataSourceExec: partitions=1, partition_sizes=[1]                                                                                               |
@@ -103,10 +103,10 @@ description: "Query: tpch_q21"
 |               |                               DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93]                                                 |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                                                               |
-|               |                       ProjectionExec: expr=[l_orderkey@1 as l_orderkey, l_suppkey@2 as l_suppkey]                                                                                             |
+|               |                       ProjectionExec: expr=[l_orderkey@2 as l_orderkey, l_suppkey@3 as l_suppkey]                                                                                             |
 |               |                         BytesProcessedExec                                                                                                                                                    |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
-|               |                             FilterExec: l_receiptdate@3 > l_commitdate@0                                                                                                                      |
+|               |                             FilterExec: l_receiptdate@0 > l_commitdate@1                                                                                                                      |
 |               |                               SchemaCastScanExec                                                                                                                                              |
 |               |                                 DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93]                                               |
 |               |                                                                                                                                                                                               |
