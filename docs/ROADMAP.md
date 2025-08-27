@@ -15,19 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.6 (August 2025)
-
-**Focus:** Indexing & Acceleration - Improved performance and reliability for indexing and alignment with data accelerators.
-
-- **Indexing**:
-  - Improved performance and reliability of vectorizing and full-text indexes.
-  - Alignment of indexes to data accelerators for optimized query execution.
-- **DataFusion**: Upgrade to v48.
-- **Hash Partitioning**: Improved query distribution and performance.
-- **Embedding Models**: Model2Vec static embedding models
-- **Data Connectors**:
-  - MongoDB Data Connector
-
 ### v1.7 (September 2025)
 
 **Focus:** Real-Time Write-Through Caching - Streamlined data and embedding caching with real-time ingestion.
@@ -47,6 +34,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - **Resource Management**: Finer-grained runtime-wide control for optimized performance.
 - **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
+- **Hash Partitioning**: Improved query distribution and performance.
 - **Write Support**:
   - MySQL write support.
   - PostgreSQL write support (expanded).
