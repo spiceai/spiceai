@@ -95,6 +95,9 @@ pub enum S3VectorIdentifier {
         bucket_name: String,
         index_name: String,
     },
+    Bucket {
+        name: String,
+    },
 }
 
 impl S3VectorIdentifier {
@@ -107,6 +110,7 @@ impl S3VectorIdentifier {
                 index_name,
             } => (None, Some(bucket_name.clone()), Some(index_name.clone())),
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
+            Self::Bucket { name } => (None, Some(name.clone()), None),
         }
     }
 }

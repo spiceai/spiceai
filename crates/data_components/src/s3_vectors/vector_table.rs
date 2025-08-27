@@ -242,7 +242,8 @@ impl S3VectorsTable {
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
         let bucket_name_opt = match id {
-            S3VectorIdentifier::Index { bucket_name, .. } => Some(bucket_name.clone()),
+            S3VectorIdentifier::Index { bucket_name, .. }
+            | S3VectorIdentifier::Bucket { name: bucket_name } => Some(bucket_name.clone()),
             S3VectorIdentifier::IndexArn(_) => None,
         };
         match client
