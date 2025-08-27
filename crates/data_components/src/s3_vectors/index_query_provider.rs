@@ -57,11 +57,11 @@ pub static S3_VECTOR_MAX_TOPK: i64 = 30;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
-pub struct S3VectorsQueryTable {
+pub struct S3VectorsQueryIndexTable {
     table: S3VectorsTable,
     query: Vec<f32>,
 }
-impl S3VectorsQueryTable {
+impl S3VectorsQueryIndexTable {
     #[must_use]
     pub fn new(table: S3VectorsTable, query: Vec<f32>) -> Self {
         Self { table, query }
@@ -69,7 +69,7 @@ impl S3VectorsQueryTable {
 }
 
 #[async_trait]
-impl TableProvider for S3VectorsQueryTable {
+impl TableProvider for S3VectorsQueryIndexTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -137,14 +137,14 @@ impl TableProvider for S3VectorsQueryTable {
         let limit: i64 = match limit {
             Some(l) if (l as i64) > S3_VECTOR_MAX_TOPK => {
                 tracing::warn!(
-                    "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                    "S3VectorsQueryIndexTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
                 );
                 S3_VECTOR_MAX_TOPK
             }
             None => S3_VECTOR_MAX_TOPK,
             Some(l) => l as i64,
         };
-        Ok(Arc::new(S3VectorsQueryExec::new(
+        Ok(Arc::new(S3VectorsQueryIndexExec::new(
             self,
             projection,
             limit,
@@ -154,13 +154,14 @@ impl TableProvider for S3VectorsQueryTable {
     }
 }
 
-impl std::fmt::Debug for S3VectorsQueryExec {
+impl std::fmt::Debug for S3VectorsQueryIndexExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3VectorsQueryExec").finish_non_exhaustive()
+        f.debug_struct("S3VectorsQueryIndexExec")
+            .finish_non_exhaustive()
     }
 }
 
-struct S3VectorsQueryExec {
+struct S3VectorsQueryIndexExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
@@ -169,9 +170,9 @@ struct S3VectorsQueryExec {
     filters: Vec<Expr>,
 }
 
-impl DisplayAs for S3VectorsQueryExec {
+impl DisplayAs for S3VectorsQueryIndexExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "S3VectorsQueryExec: ")?;
+        write!(f, "S3VectorsQueryIndexExec: ")?;
         if let Ok(Some(filter)) = convert_datafusion_filters_to_s3_vectors(&self.filters) {
             write!(f, "filter={filter} ")?;
         }
@@ -180,9 +181,9 @@ impl DisplayAs for S3VectorsQueryExec {
     }
 }
 
-impl S3VectorsQueryExec {
+impl S3VectorsQueryIndexExec {
     pub fn new(
-        table: &S3VectorsQueryTable,
+        table: &S3VectorsQueryIndexTable,
         projection: Option<&Vec<usize>>,
         limit: i64,
         query: Vec<f32>,
@@ -216,9 +217,9 @@ impl S3VectorsQueryExec {
     }
 }
 
-impl ExecutionPlan for S3VectorsQueryExec {
+impl ExecutionPlan for S3VectorsQueryIndexExec {
     fn name(&self) -> &'static str {
-        "S3VectorsQueryExec"
+        "S3VectorsQueryIndexExec"
     }
 
     fn as_any(&self) -> &dyn Any {

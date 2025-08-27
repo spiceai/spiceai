@@ -22,7 +22,7 @@ use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
     MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
-    list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+    index_query_provider::S3VectorsQueryIndexTable, list_provider::S3VectorsListTable,
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
@@ -191,7 +191,7 @@ impl VectorIndex for S3Vector {
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
         let vector = self.query_vector(query).await?;
-        let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
+        let tp = Arc::new(S3VectorsQueryIndexTable::new(self.table.clone(), vector));
 
         table_with_projection(tp, projection).boxed()
     }
