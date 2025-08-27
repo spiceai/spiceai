@@ -122,7 +122,6 @@ func NewResponsesRequestBody(model string, input string, stream bool) *Responses
 	}
 }
 
-// ResponseOutput represents the main output structure
 type ResponseOutput struct {
 	Type    string                 `json:"type"`
 	ID      string                 `json:"id"`
@@ -173,7 +172,6 @@ type ResponsesAPIErrorResponse struct {
 	Error OpenAIError `json:"error"`
 }
 
-// ResponseStreamEvent represents a streaming event from the Responses API
 type ResponseStreamEvent struct {
 	Type           string                `json:"type"`
 	ItemID         string                `json:"item_id,omitempty"`
@@ -185,7 +183,6 @@ type ResponseStreamEvent struct {
 	Response       *ResponsesAPIResponse `json:"response,omitempty"`
 }
 
-// handleResponsesAPI handles streaming and non-streaming responses using the Responses API
 func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
 	input := messagesToInput(messages)
 
@@ -201,7 +198,7 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 		}()
 	}
 
-	body := NewResponsesRequestBody(model, input, true) // Enable streaming for responses API
+	body := NewResponsesRequestBody(model, input, true)
 
 	var timeAtCompletion time.Time
 	var timeAtFirstToken time.Time
@@ -223,7 +220,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 	scanner := bufio.NewScanner(response.Body)
 	var responseMessage = ""
 
-	/// Usage for the entire stream, and related timing.
 	var usage ResponseUsage
 
 	if useSpinner {
@@ -245,7 +241,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 			break
 		}
 
-		// Check for Responses API errors first
 		responsesAPIError, err := maybeResponsesAPIErrorEvent(chunk)
 		if err != nil {
 			slog.Error("failed to decode responses API error event", "error", err)
@@ -269,7 +264,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 			timeAtCompletion = time.Now()
 		}
 
-		// Handle text delta events
 		if streamEvent.Type == "response.output_text.delta" {
 			token := streamEvent.Delta
 
@@ -283,7 +277,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 			responseMessage = responseMessage + token
 		}
 
-		// Handle completion events
 		if streamEvent.Type == "response.completed" && streamEvent.Response != nil {
 			if streamEvent.Response.Usage != nil {
 				usage = *streamEvent.Response.Usage
@@ -291,7 +284,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 			}
 		}
 
-		// Handle response done events - this indicates the stream has ended normally
 		if streamEvent.Type == "response.done" {
 			break
 		}
@@ -327,7 +319,6 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 	return messages, nil
 }
 
-// handleChatCompletions handles streaming responses using the Chat Completions API
 func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
 	// Only create these variables if using spinner
 	var done chan bool
@@ -729,6 +720,7 @@ func maybeResponsesAPIErrorEvent(chunk string) (*ResponsesAPIErrorResponse, erro
 	return nil, nil
 }
 
+// End of Stream in the Responses API is indicated by an error event with text "stream ended" contained within it
 func isEndOfStream(chunk string) bool {
 	var streamEvent ResponseStreamEvent
 	err := json.Unmarshal([]byte(chunk), &streamEvent)
