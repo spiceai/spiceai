@@ -219,11 +219,11 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }            # kczimm/prep-spiceai-48
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }     # kczimm/prep-spiceai-48
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" } # kczimm/prep-spiceai-48
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }  # kczimm/prep-spiceai-48
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "8c1051083ce452540f0c450f6cfef00ffcd255dc" }       # kczimm/prep-spiceai-48
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "28bf3e1590664d0b4faea5fcc2671548afafb35a" }            # spiceai/spiceai-48
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "28bf3e1590664d0b4faea5fcc2671548afafb35a" }     # spiceai/spiceai-48
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "28bf3e1590664d0b4faea5fcc2671548afafb35a" } # spiceai/spiceai-48
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "28bf3e1590664d0b4faea5fcc2671548afafb35a" }  # spiceai/spiceai-48
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "28bf3e1590664d0b4faea5fcc2671548afafb35a" }       # spiceai/spiceai-48
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "c920a7501cdbfe906bf8c7d4959367fd47f00774" }                      # spiceai-48
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b7b77e75bb11d85172101b5b6675a94957c6bbec" } # spiceai
@@ -238,8 +238,8 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }              # spiceai-0.5.2
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
 iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" } # spiceai-0.5.2
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
 iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ea81659ac8909fe2c4cc1c57be7208a7a2101aec" }   # spiceai-0.5.2
 
