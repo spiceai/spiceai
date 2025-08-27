@@ -20,8 +20,9 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use search::generation::{
-    CandidateGeneration, post_apply::PostApplyCandidateGeneration,
-    text_search::index::FullTextDatabaseIndex,
+    CandidateGeneration,
+    post_apply::PostApplyCandidateGeneration,
+    text_search::{FullTextSearchCandidate, index::FullTextDatabaseIndex},
 };
 use snafu::ResultExt;
 
@@ -43,9 +44,11 @@ pub async fn as_candidate_generations(
             .await
             .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
+        let candidate: FullTextSearchCandidate = base.into();
+
         let post_apply = PostApplyCandidateGeneration::new(
             Arc::clone(&database_index.base_table),
-            Arc::new(base),
+            Arc::new(candidate),
             database_index.primary_key.clone(),
         )
         .with_ctx(Arc::new(SessionContext::new_with_config_rt(

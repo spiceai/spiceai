@@ -29,9 +29,11 @@ use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::config::Config;
 use serde_json::{Value, json};
+use spicepod::acceleration::Acceleration;
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::EmbeddingChunkConfig;
+use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -224,13 +226,25 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
     primary_keys: Option<Vec<String>>,
     chunking: Option<EmbeddingChunkConfig>,
 ) -> Dataset {
-    let mut ds_tpcds_cp = get_tpcds_dataset(
-        "catalog_page",
-        Some(ds_name),
-        Some(format!(
-            "select cp_description, cp_catalog_page_sk, cp_department, cp_catalog_number from {ds_name} limit 20"
-        ).as_str()),
+    let mut ds_tpcds_cp = Dataset::new(
+        // pre-apply ordering and filtering due to https://github.com/spiceai/spiceai/issues/6876
+        // ordering will create more deterministic tests to prevent flakiness
+        "s3://spiceai-public-datasets/integration/tpcds/catalog_page.parquet".to_string(),
+        ds_name,
     );
+    ds_tpcds_cp.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    ds_tpcds_cp.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+
     ds_tpcds_cp.columns = vec![Column {
         name: "cp_description".to_string(),
         embeddings: vec![ColumnLevelEmbeddingConfig {
@@ -1077,7 +1091,6 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6817
 async fn test_search_with_cache() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search",
@@ -1137,7 +1150,6 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6818
 async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
     let chunked = catalog_page_tpcds_dataset_w_embeddings(
         "cached_search_bypass",

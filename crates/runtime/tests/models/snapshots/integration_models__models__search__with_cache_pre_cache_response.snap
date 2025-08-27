@@ -6,31 +6,24 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "multi_column_search",
+      "dataset": "spice.public.cached_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
         "cp_description": "In general basic characters welcome. Clearly lively friends con"
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.03
+      "score": 0.94
     },
     {
-      "data": {
-        "cp_catalog_number": 1
-      },
-      "dataset": "multi_column_search",
+      "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": "Close customers might struggle away different mem"
       },
       "primary_key": {
         "cp_catalog_page_sk": 15
       },
-      "score": 0.01
+      "score": 0.93
     }
   ]
 }
