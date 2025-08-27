@@ -319,6 +319,7 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 	return messages, nil
 }
 
+// handleChatCompletions handles streaming responses using the Chat Completions API
 func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
 	// Only create these variables if using spinner
 	var done chan bool
