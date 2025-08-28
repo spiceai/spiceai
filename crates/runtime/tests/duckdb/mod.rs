@@ -240,3 +240,113 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         })
         .await
 }
+
+#[tokio::test]
+async fn duckdb_regexp() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/regions.csv");
+            // Write the sample file to a temporary directory
+            let temp_dir = std::env::temp_dir().join("spiced_test_data_order_by");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+            let sample_csv_path = temp_dir.join("regions.csv");
+            std::fs::write(&sample_csv_path, sample_csv_contents)
+                .expect("failed to write sample file");
+            defer! {
+                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+            }
+
+            let app = AppBuilder::new("duckdb_regexp_test")
+                .with_dataset(make_duckdb_acceleration_dataset(
+                    "csv_test",
+                    "csv",
+                    &format!("'{}'", sample_csv_path.display()),
+                ))
+                .build();
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let cases = vec![
+                (
+                    "test_regexp_like_is_case_sensitive",
+                    "SELECT * FROM csv_test WHERE regexp_like(region, 'america')",
+                ),
+                (
+                    "test_regexp_like_with_case_insensitive_flag",
+                    "SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')",
+                ),
+                // disabled until github.com/spiceai/spiceai/issues/6964 is addressed
+                // (
+                //     "test_regexp_match",
+                //     "SELECT regexp_match(region, 'AMERICA') FROM csv_test",
+                // ),
+                (
+                    "test_regexp_count",
+                    "SELECT regexp_count(region, 'AMERICA') FROM csv_test",
+                ),
+                (
+                    "test_regexp_replace",
+                    "SELECT regexp_replace(region, 'AMERICA', 'AUSTRALIA') FROM csv_test",
+                ),
+                (
+                    "test_regexp_replace_case_insensitive",
+                    "SELECT regexp_replace(region, 'america', 'australia', 'i') FROM csv_test",
+                ),
+            ];
+
+            for (name, query) in cases {
+                let result: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .expect("query is successful")
+                    .data
+                    .try_collect()
+                    .await
+                    .expect("collects results");
+
+                let pretty = arrow::util::pretty::pretty_format_batches(&result)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_results"), pretty);
+
+                let explain_plan = rt
+                    .datafusion()
+                    .query_builder(&format!("EXPLAIN {}", query))
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+            }
+
+            Ok(())
+        })
+        .await
+}
