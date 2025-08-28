@@ -54,7 +54,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     // Insert test documents
     let test_docs = vec![
         doc! {
-            "id": 1,
+            "_id": 1,
             "col_bit": true,
             "col_tiny": 1i32,
             "col_short": 1i32,
@@ -82,7 +82,7 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
             }
         },
         doc! {
-            "id": 2,
+            "_id": 2,
             "col_bit": null,
             "col_tiny": null,
             "col_short": null,
@@ -157,7 +157,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
             }
 
             let queries: QueryTests = vec![(
-                "SELECT id, col_bit, col_tiny, col_short, col_long, col_longlong, col_float, col_double, col_timestamp, col_date, col_time, col_blob, col_string, col_decimal, col_unsigned_int, col_char, col_set, col_json FROM test",
+                "SELECT * FROM test",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
