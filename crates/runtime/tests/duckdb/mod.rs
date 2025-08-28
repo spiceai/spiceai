@@ -331,7 +331,7 @@ async fn duckdb_regexp() -> Result<(), String> {
 
                 let explain_plan = rt
                     .datafusion()
-                    .query_builder(&format!("EXPLAIN {}", query))
+                    .query_builder(&format!("EXPLAIN {query}"))
                     .build()
                     .run()
                     .await
