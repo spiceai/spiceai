@@ -12103,9 +12103,13 @@ dependencies = [
  "ahash 0.8.12",
  "arrow",
  "arrow-schema",
+ "async-openai",
  "datafusion",
  "insta",
+ "llms",
+ "once_cell",
  "snafu",
+ "tokio",
  "tracing",
  "tract-core",
 ]

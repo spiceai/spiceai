@@ -278,6 +278,11 @@ impl RuntimeBuilder {
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
+        // TODO: embed UDF needs access to the EmbeddingModelStore singleton, so it lives here
+        rt.df
+            .ctx
+            .register_udf(runtime_datafusion_udfs::embed::Embed::new(rt.embeds()).into());
+
         rt
     }
 
