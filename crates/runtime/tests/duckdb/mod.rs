@@ -28,6 +28,7 @@ use runtime::Runtime;
 use scopeguard::defer;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
+use tempfile::NamedTempFile;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
@@ -248,22 +249,27 @@ async fn duckdb_regexp() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let sample_csv_contents = include_str!("../test_data/regions.csv");
-            // Write the sample file to a temporary directory
-            let temp_dir = std::env::temp_dir().join("spiced_test_data_order_by");
-            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-            let sample_csv_path = temp_dir.join("regions.csv");
-            std::fs::write(&sample_csv_path, sample_csv_contents)
+            let mut temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
                 .expect("failed to write sample file");
-            defer! {
-                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-            }
+
+            let mut other_dataset = make_duckdb_acceleration_dataset(
+                "csv_test_arrow",
+                "csv",
+                &format!("'{}'", temp_file.path().display()),
+            );
+            other_dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                ..Default::default()
+            });
 
             let app = AppBuilder::new("duckdb_regexp_test")
                 .with_dataset(make_duckdb_acceleration_dataset(
                     "csv_test",
                     "csv",
-                    &format!("'{}'", sample_csv_path.display()),
+                    &format!("'{}'", temp_file.path().display()),
                 ))
+                .with_dataset(other_dataset)
                 .build();
 
             let rt = Runtime::builder()
@@ -308,6 +314,16 @@ async fn duckdb_regexp() -> Result<(), String> {
                 (
                     "test_regexp_replace_case_insensitive",
                     "SELECT regexp_replace(region, 'america', 'australia', 'i') FROM csv_test",
+                ),
+                (
+                    "test_regexp_results_match",
+                    "WITH duckdb_regexp_like AS (
+                        SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')
+                    ), arrow_regexp_like AS (
+                        SELECT * FROM csv_test_arrow WHERE regexp_like(region, 'america', 'i')
+                    )
+
+                    SELECT * FROM duckdb_regexp_like d JOIN arrow_regexp_like a ON d.region = a.region",
                 ),
             ];
 

@@ -226,6 +226,25 @@ impl DuckDBRegexpFunction {
         Ok(())
     }
 
+    fn wrap_function(ast_fn: ast::Expr, function_name: &str) -> ast::Expr {
+        ast::Expr::Function(Function {
+            name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+                function_name,
+            ))]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ast_fn))],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        })
+    }
+
     fn postprocess_function(&self, mut ast_fn: ast::Expr) -> datafusion_expr::sqlparser::ast::Expr {
         match self {
             DuckDBRegexpFunction::Match => {
@@ -233,39 +252,11 @@ impl DuckDBRegexpFunction {
                 // DataFusion ``regexp_match`` returns an array with a single string value
                 // wrap the output of the DuckDB function with ``array_value(arg1, ...)``
                 // https://github.com/spiceai/spiceai/issues/6964
-                ast_fn = ast::Expr::Function(Function {
-                    name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
-                        "array_value",
-                    ))]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ast_fn))],
-                        clauses: vec![],
-                    }),
-                    filter: None,
-                    null_treatment: None,
-                    over: None,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                    uses_odbc_syntax: false,
-                });
+                ast_fn = Self::wrap_function(ast_fn, "array_value");
             }
             DuckDBRegexpFunction::Count => {
                 // Wrap the extract array in a ``len()``
-                ast_fn = ast::Expr::Function(Function {
-                    name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("len"))]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ast_fn))],
-                        clauses: vec![],
-                    }),
-                    filter: None,
-                    null_treatment: None,
-                    over: None,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                    uses_odbc_syntax: false,
-                });
+                ast_fn = Self::wrap_function(ast_fn, "len");
             }
             _ => {}
         }
