@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
+use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
