@@ -16,11 +16,12 @@ limitations under the License.
 use arrow::error::ArrowError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, Document, GetIndexError,
-    GetVectorBucketError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
+pub mod bucket_query_provider;
 pub mod index_query_provider;
 pub mod list_provider;
 mod vector_table;
@@ -65,6 +66,9 @@ pub enum Error {
 
     #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
     S3VectorGetBucketError { source: GetVectorBucketError },
+
+    #[snafu(display("Failed to list indexes from S3 Vectors. {source}"))]
+    S3VectorListIndexesError { source: ListIndexesError },
 
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
     S3VectorGetIndexError { source: GetIndexError },
@@ -112,5 +116,9 @@ impl S3VectorIdentifier {
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
             Self::Bucket { name } => (None, Some(name.clone()), None),
         }
+    }
+
+    pub fn is_bucket(&self) -> bool {
+        matches!(self, Self::Bucket { .. })
     }
 }

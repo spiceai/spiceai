@@ -207,7 +207,7 @@ impl S3VectorsQueryIndexExec {
         );
 
         Self {
-            idx: table.table.idx.clone(),
+            idx: table.table.identifier.clone(),
             client: Arc::clone(&table.table.client),
             plan_properties: properties,
             query,

@@ -152,7 +152,7 @@ impl S3VectorsListExec {
         );
 
         Self {
-            idx: table.as_ref().idx.clone(),
+            idx: table.as_ref().identifier.clone(),
             client: Arc::clone(&table.as_ref().client),
             plan_properties: properties,
             limit,

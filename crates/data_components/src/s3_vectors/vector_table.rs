@@ -36,7 +36,7 @@ use snafu::ResultExt;
 /// An S3 Vector index or bucket.
 #[derive(Clone)]
 pub struct S3VectorsTable {
-    pub(super) identifier: S3VectorIdentifier,
+    pub identifier: S3VectorIdentifier,
     pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -98,7 +98,7 @@ impl S3VectorsTable {
         if !Self::check_if_bucket_exists(&client, &id).await? {
             return Ok(S3VectorTableResult::BucketDoesNotExist);
         }
-        if !Self::check_if_index_exists(&id, &client).await? {
+        if !id.is_bucket() && !Self::check_if_index_exists(&id, &client).await? {
             return Ok(S3VectorTableResult::IndexDoesNotExist);
         }
         let schema = Self::compute_schema(columns);
