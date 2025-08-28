@@ -47,9 +47,9 @@ pub enum Error {
     MissingKafkaBootstrapServers,
 
     #[snafu(display(
-        "Failed to parse 'kafka_schema_infer_num_samples' value: {source}. Ensure it is a positive integer and try again."
+        "Failed to parse 'schema_inference_sample_count' value: {source}. Ensure it is a positive integer and try again."
     ))]
-    FailedToParseSchemaInferNumSamples { source: std::num::ParseIntError },
+    FailedToParseSchemaInferenceSampleCount { source: std::num::ParseIntError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,7 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Kafka {
     kafka_config: KafkaConfig,
-    schema_infer_num_samples: Option<usize>,
+    schema_inference_sample_count: Option<usize>,
 }
 
 impl Kafka {
@@ -117,17 +117,20 @@ impl Kafka {
                 }),
         };
 
-        let schema_infer_num_samples = match params.get("schema_infer_num_samples").expose().ok() {
-            Some(v) => match v.parse() {
-                Ok(num) => Some(num),
-                Err(e) => return Err(Error::FailedToParseSchemaInferNumSamples { source: e }),
-            },
-            None => None,
-        };
+        let schema_inference_sample_count =
+            match params.get("schema_inference_sample_count").expose().ok() {
+                Some(v) => match v.parse() {
+                    Ok(num) => Some(num),
+                    Err(e) => {
+                        return Err(Error::FailedToParseSchemaInferenceSampleCount { source: e });
+                    }
+                },
+                None => None,
+            };
 
         Ok(Self {
             kafka_config,
-            schema_infer_num_samples,
+            schema_inference_sample_count,
         })
     }
 }
@@ -174,7 +177,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
-    ParameterSpec::component("schema_infer_num_samples")
+    ParameterSpec::runtime("schema_inference_sample_count")
         .default("1")
         .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
 ];
@@ -249,7 +252,7 @@ impl DataConnector for Kafka {
             dataset,
             topic,
             &self.kafka_config,
-            self.schema_infer_num_samples,
+            self.schema_inference_sample_count,
         )
         .await?;
 
@@ -303,14 +306,14 @@ async fn init_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    schema_infer_num_samples: Option<usize>,
+    schema_inference_sample_count: Option<usize>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
         return bootstrap_new_kafka_consumer(
             dataset,
             topic,
             kafka_config,
-            schema_infer_num_samples,
+            schema_inference_sample_count,
         )
         .await;
     };
@@ -370,7 +373,7 @@ async fn bootstrap_new_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    schema_infer_num_samples: Option<usize>,
+    schema_inference_sample_count: Option<usize>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
@@ -388,13 +391,13 @@ async fn bootstrap_new_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let schema_infer_num_samples = schema_infer_num_samples.unwrap_or(1);
+    let schema_inference_sample_count = schema_inference_sample_count.unwrap_or(1);
 
-    // Read schema_infer_num_samples messages to infer schema
+    // Read schema_inference_sample_count messages to infer schema
     // this is useful when some of the fields could be optional and use 'null'
-    let mut sample_values = Vec::with_capacity(schema_infer_num_samples);
+    let mut sample_values = Vec::with_capacity(schema_inference_sample_count);
 
-    for _ in 0..schema_infer_num_samples {
+    for _ in 0..schema_inference_sample_count {
         match kafka_consumer
             .next_json::<serde_json::Value, serde_json::Value>()
             .await

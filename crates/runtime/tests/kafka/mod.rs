@@ -56,10 +56,7 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
 
             let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT, None);
             let mut options = std::collections::HashMap::new();
-            options.insert(
-                "kafka_schema_infer_num_samples".to_string(),
-                "3".to_string(),
-            );
+            options.insert("schema_inference_sample_count".to_string(), "3".to_string());
             let ds_schema_infer = make_kafka_dataset(
                 "schema_infer_test",
                 "kafka_schema_infer_test",
