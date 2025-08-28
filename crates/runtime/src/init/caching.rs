@@ -76,6 +76,12 @@ impl Runtime {
                     Duration::from_secs(3600),
                     ahash::RandomState::default(),
                 )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash => Arc::new(SimpleCache::new(
+                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
+                    Duration::from_secs(3600),
+                    twox_hash::xxh3::RandomHashBuilder64::default(),
+                )),
             };
 
         caching = caching.with_plans_cache(plan_cache_provider);

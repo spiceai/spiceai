@@ -226,6 +226,12 @@ impl QueryResultsCacheProvider {
                     ttl,
                     std::hash::RandomState::default(),
                 )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash => Arc::new(LruCache::new(
+                    cache_max_size,
+                    ttl,
+                    twox_hash::xxh3::RandomHashBuilder64::default(),
+                )),
             },
             cache_max_size,
             ttl,

@@ -35,6 +35,8 @@ pub enum HashingAlgorithm {
     #[default]
     Siphash,
     Ahash,
+    #[cfg(feature = "xx-hash")]
+    XxHash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
