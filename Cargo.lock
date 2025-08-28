@@ -286,6 +286,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -13484,6 +13485,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "util",
 ]
 
 [[package]]
@@ -15928,6 +15930,7 @@ dependencies = [
  "rand 0.9.2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1081,13 +1081,3 @@ pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
 }
-
-pub fn in_tracing_context<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
-}

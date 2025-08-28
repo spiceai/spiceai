@@ -12,3 +12,4 @@ version.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
+util = { path = "../util" }
