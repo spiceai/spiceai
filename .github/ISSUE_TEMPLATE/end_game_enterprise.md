@@ -40,7 +40,7 @@ assignees: ''
 
 1. **Build Validations**
 
-   - [ ] Ensure all builds (including CUDA) pass on **Linux and Windows**.
+   - [ ] Ensure [builds pass](https://github.com/spicehq/spiceai/actions/workflows/build_and_release.yml) on **Linux and Windows**.
    - [ ] Verify all CI workflows complete without warnings or errors.
 
 1. **Unit/Integration Tests**
@@ -98,7 +98,29 @@ assignees: ''
 ### Post-Docker builds
 Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
-- [ ] Deploy the new docker image to several apps in [SCP](https://spice.ai/). Confirm upgrade and functionality.
+- [ ] Deploy the new docker image to demo and public apps [SCP](https://spice.ai/). Confirm upgrade and functionality.
+  - spicehq:
+    - https://spice.ai/spicehq/s3-vectors-demo
+    - https://spice.ai/spicehq/s3-ai-database
+    - https://spice.ai/spicehq/team-app
+    - https://spice.ai/spicehq/marketing
+    - https://spice.ai/spicehq/nginx-demo
+    - https://spice.ai/spicehq/databricks-demo
+    - https://spice.ai/spicehq/iceberg-ai-demo
+    - https://spice.ai/spicehq/ai-platform
+    - https://spice.ai/spicehq/embedding-server
+  - spiceai:
+    - https://spice.ai/spiceai/react
+    - https://spice.ai/spiceai/tpch
+    - https://spice.ai/spiceai/spiceai
+    - https://spice.ai/spiceai/vercel-ai-sdk
+    - https://spice.ai/spiceai/nginx
+    - https://spice.ai/spiceai/nextjs
+    - https://spice.ai/spiceai/dremio
+    - https://spice.ai/spiceai/fed-demo
+    - https://spice.ai/spiceai/docs
+    - https://spice.ai/spiceai/quickstart
+    - https://spice.ai/spiceai/tailwindcss
 - [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) with both configurations (these will require manual approval by either @lukekim or @phillipleblanc):
  - Standard
    - Docker image: `X.Y.Z-models`
@@ -113,6 +135,12 @@ Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/ac
 
 - [ ] Perform a final test pass on the released binaries and Docker images.
 
-## Post-Release Housekeeping
+## Post-Release Validation and Housekeeping
+- [ ] Notify the team to verify [customer fixes](https://github.com/orgs/spicehq/projects/53)(if any):
+  ```md
+  :rocket: **Enterprise release complete!** Please confirm enterprise customer fixes have been merged and resolved.
+  1. [Constraint violation check is improved to control behavior when violations occur within a batch](https://github.com/spicehq/customer-twilio/issues/77). DRI: @phillipleblanc
+  2. ..
+```
 - [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
