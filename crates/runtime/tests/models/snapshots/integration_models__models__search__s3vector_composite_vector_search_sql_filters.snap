@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "question": "What is created by making a choice?",
+    "answer": "Choices create costs and benefits.",
+    "score": 0.878
+  },
+  {
+    "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\).",
+    "answer": "\\(\\boxed{2a + 4b}\\)",
+    "score": 0.837
+  },
+  {
+    "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\).",
+    "answer": "\\(\\boxed{x = A + E}\\)",
+    "score": 0.828
+  },
+  {
+    "question": "How does the Cat obtain water?",
+    "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey.",
+    "score": 0.806
+  }
+]

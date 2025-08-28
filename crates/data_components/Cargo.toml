@@ -58,7 +58,7 @@ mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
-rdkafka = { version = "0.38.0", features = ["ssl-vendored"], optional = true }
+rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
@@ -86,7 +86,7 @@ util = { path = "../util" }
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-rdkafka = { version = "0.38.0", features = ["cmake-build"], optional = true }
+rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs"]

@@ -1,0 +1,54 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Choices create costs and benefits."
+      },
+      "primary_key": {
+        "id": 863,
+        "question": "What is created by making a choice?"
+      },
+      "score": 0.89
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\(\\boxed{2a + 4b}\\)"
+      },
+      "primary_key": {
+        "id": 1316,
+        "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\)."
+      },
+      "score": 0.84
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\(\\boxed{x = A + E}\\)"
+      },
+      "primary_key": {
+        "id": 590,
+        "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\)."
+      },
+      "score": 0.83
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+      },
+      "primary_key": {
+        "id": 6,
+        "question": "<refined question>"
+      },
+      "score": 0.83
+    }
+  ]
+}
