@@ -22,6 +22,8 @@ use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
+use arrow::array::RecordBatch;
+use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::header::HeaderMap;
@@ -288,12 +290,31 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
+    run_search_w_explain(app, test_cases, false).await
+}
+
+// if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
+pub(crate) async fn run_search_w_explain(
+    app: App,
+    test_cases: Vec<SearchTestCase>,
+    explain_sql: bool,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let client = spiceai::ClientBuilder::new()
+                .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .build()
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to build Spice client with flight address: 'http://{}'",
+                        api_config.flight_bind_address
+                    )
+                });
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -323,6 +344,21 @@ pub(crate) async fn run_search(
                         }
 
                         insta::assert_json_snapshot!(ts.name, resp?);
+
+                        if explain_sql {
+                            let c = client
+                                .query(format!("EXPLAIN {sql}").as_str())
+                                .await?
+                                .try_collect::<Vec<RecordBatch>>()
+                                .await?;
+
+                            let disp = arrow::util::pretty::pretty_format_batches(&c)?;
+
+                            insta::with_settings!({
+                                omit_expression => true,
+                                description => sql
+                            }, {insta::assert_snapshot!(format!("{}_explain", ts.name), disp)});
+                        }
                     }
                 }
             }

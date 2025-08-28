@@ -1,0 +1,37 @@
+---
+source: crates/runtime/tests/models/search.rs
+description: "SELECT id, answer, reference_answer, source, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                               |
+|               |   Projection: vector_search().id, vector_search().answer, vector_search().reference_answer, vector_search().source, trunc(vector_search().score, Int64(3)) AS score |
+|               |     BytesProcessedNode                                                                                                                                              |
+|               |       TableScan: vector_search() projection=[id, answer, reference_answer, source, score]                                                                           |
+| physical_plan | SortPreservingMergeExec: [score@4 DESC], fetch=4                                                                                                                    |
+|               |   SortExec: TopK(fetch=4), expr=[score@4 DESC], preserve_partitioning=[true]                                                                                        |
+|               |     ProjectionExec: expr=[id@0 as id, answer@1 as answer, reference_answer@2 as reference_answer, source@3 as source, trunc(score@4, 3) as score]                   |
+|               |       BytesProcessedExec                                                                                                                                            |
+|               |         ProjectionExec: expr=[id@0 as id, answer@2 as answer, reference_answer@3 as reference_answer, source@4 as source, score@1 as score]                         |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                               |
+|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |               HashJoinExec: mode=Partitioned, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, answer@2, reference_answer@4, source@5]                 |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
+|               |                   RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10                                                                               |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
+|               |                       BytesProcessedExec                                                                                                                            |
+|               |                         ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]                                              |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                     |
+|               |                             BytesProcessedExec                                                                                                                      |
+|               |                               S3VectorsQueryExec: limit=30                                                                                                          |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
+|               |                   RepartitionExec: partitioning=Hash([id@0], 10), input_partitions=10                                                                               |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                           |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                   |
+|               |                         BytesProcessedExec                                                                                                                          |
+|               |                           SchemaCastScanExec                                                                                                                        |
+|               |                             DataSourceExec: partitions=1, partition_sizes=[10]                                                                                      |
+|               |                                                                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+

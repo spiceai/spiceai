@@ -194,6 +194,7 @@ paste.workspace = true
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
+spiceai.workspace = true
 test-framework = { path = "../test-framework" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
