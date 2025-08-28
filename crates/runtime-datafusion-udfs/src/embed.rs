@@ -22,7 +22,7 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::cast::as_string_array;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{Documentation, ScalarFunctionArgs};
+use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::{Result as DataFusionResult, exec_err},
@@ -35,7 +35,7 @@ use tokio::sync::RwLock;
 
 pub static EMBED_UDF_NAME: &str = "embed";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
-    doc_section: Default::default(),
+    doc_section: DocSection::default(),
     description: "Generates embeddings for text using a specified embedding model".to_string(),
     syntax_example: "embed(text, model_name)".to_string(),
     sql_example: Some("SELECT embed('hello world', 'potion_2m')".to_string()),
@@ -50,44 +50,43 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentati
     related_udfs: None,
 });
 
+pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    Signature::one_of(
+        // In order of least likely to auto-coerce, via logical_expr docs for OneOf:
+        // > Coercion is attempted to match the signatures in order,
+        // > and stops after the first success, if any.
+        vec![
+            // embed(make_array(a, b, c), model_name)
+            TypeSignature::Exact(vec![
+                DataType::List(Arc::new(Field::new("sentence", DataType::Utf8, true))),
+                DataType::Utf8,
+            ]),
+            // embed(text, model_name)
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+        ],
+        Volatility::Stable,
+    )
+});
+
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn llms::embeddings::Embed>>;
 
 #[derive(Debug)]
 pub struct Embed {
-    signature: Signature,
     model_store: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl Embed {
     #[must_use]
     pub fn new(model_store: Arc<RwLock<EmbeddingModelStore>>) -> Self {
-        Self {
-            signature: Signature::one_of(
-                // In order of least likely to auto-coerce, via logical_expr docs for OneOf:
-                // > Coercion is attempted to match the signatures in order,
-                // > and stops after the first success, if any.
-                vec![
-                    // embed(make_array(a, b, c), model_name)
-                    TypeSignature::Exact(vec![
-                        DataType::List(Arc::new(Field::new("sentence", DataType::Utf8, true))),
-                        DataType::Utf8,
-                    ]),
-                    // embed(text, model_name)
-                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-                ],
-                Volatility::Stable,
-            ),
-            model_store,
-        }
+        Self { model_store }
     }
 
     fn embed_single(
-        &self,
         model: &Arc<dyn llms::embeddings::Embed>,
-        sentence: &String,
+        sentence: &str,
     ) -> DataFusionResult<ColumnarValue> {
         let embedding = model
-            .embed_sync(EmbeddingInput::String(sentence.clone()))
+            .embed_sync(EmbeddingInput::String(sentence.to_owned()))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let vector_size = embedding[0].len();
 
@@ -103,7 +102,6 @@ impl Embed {
     }
 
     fn embed_multiple<'a>(
-        &self,
         model: &Arc<dyn llms::embeddings::Embed>,
         sentences: impl Iterator<Item = Option<&'a str>>,
     ) -> DataFusionResult<ColumnarValue> {
@@ -138,7 +136,7 @@ impl ScalarUDFImpl for Embed {
     }
 
     fn signature(&self) -> &Signature {
-        &self.signature
+        &SIGNATURE
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
@@ -169,28 +167,27 @@ impl ScalarUDFImpl for Embed {
         let text_arg = &args.args[0];
         let model_arg = &args.args[1];
 
-        let model_name = match model_arg {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) => model_name,
-            _ => return exec_err!("{EMBED_UDF_NAME} unsupported model parameter: {model_arg}"),
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) = model_arg else {
+            return exec_err!("{EMBED_UDF_NAME} unsupported model parameter: {model_arg}");
         };
 
-        let model_store = match self.model_store.try_read() {
-            Ok(model_store) => model_store,
-            _ => return exec_err!("{EMBED_UDF_NAME} cannot read model_store"),
+        let Ok(model_store) = self.model_store.try_read() else {
+            return exec_err!("{EMBED_UDF_NAME} cannot read model_store");
         };
 
-        let model = match model_store.get(model_name) {
-            Some(model) => model,
-            _ => return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}"),
+        let Some(model) = model_store.get(model_name) else {
+            return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}");
         };
 
         match text_arg {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) => self.embed_single(model, text),
-            ColumnarValue::Array(arr) => self.embed_multiple(model, as_string_array(arr)?.iter()),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) => Self::embed_single(model, text),
+            ColumnarValue::Array(arr) => Self::embed_multiple(model, as_string_array(arr)?.iter()),
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
-                self.embed_multiple(model, as_string_array(arr.value(0).as_ref())?.iter())
+                Self::embed_multiple(model, as_string_array(arr.value(0).as_ref())?.iter())
             }
-            unsupported_text_arg => exec_err!("Unsupported text argument: {unsupported_text_arg}"),
+            unsupported_text_arg @ ColumnarValue::Scalar(_) => {
+                exec_err!("Unsupported text argument: {unsupported_text_arg}")
+            }
         }
     }
 
@@ -225,7 +222,7 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap(),
+                .expect("Model2Vec creation should succeed"),
             ) as Arc<dyn llms::embeddings::Embed>,
         );
         Arc::new(RwLock::new(store))
@@ -288,20 +285,25 @@ mod tests {
             1,
         );
 
-        let result = udf.invoke_with_args(args).unwrap();
+        let result = udf
+            .invoke_with_args(args)
+            .expect("UDF invocation should succeed");
         match result {
             ColumnarValue::Array(arr) => {
-                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                let list_arr = arr
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("Should be ListArray");
                 assert_eq!(list_arr.len(), 1, "Expected 1 embedding vector");
 
                 let inner_list = list_arr.value(0);
                 let float_arr = inner_list
                     .as_any()
                     .downcast_ref::<arrow::array::Float32Array>()
-                    .unwrap();
+                    .expect("Should be Float32Array");
                 assert_eq!(float_arr.len(), 64, "Expected embedding dimension of 64");
             }
-            _ => panic!("Expected Array result for single sentence"),
+            ColumnarValue::Scalar(_) => panic!("Expected Array result for single sentence"),
         }
     }
 
@@ -324,27 +326,32 @@ mod tests {
             2,
         );
 
-        let result = udf.invoke_with_args(args).unwrap();
+        let result = udf
+            .invoke_with_args(args)
+            .expect("UDF invocation should succeed");
         match result {
             ColumnarValue::Array(arr) => {
-                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                let list_arr = arr
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("Should be ListArray");
                 assert_eq!(list_arr.len(), 1, "Expected 1 outer list");
 
                 let inner_list = list_arr.value(0);
-                let inner_list_arr = as_list_array(&inner_list).unwrap();
+                let inner_list_arr = as_list_array(&inner_list).expect("Should be inner ListArray");
                 assert_eq!(inner_list_arr.len(), 2, "Expected 2 embedding vectors");
 
                 assert!(
                     inner_list_arr.iter().flatten().all(|a| a
                         .as_any()
                         .downcast_ref::<arrow::array::Float32Array>()
-                        .unwrap()
+                        .expect("Should be Float32Array")
                         .len()
                         == 64),
                     "All embedding vectors should be dimension 64"
                 );
             }
-            _ => panic!("Expected Array result for multiple sentences"),
+            ColumnarValue::Scalar(_) => panic!("Expected Array result for multiple sentences"),
         }
     }
 
@@ -368,14 +375,19 @@ mod tests {
             3,
         );
 
-        let result = udf.invoke_with_args(args).unwrap();
+        let result = udf
+            .invoke_with_args(args)
+            .expect("UDF invocation should succeed");
         match result {
             ColumnarValue::Array(arr) => {
-                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                let list_arr = arr
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("Should be ListArray");
                 assert_eq!(list_arr.len(), 1, "Expected 1 outer list");
 
                 let inner_list = list_arr.value(0);
-                let inner_list_arr = as_list_array(&inner_list).unwrap();
+                let inner_list_arr = as_list_array(&inner_list).expect("Should be inner ListArray");
                 assert_eq!(
                     inner_list_arr.len(),
                     3,
@@ -388,13 +400,15 @@ mod tests {
                     inner_list_arr.iter().flatten().all(|a| a
                         .as_any()
                         .downcast_ref::<arrow::array::Float32Array>()
-                        .unwrap()
+                        .expect("Should be Float32Array")
                         .len()
                         == 64),
                     "All non-null embedding vectors should be dimension 64"
                 );
             }
-            _ => panic!("Expected Array result for multiple sentences with null"),
+            ColumnarValue::Scalar(_) => {
+                panic!("Expected Array result for multiple sentences with null")
+            }
         }
     }
 }
