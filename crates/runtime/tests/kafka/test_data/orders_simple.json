@@ -1,0 +1,60 @@
+[
+  {
+    "order_id": "9e5c8a79-4f7b-4c30-9c27-1f0a4ddc1a16",
+    "custkey": 482,
+    "partkey": 215,
+    "suppkey": 77,
+    "quantity": 42,
+    "unit_price": 28.9,
+    "order_date": "2025-08-27",
+    "order_ts": "2025-08-27 16:02:11",
+    "shipped": false,
+    "tags": ["standard"]
+  },
+  {
+    "order_id": "0e1b8a8f-2c5b-4f1e-9e3c-0d2a3b4c5d6e",
+    "custkey": 17,
+    "partkey": 499,
+    "suppkey": 263,
+    "quantity": 6,
+    "unit_price": 316,
+    "order_date": "2025-08-27",
+    "order_ts": "2025-08-27 16:05:22",
+    "shipped": true,
+    "tags": ["express", "gift"]
+  },
+  {
+    "order_id": "c3b2a1d4-7e8f-4c9b-92a3-5e6f7a8b9c01",
+    "custkey": 901,
+    "partkey": 12,
+    "suppkey": 145,
+    "quantity": 87,
+    "unit_price": 742,
+    "order_date": "2025-08-26",
+    "order_ts": "2025-08-26 11:20:00",
+    "shipped": false
+  },
+  {
+    "order_id": "f61a9b30-1a2b-426b-95a2-07e2b9b3b0aa",
+    "custkey": 256,
+    "partkey": 333,
+    "suppkey": 12,
+    "quantity": 58,
+    "unit_price": 119.99,
+    "order_date": "2025-08-26",
+    "order_ts": "2025-08-26 12:45:10",
+    "shipped": true
+  },
+  {
+    "order_id": "8b92c6fe-7ce5-4f99-9a74-d0d3de7dc1f2",
+    "custkey": 774,
+    "partkey": 287,
+    "suppkey": 300,
+    "quantity": 13,
+    "unit_price": 987.5,
+    "order_date": "2025-08-25",
+    "order_ts": "2025-08-25 09:15:45",
+    "shipped": false,
+    "tags": []
+  }
+]
