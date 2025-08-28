@@ -12011,6 +12011,7 @@ dependencies = [
  "prost 0.13.5",
  "rand 0.9.2",
  "rayon",
+ "rdkafka",
  "regex",
  "reqwest",
  "rmcp",
