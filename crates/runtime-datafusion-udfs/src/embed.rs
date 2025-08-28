@@ -211,7 +211,7 @@ mod tests {
 
     fn create_fake_model_store() -> Arc<RwLock<EmbeddingModelStore>> {
         use std::collections::HashMap;
-        
+
         let mut store = HashMap::new();
         store.insert(
             "potion_2m".to_string(),
@@ -376,7 +376,11 @@ mod tests {
 
                 let inner_list = list_arr.value(0);
                 let inner_list_arr = as_list_array(&inner_list).unwrap();
-                assert_eq!(inner_list_arr.len(), 3, "Expected 3 entries (2 embeddings + 1 null)");
+                assert_eq!(
+                    inner_list_arr.len(),
+                    3,
+                    "Expected 3 entries (2 embeddings + 1 null)"
+                );
 
                 assert!(inner_list_arr.is_null(1), "Expected null at index 1");
 
