@@ -90,7 +90,7 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
-notify = "8.0.0"
+notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
