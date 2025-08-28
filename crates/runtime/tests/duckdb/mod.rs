@@ -243,13 +243,14 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
         .scope(async {
             let sample_csv_contents = include_str!("../test_data/regions.csv");
-            let mut temp_file = NamedTempFile::new().expect("Should create temp file");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
             std::fs::write(temp_file.path(), sample_csv_contents)
                 .expect("failed to write sample file");
 
