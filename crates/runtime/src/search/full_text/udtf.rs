@@ -51,7 +51,7 @@ use search::generation::text_search::{
 use crate::{
     datafusion::DataFusion,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
@@ -115,6 +115,33 @@ impl TextSearchTableFunc {
 }
 
 impl TextSearchTableFunc {
+    pub(crate) fn to_expr(args: &TextSearchTableFuncArgs) -> Vec<Expr> {
+        let mut expr = vec![
+            Expr::Column(to_column_expr(&args.tbl)),
+            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
+        ];
+
+        if let Some(col) = args.column.as_ref() {
+            expr.push(Expr::Column(Column::new_unqualified(col)));
+        }
+
+        if let Some(limit) = args.limit {
+            expr.push(Expr::Literal(
+                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
+                None,
+            ));
+        }
+
+        if let Some(include_score) = args.include_score {
+            expr.push(Expr::Literal(
+                ScalarValue::Boolean(Some(include_score)),
+                None,
+            ));
+        }
+
+        expr
+    }
+
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
         let mut args = args.iter();
 

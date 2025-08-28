@@ -151,7 +151,7 @@ impl VectorSearchTableFunc {
         }
         if let Some(limit) = args.limit {
             expr.push(Expr::Literal(
-                ScalarValue::Int64(Some(i64::try_from(limit).unwrap_or(i64::MAX))),
+                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
                 None,
             ));
         }
@@ -190,7 +190,7 @@ impl VectorSearchTableFunc {
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)), None, None) => {
+            (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)), None, None) => {
                 (None, Some(*limit), Some(true))
             }
             (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)), None, None) => {
@@ -200,7 +200,7 @@ impl VectorSearchTableFunc {
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
                 None,
             ) => (Some(col.clone()), Some(*limit), Some(true)),
             (
@@ -209,7 +209,7 @@ impl VectorSearchTableFunc {
                 None,
             ) => (Some(col.clone()), None, Some(*include_score)),
             (
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
             ) => (None, Some(*limit), Some(*include_score)),
@@ -217,7 +217,7 @@ impl VectorSearchTableFunc {
             // All three arguments provided
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
             ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
 
