@@ -47,37 +47,37 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
             // DuckDB dialect: regexp_matches(string, pattern[, options])
             // DataFusion dialect: regexp_like(str, regexp[, flags])
             REGEXP_LIKE_NAME,
-            Box::new(duckdb::regexp_to_function(
-                duckdb::REGEXP_LIKE_NAME,
-                REGEXP_LIKE_FLAGS_POSITION,
-            )) as ScalarFnToSqlHandler,
+            Box::new(
+                duckdb::DuckDBRegexpFunction::Like
+                    .to_datafusion_function(REGEXP_LIKE_FLAGS_POSITION),
+            ) as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: regexp_extract(string, pattern[, group = 0, options])
             // DataFusion dialect: regexp_match(str, regexp[, flags])
             REGEXP_MATCH_NAME,
-            Box::new(duckdb::regexp_to_function(
-                duckdb::REGEXP_MATCH_NAME,
-                REGEXP_MATCH_FLAGS_POSITION,
-            )) as ScalarFnToSqlHandler,
+            Box::new(
+                duckdb::DuckDBRegexpFunction::Match
+                    .to_datafusion_function(REGEXP_MATCH_FLAGS_POSITION),
+            ) as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: regexp_replace(string, pattern, replacement[, options])
-            // DataFusion dialect: regexp_match(str, regexp, replacement[, flags])
+            // DataFusion dialect: regexp_replace(str, regexp, replacement[, flags])
             REGEXP_REPLACE_NAME,
-            Box::new(duckdb::regexp_to_function(
-                duckdb::REGEXP_REPLACE_NAME,
-                REGEXP_REPLACE_FLAGS_POSITION,
-            )) as ScalarFnToSqlHandler,
+            Box::new(
+                duckdb::DuckDBRegexpFunction::Replace
+                    .to_datafusion_function(REGEXP_REPLACE_FLAGS_POSITION),
+            ) as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: len(regex_extract_all(string, pattern[, group = 0, options]))
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
-            Box::new(duckdb::regexp_to_function(
-                duckdb::REGEXP_COUNT_NAME,
-                REGEXP_COUNT_FLAGS_POSITION,
-            )) as ScalarFnToSqlHandler,
+            Box::new(
+                duckdb::DuckDBRegexpFunction::Count
+                    .to_datafusion_function(REGEXP_COUNT_FLAGS_POSITION),
+            ) as ScalarFnToSqlHandler,
         ),
     ]);
 
