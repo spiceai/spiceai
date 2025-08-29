@@ -114,28 +114,25 @@ async fn mongodb_integration_test() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_mongodb_docker_container(MONGODB_PORT1)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("start_mongodb_docker_container: {e}");
-                        e.to_string()
-                    })?;
+            let running_container = start_mongodb_docker_container(MONGODB_PORT1)
+                .await
+                .map_err(|e| {
+                    tracing::error!("start_mongodb_docker_container: {e}");
+                    e.to_string()
+                })?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mongodb_db(MONGODB_PORT1)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("Failed transiently  to initialize MongoDB database: {e}");
-                        RetryError::transient(e)
-                    })
+                init_mongodb_db(MONGODB_PORT1).await.map_err(|e| {
+                    tracing::error!("Failed transiently  to initialize MongoDB database: {e}");
+                    RetryError::transient(e)
+                })
             })
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to initialize MongoDB database: {e}");
-                    e.to_string()
-                })?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MongoDB database: {e}");
+                e.to_string()
+            })?;
             let app = AppBuilder::new("mongodb_integration_test")
                 .with_dataset(make_mongodb_dataset("test", "test", MONGODB_PORT1, false))
                 .build();
@@ -186,7 +183,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
                     false, // can't snapshot this plan
                     validate_result,
                 )
-                    .await?;
+                .await?;
             }
 
             running_container.remove().await.map_err(|e| {
