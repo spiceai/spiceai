@@ -113,7 +113,7 @@ datafusion-expr = "48.0.1"
 datafusion-federation = { version = "0.4.2", features = ["sql"] }
 datafusion-functions-json = "0.48"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.12", features = ["default-engine", "arrow-55"] }
+delta_kernel = { version = "0.14", features = ["default-engine", "arrow-55", "internal-api"] }
 dotenvy = "0.15"
 duckdb = "1.3.2"
 fundu = "2.0.1"

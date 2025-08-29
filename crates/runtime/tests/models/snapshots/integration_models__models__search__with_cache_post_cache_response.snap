@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -8,22 +9,22 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.cached_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Programmes receive just likely, key homes. Relevant"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 11
       },
-      "score": 0.94
+      "score": 0.61
     },
     {
       "dataset": "spice.public.cached_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 8
       },
-      "score": 0.93
+      "score": 0.59
     }
   ]
 }
