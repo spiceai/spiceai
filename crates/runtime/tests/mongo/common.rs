@@ -58,7 +58,7 @@ pub async fn start_mongodb_docker_container(
     let container_name = format!("{MONGODB_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
     let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(format!("{}mongo:latest", container_registry()))
+        .image("mongo:latest".to_string())
         .add_port_binding(27017, port)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
