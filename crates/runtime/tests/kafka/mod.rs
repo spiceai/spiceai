@@ -39,19 +39,34 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
             let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, "orders").await?;
+                start_kafka_docker_container(KAFKA_PORT, &["orders", "schema_infer_test"]).await?;
 
             tracing::debug!("Container started");
 
+            // Load test data for orders representing the simple case where all fields are present in the first topic message
             let orders_simple: Vec<serde_json::Value> =
                 serde_json::from_str(include_str!("./test_data/orders_simple.json"))?;
-
             send_messages_to_kafka(&producer, "orders", &orders_simple).await?;
 
-            let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT);
+            // Load test data for orders representing a more complex schema inference case where
+            // the first messages do not have all fields present and some contain nulls
+            let orders_schema_infer: Vec<serde_json::Value> =
+                serde_json::from_str(include_str!("./test_data/orders_schema_infer.json"))?;
+            send_messages_to_kafka(&producer, "schema_infer_test", &orders_schema_infer).await?;
+
+            let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT, None);
+            let mut options = std::collections::HashMap::new();
+            options.insert("schema_inference_sample_count".to_string(), "3".to_string());
+            let ds_schema_infer = make_kafka_dataset(
+                "schema_infer_test",
+                "kafka_schema_infer_test",
+                KAFKA_PORT,
+                Some(options),
+            );
 
             let app = AppBuilder::new("kafka_sasl_connect_test")
                 .with_dataset(ds)
+                .with_dataset(ds_schema_infer)
                 .build();
 
             let rt = Runtime::builder()
@@ -74,14 +89,18 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             // Ensure all messages are processed
             sleep(Duration::from_secs(2)).await;
 
-            run_and_snapshot_query(&rt, "describe kafka_orders", "orders_simple_schema").await?;
+            for table in ["kafka_orders", "kafka_schema_infer_test"] {
+                let schema_snapshot = format!("{table}_schema");
+                let data_snapshot = format!("{table}_data");
 
-            run_and_snapshot_query(
-                &rt,
-                "select * from kafka_orders order by order_id",
-                "orders_simple",
-            )
-            .await?;
+                run_and_snapshot_query(&rt, &format!("describe {table}"), &schema_snapshot).await?;
+                run_and_snapshot_query(
+                    &rt,
+                    &format!("select * from {table} order by order_id"),
+                    &data_snapshot,
+                )
+                .await?;
+            }
 
             rt.shutdown().await;
             drop(rt);

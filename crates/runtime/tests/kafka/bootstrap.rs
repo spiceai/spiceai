@@ -34,7 +34,7 @@ pub const KAFKA_SASL_MECHANISM: &str = "SCRAM-SHA-256";
 #[instrument]
 pub async fn start_kafka_docker_container(
     port: u16,
-    topic: &str,
+    topics: &[&str],
 ) -> Result<(RunningContainer<'static>, FutureProducer), anyhow::Error> {
     let container_name = format!("{KAFKA_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
@@ -81,18 +81,20 @@ pub async fn start_kafka_docker_container(
     )
     .await?);
 
-    tracing::debug!(
-        "Kafka topic creation command result: {}",
-        running_container
-            .exec_cmd(&format!(
-                "rpk topic create {topic} \
-            --brokers localhost:{port} \
-            --user {KAFKA_SASL_USERNAME} \
-            --password {KAFKA_SASL_PASSWORD} \
-            --sasl-mechanism {KAFKA_SASL_MECHANISM}"
-            ),)
-            .await?
-    );
+    for topic in topics {
+        tracing::debug!(
+            "Kafka topic '{topic}' creation command result: {}",
+            running_container
+                .exec_cmd(&format!(
+                    "rpk topic create {topic} \
+                --brokers localhost:{port} \
+                --user {KAFKA_SASL_USERNAME} \
+                --password {KAFKA_SASL_PASSWORD} \
+                --sasl-mechanism {KAFKA_SASL_MECHANISM}"
+                ),)
+                .await?
+        );
+    }
 
     Ok((
         running_container,
@@ -149,9 +151,13 @@ where
     Ok(())
 }
 
-pub fn make_kafka_dataset(path: &str, name: &str, port: u16) -> Dataset {
-    let mut dataset = Dataset::new(format!("kafka:{path}"), name.to_string());
-    let params = HashMap::from([
+pub fn make_kafka_dataset(
+    path: &str,
+    name: &str,
+    port: u16,
+    extra_params: Option<HashMap<String, String>>,
+) -> Dataset {
+    let mut params = HashMap::from([
         (
             "kafka_bootstrap_servers".to_string(),
             format!("localhost:{port}"),
@@ -173,6 +179,12 @@ pub fn make_kafka_dataset(path: &str, name: &str, port: u16) -> Dataset {
             KAFKA_SASL_PASSWORD.to_string(),
         ),
     ]);
+
+    if let Some(extra) = extra_params {
+        params.extend(extra);
+    }
+
+    let mut dataset = Dataset::new(format!("kafka:{path}"), name.to_string());
     dataset.params = Some(DatasetParams::from_string_map(params));
 
     // Kafka connector requires Append mode acceleration

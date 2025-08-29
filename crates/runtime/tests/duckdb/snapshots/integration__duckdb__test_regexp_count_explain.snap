@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                     |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                       |
+|               |   Federated                                                                                                                                              |
+|               |  Projection: regexp_count(csv_test.region, Utf8("AMERICA"))                                                                                              |
+|               |   TableScan: csv_test projection=[region]                                                                                                                |
+| physical_plan | BytesProcessedExec                                                                                                                                       |
+|               |   SchemaCastScanExec                                                                                                                                     |
+|               |     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT len(regexp_extract_all("csv_test"."region", 'AMERICA')) FROM "csv_test" |
+|               |                                                                                                                                                          |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------+

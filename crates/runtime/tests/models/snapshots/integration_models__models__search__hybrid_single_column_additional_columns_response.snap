@@ -1,59 +1,63 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
       "data": {
-        "question": "<refined question>"
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": "<refined question>"
-      },
-      "primary_key": {
-        "id": 6
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants.",
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "id": 361
       },
+      "score": 0.03
+    },
+    {
+      "data": {
+        "question": "How many groups of 2 are in 14?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "How many groups of 2 are in 14?"
+      },
+      "primary_key": {
+        "id": 462
+      },
       "score": 0.01
     },
     {
       "data": {
-        "question": "Evaluate \\(2^{1/2}\\)."
+        "question": "How many groups of 3 are in 18?"
       },
       "dataset": "qs",
       "matches": {
-        "question": "Evaluate \\(2^{1/2}\\)."
+        "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
-        "id": 151
+        "id": 463
       },
       "score": 0.01
     },
     {
       "data": {
-        "question": "What is the mode of the following data: 70 (10 times), 55 (5 times)?"
+        "question": "How many groups of 5 are in 25?"
       },
       "dataset": "qs",
       "matches": {
-        "question": "What is the mode of the following data: 70 (10 times), 55 (5 times)?"
+        "question": "How many groups of 5 are in 25?"
       },
       "primary_key": {
-        "id": 989
+        "id": 464
       },
       "score": 0.01
     }

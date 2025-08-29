@@ -1,23 +1,11 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "data": {
-        "question": "<refined question>"
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": "<refined question>"
-      },
-      "primary_key": {
-        "id": 6
-      },
-      "score": 0.01
-    },
     {
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
@@ -28,6 +16,19 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 525
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "primary_key": {
+        "id": 361
       },
       "score": 0.01
     },
@@ -46,14 +47,14 @@ expression: normalize_search_response(resp)
     },
     {
       "data": {
-        "question": "Evaluate \\(2^{1/2}\\)."
+        "question": "How many groups of 2 are in 14?"
       },
       "dataset": "qs",
       "matches": {
-        "question": "Evaluate \\(2^{1/2}\\)."
+        "question": "How many groups of 2 are in 14?"
       },
       "primary_key": {
-        "id": 151
+        "id": 462
       },
       "score": 0.01
     }

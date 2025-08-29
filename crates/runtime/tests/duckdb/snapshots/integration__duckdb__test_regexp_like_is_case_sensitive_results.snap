@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
+++
+++
