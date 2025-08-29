@@ -16,11 +16,12 @@ limitations under the License.
 
 //! [`ScalarUDFImpl`] definitions for embedding function.
 
+use arrow::array::Array;
 use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
-use datafusion::common::cast::as_string_array;
+use datafusion::common::cast::{as_large_string_array, as_string_array};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
@@ -70,6 +71,18 @@ pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn llms::embeddings::Embed>>;
 
+macro_rules! string_array_iter {
+    ($array:expr) => {{
+        let iter: Box<dyn Iterator<Item = Option<&str>>> = match $array.data_type() {
+            &DataType::Utf8 => Box::new(as_string_array($array)?.iter()),
+            &DataType::LargeUtf8 => Box::new(as_large_string_array($array)?.iter()),
+            other_data_type => return exec_err!("Expected strings, got {other_data_type:?}"),
+        };
+
+        iter
+    }};
+}
+
 #[derive(Debug)]
 pub struct Embed {
     model_store: Arc<RwLock<EmbeddingModelStore>>,
@@ -88,7 +101,10 @@ impl Embed {
         let embedding = model
             .embed_sync(EmbeddingInput::String(sentence.to_owned()))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let vector_size = embedding[0].len();
+        let vector_size = match embedding.first() {
+            Some(embedding) => embedding.len(),
+            _ => unreachable!("Should have at least one embedding"),
+        };
 
         let mut builder = ListBuilder::with_capacity(
             PrimitiveBuilder::<Float32Type>::with_capacity(vector_size),
@@ -140,15 +156,15 @@ impl ScalarUDFImpl for Embed {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
-        match &arg_types[0] {
+        match arg_types.first() {
             // Embed single sentence
-            DataType::Utf8 => Ok(DataType::List(Arc::new(Field::new(
+            Some(DataType::Utf8 | DataType::LargeUtf8) => Ok(DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::Float32,
                 true,
             )))),
             // Embed multiple sentences
-            DataType::List(_) => Ok(DataType::List(Arc::new(Field::new(
+            Some(DataType::List(_)) => Ok(DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::List(Arc::new(Field::new("embedding", DataType::Float32, true))),
                 true,
@@ -180,10 +196,21 @@ impl ScalarUDFImpl for Embed {
         };
 
         match text_arg {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) => Self::embed_single(model, text),
-            ColumnarValue::Array(arr) => Self::embed_multiple(model, as_string_array(arr)?.iter()),
+            ColumnarValue::Array(arr) => Self::embed_multiple(model, string_array_iter!(arr)),
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
+            ) => Self::embed_single(model, text),
+            ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
+                let inner_array = arr.value(0);
+                Self::embed_multiple(model, string_array_iter!(&inner_array))
+            }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
-                Self::embed_multiple(model, as_string_array(arr.value(0).as_ref())?.iter())
+                let inner_array = arr.value(0);
+                Self::embed_multiple(model, string_array_iter!(&inner_array))
+            }
+            ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
+                let inner_array = arr.value(0);
+                Self::embed_multiple(model, string_array_iter!(&inner_array))
             }
             unsupported_text_arg @ ColumnarValue::Scalar(_) => {
                 exec_err!("Unsupported text argument: {unsupported_text_arg}")
@@ -199,12 +226,52 @@ impl ScalarUDFImpl for Embed {
 #[cfg(test)]
 mod tests {
     use crate::embed::{Embed, EmbeddingModelStore};
+    use arrow::array::LargeListBuilder;
+    use arrow::array::LargeStringArray;
+    use arrow::array::StringBuilder;
+    use arrow::array::{FixedSizeListBuilder, LargeStringBuilder};
     use arrow_schema::{DataType, Field};
     use datafusion::common::cast::as_list_array;
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
     use llms::model2vec::Model2Vec;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    macro_rules! assert_multiple_embedding_result {
+        ($result:expr, $expected_inner_len:expr, $expected_dim:expr) => {{
+            match $result {
+                ColumnarValue::Array(arr) => {
+                    let list_arr = arr
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("Should be ListArray");
+                    assert_eq!(list_arr.len(), 1, "Expected {} outer list", 1);
+
+                    let inner_list = list_arr.value(0);
+                    let inner_list_arr =
+                        as_list_array(&inner_list).expect("Should be inner ListArray");
+                    assert_eq!(
+                        inner_list_arr.len(),
+                        $expected_inner_len,
+                        "Expected {} embedding vectors",
+                        $expected_inner_len
+                    );
+
+                    assert!(
+                        inner_list_arr.iter().flatten().all(|a| a
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .expect("Should be Float32Array")
+                            .len()
+                            == $expected_dim),
+                        "All embedding vectors should be dimension {}",
+                        $expected_dim
+                    );
+                }
+                ColumnarValue::Scalar(_) => panic!("Expected Array result for multiple sentences"),
+            }
+        }};
+    }
 
     fn create_fake_model_store() -> Arc<RwLock<EmbeddingModelStore>> {
         use std::collections::HashMap;
@@ -329,30 +396,8 @@ mod tests {
         let result = udf
             .invoke_with_args(args)
             .expect("UDF invocation should succeed");
-        match result {
-            ColumnarValue::Array(arr) => {
-                let list_arr = arr
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .expect("Should be ListArray");
-                assert_eq!(list_arr.len(), 1, "Expected 1 outer list");
 
-                let inner_list = list_arr.value(0);
-                let inner_list_arr = as_list_array(&inner_list).expect("Should be inner ListArray");
-                assert_eq!(inner_list_arr.len(), 2, "Expected 2 embedding vectors");
-
-                assert!(
-                    inner_list_arr.iter().flatten().all(|a| a
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .expect("Should be Float32Array")
-                        .len()
-                        == 64),
-                    "All embedding vectors should be dimension 64"
-                );
-            }
-            ColumnarValue::Scalar(_) => panic!("Expected Array result for multiple sentences"),
-        }
+        assert_multiple_embedding_result!(result, 2, 64);
     }
 
     #[test]
@@ -378,37 +423,89 @@ mod tests {
         let result = udf
             .invoke_with_args(args)
             .expect("UDF invocation should succeed");
+
+        assert_multiple_embedding_result!(result.clone(), 3, 64);
+
+        // Check the null element manually
         match result {
             ColumnarValue::Array(arr) => {
                 let list_arr = arr
                     .as_any()
                     .downcast_ref::<ListArray>()
                     .expect("Should be ListArray");
-                assert_eq!(list_arr.len(), 1, "Expected 1 outer list");
-
                 let inner_list = list_arr.value(0);
                 let inner_list_arr = as_list_array(&inner_list).expect("Should be inner ListArray");
-                assert_eq!(
-                    inner_list_arr.len(),
-                    3,
-                    "Expected 3 entries (2 embeddings + 1 null)"
-                );
-
                 assert!(inner_list_arr.is_null(1), "Expected null at index 1");
-
-                assert!(
-                    inner_list_arr.iter().flatten().all(|a| a
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .expect("Should be Float32Array")
-                        .len()
-                        == 64),
-                    "All non-null embedding vectors should be dimension 64"
-                );
             }
             ColumnarValue::Scalar(_) => {
                 panic!("Expected Array result for multiple sentences with null")
             }
+        }
+    }
+
+    #[test]
+    fn test_embed_multiple_with_coercions() {
+        use arrow::array::{Array, ListArray};
+        use datafusion::logical_expr::ColumnarValue;
+        use datafusion::scalar::ScalarValue;
+
+        let fake_model_store = create_fake_model_store();
+        let udf = Embed::new(fake_model_store);
+
+        let mut fixed_size_utf8 = FixedSizeListBuilder::new(StringBuilder::new(), 2);
+        fixed_size_utf8.values().append_value("hello");
+        fixed_size_utf8.values().append_value("world");
+        fixed_size_utf8.append(true);
+
+        let mut fixed_size_large_utf8 = FixedSizeListBuilder::new(LargeStringBuilder::new(), 2);
+        fixed_size_large_utf8.values().append_value("hello");
+        fixed_size_large_utf8.values().append_value("world");
+        fixed_size_large_utf8.append(true);
+
+        let mut large_list_utf8 = LargeListBuilder::new(StringBuilder::new());
+        large_list_utf8.values().append_value("hello");
+        large_list_utf8.values().append_value("world");
+        large_list_utf8.append(true);
+
+        let mut large_list_large_utf8 = LargeListBuilder::new(LargeStringBuilder::new());
+        large_list_large_utf8.values().append_value("hello");
+        large_list_large_utf8.values().append_value("world");
+        large_list_large_utf8.append(true);
+
+        let similar_values = vec![
+            // Array<LargeUtf8>
+            ColumnarValue::Array(Arc::new(LargeStringArray::from(vec![
+                Some("hello"),
+                Some("world"),
+            ]))),
+            // FixedSizeList<Utf8>
+            ColumnarValue::Scalar(ScalarValue::FixedSizeList(Arc::new(
+                fixed_size_utf8.finish(),
+            ))),
+            // FixedSizeList<LargeUtf8>
+            ColumnarValue::Scalar(ScalarValue::FixedSizeList(Arc::new(
+                fixed_size_large_utf8.finish(),
+            ))),
+            // LargeList<Utf8>
+            ColumnarValue::Scalar(ScalarValue::LargeList(Arc::new(large_list_utf8.finish()))),
+            // LargeList<LargeUtf8>
+            ColumnarValue::Scalar(ScalarValue::LargeList(Arc::new(
+                large_list_large_utf8.finish(),
+            ))),
+        ];
+
+        for values in similar_values {
+            let args = create_scalar_function_args(
+                &udf,
+                values,
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("potion_2m".to_string()))),
+                2,
+            );
+            let result = udf
+                .invoke_with_args(args)
+                .expect("UDF invocation should succeed");
+
+            assert_multiple_embedding_result!(result, 2, 64);
         }
     }
 }
