@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
+use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -278,10 +279,7 @@ impl RuntimeBuilder {
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
-        // TODO: embed UDF needs access to the EmbeddingModelStore singleton, so it lives here
-        rt.df
-            .ctx
-            .register_udf(runtime_datafusion_udfs::embed::Embed::new(rt.embeds()).into());
+        register_udfs(&rt);
 
         rt
     }
