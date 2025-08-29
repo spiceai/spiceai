@@ -13,12 +13,12 @@ description: "Query: tpch_q4"
 |               |           Projection: orders.o_orderkey, orders.o_orderpriority                                                                                 |
 |               |             BytesProcessedNode                                                                                                                  |
 |               |               Filter: orders.o_orderdate >= Date32("1993-07-01") AND orders.o_orderdate < Date32("1993-10-01")                                  |
-|               |                 TableScan: orders projection=[o_orderkey, o_orderdate, o_orderpriority]                                                         |
+|               |                 TableScan: orders projection=[o_orderdate, o_orderkey, o_orderpriority]                                                         |
 |               |           SubqueryAlias: __correlated_sq_1                                                                                                      |
 |               |             Projection: lineitem.l_orderkey                                                                                                     |
 |               |               BytesProcessedNode                                                                                                                |
 |               |                 Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                          |
-|               |                   TableScan: lineitem projection=[l_receiptdate, l_commitdate, l_orderkey]                                                      |
+|               |                   TableScan: lineitem projection=[l_commitdate, l_orderkey, l_receiptdate]                                                      |
 | physical_plan | SortPreservingMergeExec: [o_orderpriority@0 ASC NULLS LAST]                                                                                     |
 |               |   SortExec: expr=[o_orderpriority@0 ASC NULLS LAST], preserve_partitioning=[true]                                                               |
 |               |     ProjectionExec: expr=[o_orderpriority@0 as o_orderpriority, count(Int64(1))@1 as order_count]                                               |
@@ -30,18 +30,18 @@ description: "Query: tpch_q4"
 |               |                 HashJoinExec: mode=Partitioned, join_type=LeftSemi, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_orderpriority@1]           |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                                 |
-|               |                       ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_orderpriority@2 as o_orderpriority]                                   |
+|               |                       ProjectionExec: expr=[o_orderkey@1 as o_orderkey, o_orderpriority@2 as o_orderpriority]                                   |
 |               |                         BytesProcessedExec                                                                                                      |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                           |
-|               |                             FilterExec: o_orderdate@1 >= 1993-07-01 AND o_orderdate@1 < 1993-10-01                                              |
+|               |                             FilterExec: o_orderdate@0 >= 1993-07-01 AND o_orderdate@0 < 1993-10-01                                              |
 |               |                               SchemaCastScanExec                                                                                                |
 |               |                                 DataSourceExec: partitions=16, partition_sizes=[24, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 23, 23, 23, 23, 23] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                 |
-|               |                       ProjectionExec: expr=[l_orderkey@2 as l_orderkey]                                                                         |
+|               |                       ProjectionExec: expr=[l_orderkey@1 as l_orderkey]                                                                         |
 |               |                         BytesProcessedExec                                                                                                      |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                           |
-|               |                             FilterExec: l_receiptdate@0 > l_commitdate@1                                                                        |
+|               |                             FilterExec: l_receiptdate@2 > l_commitdate@0                                                                        |
 |               |                               SchemaCastScanExec                                                                                                |
 |               |                                 DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93] |
 |               |                                                                                                                                                 |
