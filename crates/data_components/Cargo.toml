@@ -28,6 +28,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }

@@ -3671,6 +3671,7 @@ dependencies = [
  "chrono",
  "clickhouse-rs",
  "ctor",
+ "dataformat-json",
  "datafusion",
  "datafusion-federation",
  "datafusion-table-providers",
