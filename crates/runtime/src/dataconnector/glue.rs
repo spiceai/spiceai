@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
-
+use std::sync::LazyLock;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
@@ -31,6 +31,7 @@ use iceberg_catalog_glue::{
     GlueCatalogConfig,
 };
 use iceberg_datafusion::IcebergTableProvider;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 
 use crate::{
@@ -100,21 +101,12 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
-    catalog_id: Option<String>,
 }
 
 impl GlueDataConnector {
     #[must_use]
     pub fn new(params: Parameters) -> Self {
-        Self {
-            params,
-            catalog_id: None,
-        }
-    }
-
-    #[must_use]
-    pub fn new_with_catalog_id(params: Parameters, catalog_id: Option<String>) -> Self {
-        Self { params, catalog_id }
+        Self { params }
     }
 }
 
@@ -144,6 +136,15 @@ impl GlueDataConnectorFactory {
     }
 }
 
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+        ParameterSpec::component("catalog_id").secret(),
+    ]);
+    all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
+    all_parameters
+});
+
 impl DataConnectorFactory for GlueDataConnectorFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -164,7 +165,7 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        crate::dataconnector::s3::PARAMETERS.as_ref()
+        PARAMETERS.as_ref()
     }
 }
 
@@ -213,8 +214,8 @@ impl DataConnector for GlueDataConnector {
 
         let mut glue_table_builder = client.get_table().database_name(database).name(table);
 
-        if let Some(catalog_id) = &self.catalog_id {
-            glue_table_builder = glue_table_builder.catalog_id(catalog_id);
+        if let Some(catalog_id) = self.params.get("catalog_id").ok() {
+            glue_table_builder = glue_table_builder.catalog_id(catalog_id.expose_secret());
         }
 
         let get_table_output = glue_table_builder.send().await.map_err(|_| {
