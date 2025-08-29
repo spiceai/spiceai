@@ -21,7 +21,7 @@ use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
-use datafusion::common::cast::{as_large_string_array, as_string_array};
+use datafusion::common::cast::{as_large_string_array, as_list_array, as_string_array};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
@@ -196,10 +196,23 @@ impl ScalarUDFImpl for Embed {
         };
 
         match text_arg {
-            ColumnarValue::Array(arr) => Self::embed_multiple(model, string_array_iter!(arr)),
+            // An array representing multiple rows
+            ColumnarValue::Array(arr) => {
+                let ColumnarValue::Array(embeddings) =
+                    Self::embed_multiple(model, string_array_iter!(arr))?
+                else {
+                    unreachable!("Should retrieve embedding list")
+                };
+
+                // Unpack the inner list (i.e. as used for single row, multiple input below)
+                let list_array = as_list_array(&*embeddings)?;
+                Ok(ColumnarValue::Array(Arc::new(list_array.value(0))))
+            }
+            // A single text value
             ColumnarValue::Scalar(
                 ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
             ) => Self::embed_single(model, text),
+            // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
                 let inner_array = arr.value(0);
                 Self::embed_multiple(model, string_array_iter!(&inner_array))
@@ -231,36 +244,19 @@ mod tests {
     use arrow::array::StringBuilder;
     use arrow::array::{FixedSizeListBuilder, LargeStringBuilder};
     use arrow_schema::{DataType, Field};
-    use datafusion::common::cast::as_list_array;
+    use datafusion::common::cast::{as_float32_array, as_list_array};
     use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
     use llms::model2vec::Model2Vec;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
     macro_rules! assert_multiple_embedding_result {
-        ($result:expr, $expected_inner_len:expr, $expected_dim:expr) => {{
+        ($result:expr, $expected_len:expr, $expected_dim:expr) => {{
             match $result {
                 ColumnarValue::Array(arr) => {
-                    let list_arr = arr
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .expect("Should be ListArray");
-                    assert_eq!(list_arr.len(), 1, "Expected {} outer list", 1);
-
-                    let inner_list = list_arr.value(0);
-                    let inner_list_arr =
-                        as_list_array(&inner_list).expect("Should be inner ListArray");
-                    assert_eq!(
-                        inner_list_arr.len(),
-                        $expected_inner_len,
-                        "Expected {} embedding vectors",
-                        $expected_inner_len
-                    );
-
+                    let list_arr = as_list_array(&arr).unwrap();
                     assert!(
-                        inner_list_arr.iter().flatten().all(|a| a
-                            .as_any()
-                            .downcast_ref::<arrow::array::Float32Array>()
+                        list_arr.iter().flatten().all(|a| as_float32_array(&a)
                             .expect("Should be Float32Array")
                             .len()
                             == $expected_dim),
@@ -375,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_multiple_sentences() {
-        use arrow::array::{Array, ListArray, StringArray};
+    fn test_embed_multiple_sentences_as_multiple_rows() {
+        use arrow::array::StringArray;
         use datafusion::logical_expr::ColumnarValue;
         use datafusion::scalar::ScalarValue;
 
@@ -401,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_multiple_sentences_with_null() {
+    fn test_embed_multiple_sentences_as_multiple_rows_with_null() {
         use arrow::array::{Array, ListArray, StringArray};
         use datafusion::logical_expr::ColumnarValue;
         use datafusion::scalar::ScalarValue;
@@ -433,9 +429,7 @@ mod tests {
                     .as_any()
                     .downcast_ref::<ListArray>()
                     .expect("Should be ListArray");
-                let inner_list = list_arr.value(0);
-                let inner_list_arr = as_list_array(&inner_list).expect("Should be inner ListArray");
-                assert!(inner_list_arr.is_null(1), "Expected null at index 1");
+                assert!(list_arr.is_null(1), "Expected null at index 1");
             }
             ColumnarValue::Scalar(_) => {
                 panic!("Expected Array result for multiple sentences with null")
@@ -444,8 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_multiple_with_coercions() {
-        use arrow::array::{Array, ListArray};
+    fn test_embed_multiple_sentences_as_single_scalars_with_coercions() {
+        use arrow::array::Array;
         use datafusion::logical_expr::ColumnarValue;
         use datafusion::scalar::ScalarValue;
 
@@ -497,15 +491,33 @@ mod tests {
         for values in similar_values {
             let args = create_scalar_function_args(
                 &udf,
-                values,
+                values.clone(),
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some("potion_2m".to_string()))),
                 2,
             );
-            let result = udf
-                .invoke_with_args(args)
-                .expect("UDF invocation should succeed");
 
-            assert_multiple_embedding_result!(result, 2, 64);
+            match udf.invoke_with_args(args) {
+                Ok(row_wise @ ColumnarValue::Array(_))
+                    if matches!(values, ColumnarValue::Array(_)) =>
+                {
+                    assert_multiple_embedding_result!(row_wise, 2, 64);
+                }
+                Ok(ColumnarValue::Array(arr)) if matches!(values, ColumnarValue::Scalar(_)) => {
+                    // Scalar values are packed in a list per row
+                    let list_arr = as_list_array(&arr).expect("Should be ListArray");
+                    assert_eq!(
+                        list_arr.len(),
+                        1,
+                        "Expected one list per single row multi-input"
+                    );
+                    assert_multiple_embedding_result!(
+                        ColumnarValue::Array(Arc::new(list_arr.value(0))),
+                        2,
+                        64
+                    );
+                }
+                _ => unreachable!("Expected array results for multiple inputs!"),
+            }
         }
     }
 }
