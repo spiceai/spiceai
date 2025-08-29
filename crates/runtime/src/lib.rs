@@ -27,7 +27,6 @@ use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
-use tracing::subscriber;
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
