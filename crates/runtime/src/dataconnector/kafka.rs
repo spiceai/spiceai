@@ -45,6 +45,11 @@ pub enum Error {
         "Missing required parameter: 'kafka_bootstrap_servers'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka#parameters"
     ))]
     MissingKafkaBootstrapServers,
+
+    #[snafu(display(
+        "Failed to parse 'schema_inference_sample_count' value: {source}. Ensure it is a positive integer and try again."
+    ))]
+    FailedToParseSchemaInferenceSampleCount { source: std::num::ParseIntError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -52,6 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Kafka {
     kafka_config: KafkaConfig,
+    schema_inference_sample_count: Option<usize>,
 }
 
 impl Kafka {
@@ -59,40 +65,40 @@ impl Kafka {
     pub fn new(params: Parameters) -> Result<Self> {
         let kafka_config = KafkaConfig {
             brokers: params
-                .get("kafka_bootstrap_servers")
+                .get("bootstrap_servers")
                 .expose()
                 .ok()
                 .context(MissingKafkaBootstrapServersSnafu)?
                 .to_string(),
             security_protocol: params
-                .get("kafka_security_protocol")
+                .get("security_protocol")
                 .expose()
                 .ok()
                 .unwrap_or("sasl_ssl")
                 .to_string(),
             sasl_mechanism: params
-                .get("kafka_sasl_mechanism")
+                .get("sasl_mechanism")
                 .expose()
                 .ok()
                 .unwrap_or("SCRAM-SHA-512")
                 .to_string(),
             sasl_username: params
-                .get("kafka_sasl_username")
+                .get("sasl_username")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
             sasl_password: params
-                .get("kafka_sasl_password")
+                .get("sasl_password")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
             ssl_ca_location: params
-                .get("kafka_ssl_ca_location")
+                .get("ssl_ca_location")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
             enable_ssl_certificate_verification: params
-                .get("kafka_enable_ssl_certificate_verification")
+                .get("enable_ssl_certificate_verification")
                 .expose()
                 .ok()
                 .unwrap_or("true")
@@ -100,7 +106,7 @@ impl Kafka {
                 .parse()
                 .unwrap_or(true),
             ssl_endpoint_identification_algorithm: params
-                .get("kafka_ssl_endpoint_identification_algorithm")
+                .get("ssl_endpoint_identification_algorithm")
                 .expose()
                 .ok()
                 .unwrap_or("https")
@@ -111,7 +117,21 @@ impl Kafka {
                 }),
         };
 
-        Ok(Self { kafka_config })
+        let schema_inference_sample_count =
+            match params.get("schema_inference_sample_count").expose().ok() {
+                Some(v) => match v.parse() {
+                    Ok(num) => Some(num),
+                    Err(e) => {
+                        return Err(Error::FailedToParseSchemaInferenceSampleCount { source: e });
+                    }
+                },
+                None => None,
+            };
+
+        Ok(Self {
+            kafka_config,
+            schema_inference_sample_count,
+        })
     }
 }
 
@@ -131,32 +151,35 @@ impl KafkaFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::runtime("kafka_bootstrap_servers")
+    ParameterSpec::component("bootstrap_servers")
         .required()
         .description(
             "A list of host/port pairs for establishing the initial Kafka cluster connection.",
         ),
-     ParameterSpec::runtime("kafka_security_protocol")
+    ParameterSpec::component("security_protocol")
         .default("sasl_ssl")
         .description("Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'."),
-    ParameterSpec::runtime("kafka_sasl_mechanism")
+    ParameterSpec::component("sasl_mechanism")
         .default("SCRAM-SHA-512")
         .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'."),
-    ParameterSpec::runtime("kafka_sasl_username")
+    ParameterSpec::component("sasl_username")
         .secret()
         .description("SASL username."),
-    ParameterSpec::runtime("kafka_sasl_password")
+    ParameterSpec::component("sasl_password")
         .secret()
         .description("SASL password."),
-    ParameterSpec::runtime("kafka_ssl_ca_location")
+    ParameterSpec::component("ssl_ca_location")
         .secret()
         .description("Path to the SSL/TLS CA certificate file for server verification."),
-    ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
+    ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
-    ParameterSpec::runtime("kafka_ssl_endpoint_identification_algorithm")
+    ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
+    ParameterSpec::runtime("schema_inference_sample_count")
+        .default("1")
+        .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
 ];
 
 impl DataConnectorFactory for KafkaFactory {
@@ -225,8 +248,13 @@ impl DataConnector for Kafka {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, schema) =
-            init_kafka_consumer(dataset, topic, &self.kafka_config).await?;
+        let (kafka_consumer, schema) = init_kafka_consumer(
+            dataset,
+            topic,
+            &self.kafka_config,
+            self.schema_inference_sample_count,
+        )
+        .await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
@@ -278,9 +306,16 @@ async fn init_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
+    schema_inference_sample_count: Option<usize>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
-        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config).await;
+        return bootstrap_new_kafka_consumer(
+            dataset,
+            topic,
+            kafka_config,
+            schema_inference_sample_count,
+        )
+        .await;
     };
 
     ensure!(
@@ -338,6 +373,7 @@ async fn bootstrap_new_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
+    schema_inference_sample_count: Option<usize>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
@@ -355,36 +391,44 @@ async fn bootstrap_new_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let msg = match kafka_consumer
-        .next_json::<serde_json::Value, serde_json::Value>()
-        .await
-    {
-        Ok(Some(msg)) => msg,
-        Ok(None) => {
-            return Err(super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "kafka".to_string(),
-                source: "No message received from Kafka.".into(),
-                connector_component: ConnectorComponent::from(dataset),
-            });
+    let schema_inference_sample_count = schema_inference_sample_count.unwrap_or(1);
+
+    // Read schema_inference_sample_count messages to infer schema
+    // this is useful when some of the fields could be optional and use 'null'
+    let mut sample_values = Vec::with_capacity(schema_inference_sample_count);
+
+    for _ in 0..schema_inference_sample_count {
+        match kafka_consumer
+            .next_json::<serde_json::Value, serde_json::Value>()
+            .await
+        {
+            Ok(Some(msg)) => sample_values.push(msg),
+            Ok(None) => {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "kafka".to_string(),
+                    source: "No message received from Kafka.".into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                });
+            }
+            Err(e) => {
+                return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "kafka",
+                    connector_component: ConnectorComponent::from(dataset),
+                });
+            }
         }
-        Err(e) => {
-            return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "kafka",
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        }
-    };
+    }
+
+    let value_iter = sample_values.into_iter().map(|v| Ok(v.value().clone()));
 
     // Infer Arrow schema from the JSON value in the message
-    let schema = datafusion::arrow::json::reader::infer_json_schema_from_iterator(std::iter::once(
-        Ok(msg.value()),
-    ))
-    .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
-        dataconnector: "kafka".to_string(),
-        source: format!("Failed to infer schema from Kafka message: {e}").into(),
-        connector_component: ConnectorComponent::from(dataset),
-    })?
-    .into();
+    let schema = datafusion::arrow::json::reader::infer_json_schema_from_iterator(value_iter)
+        .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "kafka".to_string(),
+            source: format!("Failed to infer schema from Kafka message: {e}").into(),
+            connector_component: ConnectorComponent::from(dataset),
+        })?
+        .into();
 
     let metadata = KafkaMetadata {
         consumer_group_id: kafka_consumer.group_id().to_string(),
