@@ -13,7 +13,6 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct OpenAIModel {
     id: String,
@@ -87,7 +86,7 @@ async fn test_models_http_endpoint_no_status_no_metadata() -> Result<(), Error> 
 
             runtime_ready_check(&rt).await;
 
-            let models_url = format!("{}/v1/models", http_base_url);
+            let models_url = format!("{http_base_url}/v1/models");
             let client = Client::new();
             let response = client
                 .get(&models_url)
@@ -185,7 +184,7 @@ async fn test_models_http_endpoint_status_no_metadata() -> Result<(), anyhow::Er
 
             runtime_ready_check(&rt).await;
 
-            let models_url = format!("{}/v1/models?status=true", http_base_url);
+            let models_url = format!("{http_base_url}/v1/models?status=true");
             let client = Client::new();
             let response = client
                 .get(&models_url)
@@ -288,10 +287,8 @@ async fn test_models_http_endpoint_metadata() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            let models_url = format!(
-                "{}/v1/models?metadata_fields=supports_responses_api",
-                http_base_url
-            );
+            let models_url =
+                format!("{http_base_url}/v1/models?metadata_fields=supports_responses_api",);
             let client = Client::new();
             let response = client
                 .get(&models_url)
