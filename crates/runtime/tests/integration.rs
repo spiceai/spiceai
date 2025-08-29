@@ -63,6 +63,9 @@ mod glue;
 mod graphql;
 mod iceberg;
 mod iceberg_api;
+
+#[cfg(feature = "kafka")]
+mod kafka;
 mod metadata;
 #[cfg(feature = "mongodb")]
 mod mongo;
