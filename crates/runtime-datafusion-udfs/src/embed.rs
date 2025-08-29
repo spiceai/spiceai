@@ -95,7 +95,7 @@ impl Embed {
     }
 
     fn embed_single(
-        model: &Arc<dyn llms::embeddings::Embed>,
+        model: &dyn llms::embeddings::Embed,
         sentence: &str,
     ) -> DataFusionResult<ColumnarValue> {
         let embedding = model
@@ -118,7 +118,7 @@ impl Embed {
     }
 
     fn embed_multiple<'a>(
-        model: &Arc<dyn llms::embeddings::Embed>,
+        model: &dyn llms::embeddings::Embed,
         sentences: impl Iterator<Item = Option<&'a str>>,
     ) -> DataFusionResult<ColumnarValue> {
         let mut builder =
@@ -199,7 +199,7 @@ impl ScalarUDFImpl for Embed {
             // An array representing multiple rows
             ColumnarValue::Array(arr) => {
                 let ColumnarValue::Array(embeddings) =
-                    Self::embed_multiple(model, string_array_iter!(arr))?
+                    Self::embed_multiple(&**model, string_array_iter!(arr))?
                 else {
                     unreachable!("Should retrieve embedding list")
                 };
@@ -211,19 +211,19 @@ impl ScalarUDFImpl for Embed {
             // A single text value
             ColumnarValue::Scalar(
                 ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
-            ) => Self::embed_single(model, text),
+            ) => Self::embed_single(&**model, text),
             // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
                 let inner_array = arr.value(0);
-                Self::embed_multiple(model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
                 let inner_array = arr.value(0);
-                Self::embed_multiple(model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
                 let inner_array = arr.value(0);
-                Self::embed_multiple(model, string_array_iter!(&inner_array))
+                Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             unsupported_text_arg @ ColumnarValue::Scalar(_) => {
                 exec_err!("Unsupported text argument: {unsupported_text_arg}")
