@@ -4426,9 +4426,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de0b553d03fce69da6bedd91ec7e2348d52af2783a95d2dc91970df0cb614783"
+checksum = "f06f3676832e713e44f65804cebf82f46962d3e126f64f3251eb5fbeb0ad94e4"
 dependencies = [
  "arrow",
  "bytes",
@@ -4455,9 +4455,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deacb882456b0a3e7a5bf22a708190758cc8f572e02cd34954931e24286a4509"
+checksum = "059e70a67ae0c827a0e7f393eb05db2985533b3b612f8b33243433853570db45"
 dependencies = [
  "proc-macro2",
  "quote",
