@@ -18,7 +18,7 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
-    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
+    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
 };
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
@@ -49,6 +49,11 @@ pub use index::S3Vector;
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
+        .secret(),
+    ParameterSpec::component("distance_metric")
+        .description(
+            "The distance metric to be used for similarity search. One of: euclidean | cosine.",
+        )
         .secret(),
     ParameterSpec::component("arn")
         .description("The S3 Vectors bucket ARN to use for the S3 Vectors index.")
@@ -184,24 +189,20 @@ async fn try_vector_table(
     let s3_vector_client = Arc::new(S3VectorRetryClientBuilder::new(s3_vector_client).build())
         as Arc<dyn S3Vectors + Send + Sync>;
 
-    // See if the index already exists and return early if so.
-    if let S3VectorTableResult::Table(vector_table) =
-        S3VectorsTable::try_new_table(id.clone(), Arc::clone(&s3_vector_client), columns.clone())
-            .await
-            .boxed()?
-    {
-        return Ok(vector_table);
-    }
-
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(
             "S3 Vectors index does not exist. Could not be created because the embedding dimension could not be inferred.".to_string()
         ));
     };
 
-    let Some(vector_table) =
-        S3VectorsTable::try_create_new_table(id, s3_vector_client, dimension as i64, columns)
-            .await?
+    let Some(vector_table) = S3VectorsTable::try_create_new_table(
+        id,
+        s3_vector_client,
+        dimension as i64,
+        columns,
+        string_from_params(&params, "distance_metric"),
+    )
+    .await?
     else {
         return Err(Box::from(
             "S3 Vectors index does not exist. After it was created, it still does not exist. Unexpected.".to_string()
