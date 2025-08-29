@@ -22,10 +22,7 @@ use spicepod::{
 };
 use tracing::instrument;
 
-use crate::{
-    container_registry,
-    docker::{ContainerRunnerBuilder, RunningContainer},
-};
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
