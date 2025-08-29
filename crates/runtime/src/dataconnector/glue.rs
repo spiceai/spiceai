@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
-use std::sync::LazyLock;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
@@ -33,6 +31,8 @@ use iceberg_catalog_glue::{
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use std::sync::LazyLock;
+use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use crate::{
     component::dataset::Dataset,
@@ -138,9 +138,7 @@ impl GlueDataConnectorFactory {
 
 pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
-    all_parameters.extend_from_slice(&[
-        ParameterSpec::component("catalog_id").secret(),
-    ]);
+    all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
     all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
     all_parameters
 });
