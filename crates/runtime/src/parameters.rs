@@ -454,6 +454,7 @@ impl ParameterSpec {
         self
     }
 
+    #[must_use]
     pub fn display_name(&self, prefix: &str) -> String {
         if self.r#type.is_prefixed() {
             format!("{prefix}_{}", self.name)
