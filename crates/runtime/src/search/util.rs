@@ -80,6 +80,20 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + Clone + 'static>(
     }
 }
 
+pub(crate) fn find_all_indexed_table_providers<T: TableProvider + Clone + 'static>(
+    tbl: &Arc<dyn TableProvider>,
+) -> Vec<Arc<IndexedTableProvider>> {
+    let mut tables: Vec<Arc<IndexedTableProvider>> = vec![];
+    let first = find_concrete_table_provider::<IndexedTableProvider>(tbl);
+
+    while let Some(indexed) = first {
+        tables.append(indexed);
+        first = find_concrete_table_provider::<IndexedTableProvider>(indexed);
+    }
+
+    tables
+}
+
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
 pub async fn parse_explicit_primary_keys(
     app: Arc<RwLock<Option<Arc<App>>>>,
@@ -189,8 +203,7 @@ pub async fn embedding_columns_from_table(
     // embedding columns from [`IndexedTableProvider`].
     #[cfg(feature = "s3_vectors")]
     {
-        if let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
-        {
+        for indexed in find_all_indexed_table_providers(&table_provider) {
             use crate::embeddings::index::{VectorIndex, s3::S3Vector};
             if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
                 embedding_columns.insert(s3_vector.embedded_column());

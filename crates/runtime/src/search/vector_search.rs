@@ -22,6 +22,7 @@ use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+use crate::search::util::find_all_indexed_table_providers;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -84,15 +85,24 @@ impl VectorSearch {
     async fn model_from_vector_index(
         &self,
         tbl: &Arc<dyn TableProvider>,
+        embedding_column: &str,
     ) -> Option<Arc<dyn Embed>> {
-        let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
+        let indexeds = find_all_indexed_table_providers::<IndexedTableProvider>(tbl);
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::s3::S3Vector;
-            if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
-                return s3_vector.embedding_model().await;
+            for indexed in indexeds {
+                use crate::embeddings::index::VectorIndex;
+                use crate::embeddings::index::s3::S3Vector;
+
+                let indexed: Option<S3Vector> = indexeds.into_iter().find_map(|idx| {
+                    let s3_vector = indexed.get_index::<S3Vector>()?;
+                    if s3_vector.embedded_column() == embedding_column {
+                        Some(s3_vector)
+                    };
+                    None
+                })?;
+                indexed.embedding_model().await
             }
-            None
         }
         #[cfg(not(feature = "s3_vectors"))]
         None
@@ -113,8 +123,9 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let (model, is_chunked) = if let Some(model) =
-            self.model_from_vector_index(&table_provider).await
+        let (model, is_chunked) = if let Some(model) = self
+            .model_from_vector_index(&table_provider, embedding_column)
+            .await
         {
             (model, false)
         } else {
