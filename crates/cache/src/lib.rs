@@ -227,10 +227,28 @@ impl QueryResultsCacheProvider {
                     std::hash::RandomState::default(),
                 )),
                 #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash => Arc::new(LruCache::new(
+                HashingAlgorithm::XxHash3 => Arc::new(SimpleCache::new(
                     cache_max_size,
                     ttl,
                     twox_hash::xxh3::RandomHashBuilder64::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash32 => Arc::new(SimpleCache::new(
+                    cache_max_size,
+                    ttl,
+                    twox_hash::RandomXxHashBuilder32::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash64 => Arc::new(SimpleCache::new(
+                    cache_max_size,
+                    ttl,
+                    twox_hash::RandomXxHashBuilder64::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash128 => Arc::new(SimpleCache::new(
+                    cache_max_size,
+                    ttl,
+                    twox_hash::xxh3::RandomHashBuilder128::default(),
                 )),
             },
             cache_max_size,

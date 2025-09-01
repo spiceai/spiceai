@@ -77,10 +77,28 @@ impl Runtime {
                     ahash::RandomState::default(),
                 )),
                 #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash => Arc::new(SimpleCache::new(
+                HashingAlgorithm::XxHash3 => Arc::new(SimpleCache::new(
                     DEFAULT_CACHED_PLANS_MAX_CAPACITY,
                     Duration::from_secs(3600),
                     twox_hash::xxh3::RandomHashBuilder64::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash32 => Arc::new(SimpleCache::new(
+                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
+                    Duration::from_secs(3600),
+                    twox_hash::RandomXxHashBuilder32::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash64 => Arc::new(SimpleCache::new(
+                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
+                    Duration::from_secs(3600),
+                    twox_hash::RandomXxHashBuilder64::default(),
+                )),
+                #[cfg(feature = "xx-hash")]
+                HashingAlgorithm::XxHash128 => Arc::new(SimpleCache::new(
+                    DEFAULT_CACHED_PLANS_MAX_CAPACITY,
+                    Duration::from_secs(3600),
+                    twox_hash::xxh3::RandomHashBuilder128::default(),
                 )),
             };
 
