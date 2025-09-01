@@ -99,6 +99,11 @@ $ spice trace ai_chat --include-input --truncate=120
 
 		traces, err := taskhistory.SqlRequestToTraces(rtcontext, fmt.Sprintf("SELECT * FROM runtime.task_history WHERE %s ORDER BY start_time asc", filter))
 		if err != nil {
+			// Special case when task_history is disabled.
+			if strings.Contains(err.Error(), "table 'spice.runtime.task_history' not found") {
+				cmd.PrintErrln("Task history required for trace functionality is currently disabled. Enable it in the Spicepod configuration and try again. For details, visit https://spiceai.org/docs/reference/spicepod/runtime#runtimetask_history")
+				return
+			}
 			slog.Error("SQL query to 'task_history' failed", "error", err)
 			cmd.PrintErrln("Error: failed to retrieve events from runtime.")
 			return
