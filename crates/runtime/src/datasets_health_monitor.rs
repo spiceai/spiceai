@@ -140,7 +140,7 @@ impl DatasetsHealthMonitor {
         // https://github.com/spiceai/spiceai/issues/6994
         if find_concrete_table_provider::<IcebergTableProvider>(&table_provider).is_some() {
             tracing::debug!(
-                "Skipping dataset {dataset_name} for availability monitoring (Iceberg datasets are not yet supported)",
+                "Availability monitoring skipped for dataset '{dataset_name}': Iceberg format unsupported. Support planned for future release.",
             );
             return Ok(());
         }
