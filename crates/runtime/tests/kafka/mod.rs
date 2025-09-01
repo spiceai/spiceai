@@ -38,8 +38,11 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, &["orders", "schema_infer_test"]).await?;
+            let (running_container, producer) = start_kafka_docker_container(
+                KAFKA_PORT,
+                &["orders", "schema_infer_test", "flattent_json_test"],
+            )
+            .await?;
 
             tracing::debug!("Container started");
 
@@ -54,9 +57,13 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 serde_json::from_str(include_str!("./test_data/orders_schema_infer.json"))?;
             send_messages_to_kafka(&producer, "schema_infer_test", &orders_schema_infer).await?;
 
+            // Load test data that contains complex json to test 'flatten_json' param
+            let orders_schema_infer: Vec<serde_json::Value> =
+                serde_json::from_str(include_str!("./test_data/orders_nested.json"))?;
+            send_messages_to_kafka(&producer, "flattent_json_test", &orders_schema_infer).await?;
+
             let ds = make_kafka_dataset("orders", "kafka_orders", KAFKA_PORT, None);
-            let mut options = std::collections::HashMap::new();
-            options.insert("schema_inference_sample_count".to_string(), "3".to_string());
+            let options = [("schema_infer_max_records".to_string(), "3".to_string())].into();
             let ds_schema_infer = make_kafka_dataset(
                 "schema_infer_test",
                 "kafka_schema_infer_test",
@@ -64,9 +71,18 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 Some(options),
             );
 
+            let options = [("flatten_json".to_string(), "true".to_string())].into();
+            let ds_flatten_json = make_kafka_dataset(
+                "flattent_json_test",
+                "kafka_flattent_json_test",
+                KAFKA_PORT,
+                Some(options),
+            );
+
             let app = AppBuilder::new("kafka_sasl_connect_test")
                 .with_dataset(ds)
                 .with_dataset(ds_schema_infer)
+                .with_dataset(ds_flatten_json)
                 .build();
 
             let rt = Runtime::builder()
@@ -89,7 +105,11 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
             // Ensure all messages are processed
             sleep(Duration::from_secs(2)).await;
 
-            for table in ["kafka_orders", "kafka_schema_infer_test"] {
+            for table in [
+                "kafka_orders",
+                "kafka_schema_infer_test",
+                "kafka_flattent_json_test",
+            ] {
                 let schema_snapshot = format!("{table}_schema");
                 let data_snapshot = format!("{table}_data");
 

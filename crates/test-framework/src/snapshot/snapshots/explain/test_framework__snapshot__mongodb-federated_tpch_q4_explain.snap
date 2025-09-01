@@ -18,7 +18,7 @@ description: "Query: tpch_q4"
 |               |             Projection: lineitem.l_orderkey                                                                                           |
 |               |               BytesProcessedNode                                                                                                      |
 |               |                 Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                |
-|               |                   TableScan: lineitem projection=[l_receiptdate, l_commitdate, l_orderkey]                                            |
+|               |                   TableScan: lineitem projection=[l_commitdate, l_orderkey, l_receiptdate]                                            |
 | physical_plan | SortPreservingMergeExec: [o_orderpriority@0 ASC NULLS LAST]                                                                           |
 |               |   SortExec: expr=[o_orderpriority@0 ASC NULLS LAST], preserve_partitioning=[true]                                                     |
 |               |     ProjectionExec: expr=[o_orderpriority@0 as o_orderpriority, count(Int64(1))@1 as order_count]                                     |
@@ -38,11 +38,11 @@ description: "Query: tpch_q4"
 |               |                                 MongoDBExec projection=[o_orderdate, o_orderkey, o_orderpriority] filters=[{}]                        |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                         |
 |               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                       |
-|               |                       ProjectionExec: expr=[l_orderkey@2 as l_orderkey]                                                               |
+|               |                       ProjectionExec: expr=[l_orderkey@1 as l_orderkey]                                                               |
 |               |                         BytesProcessedExec                                                                                            |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                 |
-|               |                             FilterExec: l_receiptdate@0 > l_commitdate@1                                                              |
+|               |                             FilterExec: l_receiptdate@2 > l_commitdate@0                                                              |
 |               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                   |
-|               |                                 MongoDBExec projection=[l_receiptdate, l_commitdate, l_orderkey] filters=[{}]                         |
+|               |                                 MongoDBExec projection=[l_commitdate, l_orderkey, l_receiptdate] filters=[{}]                         |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+

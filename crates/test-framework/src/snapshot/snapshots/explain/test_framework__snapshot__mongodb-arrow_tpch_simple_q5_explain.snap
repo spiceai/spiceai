@@ -15,7 +15,7 @@ description: "Query: tpch_simple_q5"
 |               |               TableScan: orders projection=[o_orderkey, o_totalprice]                                                                           |
 |               |           SubqueryAlias: l                                                                                                                      |
 |               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: lineitem projection=[l_orderkey, l_linestatus]                                                                         |
+|               |               TableScan: lineitem projection=[l_linestatus, l_orderkey]                                                                         |
 | physical_plan | SortPreservingMergeExec: [total_price@0 DESC]                                                                                                   |
 |               |   SortExec: expr=[total_price@0 DESC], preserve_partitioning=[true]                                                                             |
 |               |     ProjectionExec: expr=[sum(o.o_totalprice)@1 as total_price, l_linestatus@0 as l_linestatus]                                                 |
@@ -24,14 +24,14 @@ description: "Query: tpch_simple_q5"
 |               |           RepartitionExec: partitioning=Hash([l_linestatus@0], 16), input_partitions=16                                                         |
 |               |             AggregateExec: mode=Partial, gby=[l_linestatus@1 as l_linestatus], aggr=[sum(o.o_totalprice)]                                       |
 |               |               CoalesceBatchesExec: target_batch_size=8192                                                                                       |
-|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[o_totalprice@1, l_linestatus@3] |
+|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(o_orderkey@0, l_orderkey@1)], projection=[o_totalprice@1, l_linestatus@2] |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([o_orderkey@0], 16), input_partitions=16                                                 |
 |               |                       BytesProcessedExec                                                                                                        |
 |               |                         SchemaCastScanExec                                                                                                      |
 |               |                           DataSourceExec: partitions=16, partition_sizes=[24, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 23, 23, 23, 23, 23]       |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                     RepartitionExec: partitioning=Hash([l_orderkey@0], 16), input_partitions=16                                                 |
+|               |                     RepartitionExec: partitioning=Hash([l_orderkey@1], 16), input_partitions=16                                                 |
 |               |                       BytesProcessedExec                                                                                                        |
 |               |                         SchemaCastScanExec                                                                                                      |
 |               |                           DataSourceExec: partitions=16, partition_sizes=[94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 94, 93, 93, 93]       |
