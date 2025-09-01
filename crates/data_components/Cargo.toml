@@ -60,7 +60,7 @@ object_store = { workspace = true }
 opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
-regex = "1.10.4"
+regex = "1.11.2"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
