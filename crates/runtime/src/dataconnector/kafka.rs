@@ -22,6 +22,7 @@ use data_components::{
     cdc::ChangesStream,
     kafka::{KafkaConfig, KafkaConsumer},
 };
+use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -36,8 +37,11 @@ use crate::{
     },
     datafusion::refresh_sql,
     federated_table::FederatedTable,
-    parameters::{ParameterSpec, Parameters},
+    parameters::{ExposedParamLookup, ParameterSpec, Parameters},
 };
+
+/// Default max records to scan to infer the schema
+pub const DEFAULT_SCHEMA_INFER_MAX_RECORD: usize = 1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -46,10 +50,8 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display(
-        "Failed to parse 'schema_inference_sample_count' value: {source}. Ensure it is a positive integer and try again."
-    ))]
-    FailedToParseSchemaInferenceSampleCount { source: std::num::ParseIntError },
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidConfiguration { msg: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,7 +59,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Kafka {
     kafka_config: KafkaConfig,
-    schema_inference_sample_count: Option<usize>,
+    json_options: Arc<SpiceJsonOptions>,
 }
 
 impl Kafka {
@@ -117,22 +119,39 @@ impl Kafka {
                 }),
         };
 
-        let schema_inference_sample_count =
-            match params.get("schema_inference_sample_count").expose().ok() {
-                Some(v) => match v.parse() {
-                    Ok(num) => Some(num),
-                    Err(e) => {
-                        return Err(Error::FailedToParseSchemaInferenceSampleCount { source: e });
-                    }
-                },
-                None => None,
-            };
-
         Ok(Self {
             kafka_config,
-            schema_inference_sample_count,
+            json_options: get_json_format(&params)?,
         })
     }
+}
+
+/// Returns a [`SpiceJsonOptions`] based on the provided [`Datasets`] parameters.
+///
+/// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+fn get_json_format(params: &Parameters) -> Result<Arc<SpiceJsonOptions>> {
+    let mut options = SpiceJsonOptions::default();
+
+    if let ExposedParamLookup::Present(infer_max_rec_str) =
+        params.get("schema_infer_max_records").expose()
+    {
+        let Ok(schema_infer_max_rec) = infer_max_rec_str.parse() else {
+            return Err(Error::InvalidConfiguration {
+                msg: format!(
+                    "parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"
+                ),
+            });
+        };
+        options.schema_infer_max_rec = Some(schema_infer_max_rec);
+    }
+
+    if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
+        if flatten_json.eq_ignore_ascii_case("true") {
+            options.flatten_json = Some(".".to_string());
+        }
+    }
+
+    Ok(Arc::new(options))
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -177,9 +196,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
-    ParameterSpec::runtime("schema_inference_sample_count")
+    ParameterSpec::runtime("schema_infer_max_records")
         .default("1")
         .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
+    ParameterSpec::runtime("flatten_json")
+        .description("Set true to flatten nested structs in JSON as separate columns."),
 ];
 
 impl DataConnectorFactory for KafkaFactory {
@@ -248,13 +269,8 @@ impl DataConnector for Kafka {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, schema) = init_kafka_consumer(
-            dataset,
-            topic,
-            &self.kafka_config,
-            self.schema_inference_sample_count,
-        )
-        .await?;
+        let (kafka_consumer, schema) =
+            init_kafka_consumer(dataset, topic, &self.kafka_config, &self.json_options).await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
@@ -276,10 +292,10 @@ impl DataConnector for Kafka {
             );
         }
 
-        Ok(Arc::new(data_components::kafka::Kafka::new(
-            schema,
-            kafka_consumer,
-        )))
+        Ok(Arc::new(
+            data_components::kafka::Kafka::new(schema, kafka_consumer)
+                .with_flatten_json(self.json_options.flatten_json.clone()),
+        ))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -306,16 +322,10 @@ async fn init_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    schema_inference_sample_count: Option<usize>,
+    json_options: &Arc<SpiceJsonOptions>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
-        return bootstrap_new_kafka_consumer(
-            dataset,
-            topic,
-            kafka_config,
-            schema_inference_sample_count,
-        )
-        .await;
+        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config, json_options).await;
     };
 
     ensure!(
@@ -373,7 +383,7 @@ async fn bootstrap_new_kafka_consumer(
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
-    schema_inference_sample_count: Option<usize>,
+    json_options: &Arc<SpiceJsonOptions>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
@@ -391,7 +401,9 @@ async fn bootstrap_new_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let schema_inference_sample_count = schema_inference_sample_count.unwrap_or(1);
+    let schema_inference_sample_count = json_options
+        .schema_infer_max_rec
+        .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
 
     // Read schema_inference_sample_count messages to infer schema
     // this is useful when some of the fields could be optional and use 'null'
@@ -427,6 +439,14 @@ async fn bootstrap_new_kafka_consumer(
             dataconnector: "kafka".to_string(),
             source: format!("Failed to infer schema from Kafka message: {e}").into(),
             connector_component: ConnectorComponent::from(dataset),
+        })
+        .map(|schema| {
+            // If flatten_json is set, unnest the schema
+            if let Some(separator) = &json_options.flatten_json {
+                unnest_struct_schema(&schema, separator)
+            } else {
+                schema
+            }
         })?
         .into();
 
