@@ -465,3 +465,10 @@ pub(crate) fn get_huggingface_embeddings(
 ) -> Embeddings {
     Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name)
 }
+
+pub(crate) fn get_model_to_vec_embeddings(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> Embeddings {
+    Embeddings::new(format!("model2vec:{}", model.into()), name)
+}

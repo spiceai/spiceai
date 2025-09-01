@@ -105,7 +105,11 @@ pub(crate) struct OpenAIModel {
 
 fn get_metadata_keys(params: &ModelsQueryParams) -> Result<Vec<MetadataKeys>, String> {
     let mut keys = Vec::new();
-    for field in params.metadata_fields.split(',') {
+    for field in params
+        .metadata_fields
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
         keys.push(MetadataKeys::try_from(field.trim())?);
     }
     Ok(keys)

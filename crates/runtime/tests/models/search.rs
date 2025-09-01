@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::hf::get_huggingface_embeddings;
+use crate::models::hf::get_model_to_vec_embeddings;
 use crate::models::openai::get_openai_embeddings;
 use crate::models::{create_api_bindings_config, get_mega_science_dataset, http_post};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
+use arrow::array::RecordBatch;
+use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::header::HeaderMap;
@@ -288,12 +290,31 @@ pub(crate) async fn run_search(
     app: App,
     test_cases: Vec<SearchTestCase>,
 ) -> Result<(), anyhow::Error> {
+    run_search_w_explain(app, test_cases, false).await
+}
+
+// if `explain_sql`, for any [`SearchTestCase`] that is [`SearchTestType::Sql`], a snapshot will be taken of the associated explain query.
+pub(crate) async fn run_search_w_explain(
+    app: App,
+    test_cases: Vec<SearchTestCase>,
+    explain_sql: bool,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let client = spiceai::ClientBuilder::new()
+                .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .build()
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to build Spice client with flight address: 'http://{}'",
+                        api_config.flight_bind_address
+                    )
+                });
             for ts in test_cases {
                 if ts.skip {
                     tracing::info!("Skipping test {}", ts.name);
@@ -323,6 +344,21 @@ pub(crate) async fn run_search(
                         }
 
                         insta::assert_json_snapshot!(ts.name, resp?);
+
+                        if explain_sql {
+                            let c = client
+                                .query(format!("EXPLAIN {sql}").as_str())
+                                .await?
+                                .try_collect::<Vec<RecordBatch>>()
+                                .await?;
+
+                            let disp = arrow::util::pretty::pretty_format_batches(&c)?;
+
+                            insta::with_settings!({
+                                omit_expression => true,
+                                description => sql
+                            }, {insta::assert_snapshot!(format!("{}_explain", ts.name), disp)});
+                        }
                     }
                 }
             }
@@ -360,8 +396,8 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .build();
@@ -403,15 +439,9 @@ async fn test_multi_column_search() -> Result<(), anyhow::Error> {
 async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
-            // huggingface needs limits for local-CPU embedding performance in these tests
-            // .with_embedding(get_huggingface_embeddings(
-            //     "sentence-transformers/all-MiniLM-L6-v2",
-            //     "hf_minilm",
-            // ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-large"),
-                "openai_embeddings_2",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "hf_minilm",
             ))
             .with_embedding(get_openai_embeddings(
                 Some("text-embedding-3-small"),
@@ -423,7 +453,7 @@ async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "openai_embeddings_2".into(),
+                        model: "hf_minilm".into(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -496,8 +526,8 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
     });
     let app = AppBuilder::new("search_app")
         .with_dataset(chunked)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .build();
@@ -522,22 +552,16 @@ async fn test_multi_column_srch_no_pk() -> Result<(), anyhow::Error> {
 async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
-            // huggingface needs limits for local-CPU embedding performance in these tests
-            // .with_embedding(get_huggingface_embeddings(
-            //     "sentence-transformers/all-MiniLM-L6-v2",
-            //     "hf_minilm",
-            // ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "hf_minilm",
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 Some(Column {
                     name: "question".to_string(),
                     embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "openai_embeddings".into(),
+                        model: "hf_minilm".into(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -600,22 +624,16 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
 async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
-            // disabled until https://github.com/spiceai/spiceai/issues/6876 is resolved
-            // huggingface needs limits for local-CPU embedding performance in these tests
-            // .with_embedding(get_huggingface_embeddings(
-            //     "sentence-transformers/all-MiniLM-L6-v2",
-            //     "hf_minilm",
-            // ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "hf_minilm",
             ))
             .with_dataset(get_mega_science_dataset(
                 Some("qs"),
                 Some(Column {
                     name: "question".to_string(),
                     embeddings: vec![ColumnLevelEmbeddingConfig {
-                        model: "openai_embeddings".into(),
+                        model: "hf_minilm".into(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -958,7 +976,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
-                SearchTestType::Sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"),
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
@@ -1000,8 +1018,8 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
                 Some(vec!["cp_catalog_page_sk".to_string()]),
                 None,
             ))
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
                 "hf_minilm",
             ))
             .build(),
@@ -1051,8 +1069,8 @@ async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     ];
     let app2 = AppBuilder::new("search_app2")
         .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .build();
@@ -1110,10 +1128,11 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
         ..Default::default()
     };
 
+    // get_model_to_vec_embeddings("minishlab/potion-base-2M", "hf_minilm")
     let app = AppBuilder::new("cached_search")
         .with_dataset(chunked)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1171,8 +1190,8 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("test_search_with_cache_bypass")
         .with_dataset(chunked)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .with_search_cache(cache_config)
@@ -1224,8 +1243,8 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
     let app = AppBuilder::new("search_app")
         .with_dataset(ds)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
+        .with_embedding(get_model_to_vec_embeddings(
+            "minishlab/potion-base-2M",
             "hf_minilm",
         ))
         .build();

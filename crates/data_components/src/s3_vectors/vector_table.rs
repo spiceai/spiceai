@@ -26,8 +26,9 @@ use aws_credential_types::provider::error::CredentialsError;
 use datafusion::common::{Constraint, Constraints};
 use s3_vectors::{
     CreateIndexInput, CreateVectorBucketInput, DistanceMetric, Document, GetIndexError,
-    GetIndexInput, GetVectorBucketError, GetVectorBucketInput, MetadataConfiguration,
-    PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsInput, S3Vectors, SdkError, VectorData,
+    GetIndexInput, GetIndexOutput, GetVectorBucketError, GetVectorBucketInput,
+    MetadataConfiguration, PUT_VECTORS_MAX_ITEMS, PutInputVector, PutVectorsInput, S3Vectors,
+    SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
@@ -75,31 +76,29 @@ impl S3VectorTableResult {
 }
 
 impl S3VectorsTable {
-    pub async fn try_new_arn(
-        index_arn: impl Into<String>,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        columns: MetadataColumns,
-    ) -> Result<Option<Self>> {
-        Self::try_new_table(
-            S3VectorIdentifier::IndexArn(index_arn.into()),
-            client,
-            columns,
-        )
-        .await
-        .map(S3VectorTableResult::table)
-    }
-
     // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
     pub async fn try_new_table(
         id: S3VectorIdentifier,
         client: Arc<dyn S3Vectors + Send + Sync>,
         columns: MetadataColumns,
+        distance_metric: &DistanceMetric,
     ) -> Result<S3VectorTableResult> {
         if !Self::check_if_bucket_exists(&client, &id).await? {
             return Ok(S3VectorTableResult::BucketDoesNotExist);
         }
-        if !Self::check_if_index_exists(&id, &client).await? {
-            return Ok(S3VectorTableResult::IndexDoesNotExist);
+        match Self::get_index_if_exists(&id, &client).await? {
+            Some(GetIndexOutput {
+                index: Some(index), ..
+            }) => {
+                if index.distance_metric() != distance_metric {
+                    return Err(Error::IncompatibleDistanceMetric {
+                        exists: index.distance_metric,
+                        specified: distance_metric.clone(),
+                    });
+                }
+            }
+            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
+            Some(_) => {}
         }
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
@@ -116,45 +115,56 @@ impl S3VectorsTable {
         client: Arc<dyn S3Vectors + Send + Sync>,
         dimension: i64,
         columns: MetadataColumns,
+        distance_metric: Option<impl Into<DistanceMetric>>,
     ) -> Result<Option<Self>> {
         let non_filterable_metadata_columns = columns.non_filterable_names();
 
-        match Self::try_new_table(id.clone(), Arc::clone(&client), columns.clone()).await? {
+        let distance_metric = match distance_metric.map(Into::into) {
+            // Default to `DistanceMetric::Cosine` for backwards compatibility.
+            Some(DistanceMetric::Cosine) | None => DistanceMetric::Cosine,
+            Some(DistanceMetric::Euclidean) => DistanceMetric::Euclidean,
+            Some(distance_metric) => {
+                return Err(Error::InvalidDistanceMetric { distance_metric });
+            }
+        };
+
+        match Self::try_new_table(
+            id.clone(),
+            Arc::clone(&client),
+            columns.clone(),
+            &distance_metric,
+        )
+        .await?
+        {
             S3VectorTableResult::Table(slf) => Ok(Some(slf)),
             S3VectorTableResult::BucketDoesNotExist => {
                 Self::create_bucket(&client, &id).await?;
-                Self::create_index(&client, dimension, &id, non_filterable_metadata_columns)
-                    .await?;
-                Self::try_new_table(id, client, columns)
+                Self::create_index(
+                    &client,
+                    dimension,
+                    &id,
+                    non_filterable_metadata_columns,
+                    &distance_metric,
+                )
+                .await?;
+                Self::try_new_table(id, client, columns, &distance_metric)
                     .await
                     .map(S3VectorTableResult::table)
             }
             S3VectorTableResult::IndexDoesNotExist => {
-                Self::create_index(&client, dimension, &id, non_filterable_metadata_columns)
-                    .await?;
-                Self::try_new_table(id, client, columns)
+                Self::create_index(
+                    &client,
+                    dimension,
+                    &id,
+                    non_filterable_metadata_columns,
+                    &distance_metric,
+                )
+                .await?;
+                Self::try_new_table(id, client, columns, &distance_metric)
                     .await
                     .map(S3VectorTableResult::table)
             }
         }
-    }
-
-    pub async fn try_new_vector_index(
-        bucket_name: impl Into<String>,
-        index_name: impl Into<String>,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        columns: MetadataColumns,
-    ) -> Result<Option<Self>> {
-        Self::try_new_table(
-            S3VectorIdentifier::Index {
-                bucket_name: bucket_name.into(),
-                index_name: index_name.into(),
-            },
-            client,
-            columns,
-        )
-        .await
-        .map(S3VectorTableResult::table)
     }
 
     #[must_use]
@@ -177,6 +187,7 @@ impl S3VectorsTable {
         dimension: i64,
         vector_id: &S3VectorIdentifier,
         non_filterable_metadata_columns: Vec<String>,
+        distance_metric: &DistanceMetric,
     ) -> Result<()> {
         let S3VectorIdentifier::Index {
             bucket_name,
@@ -202,7 +213,7 @@ impl S3VectorsTable {
                 CreateIndexInput::builder()
                     .data_type(s3_vectors::DataType::Float32)
                     .dimension(dimension.try_into().unwrap_or(i32::MAX))
-                    .distance_metric(DistanceMetric::Cosine)
+                    .distance_metric(distance_metric.clone())
                     .index_name(index_name)
                     .set_metadata_configuration(metadata_configuration)
                     .vector_bucket_name(bucket_name)
@@ -284,10 +295,10 @@ impl S3VectorsTable {
     }
 
     /// Returns whether the index exists.
-    async fn check_if_index_exists(
+    async fn get_index_if_exists(
         index: &S3VectorIdentifier,
         client: &Arc<dyn S3Vectors + Send + Sync>,
-    ) -> Result<bool> {
+    ) -> Result<Option<GetIndexOutput>> {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
         match client
             .get_index(
@@ -303,9 +314,9 @@ impl S3VectorsTable {
             Err(SdkError::ServiceError(e))
                 if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
             {
-                Ok(false)
+                Ok(None)
             }
-            Ok(_) => Ok(true),
+            Ok(output) => Ok(Some(output)),
             Err(e) => Err(Error::S3VectorGetIndexError {
                 source: e.into_service_error(),
             }),

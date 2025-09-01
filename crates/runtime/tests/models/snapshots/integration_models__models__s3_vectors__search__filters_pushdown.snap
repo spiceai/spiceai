@@ -1,19 +1,19 @@
 ---
 source: crates/runtime/tests/models/s3_vectors.rs
 expression: formatted
+snapshot_kind: text
 ---
-+-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+
-| message.body                                                                  | attempt_count | message.status | package_weight_kg | round(vector_search().score,Int64(1)) |
-+-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+
-| Item available at your local depot. ID: PKG-bf2f0f1f                          | 2             | FAILED         | 9.98              | 0.9                                   |
-| Delivery confirmed but not at recipient location. Tracking ID: PKG-78ec2148   | 2             | FAILED         | 9.87              | 0.9                                   |
-| Package may have been delivered to the wrong address. Track with PKG-0fa25c7e | 2             | FAILED         | 9.68              | 0.9                                   |
-| Package may have been delivered to the wrong address. Track with PKG-b01acdcf | 2             | FAILED         | 9.57              | 0.9                                   |
-| Delivery confirmed but not at recipient location. Tracking ID: PKG-9e9045a4   | 2             | FAILED         | 9.57              | 0.9                                   |
-| Item available at your local depot. ID: PKG-5320c904                          | 2             | FAILED         | 9.47              | 0.9                                   |
-| Package may have been delivered to the wrong address. Track with PKG-5e1de6e7 | 3             | FAILED         | 9.38              | 0.9                                   |
-| Package may have been delivered to the wrong address. Track with PKG-5664abb9 | 3             | FAILED         | 9.18              | 0.9                                   |
-| Delivery confirmed but not at recipient location. Tracking ID: PKG-03499eac   | 3             | FAILED         | 8.8               | 0.9                                   |
-| Package may have been delivered to the wrong address. Track with PKG-202c3899 | 2             | FAILED         | 8.77              | 0.9                                   |
-+-------------------------------------------------------------------------------+---------------+----------------+-------------------+---------------------------------------+
-
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
+| message.body                                                                  | attempt_count | message.status | package_weight_kg | round(vector_search(delivery, Utf8("wrong location")).score,Int64(1)) |
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
+| Item available at your local depot. ID: PKG-bf2f0f1f                          | 2             | FAILED         | 9.98              | 0.9                                                                   |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-78ec2148   | 2             | FAILED         | 9.87              | 0.9                                                                   |
+| Package may have been delivered to the wrong address. Track with PKG-0fa25c7e | 2             | FAILED         | 9.68              | 0.9                                                                   |
+| Package may have been delivered to the wrong address. Track with PKG-b01acdcf | 2             | FAILED         | 9.57              | 0.9                                                                   |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-9e9045a4   | 2             | FAILED         | 9.57              | 0.9                                                                   |
+| Item available at your local depot. ID: PKG-5320c904                          | 2             | FAILED         | 9.47              | 0.9                                                                   |
+| Package may have been delivered to the wrong address. Track with PKG-5e1de6e7 | 3             | FAILED         | 9.38              | 0.9                                                                   |
+| Package may have been delivered to the wrong address. Track with PKG-5664abb9 | 3             | FAILED         | 9.18              | 0.9                                                                   |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-03499eac   | 3             | FAILED         | 8.8               | 0.9                                                                   |
+| Package may have been delivered to the wrong address. Track with PKG-202c3899 | 2             | FAILED         | 8.77              | 0.9                                                                   |
++-------------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
