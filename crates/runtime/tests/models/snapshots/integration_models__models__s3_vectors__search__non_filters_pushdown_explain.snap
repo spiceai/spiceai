@@ -1,28 +1,29 @@
 ---
 source: crates/runtime/tests/models/s3_vectors.rs
 expression: formatted
+snapshot_kind: text
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                              |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: vector_search().event.id, round(vector_search().score,Int64(1))                                                       |
-|               |   Sort: vector_search().event.id DESC NULLS FIRST, vector_search().score DESC NULLS FIRST, fetch=10                               |
-|               |     Projection: vector_search().event.id, round(vector_search().score, Int64(1)), vector_search().score                           |
-|               |       BytesProcessedNode                                                                                                          |
-|               |         Filter: vector_search().account.tier = Utf8("BUSINESS")                                                                   |
-|               |           TableScan: vector_search() projection=[event.id, account.tier, score]                                                   |
-| physical_plan | ProjectionExec: expr=[event.id@0 as event.id, round(vector_search().score,Int64(1))@1 as round(vector_search().score,Int64(1))]   |
-|               |   SortPreservingMergeExec: [event.id@0 DESC, score@2 DESC], fetch=10                                                              |
-|               |     SortExec: TopK(fetch=10), expr=[event.id@0 DESC, score@2 DESC], preserve_partitioning=[true]                                  |
-|               |       ProjectionExec: expr=[event.id@0 as event.id, round(score@2, 1) as round(vector_search().score,Int64(1)), score@2 as score] |
-|               |         BytesProcessedExec                                                                                                        |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                             |
-|               |             FilterExec: account.tier@1 = BUSINESS                                                                                 |
-|               |               ProjectionExec: expr=[event.id@0 as event.id, account.tier@2 as account.tier, score@1 as score]                     |
-|               |                 BytesProcessedExec                                                                                                |
-|               |                   ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]               |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                          |
-|               |                       BytesProcessedExec                                                                                          |
-|               |                         S3VectorsQueryExec: limit=30                                                                              |
-|               |                                                                                                                                   |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search(delivery, Utf8("wrong location")).event.id, round(vector_search(delivery, Utf8("wrong location")).score,Int64(1))                                                             |
+|               |   Sort: vector_search(delivery, Utf8("wrong location")).event.id DESC NULLS FIRST, vector_search(delivery, Utf8("wrong location")).score DESC NULLS FIRST, fetch=10                                     |
+|               |     Projection: vector_search(delivery, Utf8("wrong location")).event.id, round(vector_search(delivery, Utf8("wrong location")).score, Int64(1)), vector_search(delivery, Utf8("wrong location")).score |
+|               |       BytesProcessedNode                                                                                                                                                                                |
+|               |         Filter: vector_search(delivery, Utf8("wrong location")).account.tier = Utf8("BUSINESS")                                                                                                         |
+|               |           TableScan: vector_search(delivery, Utf8("wrong location")) projection=[event.id, account.tier, score]                                                                                         |
+| physical_plan | ProjectionExec: expr=[event.id@0 as event.id, round(vector_search(delivery, Utf8("wrong location")).score,Int64(1))@1 as round(vector_search(delivery, Utf8("wrong location")).score,Int64(1))]         |
+|               |   SortPreservingMergeExec: [event.id@0 DESC, score@2 DESC], fetch=10                                                                                                                                    |
+|               |     SortExec: TopK(fetch=10), expr=[event.id@0 DESC, score@2 DESC], preserve_partitioning=[true]                                                                                                        |
+|               |       ProjectionExec: expr=[event.id@0 as event.id, round(score@2, 1) as round(vector_search(delivery, Utf8("wrong location")).score,Int64(1)), score@2 as score]                                       |
+|               |         BytesProcessedExec                                                                                                                                                                              |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                   |
+|               |             FilterExec: account.tier@1 = BUSINESS                                                                                                                                                       |
+|               |               ProjectionExec: expr=[event.id@0 as event.id, account.tier@2 as account.tier, score@1 as score]                                                                                           |
+|               |                 BytesProcessedExec                                                                                                                                                                      |
+|               |                   ProjectionExec: expr=[key@1 as event.id, 1 - distance@2 as score, account.tier@0 as account.tier]                                                                                     |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                |
+|               |                       BytesProcessedExec                                                                                                                                                                |
+|               |                         S3VectorsQueryExec: limit=30                                                                                                                                                    |
+|               |                                                                                                                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

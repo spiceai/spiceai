@@ -6,10 +6,10 @@ snapshot_kind: text
 +---------------+------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                             |
 +---------------+------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: vector_search().subject                                                                              |
-|               |   Sort: vector_search().score DESC NULLS FIRST, fetch=4                                                          |
+| logical_plan  | Projection: vector_search(qs, Utf8("second")).subject                                                            |
+|               |   Sort: vector_search(qs, Utf8("second")).score DESC NULLS FIRST, fetch=4                                        |
 |               |     BytesProcessedNode                                                                                           |
-|               |       TableScan: vector_search() projection=[subject, score]                                                     |
+|               |       TableScan: vector_search(qs, Utf8("second")) projection=[subject, score]                                   |
 | physical_plan | ProjectionExec: expr=[subject@0 as subject]                                                                      |
 |               |   SortPreservingMergeExec: [score@1 DESC], fetch=4                                                               |
 |               |     SortExec: TopK(fetch=4), expr=[score@1 DESC], preserve_partitioning=[true]                                   |
