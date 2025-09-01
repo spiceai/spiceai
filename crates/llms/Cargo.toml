@@ -33,7 +33,7 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 spicepod = { path = "../spicepod" }
-tokenizers = "0.21.2"
+tokenizers = "0.22.0"
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
