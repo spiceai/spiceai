@@ -15,42 +15,36 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.6 (August 2025)
-
-**Focus:** Indexing & Acceleration - Improved performance and reliability for indexing and alignment with data accelerators.
-
-- **Indexing**:
-  - Improved performance and reliability of vectorizing and full-text indexes.
-  - Alignment of indexes to data accelerators for optimized query execution.
-- **DataFusion**: Upgrade to v48.
-- **Hash Partitioning**: Improved query distribution and performance.
-- **Embedding Models**: Model2Vec static embedding models
-- **Data Connectors**:
-  - MongoDB Data Connector
-
-### v1.7 (September 2025)
+### [v1.7 (September 2025)](https://github.com/spiceai/spiceai/milestone/75)
 
 **Focus:** Real-Time Write-Through Caching - Streamlined data and embedding caching with real-time ingestion.
 
+- **Query**:
+  - Regex support for DuckDB accelerator/connector.
+- **Search**:
+  - Amazon S3 Vectors cross-index query.
+  - Amazon S3 Vectors chunking support.
+  - Reciprocal Rank Fusion (RRF) UDTF
 - **Caching**:
-  - Real-time write-through caching for data and embeddings.
+  - Real-time write-through caching/acceleration for data and embeddings.
+  - xxHash (XXH3) results-caching algorithm support.
 - **Ingestion**:
   - Real-time data consumption via Apache Kafka.
-  - Improved Change Data Capture (CDC) mechanisms.
-  - Write-through support to Parquet and Apache Iceberg.
-- **DuckDB**: Upgrade to v1.4.
+  - Improved Debezium/Change Data Capture (CDC) mechanisms.
 - **DataFusion**: Upgrade to v49.
 
-### v1.8 (October 2025)
+### [v1.8 (October 2025)](https://github.com/spiceai/spiceai/milestone/77)
 
 **Focus:** Resource Management & Expanded Write Support - Fine-grained resource control and broader database compatibility.
 
 - **Resource Management**: Finer-grained runtime-wide control for optimized performance.
-- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
+- **Hash Partitioning**: Improved query distribution and performance.
 - **Write Support**:
+  - Write-through support to Apache Iceberg.
   - MySQL write support.
   - PostgreSQL write support (expanded).
   - Spice Cloud write support (expanded).
+- **DuckDB**: Upgrade to v1.4.
 - **DataFusion**: Upgrade to v50.
 
 ### v1.9 (November 2025)
@@ -59,7 +53,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 - **Hybrid Search**:
   - Boosting and re-ranking for enhanced search results.
-- **Delta Lake**: Write support for transactional data lakes.
+- **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
 - **DataFusion**: Upgrade to v51.
 
 ### v1.10 (December 2025)
@@ -85,6 +79,7 @@ These are prioritized based on community demand and strategic alignment. Share y
 
 ### Data Connectors
 
+- **Delta Lake**: Write support for transactional data lakes.
 - **Elasticsearch**: Integration for search and analytics workloads.
 - **MotherDuck**: Hybrid cloud DuckDB connector.
 - **BigQuery**: Support for Google Cloud's data warehouse.

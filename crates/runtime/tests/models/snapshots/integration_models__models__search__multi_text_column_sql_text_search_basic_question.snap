@@ -1,17 +1,27 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: resp
+expression: resp?
 snapshot_kind: text
 ---
 [
   {
-    "id": 525,
-    "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]",
-    "trunc(text_search().score,Int64(3))": 6.331
+    "id": 495,
+    "question": "If \\( b^\\circ \\) and \\( 50^\\circ \\) are vertical angles, what is the value of \\( b \\)?",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
   },
   {
-    "id": 772,
-    "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\).",
-    "trunc(text_search().score,Int64(3))": 6.192
+    "id": 494,
+    "question": "If \\( b^\\circ \\) and \\( 30^\\circ \\) are vertical angles, what is the value of \\( b \\)?",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
+  },
+  {
+    "id": 499,
+    "question": "If \\( m \\) and \\( n \\) are two angles that lie on a straight line, what is the value of \\( m + n \\)?",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.245
+  },
+  {
+    "id": 1175,
+    "question": "What is the sum of the angles \\( a + b + c + d + e + f + g + h \\) around a point in the diagram?",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.129
   }
 ]

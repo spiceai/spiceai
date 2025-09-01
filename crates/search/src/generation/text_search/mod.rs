@@ -311,6 +311,59 @@ impl FullTextSearchFieldIndex {
         )
     }
 
+    pub async fn search(
+        &self,
+        query: String,
+        opt_filters: &[&Expr],
+        addition_projection: &[&Expr],
+        limit: usize,
+    ) -> GenerationResult<SendableRecordBatchStream> {
+        if !opt_filters.is_empty() {
+            return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
+        }
+
+        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
+        let mut keep_search_field = false;
+        let cols = self.all_columns();
+        for proj in addition_projection {
+            let is_supported = match proj {
+                Expr::Identifier(Ident { value, .. }) => {
+                    if *value == self.field {
+                        keep_search_field = true;
+                    }
+                    cols.contains(value)
+                }
+                _ => false,
+            };
+            if !is_supported {
+                return Err(Error::UnsupportedAdditionalColumnsError)
+                    .context(GenerationTextSearchSnafu)?;
+            }
+        }
+
+        for pk in &self.primary_key {
+            // keep the field if it is part of the primary key
+            if pk == &self.field {
+                keep_search_field = true;
+                break;
+            }
+        }
+
+        let strm = make_stream(self.clone(), query, keep_search_field, limit);
+        let mut strm = Box::pin(strm.peekable());
+        let schema = match strm.as_mut().peek().await {
+            None => Arc::new(Schema::empty()),
+            Some(Ok(rb)) => rb.schema(),
+            Some(Err(e)) => {
+                return Err(GenerationError::internal(
+                    format!("Failed to parse schema of full text search results: {e}").as_str(),
+                ));
+            }
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
+    }
+
     /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
     fn search_query_literal(
         &self,
@@ -434,8 +487,28 @@ fn parse_query_literal(q: &str) -> UserInputAst {
     )
 }
 
+impl From<FullTextSearchFieldIndex> for FullTextSearchCandidate {
+    fn from(inner: FullTextSearchFieldIndex) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+impl From<Arc<FullTextSearchFieldIndex>> for FullTextSearchCandidate {
+    fn from(inner: Arc<FullTextSearchFieldIndex>) -> Self {
+        Self {
+            inner: Arc::clone(&inner),
+        }
+    }
+}
+
+pub struct FullTextSearchCandidate {
+    inner: Arc<FullTextSearchFieldIndex>,
+}
+
 #[async_trait]
-impl CandidateGeneration for FullTextSearchFieldIndex {
+impl CandidateGeneration for FullTextSearchCandidate {
     async fn search(
         &self,
         query: String,
@@ -443,50 +516,9 @@ impl CandidateGeneration for FullTextSearchFieldIndex {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
-        if !opt_filters.is_empty() {
-            return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
-        }
-
-        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
-        let mut keep_search_field = false;
-        let cols = self.all_columns();
-        for proj in addition_projection {
-            let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => {
-                    if *value == self.field {
-                        keep_search_field = true;
-                    }
-                    cols.contains(value)
-                }
-                _ => false,
-            };
-            if !is_supported {
-                return Err(Error::UnsupportedAdditionalColumnsError)
-                    .context(GenerationTextSearchSnafu)?;
-            }
-        }
-
-        for pk in &self.primary_key {
-            // keep the field if it is part of the primary key
-            if pk == &self.field {
-                keep_search_field = true;
-                break;
-            }
-        }
-
-        let strm = make_stream(self.clone(), query, keep_search_field, limit);
-        let mut strm = Box::pin(strm.peekable());
-        let schema = match strm.as_mut().peek().await {
-            None => Arc::new(Schema::empty()),
-            Some(Ok(rb)) => rb.schema(),
-            Some(Err(e)) => {
-                return Err(GenerationError::internal(
-                    format!("Failed to parse schema of full text search results: {e}").as_str(),
-                ));
-            }
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
+        self.inner
+            .search(query, opt_filters, addition_projection, limit)
+            .await
     }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
@@ -495,7 +527,7 @@ impl CandidateGeneration for FullTextSearchFieldIndex {
 
     /// Whether additional columns of the underlying source can also be retrieved during generation.
     fn supports_columns(&self, projection: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        let columns = self.all_columns();
+        let columns = self.inner.all_columns();
 
         let cols_found = projection
             .iter()
@@ -513,7 +545,7 @@ impl CandidateGeneration for FullTextSearchFieldIndex {
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
     fn value_derived_from(&self) -> String {
-        self.field.clone()
+        self.inner.field.clone()
     }
 }
 
@@ -582,7 +614,7 @@ pub(crate) mod tests {
         aggregation::write_to_json_string,
         generation::{
             CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearchFieldIndex, parse_query_literal},
+            text_search::{FullTextSearchCandidate, FullTextSearchFieldIndex, parse_query_literal},
         },
     };
 
@@ -672,7 +704,9 @@ pub(crate) mod tests {
         )
         .expect("failed to create FullTextSearch");
 
-        let rb_as_value = validate_result(fts.search("fish".into(), &[], &[], 3).await).await;
+        let candidate: FullTextSearchCandidate = fts.into();
+
+        let rb_as_value = validate_result(candidate.search("fish".into(), &[], &[], 3).await).await;
 
         insta::assert_json_snapshot!(rb_as_value);
     }

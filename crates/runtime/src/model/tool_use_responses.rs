@@ -21,19 +21,25 @@ use async_openai::{
         responses::{
             CodeInterpreter, CodeInterpreterContainer, CodeInterpreterContainerKind,
             CreateResponse, Function, FunctionCall, Input, InputContent, InputItem, InputMessage,
-            InputMessageType, OutputContent, Response, ResponseStream, Role, ToolChoice,
-            ToolChoiceMode, ToolDefinition, Usage, WebSearchPreview,
+            InputMessageType, OutputContent, OutputItem, Response, ResponseEvent, ResponseStream,
+            Role, ToolChoice, ToolChoiceMode, ToolDefinition, Usage, WebSearchPreview,
         },
     },
 };
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use itertools::Itertools;
 use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 use tools::SpiceModelTool;
+use tracing::{Instrument, Span};
 
 use crate::{
     model::tool_use::{combine_opt_u32, encode_tool_name},
@@ -328,6 +334,53 @@ impl ToolUsingResponses {
         .await
     }
 
+    async fn responses_stream_inner(
+        &self,
+        req: CreateResponse,
+        recursion_limit: Option<usize>,
+    ) -> Result<ResponseStream, OpenAIError> {
+        Box::pin(async move {
+            // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+            if req
+                .tool_choice
+                .as_ref()
+                .is_some_and(|t| matches!(t, ToolChoice::Mode(ToolChoiceMode::None)))
+            {
+                tracing::debug!("User asked for no tools, calling inner responses model");
+                return self.inner_responses.responses_stream(req).await;
+            }
+
+            if recursion_limit.is_some_and(|f| f == 0) {
+                tracing::debug!(
+                    "Tool-use recursion limit reached. Will call model, but not process further"
+                );
+                return self.inner_responses.responses_stream(req).await;
+            }
+
+            // Append spiced runtime tools to the request.
+            let inner_req = self.add_runtime_tools(&req);
+
+            let s = self
+                .inner_responses
+                .responses_stream(inner_req.clone())
+                .await?;
+
+            Ok(make_responses_stream(
+                Span::current(),
+                RequestContext::current(AsyncMarker::new().await),
+                Self::new(
+                    Arc::clone(&self.inner_responses),
+                    self.openai_tools.clone(),
+                    self.tools.clone(),
+                    recursion_limit.map(|r| r - 1),
+                ),
+                req,
+                s,
+            ))
+        })
+        .await
+    }
+
     fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
         let mut runtime_tools = self.runtime_tools();
         if runtime_tools.is_empty() {
@@ -352,8 +405,8 @@ impl Responses for ToolUsingResponses {
     }
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
-        self.inner_responses
-            .responses_stream(self.prepare_req(req))
+        let inner_req = self.prepare_req(req.clone());
+        self.responses_stream_inner(inner_req, self.recursion_limit)
             .await
     }
 
@@ -362,6 +415,252 @@ impl Responses for ToolUsingResponses {
         self.responses_request_inner(inner_req, self.recursion_limit)
             .await
     }
+}
+
+struct CustomResponseStream {
+    receiver: mpsc::Receiver<Result<ResponseEvent, OpenAIError>>,
+}
+
+impl Stream for CustomResponseStream {
+    type Item = Result<ResponseEvent, OpenAIError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn make_responses_stream(
+    span: Span,
+    request_context: Arc<RequestContext>,
+    model: ToolUsingResponses,
+    req: CreateResponse,
+    mut s: ResponseStream,
+) -> ResponseStream {
+    let (sender, receiver) = mpsc::channel(100);
+    let sender_clone = sender.clone();
+
+    tokio::spawn(
+        request_context
+            .scope(async move {
+                let function_call_builders: Arc<Mutex<HashMap<String, FunctionCall>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let ready_to_call_functions: Arc<Mutex<Vec<FunctionCall>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+
+                let mut captured_output = String::new();
+
+                while let Some(result) = s.next().await {
+                    let response_event = match result {
+                        Ok(event) => event,
+                        Err(e) => {
+                            if let Err(e) = sender_clone.send(Err(e)).await {
+                                if !sender_clone.is_closed() {
+                                    tracing::error!(
+                                        "Unable to send error to response stream: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                    };
+
+                    let mut should_forward = true;
+                    let mut should_process_tools = false;
+
+                    match &response_event {
+                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                            captured_output.push_str(&delta.delta);
+                        }
+                        ResponseEvent::ResponseOutputItemAdded(item_added) => {
+                            if let OutputItem::FunctionCall(function_call) = &item_added.item {
+                                let function_call_builders_clone =
+                                    Arc::clone(&function_call_builders);
+                                let Ok(mut builders_lock) = function_call_builders_clone.lock()
+                                else {
+                                    return;
+                                };
+
+                                builders_lock
+                                    .insert(function_call.id.clone(), function_call.clone());
+                                should_forward = false;
+                            }
+                        }
+                        ResponseEvent::ResponseFunctionCallArgumentsDelta(delta) => {
+                            let function_call_builders_clone = Arc::clone(&function_call_builders);
+                            let Ok(mut builders_lock) = function_call_builders_clone.lock() else {
+                                return;
+                            };
+
+                            if let Some(state) = builders_lock.get_mut(&delta.item_id) {
+                                state.arguments.push_str(&delta.delta);
+                            }
+                        }
+                        ResponseEvent::ResponseFunctionCallArgumentsDone(done) => {
+                            let function_call_builders_clone = Arc::clone(&function_call_builders);
+                            let Ok(builders_lock) = function_call_builders_clone.lock() else {
+                                return;
+                            };
+
+                            if let Some(function_call) = builders_lock.get(&done.item_id) {
+                                // Move function call to the ready to call list
+                                let ready_to_call = Arc::clone(&ready_to_call_functions);
+                                let Ok(mut ready_to_call_lock) = ready_to_call.lock() else {
+                                    return;
+                                };
+                                ready_to_call_lock.push(function_call.clone());
+                            }
+                        }
+                        ResponseEvent::ResponseOutputItemDone(item_done) => {
+                            // When an output item (like a function call) is done, just note it but don't process tools yet
+                            // Tool processing will happen when the entire response is complete
+                            if let OutputItem::FunctionCall(function_call) = &item_done.item {
+                                // Don't forward individual function call completion events for Spice tools
+                                // We'll handle them when the entire response completes
+                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
+                                let spice_tool_found = {
+                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
+                                        return;
+                                    };
+
+                                    ready_to_call_lock
+                                        .iter()
+                                        .find(|call| call.id == function_call.id)
+                                        .is_some_and(|call| model.as_spiced_tool(call).is_some())
+                                };
+
+                                if spice_tool_found {
+                                    // This is a Spice tool - don't forward this event but don't process yet
+                                    should_forward = false;
+                                    // Don't set should_process_tools = true here - wait for response completion
+                                }
+                            }
+                        }
+                        ResponseEvent::ResponseCompleted(_)
+                        | ResponseEvent::ResponseIncomplete(_) => {
+                            // Only process tools if we haven't already done so and there are spice tools
+                            if !should_process_tools {
+                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
+                                let has_spice_tools = {
+                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
+                                        return;
+                                    };
+
+                                    ready_to_call_lock
+                                        .iter()
+                                        .any(|call| model.as_spiced_tool(call).is_some())
+                                };
+
+                                if has_spice_tools {
+                                    should_forward = false;
+                                    should_process_tools = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Process completed spiced tool calls when response is complete
+                    if should_process_tools {
+                        let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
+                        let spice_tools: Vec<FunctionCall> = {
+                            let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
+                                return;
+                            };
+
+                            ready_to_call_lock
+                                .iter()
+                                .filter(|call| model.as_spiced_tool(call).is_some())
+                                .cloned()
+                                .collect()
+                        }; // Lock is dropped here
+
+                        if spice_tools.is_empty() {
+                            // No spice tools, forward the completion event normally
+                            if let Err(e) = sender_clone.send(Ok(response_event)).await {
+                                if !sender_clone.is_closed() {
+                                    tracing::error!("Error sending event: {}", e);
+                                }
+                            }
+                        } else {
+                            // Process spice tools - don't forward the completion event
+                            let new_messages = match model
+                                .process_tool_calls_and_run_spice_tools(
+                                    to_input_item(req.input.clone()),
+                                    spice_tools,
+                                )
+                                .await
+                            {
+                                Ok(Some(messages)) => messages,
+                                Ok(None) => {
+                                    // No spice tools within returned tools, forward the event
+                                    if let Err(e) = sender_clone.send(Ok(response_event)).await {
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending event: {}", e);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    if let Err(e) = sender_clone.send(Err(e)).await {
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending error: {}", e);
+                                        }
+                                    }
+                                    return;
+                                }
+                            };
+
+                            // Make recursive call for tool results
+                            match model
+                                .responses_stream_inner(
+                                    create_new_recursive_req(&req, new_messages, None),
+                                    model.recursion_limit.map(|r| r - 1),
+                                )
+                                .await
+                            {
+                                Ok(mut recursive_stream) => {
+                                    while let Some(recursive_result) = recursive_stream.next().await
+                                    {
+                                        if let Err(e) = sender_clone.send(recursive_result).await {
+                                            if !sender_clone.is_closed() {
+                                                tracing::error!(
+                                                    "Error sending recursive event: {}",
+                                                    e
+                                                );
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    // Continue processing the original stream after recursive stream completes
+                                }
+                                Err(e) => {
+                                    if let Err(e) = sender_clone.send(Err(e)).await {
+                                        if !sender_clone.is_closed() {
+                                            tracing::error!("Error sending recursive error: {}", e);
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    } else if should_forward {
+                        // Forward the event normally
+                        if let Err(e) = sender_clone.send(Ok(response_event)).await {
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending event: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!(target: "task_history", captured_output = %captured_output);
+            })
+            .instrument(span),
+    );
+
+    Box::pin(CustomResponseStream { receiver }) as ResponseStream
 }
 
 fn get_tool_name(tool: &ToolDefinition) -> &str {

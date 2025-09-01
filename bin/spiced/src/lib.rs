@@ -36,13 +36,14 @@ use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
-use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory, in_tracing_context};
+use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
+use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -181,6 +182,7 @@ pub async fn run(args: Args) -> Result<()> {
         .spicepod
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+
     let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;

@@ -319,6 +319,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::generation::CandidateGeneration;
+    use crate::generation::text_search::FullTextSearchCandidate;
     use crate::generation::text_search::tests::{create_basic_index, validate_result};
     use crate::generation::{
         post_apply::PostApplyCandidateGeneration, text_search::FullTextSearchFieldIndex,
@@ -412,10 +413,12 @@ mod tests {
         )
         .expect("failed to create FullTextSearch");
 
+        let candidate: FullTextSearchCandidate = fts.into();
+
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
             table_provider,
-            Arc::new(fts),
+            Arc::new(candidate),
             vec!["title".to_string()],
         );
 
@@ -438,10 +441,12 @@ mod tests {
         )
         .expect("failed to create FullTextSearch");
 
+        let candidate: FullTextSearchCandidate = fts.into();
+
         let table_provider = create_table_provider();
         let post_apply = PostApplyCandidateGeneration::new(
             table_provider,
-            Arc::new(fts),
+            Arc::new(candidate),
             vec!["title".to_string()],
         );
 

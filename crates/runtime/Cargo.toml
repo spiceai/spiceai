@@ -90,7 +90,7 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
-notify = "8.0.0"
+notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
@@ -194,11 +194,13 @@ paste.workspace = true
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
+spiceai.workspace = true
 test-framework = { path = "../test-framework" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+rdkafka = { workspace = true, features = ["ssl-vendored"] }
 
 [features]
 aws-secrets-manager = [

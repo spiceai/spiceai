@@ -358,12 +358,15 @@ impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
 pub struct Kafka {
     schema: SchemaRef,
     consumer: &'static KafkaConsumer,
+    flatten_json: Option<String>,
 }
 
 impl std::fmt::Debug for Kafka {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kafka")
             .field("schema", &self.schema)
+            .field("consumer_group_id", &self.consumer.group_id())
+            .field("flatten_json", &self.flatten_json)
             .finish_non_exhaustive()
     }
 }
@@ -374,12 +377,20 @@ impl Kafka {
         Self {
             schema,
             consumer: Box::leak(Box::new(consumer)),
+            flatten_json: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_flatten_json(mut self, flatten_json: Option<String>) -> Self {
+        self.flatten_json = flatten_json;
+        self
     }
 
     #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
+        let flatten_json = self.flatten_json.clone();
         let stream = self
             .consumer
             .stream_json::<serde_json::Value, serde_json::Value>()
@@ -392,8 +403,14 @@ impl Kafka {
                     )));
                 };
 
+                let json_str = match flatten_json {
+                    Some(ref delimiter) => {
+                        dataformat_json::flatten_json_obj(msg.value(), delimiter).to_string()
+                    }
+                    None => msg.value().to_string(),
+                };
+
                 // convert JSON string to Arrow record batch
-                let json_str = msg.value().to_string();
                 let rb = ReaderBuilder::new(Arc::clone(&schema))
                     .build(std::io::Cursor::new(json_str.as_bytes()))
                     .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
