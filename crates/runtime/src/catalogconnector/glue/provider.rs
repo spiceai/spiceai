@@ -171,10 +171,12 @@ impl GlueCatalogProvider {
                 .collect::<Vec<_>>();
 
             for table in some_tables {
-                let connector = GlueDataConnector::new_with_catalog_id(
-                    self.parameters.parameters.clone(),
-                    self.catalog_id.clone(),
-                );
+                let mut parameters = self.parameters.parameters.clone();
+                if let Some(catalog_id) = &self.catalog_id {
+                    parameters.insert("catalog_id".to_string(), catalog_id.to_string().into());
+                }
+
+                let connector = GlueDataConnector::new(parameters);
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())

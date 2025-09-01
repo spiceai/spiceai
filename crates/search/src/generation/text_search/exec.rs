@@ -29,7 +29,7 @@ use datafusion::{
 
 use futures::StreamExt;
 
-use super::{CandidateGeneration, FullTextSearchFieldIndex};
+use super::FullTextSearchFieldIndex;
 
 /// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
 pub struct FullTextSearchExec {
