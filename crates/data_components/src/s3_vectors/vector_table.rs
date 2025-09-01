@@ -99,7 +99,7 @@ impl S3VectorsTable {
             }
             None => return Ok(S3VectorTableResult::IndexDoesNotExist),
             Some(_) => {}
-        };
+        }
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
         Ok(S3VectorTableResult::Table(Self {
