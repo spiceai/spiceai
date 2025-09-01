@@ -976,7 +976,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
             ),
             SearchTestCase::new(
                 "multi_text_column_sql_text_search_basic_question",
-                SearchTestType::Sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4"),
+                SearchTestType::Sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
             ),
             SearchTestCase::new(
                 // When there are multiple columns, `text_search` needs column explicitly as input.
