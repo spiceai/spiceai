@@ -1,10 +1,21 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+      },
+      "primary_key": {
+        "id": 938
+      },
+      "score": 0.01
+    },
     {
       "dataset": "qs",
       "matches": {
@@ -18,30 +29,10 @@ expression: normalize_search_response(resp)
     {
       "dataset": "qs",
       "matches": {
-        "question": "<refined question>"
+        "question": "Which compound is not an intermediate of the TCA cycle?"
       },
       "primary_key": {
-        "id": 6
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "question": "In the prescription label \"Sig: gtt ii OS TID,\" what does \"OS\" mean?"
-      },
-      "primary_key": {
-        "id": 537
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
-        "question": "What are consequential late effects?"
-      },
-      "primary_key": {
-        "id": 810
+        "id": 1279
       },
       "score": 0.01
     }

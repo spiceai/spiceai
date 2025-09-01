@@ -35,6 +35,7 @@ mod bedrock;
 mod embedding;
 mod hf;
 mod local;
+mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
