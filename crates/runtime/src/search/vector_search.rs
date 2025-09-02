@@ -309,7 +309,8 @@ impl VectorSearch {
 
         match vector_search_result {
             Ok(result) => {
-                tracing::info!(target: "task_history", captured_output = ?result);
+                let captured_output_json = serde_json::to_string(&result).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(result)
             }
             Err(e) => {
