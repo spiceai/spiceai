@@ -20,15 +20,16 @@ use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_stream::StreamExt;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::changes::index_change_envelope;
+use crate::changes::{flatten_change_envelope_stream, index_change_envelope};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::make_spice_data_sub_directory;
-use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -210,12 +211,12 @@ impl DataConnector for FullTextConnector {
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying = indexed_table.get_underlying();
-            return Some(
+            return Some(flatten_change_envelope_stream(Box::pin(
                 self.inner_connector
                     .changes_stream(Arc::new(FederatedTable::Immediate(underlying)))?
-                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                    .boxed(),
-            );
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            )));
         } else {
             unreachable!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"
@@ -237,12 +238,12 @@ impl DataConnector for FullTextConnector {
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying = indexed_table.get_underlying();
-            return Some(
+            return Some(flatten_change_envelope_stream(Box::pin(
                 self.inner_connector
                     .append_stream(Arc::new(FederatedTable::Immediate(underlying)))?
-                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                    .boxed(),
-            );
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            )));
         } else {
             unreachable!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"

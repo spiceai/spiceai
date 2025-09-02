@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::flatten_change_envelope_stream;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
@@ -33,7 +34,6 @@ use data_components::cdc::ChangesStream;
 use data_components::cdc::StreamError;
 use data_components::cdc::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
-use futures::StreamExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -42,7 +42,9 @@ use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_stream::StreamExt;
 
 use super::table::EmbeddingTable;
 
@@ -360,13 +362,14 @@ impl DataConnector for EmbeddingConnector {
                 return self.inner_connector.changes_stream(federated_table);
             };
 
-            let stream = self
-                .inner_connector
-                .changes_stream(underlying_federated_table)?
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                .boxed();
+            let stream = Box::pin(
+                self.inner_connector
+                    .changes_stream(underlying_federated_table)?
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            );
 
-            return Some(stream);
+            return Some(flatten_change_envelope_stream(stream));
         }
 
         let embedding_table = Arc::new(
@@ -378,11 +381,11 @@ impl DataConnector for EmbeddingConnector {
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
 
-        let stream = self
-            .inner_connector
-            .changes_stream(underlying_federated_table)?
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
+        let stream = Box::pin(
+            self.inner_connector
+                .changes_stream(underlying_federated_table)?
+                .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table))),
+        );
 
         Some(stream)
     }
@@ -403,13 +406,14 @@ impl DataConnector for EmbeddingConnector {
             let underlying_federated_table =
                 underlying_federated_table_for_indexed_table(&table_provider)?;
 
-            let stream = self
-                .inner_connector
-                .append_stream(underlying_federated_table)?
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                .boxed();
+            let stream = Box::pin(
+                self.inner_connector
+                    .append_stream(underlying_federated_table)?
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            );
 
-            return Some(stream);
+            return Some(flatten_change_envelope_stream(stream));
         }
 
         let embedding_table = Arc::new(
@@ -421,11 +425,11 @@ impl DataConnector for EmbeddingConnector {
         let underlying_table = Arc::clone(&embedding_table.base_table);
         let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
 
-        let stream = self
-            .inner_connector
-            .append_stream(underlying_federated_table)?
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
+        let stream = Box::pin(
+            self.inner_connector
+                .append_stream(underlying_federated_table)?
+                .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table))),
+        );
 
         Some(stream)
     }
