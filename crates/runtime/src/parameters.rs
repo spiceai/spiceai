@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
+use itertools::Itertools;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
-use tract_core::tract_data::itertools::Itertools;
 
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 use crate::secrets::Secrets;
@@ -451,6 +451,12 @@ impl ParameterSpec {
     #[must_use]
     pub const fn one_of(mut self, options: &'static [&'static str]) -> Self {
         self.one_of = Some(options);
+        self
+    }
+
+    #[must_use]
+    pub const fn is_boolean(mut self) -> Self {
+        self = self.one_of(["true", "false"]);
         self
     }
 
