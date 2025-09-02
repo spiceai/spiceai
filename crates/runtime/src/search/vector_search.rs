@@ -84,13 +84,16 @@ impl VectorSearch {
     async fn model_from_vector_index(
         &self,
         tbl: &Arc<dyn TableProvider>,
+        embedding_column: &str,
     ) -> Option<Arc<dyn Embed>> {
-        let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
         #[cfg(feature = "s3_vectors")]
         {
             use crate::embeddings::index::s3::S3Vector;
-            if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
-                return s3_vector.embedding_model().await;
+            let index = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
+            for s3v in index.get_indexes::<S3Vector>() {
+                if s3v.embedded_column == embedding_column {
+                    return s3v.embedding_model().await;
+                }
             }
             None
         }
@@ -113,8 +116,9 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let (model, is_chunked) = if let Some(model) =
-            self.model_from_vector_index(&table_provider).await
+        let (model, is_chunked) = if let Some(model) = self
+            .model_from_vector_index(&table_provider, embedding_column)
+            .await
         {
             (model, false)
         } else {
