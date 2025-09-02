@@ -18,13 +18,12 @@ use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
 use std::any::Any;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::{make_spice_data_sub_directory, spice_data_base_path};
+use crate::make_spice_data_sub_directory;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
