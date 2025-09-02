@@ -82,9 +82,6 @@ $ spice trace ai_chat --include-input --truncate=120
 
 # returns the SQL query for the trace
 $ spice trace ai_chat --output=sql
-
-# (future) returns the trace as CSV
-$ spice trace ai_chat --output=csv
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
