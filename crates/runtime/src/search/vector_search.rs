@@ -22,6 +22,7 @@ use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+use crate::search::FormattingSnafu;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -309,7 +310,13 @@ impl VectorSearch {
 
         match vector_search_result {
             Ok(result) => {
-                let captured_output_json = serde_json::to_string(&result).boxed()?;
+                let displayable: HashMap<String, serde_json::Value> = result
+                    .iter()
+                    .map(|(tbl, agg_result)| (tbl.to_string(), agg_result.display_json()))
+                    .collect();
+                let captured_output_json = serde_json::to_string(&displayable)
+                    .boxed()
+                    .context(FormattingSnafu)?;
                 tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(result)
             }

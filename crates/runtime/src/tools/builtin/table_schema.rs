@@ -161,8 +161,6 @@ impl TableSchemaTool {
 
                 table_schemas.push(table_schema);
             }
-            .instrument(span.clone())
-            .await;
 
             Ok(table_schemas)
         }
