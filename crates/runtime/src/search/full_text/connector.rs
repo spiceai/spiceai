@@ -16,12 +16,15 @@ limitations under the License.
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
+use snafu::ResultExt;
 use std::any::Any;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::{make_spice_data_sub_directory, spice_data_base_path};
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -61,6 +64,20 @@ impl FullTextConnector {
             return Ok(inner_table_provider);
         }
 
+        // Example `.spice/data/fts/catalog/schema/table/`.
+        let index_directory = make_spice_data_sub_directory(
+            [vec!["fts".to_string()], dataset.name.to_vec()]
+                .concat()
+                .as_slice(),
+        )
+        .boxed()
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })?;
+
         let index = FullTextDatabaseIndex::try_new(
             Arc::clone(&inner_table_provider),
             search_fields.clone(),
@@ -69,6 +86,7 @@ impl FullTextConnector {
                 primary_key_overrides,
                 search_fields.as_slice(),
             ),
+            Some(index_directory),
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
