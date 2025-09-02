@@ -8,32 +8,6 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
-      },
-      "primary_key": {
-        "id": 525
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-      },
-      "dataset": "qs",
-      "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-      },
-      "primary_key": {
-        "id": 361
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
       "dataset": "qs",
@@ -47,14 +21,40 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many groups of 3 are in 18?"
       },
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
-        "id": 462
+        "id": 463
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+      },
+      "primary_key": {
+        "id": 525
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "How many groups of 5 are in 25?"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "How many groups of 5 are in 25?"
+      },
+      "primary_key": {
+        "id": 464
       },
       "score": 0.01
     }
