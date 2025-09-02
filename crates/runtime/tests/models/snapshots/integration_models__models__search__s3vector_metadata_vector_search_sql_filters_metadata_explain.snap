@@ -3,22 +3,22 @@ source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4"
 snapshot_kind: text
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                    |
-+---------------+-------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                   |
-|               |   Projection: vector_search().id, vector_search().answer, trunc(vector_search().score, Int64(3)) AS score               |
-|               |     BytesProcessedNode                                                                                                  |
-|               |       TableScan: vector_search() projection=[id, answer, score], full_filters=[vector_search().subject != Utf8("math")] |
-| physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                        |
-|               |   SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                            |
-|               |     ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as score]                                   |
-|               |       BytesProcessedExec                                                                                                |
-|               |         ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                         |
-|               |           BytesProcessedExec                                                                                            |
-|               |             ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]              |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                     |
-|               |                 BytesProcessedExec                                                                                      |
-|               |                   S3VectorsQueryExec: filter={subject:{$ne:"math"}} limit=30                                            |
-|               |                                                                                                                         |
-+---------------+-------------------------------------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                     |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                                    |
+|               |   Projection: vector_search(qs, Utf8("secondary")).id, vector_search(qs, Utf8("secondary")).answer, trunc(vector_search(qs, Utf8("secondary")).score, Int64(3)) AS score |
+|               |     BytesProcessedNode                                                                                                                                                   |
+|               |       TableScan: vector_search(qs, Utf8("secondary")) projection=[id, answer, score], full_filters=[vector_search(qs, Utf8("secondary")).subject != Utf8("math")]        |
+| physical_plan | SortPreservingMergeExec: [score@2 DESC], fetch=4                                                                                                                         |
+|               |   SortExec: TopK(fetch=4), expr=[score@2 DESC], preserve_partitioning=[true]                                                                                             |
+|               |     ProjectionExec: expr=[id@0 as id, answer@1 as answer, trunc(score@2, 3) as score]                                                                                    |
+|               |       BytesProcessedExec                                                                                                                                                 |
+|               |         ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                          |
+|               |           BytesProcessedExec                                                                                                                                             |
+|               |             ProjectionExec: expr=[CAST(key@1 AS Int64) as id, 1 - distance@2 as score, answer@0 as answer]                                                               |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                                                                      |
+|               |                 BytesProcessedExec                                                                                                                                       |
+|               |                   S3VectorsQueryExec: filter={subject:{$ne:"math"}} limit=30                                                                                             |
+|               |                                                                                                                                                                          |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

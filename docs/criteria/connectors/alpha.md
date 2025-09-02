@@ -23,6 +23,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | HTTP/HTTPS                       | ➖            |                 |
 | IMAP                             | ✅            | @peasee         |
 | Iceberg                          | ✅            | @phillipleblanc |
+| Kafka                            | ✅            | @sgrebnov       |
 | Localpod                         | ➖            |                 |
 | MS SQL                           | ✅            | @peasee         |
 | MySQL                            | ✅            | @peasee         |

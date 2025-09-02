@@ -168,8 +168,9 @@ jobs:
       - name: Install missing tools (Mac)
         if: matrix.target.target_os == 'darwin'
         run: |
+          brew update
           brew install protobuf
-          brew install cmake
+          brew list cmake || brew install cmake
           brew install unixodbc
           echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
 
