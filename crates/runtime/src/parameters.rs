@@ -456,7 +456,7 @@ impl ParameterSpec {
 
     #[must_use]
     pub const fn is_boolean(mut self) -> Self {
-        self = self.one_of(["true", "false"]);
+        self = self.one_of(&["true", "false"]);
         self
     }
 
