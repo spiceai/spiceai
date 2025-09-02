@@ -378,8 +378,11 @@ impl DataConnector for EmbeddingConnector {
             .cloned()
         {
             let indexed_table = Arc::new(indexed_table);
-            let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&table_provider)?;
+            let Some(underlying_federated_table) =
+                underlying_federated_table_for_indexed_table(&table_provider)
+            else {
+                return self.inner_connector.changes_stream(federated_table);
+            };
 
             let stream = self
                 .inner_connector
