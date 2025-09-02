@@ -75,6 +75,7 @@ pub mod auth;
 mod builder;
 mod cancellable_task;
 pub mod catalogconnector;
+mod changes;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
