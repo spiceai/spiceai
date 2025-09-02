@@ -471,7 +471,9 @@ fn underlying_federated_table_for_indexed_table(
             return underlying_federated_table_for_indexed_table(&indexed_scan.underlying);
         }
 
-        Some(Arc::new(FederatedTable::Immediate(Arc::clone(src_table_provider))))
+        Some(Arc::new(FederatedTable::Immediate(Arc::clone(
+            src_table_provider,
+        ))))
     }
     #[cfg(not(feature = "s3_vectors"))]
     {
