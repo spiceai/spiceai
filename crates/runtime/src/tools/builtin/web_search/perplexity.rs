@@ -25,7 +25,7 @@ use llms::perplexity::types::{PerplexityRequest, PerplexityResponse};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{WebSearchParams, WebSearchParamsType, WebSearchResponse, WebSearchResult};
+use super::{WebSearchParams, WebSearchResponse, WebSearchResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PerplexityWebSearchParams {
@@ -36,8 +36,8 @@ impl TryFrom<WebSearchParams> for PerplexityRequest {
     type Error = OpenAIError;
 
     fn try_from(web_search: WebSearchParams) -> Result<PerplexityRequest, Self::Error> {
-        match web_search.params {
-            WebSearchParamsType::Perplexity(perplexity_params) => {
+        match web_search {
+            WebSearchParams::Perplexity(perplexity_params) => {
                 let openai_request = CreateChatCompletionRequestArgs::default()
                     .messages(vec![ChatCompletionRequestMessage::User(
                         ChatCompletionRequestUserMessageArgs::default()

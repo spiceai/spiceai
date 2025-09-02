@@ -104,13 +104,8 @@ impl SearchEngine {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
-pub enum WebSearchParamsType {
+pub enum WebSearchParams {
     Perplexity(PerplexityWebSearchParams),
-}
-
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-pub struct WebSearchParams {
-    params: WebSearchParamsType,
 }
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize, Default)]
