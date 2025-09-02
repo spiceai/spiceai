@@ -29,6 +29,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
+use crate::make_spice_data_sub_directory;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
