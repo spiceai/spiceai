@@ -21,11 +21,12 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::index_change_envelope;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::embeddings::index;
 use crate::federated_table::FederatedTable;
+use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -190,10 +191,14 @@ impl DataConnector for FullTextConnector {
             .downcast_ref::<IndexedTableProvider>()
             .cloned()
         {
+            let indexed_table = Arc::new(indexed_table);
             let underlying = indexed_table.get_underlying();
-            return self
-                .inner_connector
-                .changes_stream(Arc::new(FederatedTable::Immediate(underlying)));
+            return Some(
+                self.inner_connector
+                    .changes_stream(Arc::new(FederatedTable::Immediate(underlying)))?
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
+                    .boxed(),
+            );
         } else {
             unreachable!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"
@@ -213,10 +218,14 @@ impl DataConnector for FullTextConnector {
             .downcast_ref::<IndexedTableProvider>()
             .cloned()
         {
+            let indexed_table = Arc::new(indexed_table);
             let underlying = indexed_table.get_underlying();
-            return self
-                .inner_connector
-                .append_stream(Arc::new(FederatedTable::Immediate(underlying)));
+            return Some(
+                self.inner_connector
+                    .append_stream(Arc::new(FederatedTable::Immediate(underlying)))?
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
+                    .boxed(),
+            );
         } else {
             unreachable!(
                 "FullTextConnector didn't wrap underlying table with index - this is unexpected"
