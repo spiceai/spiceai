@@ -16,4 +16,6 @@ snafu.workspace = true
 datafusion.workspace = true
 
 [dev-dependencies]
-insta.workspace = true
+insta = {workspace = true, features = ["json"]}
+arrow-json.workspace = true
+serde_json.workspace = true

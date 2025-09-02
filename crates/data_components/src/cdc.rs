@@ -45,10 +45,16 @@ pub enum ChangeBatchError {
 
 #[derive(Debug)]
 pub enum StreamError {
+    /// Error from the Kafka client, such as failure to consume messages.
     Kafka(String),
+    /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
+    /// Error from Arrow Flight, such as failure during streaming or subscription.
     Flight(String),
+    /// Error from the Arrow library, such as failure during batch processing or manipulation.
     Arrow(String),
+    /// External error not originating from `ChangesStream` core logic, such as index processing failure.
+    External(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -60,6 +66,7 @@ impl std::fmt::Display for StreamError {
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
+            StreamError::External(e) => write!(f, "External error: {e}"),
         }
     }
 }
@@ -329,6 +336,38 @@ pub fn wrap_data_as_change_batch(
     let record_batch = RecordBatch::try_new(schema.into(), columns).context(ArrowSnafu)?;
 
     ChangeBatch::try_new(record_batch)
+}
+
+pub fn replace_change_batch_data(
+    new_data: &RecordBatch,
+    change: &ChangeBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
+    let schema = changes_schema(&new_data.schema());
+
+    let cols = change
+        .record
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "data" {
+                Arc::new(StructArray::new(
+                    new_data.schema().fields().clone(),
+                    new_data.columns().to_vec(),
+                    None,
+                )) as Arc<dyn Array>
+            } else {
+                match change.record.column_by_name(f.name()) {
+                    Some(column) => Arc::clone(column),
+                    None => unreachable!("Column {} must exist", f.name()),
+                }
+            }
+        })
+        .collect();
+
+    RecordBatch::try_new(schema.into(), cols)
+        .map_err(|source| ChangeBatchError::Arrow { source })
+        .and_then(ChangeBatch::try_new)
 }
 
 #[cfg(test)]

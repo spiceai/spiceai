@@ -49,6 +49,13 @@ func SqlRequestToTraces(rtcontext *context.RuntimeContext, sql string) ([]TaskHi
 	if err != nil {
 		return []TaskHistory{}, fmt.Errorf("error reading response from spiced: %w", err)
 	}
+
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SQL request failed with code: %d, error: %s", response.StatusCode, string(raw))
+	}
+
 	if len(raw) == 0 {
 		return []TaskHistory{}, nil
 	}

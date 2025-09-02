@@ -393,7 +393,7 @@ mod tests {
                 filters: vec![binary_expr(
                     col("a"),
                     Operator::Gt,
-                    Expr::Literal(ScalarValue::Int64(Some(3))),
+                    Expr::Literal(ScalarValue::Int64(Some(3)), None),
                 )],
                 limit: None,
             };

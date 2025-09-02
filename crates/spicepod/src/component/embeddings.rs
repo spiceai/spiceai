@@ -25,6 +25,7 @@ use super::{
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -37,7 +38,7 @@ pub struct Embeddings {
     pub files: Vec<ModelFile>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, String>,
+    pub params: HashMap<String, Value>,
 
     #[serde(rename = "datasets", default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<String>,
@@ -151,6 +152,10 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("bedrock:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Model2Vec) => {
+                let from = &self.from;
+                from.strip_prefix("model2vec:").map(ToString::to_string)
+            }
             None => None,
         }
     }
@@ -163,6 +168,7 @@ pub enum EmbeddingPrefix {
     File,
     Databricks,
     Bedrock,
+    Model2Vec,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -181,6 +187,8 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(EmbeddingPrefix::Bedrock)
+        } else if value.starts_with("model2vec") {
+            Ok(EmbeddingPrefix::Model2Vec)
         } else {
             Err("Unknown prefix")
         }
@@ -196,6 +204,7 @@ impl Display for EmbeddingPrefix {
             EmbeddingPrefix::File => write!(f, "file"),
             EmbeddingPrefix::Databricks => write!(f, "databricks"),
             EmbeddingPrefix::Bedrock => write!(f, "bedrock"),
+            EmbeddingPrefix::Model2Vec => write!(f, "model2vec"),
         }
     }
 }

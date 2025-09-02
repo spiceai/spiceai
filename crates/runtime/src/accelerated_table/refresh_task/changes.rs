@@ -72,6 +72,7 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
+
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
@@ -87,6 +88,10 @@ impl RefreshTask {
                                 ready_sender.notify_waiters();
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
+
+                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
+                            self.update_component_status(status::ComponentStatus::Ready)
+                                .await;
 
                             if let Err(e) = change_envelope.commit() {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");

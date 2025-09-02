@@ -56,6 +56,7 @@ impl LogVerbosity {
 }
 
 const INTERNAL_COMPONENTS: &[&str] = &[
+    "app",
     "task_history",
     "spiced",
     "runtime",

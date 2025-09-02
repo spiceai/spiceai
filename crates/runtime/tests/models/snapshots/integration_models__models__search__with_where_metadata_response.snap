@@ -1,0 +1,30 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Choices create costs and benefits."
+      },
+      "primary_key": {
+        "id": 863
+      },
+      "score": 0.93
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.9
+    }
+  ]
+}

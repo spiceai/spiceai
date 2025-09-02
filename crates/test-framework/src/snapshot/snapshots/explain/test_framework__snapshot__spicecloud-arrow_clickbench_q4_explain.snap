@@ -2,18 +2,17 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q4"
 ---
-+---------------+---------------------------------------------------------------------------------+
-| plan_type     | plan                                                                            |
-+---------------+---------------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]             |
-|               |   BytesProcessedNode                                                            |
-|               |     TableScan: hits projection=[UserID]                                         |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                      |
-|               |   CoalescePartitionsExec                                                        |
-|               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                |
-|               |       BytesProcessedExec                                                        |
-|               |         SchemaCastScanExec                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |             DataSourceExec: partitions=1, partition_sizes=[24415]               |
-|               |                                                                                 |
-+---------------+---------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                      |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]                                                                                       |
+|               |   BytesProcessedNode                                                                                                                                      |
+|               |     TableScan: hits projection=[UserID]                                                                                                                   |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                                                                                                |
+|               |   CoalescePartitionsExec                                                                                                                                  |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                                                                                          |
+|               |       BytesProcessedExec                                                                                                                                  |
+|               |         SchemaCastScanExec                                                                                                                                |
+|               |           DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1525] |
+|               |                                                                                                                                                           |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+

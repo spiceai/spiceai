@@ -130,7 +130,7 @@ fn supports_in_list(columns: &[String], in_list: &datafusion::logical_expr::expr
 
 /// Checks if an expression is a literal value
 fn is_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(_))
+    matches!(expr, Expr::Literal(..))
 }
 
 /// Converts a single `DataFusion` Expr to a `MetadataFilter`
@@ -293,7 +293,7 @@ fn extract_field_name(expr: &Expr) -> DataFusionResult<String> {
 /// Extracts literal value from a `DataFusion` expression
 fn extract_literal_value(expr: &Expr) -> DataFusionResult<serde_json::Value> {
     match expr {
-        Expr::Literal(scalar) => scalar_to_json_value(scalar),
+        Expr::Literal(scalar, _) => scalar_to_json_value(scalar),
         _ => Err(DataFusionError::Plan(format!(
             "Expected literal value, got: {expr:?}"
         ))),

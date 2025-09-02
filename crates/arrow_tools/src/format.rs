@@ -243,14 +243,10 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let nulls = new_child_array.nulls().cloned();
 
     ListArray::try_new(
-        Arc::new(Field::new_list(
+        Arc::new(Field::new(
             "item",
-            Field::new(
-                "item",
-                child_array.data_type().clone(),
-                child_array.is_nullable(),
-            ),
-            list_array.is_nullable(),
+            child_array.data_type().clone(),
+            child_array.is_nullable(),
         )),
         OffsetBuffer::from_lengths(new_lengths),
         new_child_array,
@@ -333,11 +329,17 @@ fn column_indices(batch: &RecordBatch, column_names: &[String]) -> Result<Vec<us
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Float32Array, RecordBatch, StringArray};
+    use arrow::{
+        array::{ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray},
+        datatypes::Int32Type,
+    };
     use arrow_schema::{DataType, Field, Schema};
+    use snafu::ResultExt;
     use std::sync::Arc;
 
-    use crate::format::to_markdown_documents;
+    use crate::format::{
+        to_markdown_documents, truncate_fixed_size_list_array, truncate_list_array,
+    };
 
     #[test]
     fn test_pretty_format_markdown() -> Result<(), Box<dyn std::error::Error>> {
@@ -351,12 +353,12 @@ mod tests {
             Some(
                 "Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
-Sed do eiusmod tempor aliqua. 
+Sed do eiusmod tempor aliqua.
 
 reprehenderit nulla pariatur.",
             ),
             Some(
-                "Lorem ipsum dolor adipiscing elit. 
+                "Lorem ipsum dolor adipiscing elit.
 Cras venenatis euismod malesuada.",
             ),
         ]);
@@ -396,5 +398,107 @@ Cras venenatis euismod malesuada.",
         insta::assert_snapshot!("with_alias", formatted);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_truncate_list_array() {
+        let test_cases: Vec<(&str, usize, ListArray)> = vec![
+            (
+                "truncate_list_array_basic",
+                2,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2)]),
+                    Some(vec![Some(3), Some(4), Some(5)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+            (
+                "truncate_list_array_unchanged",
+                5,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2)]),
+                    Some(vec![Some(3), Some(4), Some(5)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+            (
+                "truncate_list_array_split",
+                3,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2), Some(3)]),
+                    Some(vec![Some(3), Some(4), Some(5), Some(6)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+        ];
+        for (test_name, max_len, input) in test_cases {
+            let output: ArrayRef =
+                Arc::new(truncate_list_array(&input, max_len).expect("truncate_list_array failed"));
+            insta::assert_json_snapshot!(
+                test_name,
+                write_to_json_value(output).expect("could not write ListArray to JSON")
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_fixed_size_list_array() {
+        let test_cases: Vec<(&str, usize, FixedSizeListArray)> = vec![
+            (
+                "truncate_fixed_size_list_array_basic",
+                2,
+                FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                    vec![
+                        Some(vec![Some(0), Some(1), Some(2)]),
+                        Some(vec![Some(3), Some(4), Some(5)]),
+                        Some(vec![Some(6), Some(7), Some(8)]),
+                    ],
+                    3,
+                ),
+            ),
+            (
+                "truncate_fixed_size_list_array_unchanged",
+                5,
+                FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                    vec![
+                        Some(vec![Some(0), Some(1), Some(2)]),
+                        Some(vec![Some(3), Some(4), Some(5)]),
+                        Some(vec![Some(6), Some(7), Some(8)]),
+                    ],
+                    3,
+                ),
+            ),
+        ];
+        for (test_name, max_len, input) in test_cases {
+            let output: ArrayRef = Arc::new(
+                truncate_fixed_size_list_array(&input, max_len)
+                    .expect("truncate_fixed_size_list_array failed"),
+            );
+            insta::assert_json_snapshot!(
+                test_name,
+                write_to_json_value(output).expect("could not write FixedSizeListArray to JSON")
+            );
+        }
+    }
+
+    pub fn write_to_json_value(
+        data: ArrayRef,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let rb = RecordBatch::try_new(
+            Schema::new(vec![Field::new(
+                "col",
+                data.data_type().clone(),
+                data.is_nullable(),
+            )])
+            .into(),
+            vec![data],
+        )
+        .boxed()?;
+        let buf = Vec::new();
+        let mut writer = arrow_json::ArrayWriter::new(buf);
+
+        writer.write_batches([rb].iter().collect::<Vec<&RecordBatch>>().as_slice())?;
+        writer.finish()?;
+        serde_json::from_reader::<_, serde_json::Value>(writer.into_inner().as_slice()).boxed()
     }
 }
