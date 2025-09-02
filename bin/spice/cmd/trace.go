@@ -43,8 +43,8 @@ include_output bool
 // The truncation length
 truncateLength int
 
-// The sql only flag
-sqlOnly bool
+// The output format flag: table (default), sql, csv (future)
+outputFormat string
 )
 
 var supported_trace_tasks = []string{
@@ -81,7 +81,10 @@ Include the input and truncate to 120 characters (default is 80).
 $ spice trace ai_chat --include-input --truncate=120
 
 # returns the SQL query for the trace
-$ spice trace ai_chat --sql
+$ spice trace ai_chat --output=sql
+
+# (future) returns the trace as CSV
+$ spice trace ai_chat --output=csv
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -104,8 +107,14 @@ $ spice trace ai_chat --sql
 		}
 
 		sqlQuery := fmt.Sprintf("SELECT * FROM runtime.task_history WHERE %s ORDER BY start_time asc", filter)
-		if sqlOnly {
+		switch outputFormat {
+		case "sql":
 			cmd.Println(sqlQuery)
+			return
+		case "table":
+			// default behavior
+		default:
+			cmd.PrintErrln("Unknown output format: " + outputFormat)
 			return
 		}
 
@@ -216,7 +225,7 @@ func init() {
 	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
 	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncates the input/output data to 80 when set, or to the given length")
 	traceCmd.Flags().Lookup("truncate").NoOptDefVal = "80"
-	traceCmd.Flags().BoolVar(&sqlOnly, "sql", false, "If set, outputs the SQL query used for tracing instead of executing it.")
+	traceCmd.Flags().StringVar(&outputFormat, "output", "table", "Output format: table (default), sql (return the SQL query)")
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {
