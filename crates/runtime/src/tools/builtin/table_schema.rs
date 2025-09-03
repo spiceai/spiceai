@@ -109,62 +109,75 @@ impl TableSchemaTool {
             _ => vec![],
         };
 
-        let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
-        for (i, t) in tables.iter().enumerate() {
-            let base_schema = self
-                .rt
-                .datafusion()
-                .get_arrow_schema(t)
-                .instrument(span.clone())
-                .await
-                .boxed()?;
+        let result: Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> = async {
+            let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
+            for (i, t) in tables.iter().enumerate() {
+                let base_schema = self
+                    .rt
+                    .datafusion()
+                    .get_arrow_schema(t)
+                    .instrument(span.clone())
+                    .await
+                    .boxed()?;
 
-            let schema = match output {
-                OutputType::Minimal => base_schema,
-                OutputType::Full => {
-                    let Schema {
-                        mut fields,
-                        metadata,
-                    } = base_schema;
+                let schema = match output {
+                    OutputType::Minimal => base_schema,
+                    OutputType::Full => {
+                        let Schema {
+                            mut fields,
+                            metadata,
+                        } = base_schema;
 
-                    if let Some((_tbl, Some(columns))) = column_info.get(i) {
-                        fields = fields
-                            .into_iter()
-                            .map(|f| {
-                                let col = columns.iter().find(|c| c.name == *f.name());
-                                match col {
-                                    Some(c) => Arc::new(
-                                        Field::new(
-                                            f.name(),
-                                            f.data_type().clone(),
-                                            f.is_nullable(),
-                                        )
-                                        .with_metadata(c.metadata().clone()),
-                                    ),
-                                    None => Arc::clone(f),
-                                }
-                            })
-                            .collect();
+                        if let Some((_tbl, Some(columns))) = column_info.get(i) {
+                            fields = fields
+                                .into_iter()
+                                .map(|f| {
+                                    let col = columns.iter().find(|c| c.name == *f.name());
+                                    match col {
+                                        Some(c) => Arc::new(
+                                            Field::new(
+                                                f.name(),
+                                                f.data_type().clone(),
+                                                f.is_nullable(),
+                                            )
+                                            .with_metadata(c.metadata().clone()),
+                                        ),
+                                        None => Arc::clone(f),
+                                    }
+                                })
+                                .collect();
+                        }
+
+                        Schema::new_with_metadata(fields, metadata)
                     }
+                };
 
-                    Schema::new_with_metadata(fields, metadata)
-                }
-            };
+                let schema_value = serde_json::value::to_value(schema).boxed()?;
 
-            let schema_value = serde_json::value::to_value(schema).boxed()?;
+                let table_schema = serde_json::json!({
+                    "table": t,
+                    "schema": schema_value
+                });
 
-            let table_schema = serde_json::json!({
-                "table": t,
-                "schema": schema_value
-            });
+                table_schemas.push(table_schema);
+            }
 
-            table_schemas.push(table_schema);
+            Ok(table_schemas)
         }
+        .instrument(span.clone())
+        .await;
 
-        let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
-
-        Ok(Value::Array(table_schemas))
+        match result {
+            Ok(table_schemas) => {
+                let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(Value::Array(table_schemas))
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 
     /// Retrieve column information for the given table.
