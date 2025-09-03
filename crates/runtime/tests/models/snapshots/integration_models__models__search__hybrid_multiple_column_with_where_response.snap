@@ -9,16 +9,6 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
-      },
-      "primary_key": {
-        "id": 938
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "qs",
-      "matches": {
         "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },
       "primary_key": {
@@ -33,6 +23,16 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 1279
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+      },
+      "primary_key": {
+        "id": 938
       },
       "score": 0.01
     }

@@ -6,13 +6,13 @@ snapshot_kind: text
 WITH alpha AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY k1, k2, k3) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM alpha
 ),
 beta AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY k1, k2, k3) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM beta
 )
 SELECT
