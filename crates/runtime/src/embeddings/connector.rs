@@ -370,10 +370,11 @@ impl DataConnector for EmbeddingConnector {
                 .inner_connector
                 .changes_stream(underlying_federated_table)?;
 
-            let stream = changes_stream
-                .chunks_timeout(100, Duration::from_secs(2))
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                .boxed();
+            let stream = Box::pin(
+                changes_stream
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            );
 
             return Some((flatten_change_envelope_stream(stream), readiness));
         }
@@ -391,11 +392,12 @@ impl DataConnector for EmbeddingConnector {
             .inner_connector
             .changes_stream(underlying_federated_table)?;
 
-        let stream = stream
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
+        let stream = Box::pin(
+            stream
+                .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table))),
+        );
 
-        Some((flatten_change_envelope_stream(stream), readiness))
+        Some((stream, readiness))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -421,10 +423,11 @@ impl DataConnector for EmbeddingConnector {
                 .inner_connector
                 .append_stream(underlying_federated_table)?;
 
-            let stream = stream
-                .chunks_timeout(100, Duration::from_secs(2))
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
-                .boxed();
+            let stream = Box::pin(
+                stream
+                    .chunks_timeout(100, Duration::from_secs(2))
+                    .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
+            );
 
             return Some((flatten_change_envelope_stream(stream), readiness));
         }
@@ -442,11 +445,12 @@ impl DataConnector for EmbeddingConnector {
             .inner_connector
             .append_stream(underlying_federated_table)?;
 
-        let stream = stream
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
+        let stream = Box::pin(
+            stream
+                .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table))),
+        );
 
-        Some((flatten_change_envelope_stream(stream), readiness))
+        Some((stream, readiness))
     }
 }
 
