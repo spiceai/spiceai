@@ -180,13 +180,13 @@ impl SpiceTestQueryWorker {
                             )
                             .await?
                         {
-                            return SpiceTestQueryWorkerResult::new(
+                            return Ok(SpiceTestQueryWorkerResult::new(
                                 &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
                                 true,
                                 row_counts,
-                            );
+                            ));
                         }
                         query_set_count += 1;
                     }
@@ -223,13 +223,13 @@ impl SpiceTestQueryWorker {
                             )
                             .await?;
                         if connection_failed {
-                            return SpiceTestQueryWorkerResult::new(
+                            return Ok(SpiceTestQueryWorkerResult::new(
                                 &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
                                 true,
                                 row_counts,
-                            );
+                            ));
                         }
 
                         if self.explain_plan_snapshot && self.id == 0 {
@@ -282,13 +282,13 @@ impl SpiceTestQueryWorker {
                                 .await?;
 
                             if connection_failed {
-                                return SpiceTestQueryWorkerResult::new(
+                                return Ok(SpiceTestQueryWorkerResult::new(
                                     &query_durations,
                                     query_iteration_durations,
                                     query_statuses,
                                     true,
                                     row_counts,
-                                );
+                                ));
                             }
 
                             if let Some(query_failure) = query_failure {
@@ -305,13 +305,13 @@ impl SpiceTestQueryWorker {
                 }
             }
 
-            SpiceTestQueryWorkerResult::new(
+            Ok(SpiceTestQueryWorkerResult::new(
                 &query_durations,
                 query_iteration_durations,
                 query_statuses,
                 false,
                 row_counts,
-            )
+            ))
         })
     }
 
