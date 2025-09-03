@@ -21,6 +21,9 @@ on:
           - 'openai[text-embedding-3-small]-duckdb[file]'
           - 'openai[text-embedding-3-small[chunking]]-duckdb[file]'
           - 'openai[text-embedding-3-small]-s3_vectors'
+          - 'full_text_search-duckdb[file]'
+          - 'hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]'
+          - 'model2vec[potion-multilingual-128M]-duckdb[file]'
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -48,6 +51,9 @@ jobs:
               { name: "openai[text-embedding-3-small]-duckdb[file]" },
               { name: "openai[text-embedding-3-small[chunking]]-duckdb[file]" },
               { name: "openai[text-embedding-3-small]-s3_vectors" },
+              { name: "full_text_search-duckdb[file]" },
+              { name: "hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]" },
+              { name: "model2vec[potion-multilingual-128M]-duckdb[file]" },
             ];
 
             const configuration = context.payload.inputs?.configuration || 'all';
