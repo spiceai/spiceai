@@ -21,7 +21,6 @@ use super::{
     Error,
     index_query_provider::{S3_VECTOR_DISTANCE_NAME, S3VectorsQueryIndexTable},
 };
-use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -30,11 +29,7 @@ use datafusion::{
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::TableProviderFilterPushDown,
-    physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
-    physical_plan::{
-        ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, sorts::sort::SortExec,
-        union::UnionExec,
-    },
+    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
 };
 use s3_vectors::ListIndexesInput;
@@ -124,8 +119,10 @@ impl TableProvider for S3VectorsQueryBucketTable {
             return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema()))));
         }
 
-        let S3VectorIdentifier::Bucket { name: bucket_name } = self.table.identifier.clone() else {
-            todo!()
+        let Some(bucket_name) = self.table.identifier.index_identifier_variables().1 else {
+            return Err(DataFusionError::Execution(format!(
+                "No bucket name for bucket query"
+            )));
         };
 
         let list_indexes_output = self
@@ -180,21 +177,6 @@ impl TableProvider for S3VectorsQueryBucketTable {
 
         let union_plan = Arc::new(UnionExec::new(index_plans));
 
-        // Sort by distance to get the best results across all indexes.
-        // let sort_exprs = vec![PhysicalSortExpr {
-        //     expr: Arc::new(Column::new_with_schema(
-        //         S3_VECTOR_DISTANCE_NAME,
-        //         &self.schema(),
-        //     )?),
-        //     options: SortOptions {
-        //         descending: false,
-        //         nulls_first: true,
-        //     },
-        // }];
-
-        // let sort_plan = Arc::new(SortExec::new(LexOrdering::new(sort_exprs), union_plan));
-
-        // let limit_plan = Arc::new(GlobalLimitExec::new(sort_plan, 0, limit));
         let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, limit));
 
         Ok(limit_plan)

@@ -20,7 +20,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::s3_vectors::{
     MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorTableResult, S3VectorsTable,
 };
-use datafusion::catalog::TableProvider;
+use datafusion::{catalog::TableProvider, sql::TableReference};
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
 use search::generation::util::get_primary_keys;
@@ -68,11 +68,15 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("num_partitions")
+        .description("The number of index partitions to use.")
+        .secret(),
 ];
 
 /// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_from_dataset(
+    ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
@@ -101,9 +105,11 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    let default_s3_index_name = format!("{ds_name}-{column}-{}", config.model).replace('_', "-");
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
+        &default_s3_index_name,
         Arc::clone(&embedding_models),
         config.model.as_str(),
     )
@@ -136,12 +142,15 @@ async fn embedding_vector_size(
 async fn try_vector_table(
     columns: MetadataColumns,
     params: Parameters,
+    default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
+    let s3_num_partitions =
+        string_from_params(&params, "num_partitions").and_then(|s| s.parse().ok());
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -150,8 +159,9 @@ async fn try_vector_table(
             bucket_name: bucket.to_string(),
             index_name: index.to_string(),
         }),
-        (None, Some(bucket), None) => Ok(S3VectorIdentifier::Bucket {
-            name: bucket.to_string(),
+        (None, Some(bucket), None) => Ok(S3VectorIdentifier::Index {
+            bucket_name: bucket.to_string(),
+            index_name: default_s3_index_name.to_string(),
         }),
         (None, None, Some(_)) => Err("'s3_vectors_index' provided without associated 's3_vectors_bucket'.".to_string()),
         (Some(_), None, Some(_)) | (Some(_), Some(_), None) => {
@@ -162,6 +172,24 @@ async fn try_vector_table(
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
         Box::from(format!("Invalid S3 Vectors bucket defined: {e}"))
     })?;
+
+    let id = match s3_num_partitions {
+        Some(num_partitions) => {
+            let S3VectorIdentifier::Index {
+                bucket_name,
+                index_name,
+            } = id
+            else {
+                return Err(Box::from("Vector Index via ARN cannot be partitioned"));
+            };
+            S3VectorIdentifier::PartitionedIndex {
+                bucket_name,
+                index_name,
+                num_partitions,
+            }
+        }
+        None => id,
+    };
 
     let config = load_config(
         "S3Vectors",

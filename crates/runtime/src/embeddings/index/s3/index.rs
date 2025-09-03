@@ -193,7 +193,10 @@ impl VectorIndex for S3Vector {
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
         let vector = self.query_vector(query).await?;
 
-        let tp = if matches!(&self.table.identifier, S3VectorIdentifier::Bucket { .. }) {
+        let tp = if matches!(
+            self.table.identifier,
+            S3VectorIdentifier::PartitionedIndex { .. }
+        ) {
             // Table Provider for the S3V Bucket will perform cross-index queries
             Arc::new(S3VectorsQueryBucketTable::new(self.table.clone(), vector))
                 as Arc<dyn TableProvider>

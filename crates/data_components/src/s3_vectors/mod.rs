@@ -99,8 +99,10 @@ pub enum S3VectorIdentifier {
         bucket_name: String,
         index_name: String,
     },
-    Bucket {
-        name: String,
+    PartitionedIndex {
+        bucket_name: String,
+        index_name: String,
+        num_partitions: usize,
     },
 }
 
@@ -112,13 +114,13 @@ impl S3VectorIdentifier {
             Self::Index {
                 bucket_name,
                 index_name,
+            }
+            | Self::PartitionedIndex {
+                bucket_name,
+                index_name,
+                ..
             } => (None, Some(bucket_name.clone()), Some(index_name.clone())),
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
-            Self::Bucket { name } => (None, Some(name.clone()), None),
         }
-    }
-
-    pub fn is_bucket(&self) -> bool {
-        matches!(self, Self::Bucket { .. })
     }
 }

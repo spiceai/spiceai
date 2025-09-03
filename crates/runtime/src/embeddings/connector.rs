@@ -203,6 +203,7 @@ impl EmbeddingConnector {
                     use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
                     let vector_index = super::index::s3::try_from_dataset(
+                        &dataset.name,
                         column,
                         config,
                         vector_store,
