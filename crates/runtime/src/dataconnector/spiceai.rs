@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
+use data_components::cdc::readiness::Readiness;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
@@ -329,32 +330,39 @@ impl DataConnector for SpiceAI {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        Some(Box::pin(stream! {
-            let table_provider = federated_table.table_provider().await;
-            let Some(federated_table_provider_adaptor) = table_provider
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>() else {
-                return;
-            };
-            let Some(federated_adaptor) = federated_table_provider_adaptor.table_provider.as_ref() else {
-                return;
-            };
-            let Some(flight_table) = federated_adaptor
-            .as_any()
-            .downcast_ref::<FlightTable>() else {
-                return;
-            };
+    fn append_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        let readiness = Readiness::immediate();
+        Some((
+            Box::pin(stream! {
+                let table_provider = federated_table.table_provider().await;
+                let Some(federated_table_provider_adaptor) = table_provider
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>() else {
+                    return;
+                };
+                let Some(federated_adaptor) = federated_table_provider_adaptor.table_provider.as_ref() else {
+                    return;
+                };
+                let Some(flight_table) = federated_adaptor
+                .as_any()
+                .downcast_ref::<FlightTable>() else {
+                    return;
+                };
 
-            let mut stream = Box::pin(subscribe_to_append_stream(
-                flight_table.get_flight_client(),
-                flight_table.get_table_reference(),
-            ));
+                let mut stream = Box::pin(subscribe_to_append_stream(
+                    flight_table.get_flight_client(),
+                    flight_table.get_table_reference(),
+                ));
 
-            while let Some(item) = stream.next().await {
-                yield item;
-            }
-        }))
+                while let Some(item) = stream.next().await {
+                    yield item;
+                }
+            }),
+            readiness,
+        ))
     }
 }
 

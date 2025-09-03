@@ -19,7 +19,7 @@ use std::{any::Any, pin::Pin, sync::Arc};
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
-    cdc::ChangesStream,
+    cdc::{ChangesStream, readiness::Readiness},
     kafka::{KafkaConfig, KafkaConsumer},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
@@ -302,19 +302,25 @@ impl DataConnector for Kafka {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        Some(Box::pin(stream! {
-            let table_provider = federated_table.table_provider().await;
-            let Some(kafka) = table_provider.as_any().downcast_ref::<data_components::kafka::Kafka>() else {
-                return;
-            };
+    fn append_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        Some((
+            Box::pin(stream! {
+                    let table_provider = federated_table.table_provider().await;
+                    let Some(kafka) = table_provider.as_any().downcast_ref::<data_components::kafka::Kafka>() else {
+                        return;
+                    };
 
-            let mut changes_stream = kafka.stream_changes();
+                let mut changes_stream = kafka.stream_changes();
 
-            while let Some(item) = changes_stream.next().await {
-                yield item;
-            }
-        }))
+                while let Some(item) = changes_stream.next().await {
+                    yield item;
+                }
+            }),
+            Readiness::immediate(),
+        ))
     }
 }
 

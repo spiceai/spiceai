@@ -29,6 +29,7 @@ use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use datafusion::common::Column;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::tree_node::TreeNode;
@@ -500,7 +501,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
         None
     }
 
@@ -508,7 +512,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
         None
     }
 
