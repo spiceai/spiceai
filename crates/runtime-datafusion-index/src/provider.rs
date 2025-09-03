@@ -45,9 +45,16 @@ pub struct IndexedTableProvider {
 
 impl IndexedTableProvider {
     pub fn new(underlying: Arc<dyn TableProvider>) -> Self {
+        IndexedTableProvider::with_indexes(underlying, vec![])
+    }
+
+    pub fn with_indexes(
+        underlying: Arc<dyn TableProvider>,
+        indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    ) -> Self {
         Self {
             underlying,
-            indexes: Vec::new(),
+            indexes,
         }
     }
 

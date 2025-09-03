@@ -22,7 +22,7 @@ use app::App;
 use datafusion::common::Column;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
-use runtime_datafusion_index::IndexedTableProvider;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::generation::CandidateGeneration;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::generation::util::get_primary_keys;
@@ -83,6 +83,20 @@ pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
         // Exit if no further wrapping is found.
         return None;
     }
+}
+
+pub(crate) fn find_index_in_table_provider<T: Index + 'static>(
+    tbl: &Arc<dyn TableProvider>,
+) -> Option<Vec<&T>> {
+    let mut indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(tbl);
+    while let Some(indexed_table) = indexed_table_opt {
+        let indexes = indexed_table.get_indexes::<T>();
+        if !indexes.is_empty() {
+            return Some(indexes);
+        }
+        indexed_table_opt = find_concrete_table_provider::<IndexedTableProvider>(&z.underlying);
+    }
+    None
 }
 
 /// Compute the primary keys for each table in the app. Primary Keys can be explicitly defined in the Spicepod.yaml
