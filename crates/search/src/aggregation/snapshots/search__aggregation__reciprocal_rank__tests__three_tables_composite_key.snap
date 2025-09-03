@@ -6,19 +6,19 @@ snapshot_kind: text
 WITH t1 AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY doc_id, section) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM t1
 ),
 t2 AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY doc_id, section) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM t2
 ),
 t3 AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY doc_id, section) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM t3
 )
 SELECT

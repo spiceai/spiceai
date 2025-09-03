@@ -22,28 +22,33 @@ use async_openai::{
     },
 };
 use llms::perplexity::types::{PerplexityRequest, PerplexityResponse};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use super::{WebSearchParams, WebSearchResponse, WebSearchResult};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexityWebSearchParams {
+    query: String,
+}
 
 impl TryFrom<WebSearchParams> for PerplexityRequest {
     type Error = OpenAIError;
 
-    fn try_from(params: WebSearchParams) -> Result<PerplexityRequest, Self::Error> {
-        let WebSearchParams { query, limit: None } = params else {
-            return Err(OpenAIError::InvalidArgument(
-                "Perplexity web search does not support 'limit'".to_string(),
-            ));
-        };
+    fn try_from(web_search: WebSearchParams) -> Result<PerplexityRequest, Self::Error> {
+        match web_search {
+            WebSearchParams::Perplexity(perplexity_params) => {
+                let openai_request = CreateChatCompletionRequestArgs::default()
+                    .messages(vec![ChatCompletionRequestMessage::User(
+                        ChatCompletionRequestUserMessageArgs::default()
+                            .content(perplexity_params.query)
+                            .build()?,
+                    )])
+                    .build()?;
 
-        let openai_request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessageArgs::default()
-                    .content(query)
-                    .build()?,
-            )])
-            .build()?;
-
-        Ok(openai_request.into())
+                Ok(openai_request.into())
+            }
+        }
     }
 }
 
