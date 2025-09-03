@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::flatten_change_envelope_stream;
+use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
@@ -33,7 +35,6 @@ use data_components::cdc::StreamError;
 use data_components::cdc::readiness::Readiness;
 use data_components::cdc::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
-use futures::StreamExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -42,7 +43,9 @@ use spicepod::vector::VectorStore;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_stream::StreamExt;
 
 use super::table::EmbeddingTable;
 
@@ -250,31 +253,6 @@ impl EmbeddingConnector {
         }
     }
 
-    async fn index_change_envelope(
-        maybe_envelope: Result<ChangeEnvelope, StreamError>,
-        embedding_table: Arc<IndexedTableProvider>,
-    ) -> Result<ChangeEnvelope, StreamError> {
-        let envelope = maybe_envelope.map_err(|e| {
-            tracing::debug!("Error in underlying base stream: {e:?}");
-            e
-        })?;
-
-        let (change_committer, batch) = envelope.into_parts();
-        let mut batches = vec![batch.data_batch()];
-
-        for index in &embedding_table.indexes {
-            batches = index
-                .compute_index(batches)
-                .await
-                .map_err(|e| StreamError::External(e.to_string()))?;
-        }
-
-        let new_change_batch = replace_change_batch_data(&batches[0], &batch)
-            .map_err(|e| StreamError::Arrow(e.to_string()))?;
-
-        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
-    }
-
     async fn embed_change_envelope(
         maybe_envelope: Result<ChangeEnvelope, StreamError>,
         embedding_table: Arc<EmbeddingTable>,
@@ -382,18 +360,22 @@ impl DataConnector for EmbeddingConnector {
             .cloned()
         {
             let indexed_table = Arc::new(indexed_table);
-            let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&table_provider)?;
+            let Some(underlying_federated_table) =
+                underlying_federated_table_for_indexed_table(&table_provider)
+            else {
+                return self.inner_connector.changes_stream(federated_table);
+            };
 
             let (changes_stream, readiness) = self
                 .inner_connector
                 .changes_stream(underlying_federated_table)?;
 
             let stream = changes_stream
-                .then(move |item| Self::index_change_envelope(item, Arc::clone(&indexed_table)))
+                .chunks_timeout(100, Duration::from_secs(2))
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
                 .boxed();
 
-            return Some((stream, readiness));
+            return Some((flatten_change_envelope_stream(stream), readiness));
         }
 
         let embedding_table = Arc::new(
@@ -413,7 +395,7 @@ impl DataConnector for EmbeddingConnector {
             .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
             .boxed();
 
-        Some((stream, readiness))
+        Some((flatten_change_envelope_stream(stream), readiness))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -440,10 +422,11 @@ impl DataConnector for EmbeddingConnector {
                 .append_stream(underlying_federated_table)?;
 
             let stream = stream
-                .then(move |item| Self::index_change_envelope(item, Arc::clone(&indexed_table)))
+                .chunks_timeout(100, Duration::from_secs(2))
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table)))
                 .boxed();
 
-            return Some((stream, readiness));
+            return Some((flatten_change_envelope_stream(stream), readiness));
         }
 
         let embedding_table = Arc::new(
@@ -463,7 +446,7 @@ impl DataConnector for EmbeddingConnector {
             .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
             .boxed();
 
-        Some((stream, readiness))
+        Some((flatten_change_envelope_stream(stream), readiness))
     }
 }
 
