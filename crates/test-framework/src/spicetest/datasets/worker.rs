@@ -21,9 +21,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use antithesis_sdk::{assert_always, assert_sometimes, assert_unreachable};
 use anyhow::Result;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
+use serde_json::json;
 use spiceai::{Client as SpiceClient, SpiceClientError};
 use tokio::task::JoinHandle;
 
@@ -409,6 +411,14 @@ impl SpiceTestQueryWorker {
                         e
                     );
 
+                    assert_unreachable!(
+                        "Query failed due to non-connection error",
+                        &json!({
+                            "query": query.name,
+                            "sql": query.sql,
+                        })
+                    );
+
                     let cloned_durations_mutex = Arc::clone(&query_durations);
                     let Ok(mut durations_lock) = cloned_durations_mutex.lock() else {
                         return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
@@ -545,6 +555,12 @@ impl SpiceTestQueryWorker {
             return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
         };
 
+        assert_sometimes!(
+            !duration.is_zero(),
+            "flight query succeeded",
+            &json!({"query": query.name})
+        );
+
         durations_lock
             .entry(Arc::clone(&query.name))
             .or_default()
@@ -573,6 +589,12 @@ impl SpiceTestQueryWorker {
                 .body(query.sql.to_string())
                 .send()
                 .await?;
+
+            assert_sometimes!(
+                http_response.status().is_success(),
+                "http query succeeded",
+                &json!({"query": query.name})
+            );
 
             if !http_response.status().is_success() {
                 eprintln!(

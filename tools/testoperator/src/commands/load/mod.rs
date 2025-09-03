@@ -16,6 +16,8 @@ limitations under the License.
 
 use super::get_app_and_start_request;
 use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use antithesis_sdk::lifecycle::setup_complete;
+use serde_json::json;
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -49,6 +51,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+
+    setup_complete(&json!({
+        "app_name": app.name.clone(),
+        "spicepod_path": args.common.spicepod_path.to_string_lossy(),
+        "query_set": query_set.to_string()
+    }));
 
     let test_duration = Duration::from_secs(args.common.duration);
     let test_hours = (test_duration.as_secs() / 60 / 60).max(1);

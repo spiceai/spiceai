@@ -21,6 +21,8 @@ mod args;
 mod commands;
 mod metrics;
 
+use antithesis_sdk::prelude::*;
+
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
     HttpOverheadTestArgs, TestCommands,
@@ -37,6 +39,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    antithesis_init();
+
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
