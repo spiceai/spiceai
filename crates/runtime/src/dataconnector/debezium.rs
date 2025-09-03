@@ -20,16 +20,17 @@ use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::search::util::find_concrete_table_provider;
 use arrow::datatypes::SchemaRef;
+use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer};
 use datafusion::datasource::TableProvider;
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
@@ -346,47 +347,26 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        Some(Box::pin(stream::unfold(
-            (federated_table, None::<ChangesStream>),
-            |(federated_table, mut changes_stream)| async move {
-                // Initialize the changes stream if not already done
-                if changes_stream.is_none() {
-                    let table_provider = federated_table.table_provider().await;
-                    let Some(debezium_kafka) =
-                        find_concrete_table_provider::<DebeziumKafka>(&table_provider)
-                    else {
-                        let any_provider = table_provider.as_any();
-                        let type_id = any_provider.type_id();
-                        let type_name = std::any::type_name::<DebeziumKafka>();
-                        tracing::error!(
-                            "Encountered a table provider that is not DebeziumKafka in changes_stream. Expected TypeId: {:?} ({}), Actual TypeId: {:?}. This should never happen.",
-                            std::any::TypeId::of::<DebeziumKafka>(),
-                            type_name,
-                            type_id
-                        );
-                        assert!(
-                            false,
-                            "TableProvider is not DebeziumKafka in changes_stream. Expected TypeId: {:?} ({}), Actual TypeId: {:?}. This should never happen.",
-                            std::any::TypeId::of::<DebeziumKafka>(),
-                            type_name,
-                            type_id
-                        );
-                        return None;
-                    };
-                    changes_stream = Some(debezium_kafka.stream_changes());
-                }
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        let readiness = Readiness::immediate();
+        Some((
+            Box::pin(stream! {
+                let table_provider = federated_table.table_provider().await;
+                let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
+                    return;
+                };
 
-                // Get the next item from the changes stream
-                if let Some(ref mut stream) = changes_stream {
-                    if let Some(item) = stream.next().await {
-                        return Some((item, (federated_table, changes_stream)));
-                    }
-                }
+                let mut changes_stream = debezium_kafka.stream_changes();
 
-                None
-            },
-        )))
+                while let Some(item) = changes_stream.next().await {
+                    yield item;
+                }
+            }),
+            readiness,
+        ))
     }
 }
 

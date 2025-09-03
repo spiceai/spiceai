@@ -28,6 +28,7 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use cache::Caching;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -233,8 +234,8 @@ pub struct Builder {
     refresh_on_startup: RefreshOnStartup,
     ready_state: ReadyState,
     caching: Option<Arc<Caching>>,
-    changes_stream: Option<ChangesStream>,
-    append_stream: Option<ChangesStream>,
+    changes_stream: Option<(ChangesStream, Readiness)>,
+    append_stream: Option<(ChangesStream, Readiness)>,
     disable_federation: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
@@ -308,14 +309,18 @@ impl Builder {
         self
     }
 
-    /// Set the changes stream for the accelerated table
+    /// Set the changes stream for the accelerated table along with when the stream should be considered ready.
     ///
     /// # Panics
     ///
     /// Panics if the refresh mode isn't `RefreshMode::Changes`.
-    pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
+    pub fn changes_stream_and_readiness(
+        &mut self,
+        changes_stream: ChangesStream,
+        readiness: Readiness,
+    ) -> &mut Self {
         assert!(self.refresh.mode == RefreshMode::Changes);
-        self.changes_stream = Some(changes_stream);
+        self.changes_stream = Some((changes_stream, readiness));
         self
     }
 
@@ -324,9 +329,13 @@ impl Builder {
     /// # Panics
     ///
     /// Panics if the refresh mode isn't `RefreshMode::Append`.
-    pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
+    pub fn append_stream_and_readiness(
+        &mut self,
+        append_stream: ChangesStream,
+        readiness: Readiness,
+    ) -> &mut Self {
         assert!(self.refresh.mode == RefreshMode::Append);
-        self.append_stream = Some(append_stream);
+        self.append_stream = Some((append_stream, readiness));
         self
     }
 
@@ -392,11 +401,11 @@ impl Builder {
             RefreshMode::Append => {
                 if self.refresh.time_column.is_none() {
                     // Get the append stream
-                    let Some(append_stream) = self.append_stream else {
+                    let Some((append_stream, readiness)) = self.append_stream else {
                         return AppendStreamRequiredSnafu.fail();
                     };
                     (
-                        refresh::AccelerationRefreshMode::Changes(append_stream),
+                        refresh::AccelerationRefreshMode::Changes(append_stream, readiness),
                         None,
                     )
                 } else {
@@ -417,11 +426,11 @@ impl Builder {
                 )
             }
             RefreshMode::Changes => {
-                let Some(changes_stream) = self.changes_stream else {
+                let Some((changes_stream, readiness)) = self.changes_stream else {
                     return ExpectedChangesStreamSnafu.fail();
                 };
                 (
-                    refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    refresh::AccelerationRefreshMode::Changes(changes_stream, readiness),
                     None,
                 )
             }

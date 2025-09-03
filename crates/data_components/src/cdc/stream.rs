@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,23 +25,7 @@ use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
-
-#[derive(Debug, Snafu)]
-pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
-    UnableToCommitChange {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-#[derive(Debug, Snafu)]
-pub enum ChangeBatchError {
-    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
-    SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
-    Arrow { source: ArrowError },
-}
+use crate::cdc::{CommitChange, CommitError};
 
 #[derive(Debug)]
 pub enum StreamError {
@@ -71,9 +55,14 @@ impl std::fmt::Display for StreamError {
     }
 }
 
-/// Allows to commit a change that has been processed.
-pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
+
+#[derive(Debug, Snafu)]
+pub enum ChangeBatchError {
+    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
+    SchemaMismatch { detail: String, schema: SchemaRef },
+    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    Arrow { source: ArrowError },
 }
 
 pub struct ChangeEnvelope {
