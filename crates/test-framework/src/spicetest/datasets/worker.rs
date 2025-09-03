@@ -67,25 +67,25 @@ struct QueryRunResult {
 }
 
 impl SpiceTestQueryWorkerResult {
-    pub fn try_new(
+    pub fn new(
         query_durations: &Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
         query_statuses: BTreeMap<Arc<str>, QueryStatus>,
         connection_failed: bool,
         row_counts: BTreeMap<Arc<str>, Vec<usize>>,
-    ) -> Result<Self> {
+    ) -> Self {
         let query_durations = query_durations
             .iter()
             .map(|mapref| (Arc::clone(mapref.key()), mapref.value().clone()))
             .collect();
 
-        Ok(Self {
+        Self {
             query_durations,
             query_iteration_durations,
             query_statuses,
             connection_failed,
             row_counts,
-        })
+        }
     }
 }
 
@@ -180,7 +180,7 @@ impl SpiceTestQueryWorker {
                             )
                             .await?
                         {
-                            return SpiceTestQueryWorkerResult::try_new(
+                            return SpiceTestQueryWorkerResult::new(
                                 &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
@@ -223,7 +223,7 @@ impl SpiceTestQueryWorker {
                             )
                             .await?;
                         if connection_failed {
-                            return SpiceTestQueryWorkerResult::try_new(
+                            return SpiceTestQueryWorkerResult::new(
                                 &query_durations,
                                 query_iteration_durations,
                                 query_statuses,
@@ -282,7 +282,7 @@ impl SpiceTestQueryWorker {
                                 .await?;
 
                             if connection_failed {
-                                return SpiceTestQueryWorkerResult::try_new(
+                                return SpiceTestQueryWorkerResult::new(
                                     &query_durations,
                                     query_iteration_durations,
                                     query_statuses,
@@ -305,7 +305,7 @@ impl SpiceTestQueryWorker {
                 }
             }
 
-            SpiceTestQueryWorkerResult::try_new(
+            SpiceTestQueryWorkerResult::new(
                 &query_durations,
                 query_iteration_durations,
                 query_statuses,
