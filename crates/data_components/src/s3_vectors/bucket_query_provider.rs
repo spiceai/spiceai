@@ -119,9 +119,11 @@ impl TableProvider for S3VectorsQueryBucketTable {
             return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema()))));
         }
 
-        let Some(bucket_name) = self.table.identifier.index_identifier_variables().1 else {
+        let (_, Some(bucket_name), Some(index_name)) =
+            self.table.identifier.index_identifier_variables()
+        else {
             return Err(DataFusionError::Execution(format!(
-                "No bucket name for bucket query"
+                "No bucket name or index name for bucket query"
             )));
         };
 
@@ -148,7 +150,14 @@ impl TableProvider for S3VectorsQueryBucketTable {
         let index_names: Vec<_> = list_indexes_output
             .indexes()
             .iter()
-            .map(|idx| idx.index_name().to_string())
+            .filter_map(|idx| {
+                let name = idx.index_name().to_string();
+                if name.starts_with(&index_name) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         if index_names.is_empty() {
