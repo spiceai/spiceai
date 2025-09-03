@@ -221,6 +221,7 @@ impl AggregationResult {
     }
 
     /// Provides a user-friendly representation of the result.
+    #[must_use]
     pub fn display_json(&self) -> Value {
         json!({
             "primary_key_columns": self.primary_key,
