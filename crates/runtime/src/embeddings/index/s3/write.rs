@@ -167,13 +167,41 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
         update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors)
             .map_err(|e| *e)?;
 
-    index
-        .table
-        .write_data(embedding_vectors, primary_key, metadata)
-        .await
-        .context(CannotWriteIndexSnafu {
-            index: index.name().to_string(),
-        })?;
+    // If S3 Vectors fails due to a conflicting write, split the batch in half and retry.
+    //
+    // Example error:
+    // ValidationException: Request must not contain duplicate keys
+    let mut embedding_vectors_batches = vec![embedding_vectors];
+    loop {
+        let Some(next) = embedding_vectors_batches.pop() else {
+            break;
+        };
+        let next_len = next.len();
+        match index
+            .table
+            .write_data(next.clone(), primary_key.clone(), metadata.clone())
+            .await
+        {
+            Ok(_) => {}
+            Err(data_components::s3_vectors::Error::S3VectorPutVectorError { source })
+                if source
+                    .to_string()
+                    .contains("Request must not contain duplicate keys")
+                    && next_len > 1 =>
+            {
+                let mid = next_len / 2;
+                embedding_vectors_batches.push(next[mid..].to_vec());
+                embedding_vectors_batches.push(next[..mid].to_vec());
+                tracing::warn!(
+                    "Write to '{}' index failed due to conflicting writes. Splitting batch and retrying.",
+                    index.name()
+                );
+            }
+            Err(e) => Err(e).context(CannotWriteIndexSnafu {
+                index: index.name().to_string(),
+            })?,
+        }
+    }
 
     Ok(updated_record)
 }
