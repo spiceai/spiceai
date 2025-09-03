@@ -14382,6 +14382,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "dashmap",
  "duckdb",
  "flight_client",
  "futures",

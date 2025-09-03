@@ -140,3 +140,12 @@ pub struct DataConsistencyArgs {
     #[arg(long)]
     pub(crate) compare_spicepod: PathBuf,
 }
+
+#[derive(Parser, Debug)]
+pub struct LoadTestArgs {
+    #[command(flatten)]
+    pub(crate) test_args: DatasetTestArgs,
+
+    #[arg(long)]
+    pub(crate) no_error: bool,
+}

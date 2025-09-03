@@ -18,6 +18,7 @@ async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
+dashmap = "6.1.0"
 duckdb = { optional = true, workspace = true, features = [
     "bundled",
     "r2d2",

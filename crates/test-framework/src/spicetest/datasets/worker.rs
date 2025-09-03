@@ -17,11 +17,12 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     panic,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
+use dashmap::DashMap;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use spiceai::{Client as SpiceClient, SpiceClientError};
@@ -67,19 +68,15 @@ struct QueryRunResult {
 
 impl SpiceTestQueryWorkerResult {
     pub fn try_new(
-        query_durations: &Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: &Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
         query_statuses: BTreeMap<Arc<str>, QueryStatus>,
         connection_failed: bool,
         row_counts: BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Result<Self> {
-        let Ok(durations_lock) = query_durations.lock() else {
-            return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
-        };
-
-        let query_durations = durations_lock
+        let query_durations = query_durations
             .iter()
-            .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .map(|mapref| (Arc::clone(mapref.key()), mapref.value().clone()))
             .collect();
 
         Ok(Self {
@@ -151,8 +148,7 @@ impl SpiceTestQueryWorker {
     #[allow(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
-            let query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>> =
-                Arc::new(Mutex::new(BTreeMap::new()));
+            let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
 
             // Keeps track of the start and end time of each query iteration
             let mut query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)> =
@@ -220,7 +216,7 @@ impl SpiceTestQueryWorker {
                         } = self
                             .run_single_query(
                                 query,
-                                Arc::new(Mutex::new(BTreeMap::new())),
+                                Arc::new(DashMap::new()),
                                 &mut BTreeMap::new(),
                                 snapshot_results,
                                 false,
@@ -322,7 +318,7 @@ impl SpiceTestQueryWorker {
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
-        query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Result<bool> {
@@ -366,7 +362,7 @@ impl SpiceTestQueryWorker {
     async fn run_single_query(
         &self,
         query: &Query,
-        query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
@@ -409,11 +405,7 @@ impl SpiceTestQueryWorker {
                         e
                     );
 
-                    let cloned_durations_mutex = Arc::clone(&query_durations);
-                    let Ok(mut durations_lock) = cloned_durations_mutex.lock() else {
-                        return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
-                    };
-                    durations_lock.entry(Arc::clone(&query.name)).or_default();
+                    query_durations.entry(Arc::clone(&query.name)).or_default();
                     Ok(QueryRunResult {
                         connection_failed: false,
                         query_failure: Some(format!("{e}")),
@@ -427,7 +419,7 @@ impl SpiceTestQueryWorker {
     async fn execute_flight(
         &self,
         query: &Query,
-        query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
@@ -461,13 +453,7 @@ impl SpiceTestQueryWorker {
                             e
                         );
 
-                        let Ok(mut durations_lock) = query_durations.lock() else {
-                            return Err(anyhow::anyhow!(
-                                "Failed to acquire lock on query durations"
-                            ));
-                        };
-
-                        durations_lock.entry(Arc::clone(&query.name)).or_default();
+                        query_durations.entry(Arc::clone(&query.name)).or_default();
                         return Err(e.into());
                     }
                 }
@@ -541,11 +527,7 @@ impl SpiceTestQueryWorker {
 
         let duration = query_start.elapsed();
 
-        let Ok(mut durations_lock) = query_durations.lock() else {
-            return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
-        };
-
-        durations_lock
+        query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
             .push(duration);
@@ -564,7 +546,7 @@ impl SpiceTestQueryWorker {
     async fn execute_http(
         &self,
         query: &Query,
-        query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
     ) -> Result<()> {
         if let Some(http_client) = self.http_client.as_ref() {
             let query_start = Instant::now();
@@ -590,15 +572,10 @@ impl SpiceTestQueryWorker {
 
             let duration = query_start.elapsed();
 
-            let Ok(mut durations_lock) = query_durations.lock() else {
-                return Err(anyhow::anyhow!("Failed to acquire lock on query durations"));
-            };
-
-            durations_lock
+            query_durations
                 .entry(Arc::clone(&query.name))
                 .or_default()
                 .push(duration);
-            drop(durations_lock);
         }
 
         Ok(())
@@ -607,7 +584,7 @@ impl SpiceTestQueryWorker {
     async fn execute_query(
         &self,
         query: &Query,
-        query_durations: Arc<Mutex<BTreeMap<Arc<str>, Vec<Duration>>>>,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
         results_snapshot: bool,
         validate: bool,
