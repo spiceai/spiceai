@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::functions::math::random::RandomFunc;
-use runtime_datafusion_udfs::{alias, bucket, cosine_distance, embed, truncate};
+use runtime_datafusion_udfs::{alias, bucket, cosine_distance, rrf, truncate};
 
 pub fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
@@ -25,5 +25,6 @@ pub fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udf(bucket::Bucket::new().into());
     ctx.register_udf(cosine_distance::CosineDistance::new().into());
     ctx.register_udf(truncate::Truncate::new().into());
-    ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
+    ctx.register_udf(rrf::udf::ReciprocalRankFusion::default().into());
+    ctx.register_udtf("rrf", rrf::udf::ReciprocalRankFusion::default().into());
 }

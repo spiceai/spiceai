@@ -13,15 +13,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::DataType;
-use datafusion::common::{DataFusionError, exec_err};
+use arrow_schema::{DataType, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
+use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::datasource::TableType;
 use datafusion::logical_expr::{
-    ColumnarValue, DocSection, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
+    ColumnarValue, DocSection, Documentation, Expr, ScalarFunctionArgs, ScalarUDFImpl, Signature,
     Volatility,
 };
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use std::any::Any;
 use std::fmt::Debug;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 pub static RRF_UDF_NAME: &str = "reciprocal_rank_fusion";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
@@ -43,17 +48,22 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentati
 pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
-/// A no-op UDF detected by an Optimizer that subsequently implements RRF
-/// using plain SQL
-#[derive(Debug)]
+/// A no-op UDTF detected by an Optimizer that subsequently implements RRF using plain SQL
+#[derive(Debug, Default)]
 pub struct ReciprocalRankFusion {}
 
 impl ReciprocalRankFusion {
+    #[must_use]
+    pub fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn default_error<T>() -> Result<T, DataFusionError> {
         exec_err!("This is a bug! {RRF_UDF_NAME} should be rewritten by an optimizer rule.")
     }
 }
 
+/// This is only implemented as a documentation stub, so that we show up in `SHOW FUNCTIONS`
 impl ScalarUDFImpl for ReciprocalRankFusion {
     fn as_any(&self) -> &dyn Any {
         self
@@ -80,5 +90,36 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
     fn documentation(&self) -> Option<&Documentation> {
         Some(&*DOCUMENTATION)
+    }
+}
+
+impl TableFunctionImpl for ReciprocalRankFusion {
+    fn call(&self, _args: &[Expr]) -> datafusion::common::Result<Arc<dyn TableProvider>> {
+        Ok(Arc::new(ReciprocalRankFusion::default()))
+    }
+}
+
+#[async_trait]
+impl TableProvider for ReciprocalRankFusion {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(EmptyExec::new(self.schema())))
     }
 }

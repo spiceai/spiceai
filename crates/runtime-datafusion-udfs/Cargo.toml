@@ -16,6 +16,8 @@ datafusion.workspace = true
 snafu.workspace = true
 tracing.workspace = true
 tract-core = "0.21.10"
+tokio = "1.47.1"
+async-trait = "0.1.89"
 
 [dev-dependencies]
 insta.workspace = true
