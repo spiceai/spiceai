@@ -221,7 +221,7 @@ impl DataConnector for FullTextConnector {
             return Some((
                 flatten_change_envelope_stream(Box::pin(
                     changes_stream
-                        .chunks_timeout(100, Duration::from_secs(2))
+                        .chunks_timeout(10000, Duration::from_secs(1))
                         .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
                 )),
                 readiness,
@@ -256,7 +256,7 @@ impl DataConnector for FullTextConnector {
             return Some((
                 flatten_change_envelope_stream(Box::pin(
                     append_stream
-                        .chunks_timeout(100, Duration::from_secs(2))
+                        .chunks_timeout(10000, Duration::from_secs(1))
                         .then(move |item| index_change_envelope(item, Arc::clone(&indexed_table))),
                 )),
                 readiness,
