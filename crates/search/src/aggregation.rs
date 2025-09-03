@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use serde_json::Value;
+use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult};
@@ -218,6 +218,16 @@ impl AggregationResult {
         serde_json::from_str(&str)
             .boxed()
             .context(InconsistentAggregationResultSnafu)
+    }
+
+    /// Provides a user-friendly representation of the result.
+    #[must_use]
+    pub fn display_json(&self) -> Value {
+        json!({
+            "primary_key_columns": self.primary_key,
+            "additional_columns": self.data_columns,
+            "queried_columns": self.matches.keys().collect::<Vec<_>>()
+        })
     }
 }
 

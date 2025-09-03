@@ -164,7 +164,7 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
 
     // Update the embedding column in the batch with computed embeddings
     let updated_record =
-        update_embedding_column_in_batch(record, &index.embedded_column, &embedding_vectors)
+        update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors)
             .map_err(|e| *e)?;
 
     index
@@ -385,37 +385,39 @@ async fn embed_column(
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.
 fn update_embedding_column_in_batch(
-    record: RecordBatch,
+    record: &RecordBatch,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
 ) -> Result<RecordBatch, Box<Error>> {
     let embedding_column_name = embedding_col!(embedded_column_name);
 
-    // Check if the embedding column already exists
     let schema = record.schema();
-    let embedding_column_idx = schema
-        .column_with_name(&embedding_column_name)
-        .map(|(idx, _)| idx);
+    let mut columns = record.columns().to_vec();
 
-    if let Some(idx) = embedding_column_idx {
-        // Update existing embedding column
-        let mut columns: Vec<Arc<dyn Array>> = (0..record.num_columns())
-            .map(|i| Arc::clone(record.column(i)))
-            .collect();
+    // Create new embedding array that will replace the existing column or be added as a new column
+    let embedding_array = create_embedding_array(embedding_vectors)?;
 
-        // Create new embedding array
-        let embedding_array = create_embedding_array(embedding_vectors)?;
+    // Check if the embedding column already exists
+    let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
+        // Replace existing embedding column
         columns[idx] = embedding_array;
-
-        // Create new RecordBatch with updated column
-        RecordBatch::try_new(schema, columns)
-            .context(CannotUpdateEmbeddingColumnSnafu)
-            .map_err(Box::from)
+        schema
     } else {
-        // If embedding column doesn't exist, return original batch
-        // This shouldn't happen in normal operation since we check for it earlier
-        Ok(record)
-    }
+        // Create new schema with the embedding column appended
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            &embedding_column_name,
+            embedding_array.data_type().clone(),
+            true,
+        )));
+        // Append embedding column
+        columns.push(embedding_array);
+        Arc::new(arrow_schema::Schema::new(fields))
+    };
+
+    RecordBatch::try_new(target_schema, columns)
+        .context(CannotUpdateEmbeddingColumnSnafu)
+        .map_err(Box::from)
 }
 
 /// Create an Arrow array from embedding vectors.
@@ -564,7 +566,7 @@ mod tests {
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(record, "text", &new_embeddings)
+        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings)
             .expect("Failed to update embedding column");
 
         // Verify the updated batch has the new embeddings
@@ -588,16 +590,42 @@ mod tests {
     }
 
     #[test]
-    fn test_update_embedding_column_in_batch_without_existing_column() {
+    #[allow(clippy::float_cmp)]
+    fn test_update_embedding_column_in_batch_append_embedding_column() {
         let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(record.clone(), "text", &new_embeddings)
+        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings)
             .expect("Failed to handle missing embedding column");
 
-        // Should return original batch when embedding column doesn't exist
-        assert_eq!(result.num_columns(), record.num_columns());
+        // Should append the embedding column with the correct name
+        let expected_embedding_col = embedding_col!("text");
+        assert_eq!(result.num_columns(), record.num_columns() + 1);
         assert_eq!(result.num_rows(), record.num_rows());
+
+        // Check that the last column is the embedding column
+        let schema = result.schema();
+        let embedding_field = schema.field(result.num_columns() - 1);
+        assert_eq!(embedding_field.name(), &expected_embedding_col);
+
+        // Check that the embedding column contains the correct values
+        let embedding_column = result.column(result.num_columns() - 1);
+        let list_array = embedding_column
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("Embedding column should be ListArray");
+
+        assert!(!list_array.is_null(0));
+        assert!(!list_array.is_null(1));
+
+        let first_values = list_array.value(0);
+        let first_floats = first_values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Values should be Float32Array");
+        assert_eq!(first_floats.value(0), 0.1);
+        assert_eq!(first_floats.value(1), 0.2);
+        assert_eq!(first_floats.value(2), 0.3);
     }
 }
