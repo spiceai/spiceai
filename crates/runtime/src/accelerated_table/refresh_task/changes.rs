@@ -25,14 +25,19 @@ use cache::Caching;
 use data_components::cdc::readiness::Readiness;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
+use datafusion::common::{Constraint, Constraints};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
+use datafusion_table_providers::util::constraints::{
+    UpsertOptions, validate_batch_with_constraints,
+};
 use futures::stream;
 use snafu::{OptionExt, ResultExt};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -325,14 +330,45 @@ impl RefreshTask {
         let record_batches: Vec<&RecordBatch> = operations.iter().map(|(batch, _)| batch).collect();
         let schema = record_batches[0].schema();
 
+        let total_primary_keys: HashSet<String> = operations
+            .iter()
+            .flat_map(|(_, primary_keys)| primary_keys.iter().cloned())
+            .collect();
+
+        let constraint = Constraint::PrimaryKey(
+            total_primary_keys
+                .iter()
+                .map(|key| schema.index_of(key).unwrap())
+                .collect::<Vec<usize>>(),
+        );
+        let test_constraints = Constraints::new_unverified(vec![constraint]);
+
         let combined_batch = compute::concat_batches(&schema, record_batches)
             .map_err(|e| DataFusionError::ArrowError(e, None))
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
-        let total_primary_keys: Vec<String> = operations
-            .iter()
-            .flat_map(|(_, primary_keys)| primary_keys.iter().cloned())
-            .collect();
+        debug_assert!(
+            test_constraints
+                == *self
+                    .accelerator
+                    .constraints()
+                    .unwrap_or(&Constraints::empty())
+        );
+
+        let Some(combined_batch) = validate_batch_with_constraints(
+            vec![combined_batch],
+            self.accelerator
+                .constraints()
+                .unwrap_or(&Constraints::empty()),
+            &UpsertOptions::new()
+                .with_remove_duplicates(true)
+                .with_last_write_wins(true),
+        )
+        .await
+        .unwrap()
+        .pop() else {
+            panic!("uhoh!");
+        };
 
         if total_primary_keys.is_empty() {
             tracing::debug!(
