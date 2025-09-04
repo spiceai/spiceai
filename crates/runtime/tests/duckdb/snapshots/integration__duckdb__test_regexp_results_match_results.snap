@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------------+---------------+
+| region        | region        |
++---------------+---------------+
+| NORTH AMERICA | NORTH AMERICA |
+| SOUTH AMERICA | SOUTH AMERICA |
++---------------+---------------+

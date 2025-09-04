@@ -50,8 +50,9 @@ use search::generation::text_search::{
 
 use crate::{
     datafusion::DataFusion,
+    embeddings::udtf::parse_limit_scalar,
     request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr},
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
@@ -115,6 +116,33 @@ impl TextSearchTableFunc {
 }
 
 impl TextSearchTableFunc {
+    pub(crate) fn to_expr(args: &TextSearchTableFuncArgs) -> Vec<Expr> {
+        let mut expr = vec![
+            Expr::Column(to_column_expr(&args.tbl)),
+            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
+        ];
+
+        if let Some(col) = args.column.as_ref() {
+            expr.push(Expr::Column(Column::new_unqualified(col)));
+        }
+
+        if let Some(limit) = args.limit {
+            expr.push(Expr::Literal(
+                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
+                None,
+            ));
+        }
+
+        if let Some(include_score) = args.include_score {
+            expr.push(Expr::Literal(
+                ScalarValue::Boolean(Some(include_score)),
+                None,
+            ));
+        }
+
+        expr
+    }
+
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
         let mut args = args.iter();
 
@@ -141,36 +169,50 @@ impl TextSearchTableFunc {
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)), None, None) => {
-                (None, Some(*limit), Some(true))
-            }
-            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)), None, None) => {
-                (None, None, Some(*include_score))
+            (Some(Expr::Literal(scalar, None)), None, None) => {
+                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                    (None, None, Some(include_score))
+                } else {
+                    (None, Some(parse_limit_scalar(scalar)?), Some(true))
+                }
             }
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
+                Some(Expr::Literal(scalar, None)),
                 None,
-            ) => (Some(col.clone()), Some(*limit), Some(true)),
+            ) => {
+                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                    (Some(col.clone()), None, Some(include_score))
+                } else {
+                    (
+                        Some(col.clone()),
+                        Some(parse_limit_scalar(scalar)?),
+                        Some(true),
+                    )
+                }
+            }
             (
-                Some(Expr::Column(Column { name: col, .. })),
+                Some(Expr::Literal(scalar, None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
-            ) => (Some(col.clone()), None, Some(*include_score)),
-            (
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
+            ) => (
                 None,
-            ) => (None, Some(*limit), Some(*include_score)),
+                Some(parse_limit_scalar(scalar)?),
+                Some(*include_score),
+            ),
 
             // All three arguments provided
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::UInt64(Some(limit)), None)),
+                Some(Expr::Literal(scalar, None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
-            ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
+            ) => (
+                Some(col.clone()),
+                Some(parse_limit_scalar(scalar)?),
+                Some(*include_score),
+            ),
 
             // Invalid argument combinations
             (a, b, c) => {

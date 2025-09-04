@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,30 +25,20 @@ use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
-
-#[derive(Debug, Snafu)]
-pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
-    UnableToCommitChange {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-#[derive(Debug, Snafu)]
-pub enum ChangeBatchError {
-    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
-    SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
-    Arrow { source: ArrowError },
-}
+use crate::cdc::{CommitChange, CommitError};
 
 #[derive(Debug)]
 pub enum StreamError {
+    /// Error from the Kafka client, such as failure to consume messages.
     Kafka(String),
+    /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
+    /// Error from Arrow Flight, such as failure during streaming or subscription.
     Flight(String),
+    /// Error from the Arrow library, such as failure during batch processing or manipulation.
     Arrow(String),
+    /// External error not originating from `ChangesStream` core logic, such as index processing failure.
+    External(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -60,13 +50,19 @@ impl std::fmt::Display for StreamError {
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
+            StreamError::External(e) => write!(f, "External error: {e}"),
         }
     }
 }
 
-/// Allows to commit a change that has been processed.
-pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
+
+#[derive(Debug, Snafu)]
+pub enum ChangeBatchError {
+    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
+    SchemaMismatch { detail: String, schema: SchemaRef },
+    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    Arrow { source: ArrowError },
 }
 
 pub struct ChangeEnvelope {

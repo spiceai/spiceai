@@ -28,6 +28,7 @@ use crate::status;
 use arrow::datatypes::Schema;
 use cache::Caching;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
@@ -409,7 +410,7 @@ pub(crate) enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Option<Receiver<Option<RefreshOverrides>>>),
-    Changes(ChangesStream),
+    Changes(ChangesStream, Readiness),
 }
 
 pub struct Refresher {
@@ -584,8 +585,8 @@ impl Refresher {
             (AccelerationRefreshMode::Append(_), _) => {
                 return Some(self.start_streaming_append());
             }
-            (AccelerationRefreshMode::Changes(stream), _) => {
-                return Some(self.start_changes_stream(stream));
+            (AccelerationRefreshMode::Changes(stream, readiness), _) => {
+                return Some(self.start_changes_stream(stream, readiness));
             }
         };
 
@@ -763,6 +764,7 @@ impl Refresher {
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
+        readiness: Readiness,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task = Arc::new(
             RefreshTask::builder(
@@ -786,6 +788,7 @@ impl Refresher {
                 .start_changes_stream(
                     refresh,
                     changes_stream,
+                    readiness,
                     caching,
                     notifier,
                     initial_load_completed,

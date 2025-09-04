@@ -24,6 +24,7 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
@@ -346,19 +347,26 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        Some(Box::pin(stream! {
-            let table_provider = federated_table.table_provider().await;
-            let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
-                return;
-            };
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        let readiness = Readiness::immediate();
+        Some((
+            Box::pin(stream! {
+                let table_provider = federated_table.table_provider().await;
+                let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
+                    return;
+                };
 
-            let mut changes_stream = debezium_kafka.stream_changes();
+                let mut changes_stream = debezium_kafka.stream_changes();
 
-            while let Some(item) = changes_stream.next().await {
-                yield item;
-            }
-        }))
+                while let Some(item) = changes_stream.next().await {
+                    yield item;
+                }
+            }),
+            readiness,
+        ))
     }
 }
 

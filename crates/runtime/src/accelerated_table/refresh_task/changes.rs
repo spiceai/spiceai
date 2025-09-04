@@ -21,6 +21,7 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use cache::Caching;
+use data_components::cdc::readiness::Readiness;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
@@ -66,6 +67,7 @@ impl RefreshTask {
         &self,
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
+        readiness: Readiness,
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
@@ -76,6 +78,18 @@ impl RefreshTask {
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
+        let runtime_status = Arc::clone(&self.runtime_status);
+        let dataset_name_readiness = dataset_name.clone();
+        tokio::spawn(async move {
+            readiness.wait_until_ready().await;
+            tracing::info!("Dataset {dataset_name_readiness} is ready");
+            if let Some(ready_sender) = ready_sender.as_ref() {
+                ready_sender.notify_waiters();
+            }
+            initial_load_completed.store(true, Ordering::Relaxed);
+            runtime_status.update_dataset(&dataset_name_readiness, status::ComponentStatus::Ready);
+        });
+
         while let Some(update) = changes_stream.next().await {
             match update {
                 Ok(change_envelope) => {
@@ -84,15 +98,6 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.as_ref() {
-                                ready_sender.notify_waiters();
-                            }
-                            initial_load_completed.store(true, Ordering::Relaxed);
-
-                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
-                            self.update_component_status(status::ComponentStatus::Ready)
-                                .await;
-
                             if let Err(e) = change_envelope.commit() {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");
                             }

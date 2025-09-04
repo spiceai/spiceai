@@ -45,7 +45,6 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 use std::cmp::min;
 use std::{
     any::Any,
@@ -106,7 +105,7 @@ impl VectorSearchTableFuncArgs {
             ))),
             (None, _) => {
                 if embedded_columns.len() > 1 {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
                         embedded_columns.len()
@@ -115,7 +114,7 @@ impl VectorSearchTableFuncArgs {
                 if let Some((col, cfg)) = embedded_columns.iter().next() {
                     Ok((col.clone(), cfg.clone()))
                 } else {
-                    Err(DataFusionError::Internal(format!(
+                    Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has no associated full text search index.",
                         self.tbl,
                     )))
@@ -129,6 +128,25 @@ impl VectorSearchTableFuncArgs {
 pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+}
+
+pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
+    match scalar {
+        ScalarValue::Int64(Some(limit)) => u64::try_from(*limit).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Limit argument must be a non-negative integer, but got {limit}."
+            ))
+        }),
+        ScalarValue::UInt64(Some(limit)) => Ok(*limit),
+        ScalarValue::Utf8(Some(limit_str)) => limit_str.parse::<u64>().map_err(|_| {
+            DataFusionError::Plan(format!(
+                "Limit argument must be a non-negative integer, but got '{limit_str}'."
+            ))
+        }),
+        _ => Err(DataFusionError::Plan(format!(
+            "Limit argument must be a non-negative integer, but got {scalar}."
+        ))),
+    }
 }
 
 impl VectorSearchTableFunc {
@@ -151,7 +169,7 @@ impl VectorSearchTableFunc {
         }
         if let Some(limit) = args.limit {
             expr.push(Expr::Literal(
-                ScalarValue::Int64(Some(i64::try_from(limit).unwrap_or(i64::MAX))),
+                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
                 None,
             ));
         }
@@ -190,36 +208,50 @@ impl VectorSearchTableFunc {
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
                 (Some(col.clone()), None, Some(true))
             }
-            (Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)), None, None) => {
-                (None, Some(*limit), Some(true))
-            }
-            (Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)), None, None) => {
-                (None, None, Some(*include_score))
+            (Some(Expr::Literal(scalar, None)), None, None) => {
+                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                    (None, None, Some(include_score))
+                } else {
+                    (None, Some(parse_limit_scalar(scalar)?), Some(true))
+                }
             }
 
             // 2 of 3 arguments. When user provides two of three arguments, they must still be in correct order (i.e. no limit before column)
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(scalar, None)),
                 None,
-            ) => (Some(col.clone()), Some(*limit), Some(true)),
+            ) => {
+                if let ScalarValue::Boolean(Some(include_score)) = *scalar {
+                    (Some(col.clone()), None, Some(include_score))
+                } else {
+                    (
+                        Some(col.clone()),
+                        Some(parse_limit_scalar(scalar)?),
+                        Some(true),
+                    )
+                }
+            }
             (
-                Some(Expr::Column(Column { name: col, .. })),
+                Some(Expr::Literal(scalar, None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
                 None,
-            ) => (Some(col.clone()), None, Some(*include_score)),
-            (
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
-                Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
+            ) => (
                 None,
-            ) => (None, Some(*limit), Some(*include_score)),
+                Some(parse_limit_scalar(scalar)?),
+                Some(*include_score),
+            ),
 
             // All three arguments provided
             (
                 Some(Expr::Column(Column { name: col, .. })),
-                Some(Expr::Literal(ScalarValue::Int64(Some(limit)), None)),
+                Some(Expr::Literal(scalar, None)),
                 Some(Expr::Literal(ScalarValue::Boolean(Some(include_score)), None)),
-            ) => (Some(col.clone()), Some(*limit), Some(*include_score)),
+            ) => (
+                Some(col.clone()),
+                Some(parse_limit_scalar(scalar)?),
+                Some(*include_score),
+            ),
 
             // Invalid argument combinations
             (a, b, c) => {
@@ -242,13 +274,11 @@ impl VectorSearchTableFunc {
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        // TODO: we might actually not want to recurse over accelerated table here.
-
-        use crate::embeddings::index::s3::S3Vector;
-        let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
+        use crate::{embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider};
+        let Some(mut vector_indexes) = find_index_in_table_provider::<S3Vector>(tbl) else {
             return Ok(None);
         };
-        let mut vector_indexes = indexed.get_indexes::<S3Vector>();
+
         let vector_index_opt = if let Some(col) = &args.column {
             vector_indexes
                 .into_iter()

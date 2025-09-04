@@ -40,7 +40,6 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
-use delta_kernel::Table;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
@@ -110,7 +109,7 @@ impl Read for DeltaTableFactory {
 
 #[derive(Debug)]
 pub struct DeltaTable {
-    table: Table,
+    table_url: Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     arrow_schema: SchemaRef,
     delta_schema: delta_kernel::schema::SchemaRef,
@@ -118,7 +117,7 @@ pub struct DeltaTable {
 
 impl DeltaTable {
     pub fn from(table_location: String, options: HashMap<String, SecretString>) -> Result<Self> {
-        let table = Table::try_from_uri(ensure_folder_location(table_location))
+        let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
 
         let mut storage_options: HashMap<String, String> = HashMap::new();
@@ -148,12 +147,8 @@ impl DeltaTable {
         ) {
             (true, Some(sdk_config)) => {
                 let region = storage_options.get("aws_region").map(ToString::to_string);
-                aws_sdk_credential_bridge::from_s3_url_and_config(
-                    table.location(),
-                    region,
-                    sdk_config,
-                )
-                .ok()
+                aws_sdk_credential_bridge::from_s3_url_and_config(&table_url, region, sdk_config)
+                    .ok()
             }
             _ => None,
         };
@@ -165,7 +160,7 @@ impl DeltaTable {
             )),
             None => Arc::new(
                 DefaultEngine::try_new(
-                    table.location(),
+                    &table_url,
                     storage_options,
                     Arc::new(TokioBackgroundExecutor::new()),
                 )
@@ -173,15 +168,14 @@ impl DeltaTable {
             ),
         };
 
-        let snapshot = table
-            .snapshot(engine.as_ref(), None)
+        let snapshot = Snapshot::try_new(table_url.clone(), engine.as_ref(), None)
             .map_err(handle_delta_error)?;
 
         let arrow_schema = Self::get_schema(&snapshot);
         let delta_schema = snapshot.schema();
 
         Ok(Self {
-            table,
+            table_url,
             engine,
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
@@ -296,7 +290,8 @@ fn map_delta_data_type_to_arrow_data_type(
             map_delta_data_type_to_arrow_data_type(array_type.element_type()),
             array_type.contains_null(),
         ))),
-        delta_kernel::schema::DataType::Struct(struct_type) => {
+        delta_kernel::schema::DataType::Struct(struct_type)
+        | delta_kernel::schema::DataType::Variant(struct_type) => {
             let mut fields: Vec<Field> = vec![];
             for field in struct_type.fields() {
                 fields.push(Field::new(
@@ -358,16 +353,14 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let snapshot = self
-            .table
-            .snapshot(self.engine.as_ref(), None)
+        let snapshot = Snapshot::try_new(self.table_url.clone(), self.engine.as_ref(), None)
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
 
         let store = self
             .engine
-            .get_object_store_for_url(self.table.location())
+            .get_object_store_for_url(&self.table_url)
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
                     "Failed to get object store for table location".to_string(),
