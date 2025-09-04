@@ -24,11 +24,12 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::prelude::SessionContext;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
 
-pub static RRF_UDF_NAME: &str = "reciprocal_rank_fusion";
+pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Merge and re-rank several search queries into one result set".to_string(),
@@ -49,12 +50,32 @@ pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 /// A no-op UDTF detected by an Optimizer that subsequently implements RRF using plain SQL
-#[derive(Debug, Default)]
-pub struct ReciprocalRankFusion {}
+pub struct ReciprocalRankFusion {
+    pub args: Vec<Expr>,
+    pub session_context: Arc<SessionContext>,
+}
+
+impl Debug for ReciprocalRankFusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReciprocalRankFusion {:?}", self.args)
+    }
+}
 
 impl ReciprocalRankFusion {
+    pub fn from_ctx(session_context: Arc<SessionContext>) -> Self {
+        Self {
+            args: vec![],
+            session_context,
+        }
+    }
+
     #[must_use]
     pub fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    pub fn with_args(mut self, args: &[Expr]) -> Self {
+        self.args = args.to_vec();
         self
     }
 
@@ -94,8 +115,10 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 }
 
 impl TableFunctionImpl for ReciprocalRankFusion {
-    fn call(&self, _args: &[Expr]) -> datafusion::common::Result<Arc<dyn TableProvider>> {
-        Ok(Arc::new(ReciprocalRankFusion::default()))
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        Ok(Arc::new(
+            ReciprocalRankFusion::from_ctx(Arc::clone(&self.session_context)).with_args(args),
+        ))
     }
 }
 

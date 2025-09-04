@@ -17,5 +17,4 @@ limitations under the License.
 pub mod alias;
 pub mod bucket;
 pub mod cosine_distance;
-pub mod rrf;
 pub mod truncate;
