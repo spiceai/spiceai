@@ -20,6 +20,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::search::rrf::optimizer::ReciprocalRankUDFRewriteRule;
+use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
 use datafusion::{
@@ -41,8 +43,6 @@ use datafusion::{
 use datafusion_federation::sql::federation_analyzer_rule;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
-
-use crate::status;
 
 use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
@@ -170,6 +170,7 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+        ctx.add_analyzer_rule(Arc::new(ReciprocalRankUDFRewriteRule::default()));
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
