@@ -31,8 +31,6 @@ use async_trait::async_trait;
 use data_components::cdc::ChangeBatch;
 use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
-use data_components::cdc::ChunkedChangesStream;
-use data_components::cdc::StreamError;
 use data_components::cdc::readiness::Readiness;
 use datafusion::common::Column;
 use datafusion::common::Constraint;
@@ -531,7 +529,6 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
                         // TODO: validate the operations of the batched change envelopes
                         let chunk = chunk.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
                         let change_committer = chunk[0].change_committer.clone();
-                        let data_idx = chunk[0].change_batch.data_idx;
                         let op_idx = chunk[0].change_batch.op_idx;
                         let primary_keys_idx = chunk[0].change_batch.primary_keys_idx;
                         let schema = chunk[0].change_batch.data(0).schema();
