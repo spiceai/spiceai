@@ -34,11 +34,11 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentati
     doc_section: DocSection::default(),
     description: "Merge and re-rank several search queries into one result set".to_string(),
     syntax_example: "rrf(query_1, query_2, ..., k)".to_string(),
-    sql_example: Some("SELECT embed('hello world', 'potion_2m')".to_string()),
+    sql_example: None,
     arguments: Some(vec![
         (
             "query...".to_string(),
-            "Varadic queries or table references".to_string(),
+            "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
         ("k".to_string(), "RRF smoothing parameter".to_string()),
     ]),

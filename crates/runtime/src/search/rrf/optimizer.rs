@@ -1,14 +1,15 @@
-use crate::search::rrf::udf::{ReciprocalRankFusion, RRF_UDF_NAME};
+use crate::search::rrf::udf::{RRF_UDF_NAME, ReciprocalRankFusion};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion::prelude::{coalesce, DataFrame};
-use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
+use datafusion::prelude::{DataFrame, coalesce};
 use datafusion::sql::unparser::Unparser;
-use datafusion_expr::{col, lit, ExprFunctionExt, JoinType};
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion_expr::{ExprFunctionExt, JoinType, col, lit};
 use futures::future::join_all;
 use tokio::runtime::Handle;
 use tokio::task;
@@ -106,20 +107,8 @@ impl ReciprocalRankUDFRewriteRule {
     }
 }
 
-impl OptimizerRule for ReciprocalRankUDFRewriteRule {
-    fn name(&self) -> &'static str {
-        "rrf_rewrite"
-    }
-
-    fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::BottomUp)
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
+impl AnalyzerRule for ReciprocalRankUDFRewriteRule {
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_down(|node| {
             if let LogicalPlan::TableScan(scan) = &node {
                 // Although the casting is ugly, this makes it unambiguous that this is our RRF node
@@ -137,15 +126,20 @@ impl OptimizerRule for ReciprocalRankUDFRewriteRule {
                 Ok(Transformed::no(node))
             }
         })
+        .map(|tp| tp.data)
+    }
+
+    fn name(&self) -> &'static str {
+        "rrf_rewrite"
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::udf::register_udfs;
     use crate::search::rrf::optimizer::ReciprocalRankUDFRewriteRule;
-    use crate::Runtime;
     use std::sync::Arc;
 
     async fn test_runtime() -> datafusion::common::Result<Runtime> {
@@ -194,7 +188,7 @@ mod tests {
             .expect("Failed to register foo table");
         rt.df
             .ctx
-            .add_optimizer_rule(Arc::new(ReciprocalRankUDFRewriteRule::default()));
+            .add_analyzer_rule(Arc::new(ReciprocalRankUDFRewriteRule::default()));
         Ok(rt)
     }
 
@@ -206,6 +200,6 @@ mod tests {
 
         let df = ctx.sql(query).await.expect("Must parse query");
         let plan = df.into_optimized_plan().unwrap();
-        println!("plan {plan}");
+        println!("{plan}");
     }
 }
