@@ -21,9 +21,9 @@ use s3_vectors::{
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
-pub mod bucket_query_provider;
 pub mod index_query_provider;
 pub mod list_provider;
+pub mod partitioned_index_query_provider;
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;

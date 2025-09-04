@@ -22,8 +22,9 @@ use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
     MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier,
-    S3VectorsTable, bucket_query_provider::S3VectorsQueryBucketTable,
-    index_query_provider::S3VectorsQueryIndexTable, list_provider::S3VectorsListTable,
+    S3VectorsTable, index_query_provider::S3VectorsQueryIndexTable,
+    list_provider::S3VectorsListTable,
+    partitioned_index_query_provider::S3VectorsQueryPartitionedIndexTable,
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
@@ -198,8 +199,10 @@ impl VectorIndex for S3Vector {
             S3VectorIdentifier::PartitionedIndex { .. }
         ) {
             // Table Provider for the S3V Bucket will perform cross-index queries
-            Arc::new(S3VectorsQueryBucketTable::new(self.table.clone(), vector))
-                as Arc<dyn TableProvider>
+            Arc::new(S3VectorsQueryPartitionedIndexTable::new(
+                self.table.clone(),
+                vector,
+            )) as Arc<dyn TableProvider>
         } else {
             Arc::new(S3VectorsQueryIndexTable::new(self.table.clone(), vector))
                 as Arc<dyn TableProvider>
