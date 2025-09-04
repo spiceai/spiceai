@@ -19,6 +19,7 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::compute;
 use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
@@ -28,17 +29,20 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::{StreamExt, stream};
+use futures::stream;
 use snafu::{OptionExt, ResultExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
+use tokio_stream::StreamExt;
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
@@ -71,7 +75,8 @@ impl RefreshTask {
     pub async fn start_changes_stream(
         &self,
         refresh: Arc<RwLock<Refresh>>,
-        mut changes_stream: ChangesStream,
+        changes_stream: ChangesStream,
+        readiness: Readiness,
         caching: Option<Weak<Caching>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
@@ -82,25 +87,35 @@ impl RefreshTask {
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
 
-        while let Some(update) = changes_stream.next().await {
-            match update {
-                Ok(change_envelope) => {
-                    match self
-                        .write_change(change_envelope.change_batch.clone())
-                        .await
-                    {
+        let runtime_status = Arc::clone(&self.runtime_status);
+        let dataset_name_readiness = dataset_name.clone();
+        tokio::spawn(async move {
+            readiness.wait_until_ready().await;
+            tracing::info!("Dataset {dataset_name_readiness} is ready");
+            if let Some(ready_sender) = ready_sender.as_ref() {
+                ready_sender.notify_waiters();
+            }
+            initial_load_completed.store(true, Ordering::Relaxed);
+            runtime_status.update_dataset(&dataset_name_readiness, status::ComponentStatus::Ready);
+        });
+
+        let mut chunked_stream =
+            Box::pin(changes_stream.chunks_timeout(10000, Duration::from_secs(1)));
+
+        while let Some(update) = chunked_stream.next().await {
+            match update.into_iter().collect::<Result<Vec<_>, _>>() {
+                Ok(change_envelopes) => {
+                    let change_batches: Vec<ChangeBatch> = change_envelopes
+                        .iter()
+                        .map(|envelope| envelope.change_batch.clone())
+                        .collect();
+
+                    match self.write_changes(change_batches).await {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.as_ref() {
-                                ready_sender.notify_waiters();
-                            }
-                            initial_load_completed.store(true, Ordering::Relaxed);
-
-                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
-                            self.update_component_status(status::ComponentStatus::Ready)
-                                .await;
-
-                            if let Err(e) = change_envelope.commit() {
-                                tracing::debug!("Failed to commit CDC change envelope: {e}");
+                            for change_envelope in change_envelopes {
+                                if let Err(e) = change_envelope.commit() {
+                                    tracing::debug!("Failed to commit CDC change envelope: {e}");
+                                }
                             }
 
                             if let Some(cache_provider_ref) = caching.as_ref() {
@@ -123,7 +138,7 @@ impl RefreshTask {
                                 status::ComponentStatus::Error,
                             )
                             .await;
-                            tracing::error!("Error writing change for {dataset_name}: {e}");
+                            tracing::error!("Error writing changes for {dataset_name}: {e}");
                         }
                     }
                 }
@@ -147,82 +162,222 @@ impl RefreshTask {
         Ok(())
     }
 
-    async fn write_change(
+    async fn write_changes(
         &self,
-        change_batch: ChangeBatch,
+        change_batches: Vec<ChangeBatch>,
+    ) -> crate::accelerated_table::Result<()> {
+        let dataset_name = self.dataset_name.clone();
+
+        // Separate deletes from upserts
+        let mut delete_operations = Vec::new();
+        let mut upsert_operations = Vec::new();
+
+        for change_batch in change_batches {
+            for row in 0..change_batch.record.num_rows() {
+                let op = change_batch.op(row);
+                match op {
+                    ChangeOperation::Delete => {
+                        let inner_data: RecordBatch = change_batch.data(row);
+                        let primary_keys = change_batch.primary_keys(row);
+                        delete_operations.push((inner_data, primary_keys));
+                    }
+                    ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
+                        let inner_data: RecordBatch = change_batch.data(row);
+                        let primary_keys = change_batch.primary_keys(row);
+                        upsert_operations.push((inner_data, primary_keys));
+                    }
+                    _ => {
+                        tracing::error!("Unknown change operation {op} for {dataset_name}");
+                    }
+                }
+            }
+        }
+
+        // Process all delete operations first
+        if !delete_operations.is_empty() {
+            self.execute_delete_operations(delete_operations).await?;
+        }
+
+        // Process upsert operations with batching to handle conflicts
+        if !upsert_operations.is_empty() {
+            self.write_upserts_with_batching(upsert_operations).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn execute_delete_operations(
+        &self,
+        delete_operations: Vec<(RecordBatch, Vec<String>)>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
             .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
-        for row in 0..change_batch.record.num_rows() {
-            let op = change_batch.op(row);
-            match op {
-                ChangeOperation::Delete => {
-                    let inner_data: RecordBatch = change_batch.data(row);
-                    let primary_keys = change_batch.primary_keys(row);
-                    let primary_key_log_fmt =
-                        Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?;
-                    let delete_where_exprs =
-                        Self::get_delete_where_expr(&inner_data, primary_keys)?;
+        // Build OR'ed delete conditions for all operations
+        let mut all_delete_conditions = Vec::new();
+        let mut log_messages = Vec::new();
 
-                    tracing::info!("Deleting data for {dataset_name} where {primary_key_log_fmt}");
+        for (inner_data, primary_keys) in delete_operations {
+            let primary_key_log_fmt = Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?;
+            let delete_where_exprs = Self::get_delete_where_expr(&inner_data, primary_keys)?;
 
-                    let ctx = SessionContext::new();
-                    let session_state = ctx.state();
+            log_messages.push(primary_key_log_fmt);
 
-                    let delete_plan = deletion_provider
-                        .delete_from(&session_state, &delete_where_exprs)
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            // Create an AND condition for this row's primary key constraints
+            let row_condition = if delete_where_exprs.len() == 1 {
+                delete_where_exprs.into_iter().next().unwrap()
+            } else {
+                delete_where_exprs
+                    .into_iter()
+                    .reduce(|acc, expr| acc.and(expr))
+                    .unwrap()
+            };
 
-                    collect(delete_plan, ctx.task_ctx())
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            all_delete_conditions.push(row_condition);
+        }
+
+        if all_delete_conditions.is_empty() {
+            return Ok(());
+        }
+
+        // Combine all row conditions with OR
+        let final_condition = all_delete_conditions
+            .into_iter()
+            .reduce(|acc, expr| acc.or(expr))
+            .unwrap();
+
+        tracing::info!(
+            "Deleting data for {dataset_name} where: {}",
+            log_messages.join(" OR ")
+        );
+
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        let delete_plan = deletion_provider
+            .delete_from(&session_state, &[final_condition])
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        collect(delete_plan, ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        Ok(())
+    }
+
+    async fn write_upserts_with_batching(
+        &self,
+        upsert_operations: Vec<(RecordBatch, Vec<String>)>,
+    ) -> crate::accelerated_table::Result<()> {
+        let dataset_name = self.dataset_name.clone();
+
+        // Start with the full batch of upsert operations
+        let mut operation_batches = vec![upsert_operations];
+
+        loop {
+            let Some(next_batch) = operation_batches.pop() else {
+                break;
+            };
+
+            let batch_len = next_batch.len();
+
+            match self.execute_upsert_batch(&next_batch).await {
+                Ok(()) => {
+                    // Batch succeeded, continue to next batch
                 }
-                ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
-                    let inner_data: RecordBatch = change_batch.data(row);
-                    let primary_keys = change_batch.primary_keys(row);
-                    let ctx = SessionContext::new();
-                    let session_state = ctx.state();
+                Err(e) => {
+                    // Check if error indicates a conflict and we can split the batch
+                    let error_string = e.to_string();
+                    if (error_string.contains("duplicate")
+                        || error_string.contains("conflict")
+                        || error_string.contains("unique constraint"))
+                        || error_string
+                            .contains("Incoming data violates uniqueness constraint on column")
+                        || error_string.contains("Constraint Violation") && batch_len > 1
+                    {
+                        // Split the batch in half and retry
+                        let mid = batch_len / 2;
+                        operation_batches.push(next_batch[mid..].to_vec());
+                        operation_batches.push(next_batch[..mid].to_vec());
 
-                    if primary_keys.is_empty() {
-                        tracing::debug!("Inserting data row for {dataset_name}",);
-                    } else {
-                        tracing::debug!(
-                            "Upserting data row for {dataset_name} with {}",
-                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
+                        tracing::warn!(
+                            "Write to dataset '{}' failed due to conflicting writes. Splitting batch of {} operations and retrying.",
+                            dataset_name,
+                            batch_len
                         );
+                    } else {
+                        // Error is not recoverable by splitting, or batch size is 1
+                        return Err(e);
                     }
-
-                    let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
-                        inner_data.schema(),
-                        Box::pin(stream::once(async { Ok(inner_data) })),
-                    ));
-
-                    let insert_plan = self
-                        .accelerator
-                        .insert_into(
-                            &session_state,
-                            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                            InsertOp::Append,
-                        )
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-
-                    collect(insert_plan, ctx.task_ctx())
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-                }
-                _ => {
-                    tracing::error!("Unknown change operation {op} for {dataset_name}");
                 }
             }
         }
+
+        Ok(())
+    }
+
+    async fn execute_upsert_batch(
+        &self,
+        operations: &[(RecordBatch, Vec<String>)],
+    ) -> crate::accelerated_table::Result<()> {
+        let dataset_name = self.dataset_name.clone();
+
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        // Extract record batches and combine them
+        let record_batches: Vec<&RecordBatch> = operations.iter().map(|(batch, _)| batch).collect();
+        let schema = record_batches[0].schema();
+
+        let combined_batch = compute::concat_batches(&schema, record_batches)
+            .map_err(|e| DataFusionError::ArrowError(e, None))
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        let total_primary_keys: Vec<String> = operations
+            .iter()
+            .flat_map(|(_, primary_keys)| primary_keys.iter().cloned())
+            .collect();
+
+        if total_primary_keys.is_empty() {
+            tracing::debug!(
+                "Inserting {} data rows for {dataset_name}",
+                operations.len()
+            );
+        } else {
+            tracing::debug!(
+                "Upserting {} data rows for {dataset_name}",
+                operations.len()
+            );
+        }
+
+        let ctx = SessionContext::new();
+        let session_state = ctx.state();
+
+        let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
+            combined_batch.schema(),
+            Box::pin(stream::once(async { Ok(combined_batch) })),
+        ));
+
+        let insert_plan = self
+            .accelerator
+            .insert_into(
+                &session_state,
+                Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
+                InsertOp::Append,
+            )
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
         Ok(())
     }
