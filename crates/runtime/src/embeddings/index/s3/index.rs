@@ -21,8 +21,10 @@ use arrow_schema::{DataType, Field};
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
 use data_components::s3_vectors::{
-    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable,
-    list_provider::S3VectorsListTable, query_provider::S3VectorsQueryTable,
+    MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier,
+    S3VectorsTable, index_query_provider::S3VectorsQueryIndexTable,
+    list_provider::S3VectorsListTable,
+    partitioned_index_query_provider::S3VectorsQueryPartitionedIndexTable,
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
@@ -191,7 +193,20 @@ impl VectorIndex for S3Vector {
         // TODO: Restructure [`S3VectorsQueryTable`] to take an async function (probably a trait)
         // like `async fn(&str) -> vec<f32>`, to avoid early embedding request.
         let vector = self.query_vector(query).await?;
-        let tp = Arc::new(S3VectorsQueryTable::new(self.table.clone(), vector));
+
+        let tp = if matches!(
+            self.table.identifier,
+            S3VectorIdentifier::PartitionedIndex { .. }
+        ) {
+            // Table Provider for the S3V Bucket will perform cross-index queries
+            Arc::new(S3VectorsQueryPartitionedIndexTable::new(
+                self.table.clone(),
+                vector,
+            )) as Arc<dyn TableProvider>
+        } else {
+            Arc::new(S3VectorsQueryIndexTable::new(self.table.clone(), vector))
+                as Arc<dyn TableProvider>
+        };
 
         table_with_projection(tp, projection).boxed()
     }

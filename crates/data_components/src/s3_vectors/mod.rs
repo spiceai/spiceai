@@ -16,13 +16,14 @@ limitations under the License.
 use arrow::error::ArrowError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::Snafu;
 
+pub mod index_query_provider;
 pub mod list_provider;
-pub mod query_provider;
+pub mod partitioned_index_query_provider;
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;
@@ -65,6 +66,9 @@ pub enum Error {
 
     #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
     S3VectorGetBucketError { source: GetVectorBucketError },
+
+    #[snafu(display("Failed to list indexes from S3 Vectors. {source}"))]
+    S3VectorListIndexesError { source: ListIndexesError },
 
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
     S3VectorGetIndexError { source: GetIndexError },
@@ -110,6 +114,11 @@ pub enum S3VectorIdentifier {
         bucket_name: String,
         index_name: String,
     },
+    PartitionedIndex {
+        bucket_name: String,
+        index_name: String,
+        num_partitions: usize,
+    },
 }
 
 impl S3VectorIdentifier {
@@ -120,6 +129,11 @@ impl S3VectorIdentifier {
             Self::Index {
                 bucket_name,
                 index_name,
+            }
+            | Self::PartitionedIndex {
+                bucket_name,
+                index_name,
+                ..
             } => (None, Some(bucket_name.clone()), Some(index_name.clone())),
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
         }

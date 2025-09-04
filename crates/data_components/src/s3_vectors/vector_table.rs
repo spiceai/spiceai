@@ -34,10 +34,10 @@ use s3_vectors_metadata_filter::json_value_to_document;
 use serde_json::Value;
 use snafu::ResultExt;
 
-/// An S3 Vector index.
+/// An S3 Vector index or bucket.
 #[derive(Clone)]
 pub struct S3VectorsTable {
-    pub(super) idx: S3VectorIdentifier,
+    pub identifier: S3VectorIdentifier,
     pub(super) client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -54,7 +54,7 @@ impl std::fmt::Debug for S3VectorsTable {
         f.debug_struct("S3VectorsListTable")
             .field("schema", &self.schema)
             .field("constraints", &self.constraints)
-            .field("index_identifier", &self.idx)
+            .field("identifier", &self.identifier)
             .finish_non_exhaustive()
     }
 }
@@ -86,24 +86,42 @@ impl S3VectorsTable {
         if !Self::check_if_bucket_exists(&client, &id).await? {
             return Ok(S3VectorTableResult::BucketDoesNotExist);
         }
-        match Self::get_index_if_exists(&id, &client).await? {
-            Some(GetIndexOutput {
-                index: Some(index), ..
-            }) => {
-                if index.distance_metric() != distance_metric {
-                    return Err(Error::IncompatibleDistanceMetric {
-                        exists: index.distance_metric,
-                        specified: distance_metric.clone(),
-                    });
+
+        if let S3VectorIdentifier::PartitionedIndex {
+            bucket_name,
+            index_name,
+            num_partitions,
+        } = id.clone()
+        {
+            for i in 0..num_partitions {
+                let index_name = format!("{index_name}-{i}");
+                let identifier = S3VectorIdentifier::Index {
+                    bucket_name: bucket_name.clone(),
+                    index_name,
+                };
+                match Self::get_index_if_exists(&identifier, &client).await? {
+                    Some(GetIndexOutput {
+                        index: Some(index), ..
+                    }) => {
+                        if index.distance_metric() != distance_metric {
+                            return Err(Error::IncompatibleDistanceMetric {
+                                exists: index.distance_metric,
+                                specified: distance_metric.clone(),
+                            });
+                        }
+                    }
+                    None => return Ok(S3VectorTableResult::IndexDoesNotExist),
+                    Some(_) => {}
                 }
             }
-            None => return Ok(S3VectorTableResult::IndexDoesNotExist),
-            Some(_) => {}
+        } else if !Self::check_if_index_exists(&id, &client).await? {
+            return Ok(S3VectorTableResult::IndexDoesNotExist);
         }
+
         let schema = Self::compute_schema(columns);
         let constraints = Self::primary_key(&schema);
         Ok(S3VectorTableResult::Table(Self {
-            idx: id,
+            identifier: id,
             client,
             schema,
             constraints,
@@ -167,21 +185,6 @@ impl S3VectorsTable {
         }
     }
 
-    #[must_use]
-    pub fn new(
-        index: S3VectorIdentifier,
-        client: Arc<dyn S3Vectors + Send + Sync>,
-        schema: SchemaRef,
-    ) -> Self {
-        let constraints = Self::primary_key(&schema);
-        Self {
-            idx: index,
-            client,
-            schema,
-            constraints,
-        }
-    }
-
     async fn create_index(
         client: &Arc<dyn S3Vectors + Send + Sync>,
         dimension: i64,
@@ -189,12 +192,17 @@ impl S3VectorsTable {
         non_filterable_metadata_columns: Vec<String>,
         distance_metric: &DistanceMetric,
     ) -> Result<()> {
-        let S3VectorIdentifier::Index {
-            bucket_name,
-            index_name,
-        } = vector_id
-        else {
-            return Err(Error::CreateIndexUsingArn);
+        let (bucket_name, index_name, num_partitions) = match vector_id {
+            S3VectorIdentifier::IndexArn(_) => return Err(Error::CreateIndexUsingArn),
+            S3VectorIdentifier::Index {
+                bucket_name,
+                index_name,
+            } => (bucket_name, index_name, None),
+            S3VectorIdentifier::PartitionedIndex {
+                bucket_name,
+                index_name,
+                num_partitions,
+            } => (bucket_name, index_name, Some(num_partitions)),
         };
 
         let metadata_configuration = if non_filterable_metadata_columns.is_empty() {
@@ -208,22 +216,32 @@ impl S3VectorsTable {
             )
         };
 
-        client
-            .create_index(
-                CreateIndexInput::builder()
-                    .data_type(s3_vectors::DataType::Float32)
-                    .dimension(dimension.try_into().unwrap_or(i32::MAX))
-                    .distance_metric(distance_metric.clone())
-                    .index_name(index_name)
-                    .set_metadata_configuration(metadata_configuration)
-                    .vector_bucket_name(bucket_name)
-                    .build()
-                    .context(S3VectorBuildSnafu)?,
-            )
-            .await
-            .map_err(|e| Error::S3VectorCreateIndexError {
-                source: e.into_service_error(),
-            })?;
+        let index_names = match num_partitions {
+            Some(num_partitions) => (0..*num_partitions)
+                .map(|i| format!("{index_name}-{i}"))
+                .collect(),
+            None => vec![index_name.clone()],
+        };
+
+        for index_name in index_names {
+            client
+                .create_index(
+                    CreateIndexInput::builder()
+                        .data_type(s3_vectors::DataType::Float32)
+                        .dimension(dimension.try_into().unwrap_or(i32::MAX))
+                        .distance_metric(distance_metric.clone())
+                        .index_name(index_name)
+                        .set_metadata_configuration(metadata_configuration.clone())
+                        .vector_bucket_name(bucket_name)
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
+                .await
+                .map_err(|e| Error::S3VectorCreateIndexError {
+                    source: e.into_service_error(),
+                })?;
+        }
+
         Ok(())
     }
 
@@ -231,9 +249,11 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<()> {
-        let S3VectorIdentifier::Index { bucket_name, .. } = id else {
-            return Err(Error::CreateIndexUsingArn);
+        let bucket_name = match id {
+            S3VectorIdentifier::Index { bucket_name, .. } => bucket_name,
+            _ => return Err(Error::CreateIndexUsingArn),
         };
+
         client
             .create_vector_bucket(
                 CreateVectorBucketInput::builder()
@@ -248,12 +268,42 @@ impl S3VectorsTable {
         Ok(())
     }
 
+    /// Returns whether the index exists.
+    async fn check_if_index_exists(
+        identifier: &S3VectorIdentifier,
+        client: &Arc<dyn S3Vectors + Send + Sync>,
+    ) -> Result<bool> {
+        let (index_arn, vector_bucket_name, index_name) = identifier.index_identifier_variables();
+        match client
+            .get_index(
+                GetIndexInput::builder()
+                    .set_index_arn(index_arn)
+                    .set_vector_bucket_name(vector_bucket_name)
+                    .set_index_name(index_name)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+            .await
+        {
+            Err(SdkError::ServiceError(e))
+                if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
+            {
+                Ok(false)
+            }
+            Ok(_) => Ok(true),
+            Err(e) => Err(Error::S3VectorGetIndexError {
+                source: e.into_service_error(),
+            }),
+        }
+    }
+
     async fn check_if_bucket_exists(
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
         let bucket_name_opt = match id {
-            S3VectorIdentifier::Index { bucket_name, .. } => Some(bucket_name.clone()),
+            S3VectorIdentifier::Index { bucket_name, .. }
+            | S3VectorIdentifier::PartitionedIndex { bucket_name, .. } => Some(bucket_name.clone()),
             S3VectorIdentifier::IndexArn(_) => None,
         };
         match client
@@ -422,14 +472,25 @@ impl S3VectorsTable {
             })
             .collect();
 
-        let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
+        let (index_arn, vector_bucket_name, index_name) =
+            self.identifier.index_identifier_variables();
 
-        for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
+        let num_partitions = match self.identifier {
+            S3VectorIdentifier::PartitionedIndex { num_partitions, .. } => Some(num_partitions),
+            _ => None,
+        };
+
+        let index_name = index_name.unwrap();
+        for (i, chunk) in vectors.chunks(PUT_VECTORS_MAX_ITEMS).enumerate() {
+            let index_name = match num_partitions {
+                Some(n) => format!("{index_name}-{}", i % n),
+                None => index_name.clone(),
+            };
             self.client
                 .put_vectors(
                     PutVectorsInput::builder()
                         .set_index_arn(index_arn.clone())
-                        .set_index_name(index_name.clone())
+                        .set_index_name(Some(index_name))
                         .set_vector_bucket_name(vector_bucket_name.clone())
                         .set_vectors(Some(chunk.to_vec()))
                         .build()

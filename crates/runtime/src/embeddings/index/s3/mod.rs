@@ -73,6 +73,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("num_partitions")
+        .description("The number of index partitions to use.")
+        .secret(),
 ];
 
 /// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
@@ -107,12 +110,11 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    let default_s3_index_name = format!("{ds_name}-{column}-{}", config.model).replace('_', "-");
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
-        format!("{}-{}-{}", ds_name, column, config.model)
-            .replace('_', "-")
-            .as_str(),
+        &default_s3_index_name,
         Arc::clone(&embedding_models),
         config.model.as_str(),
     )
@@ -152,6 +154,8 @@ async fn try_vector_table(
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
+    let s3_num_partitions =
+        string_from_params(&params, "num_partitions").and_then(|s| s.parse().ok());
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -173,6 +177,24 @@ async fn try_vector_table(
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
         Box::from(format!("Invalid S3 Vectors bucket defined: {e}"))
     })?;
+
+    let id = match s3_num_partitions {
+        Some(num_partitions) => {
+            let S3VectorIdentifier::Index {
+                bucket_name,
+                index_name,
+            } = id
+            else {
+                return Err(Box::from("Vector Index via ARN cannot be partitioned"));
+            };
+            S3VectorIdentifier::PartitionedIndex {
+                bucket_name,
+                index_name,
+                num_partitions,
+            }
+        }
+        None => id,
+    };
 
     let config = load_config(
         "S3Vectors",

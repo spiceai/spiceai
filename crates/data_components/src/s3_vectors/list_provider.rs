@@ -152,7 +152,7 @@ impl S3VectorsListExec {
         );
 
         Self {
-            idx: table.as_ref().idx.clone(),
+            idx: table.as_ref().identifier.clone(),
             client: Arc::clone(&table.as_ref().client),
             plan_properties: properties,
             limit,
@@ -294,68 +294,81 @@ async fn list_vector_segment(
     let mut next_token = None;
     let mut segment_vectors_retrieved = 0;
 
-    while remaining_limit > 0 {
-        let ListVectorsOutput {
-            next_token: next_token_opt,
-            vectors,
+    let index_names = match idx {
+        S3VectorIdentifier::PartitionedIndex {
+            index_name,
+            num_partitions,
             ..
-        } = client
-            .list_vectors(
-                ListVectorsInput::builder()
-                    .set_vector_bucket_name(bucket_name.clone())
-                    .set_index_arn(arn.clone())
-                    .set_index_name(index_name.clone())
-                    .max_results(
-                        i32::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS))
-                            .unwrap_or(i32::MAX),
-                    )
-                    .set_next_token(next_token.clone())
-                    .return_data(true)
-                    .return_metadata(true)
-                    .segment_count(i32::try_from(segment_count).unwrap_or(i32::MAX))
-                    .segment_index(i32::try_from(segment_index).unwrap_or(i32::MAX))
-                    .build()
-                    .boxed()
-                    .map_err(DataFusionError::External)?,
-            )
-            .await
-            .boxed()
-            .map_err(DataFusionError::External)?;
+        } => (0..num_partitions)
+            .map(|i| Some(format!("{index_name}-{i}")))
+            .collect(),
+        _ => vec![index_name],
+    };
 
-        remaining_limit = remaining_limit.saturating_sub(vectors.len());
-        let num_vectors = vectors.len();
-        segment_vectors_retrieved += num_vectors;
-        next_token = next_token_opt;
+    for index_name in index_names {
+        while remaining_limit > 0 {
+            let ListVectorsOutput {
+                next_token: next_token_opt,
+                vectors,
+                ..
+            } = client
+                .list_vectors(
+                    ListVectorsInput::builder()
+                        .set_vector_bucket_name(bucket_name.clone())
+                        .set_index_arn(arn.clone())
+                        .set_index_name(index_name.clone())
+                        .max_results(
+                            i32::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS))
+                                .unwrap_or(i32::MAX),
+                        )
+                        .set_next_token(next_token.clone())
+                        .return_data(true)
+                        .return_metadata(true)
+                        .segment_count(i32::try_from(segment_count).unwrap_or(i32::MAX))
+                        .segment_index(i32::try_from(segment_index).unwrap_or(i32::MAX))
+                        .build()
+                        .boxed()
+                        .map_err(DataFusionError::External)?,
+                )
+                .await
+                .boxed()
+                .map_err(DataFusionError::External)?;
 
-        let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
-        decoder.serialize(rows.as_slice()).map_err(|e| {
-            DataFusionError::ArrowError(
-                e,
-                Some(
-                    "could not convert ListVectors JSON response into expected Arrow format"
-                        .to_string(),
-                ),
-            )
-        })?;
+            remaining_limit = remaining_limit.saturating_sub(vectors.len());
+            let num_vectors = vectors.len();
+            segment_vectors_retrieved += num_vectors;
+            next_token = next_token_opt;
 
-        match decoder.flush() {
-            Ok(Some(rb)) => {
-                let _ = tx.send(Ok(rb)).await;
+            let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
+            decoder.serialize(rows.as_slice()).map_err(|e| {
+                DataFusionError::ArrowError(
+                    e,
+                    Some(
+                        "could not convert ListVectors JSON response into expected Arrow format"
+                            .to_string(),
+                    ),
+                )
+            })?;
+
+            match decoder.flush() {
+                Ok(Some(rb)) => {
+                    let _ = tx.send(Ok(rb)).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::ArrowError(
+                            e,
+                            Some("Received only partial JSON payload from ListVectors".to_string()),
+                        )))
+                        .await;
+                }
             }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx
-                    .send(Err(DataFusionError::ArrowError(
-                        e,
-                        Some("Received only partial JSON payload from ListVectors".to_string()),
-                    )))
-                    .await;
-            }
-        }
 
-        // No more results for this segment
-        if next_token.is_none() {
-            break;
+            // No more results for this segment
+            if next_token.is_none() {
+                break;
+            }
         }
     }
 
