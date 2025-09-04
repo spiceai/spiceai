@@ -26,11 +26,12 @@ use futures::stream::BoxStream;
 use snafu::prelude::*;
 
 use crate::cdc::{CommitChange, CommitError};
+use crate::kafka;
 
 #[derive(Debug)]
 pub enum StreamError {
     /// Error from the Kafka client, such as failure to consume messages.
-    Kafka(String),
+    Kafka(kafka::Error),
     /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
     /// Error from Arrow Flight, such as failure during streaming or subscription.
