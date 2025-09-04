@@ -152,7 +152,8 @@ impl TableProvider for S3VectorsQueryPartitionedIndexTable {
             .iter()
             .filter_map(|idx| {
                 let name = idx.index_name().to_string();
-                if name.starts_with(&index_name) {
+                // Avoid `index_name.len() == name.len()` as this will be a non-partitioned index we don't expect.
+                if name.starts_with(&index_name) && index_name.len() > name.len() {
                     Some(name)
                 } else {
                     None
