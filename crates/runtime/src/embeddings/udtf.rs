@@ -45,7 +45,6 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 use std::cmp::min;
 use std::{
     any::Any,
