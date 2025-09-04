@@ -13,7 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error as StdError,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
@@ -424,29 +429,69 @@ impl S3VectorsTable {
 
         let (index_arn, vector_bucket_name, index_name) = self.idx.index_identifier_variables();
 
-        for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            self.client
-                .put_vectors(
-                    PutVectorsInput::builder()
-                        .set_index_arn(index_arn.clone())
-                        .set_index_name(index_name.clone())
-                        .set_vector_bucket_name(vector_bucket_name.clone())
-                        .set_vectors(Some(chunk.to_vec()))
-                        .build()
-                        .context(S3VectorBuildSnafu)?,
-                )
-                .await
-                .map_err(|e| Error::S3VectorPutVectorError {
-                    source: e.into_service_error(),
-                })?;
+        let num_partitions = match self.identifier {
+            S3VectorIdentifier::PartitionedIndex { num_partitions, .. } => Some(num_partitions),
+            _ => None,
+        };
+
+        let index_name = index_name.unwrap();
+        let vectors_len = vectors.len();
+
+        for (i, chunk) in bucket_by(vectors, num_partitions.unwrap_or(1), |put_input| {
+            let mut h = DefaultHasher::new();
+            put_input.key.hash(&mut h);
+            h.finish() as usize
+        })
+        .into_iter()
+        .enumerate()
+        {
+            let index_name = match num_partitions {
+                Some(n) => format!("{index_name}-{}", i % n),
+                None => index_name.clone(),
+            };
+
+            for c in chunk.chunks(PUT_VECTORS_MAX_ITEMS) {
+                // TODO: Don't do these `put_vectors` in serial
+                self.client
+                    .put_vectors(
+                        PutVectorsInput::builder()
+                            .set_index_arn(index_arn.clone())
+                            .set_index_name(Some(index_name.clone()))
+                            .set_vector_bucket_name(vector_bucket_name.clone())
+                            .set_vectors(Some(c.to_vec()))
+                            .build()
+                            .context(S3VectorBuildSnafu)?,
+                    )
+                    .await
+                    .map_err(|e| Error::S3VectorPutVectorError {
+                        source: e.into_service_error(),
+                    })?;
+            }
         }
 
         tracing::info!(
-            "S3 Vectors Index updated; records={} records, duration={duration:?}",
-            vectors.len(),
+            "S3 Vectors Index updated for index '{index_name}'; records={vectors_len} records, duration={duration:?}",
             duration = start.elapsed()
         );
 
         Ok(())
     }
+}
+
+fn bucket_by<T, F>(items: Vec<T>, n_buckets: usize, mut by: F) -> Vec<Vec<T>>
+where
+    F: FnMut(&T) -> usize,
+{
+    if n_buckets <= 1 {
+        return vec![items];
+    }
+
+    let mut buckets: Vec<Vec<T>> = (0..n_buckets).map(|_| Vec::new()).collect();
+
+    for item in items {
+        let b = by(&item) % n_buckets;
+        buckets[b].push(item);
+    }
+
+    buckets
 }
