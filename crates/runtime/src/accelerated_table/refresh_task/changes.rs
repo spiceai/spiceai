@@ -138,6 +138,15 @@ impl RefreshTask {
                     }
                 }
                 Err(e) => {
+                    // rdkafka will automatically recover from poll timeout errors, so we can continue.
+                    // warning is logged to inform the user about potential performance or connectivity issues.
+                    if data_components::kafka::is_max_poll_interval_err(&e) {
+                        tracing::warn!(
+                            "Kafka poll interval exceeded for dataset '{dataset_name}': connection lost or consumer too slow. Retrying."
+                        );
+                        continue;
+                    }
+
                     tracing::error!("Changes stream error for {dataset_name}: {e}");
                     self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),

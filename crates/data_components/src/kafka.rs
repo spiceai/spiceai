@@ -396,12 +396,7 @@ impl Kafka {
             .stream_json::<serde_json::Value, serde_json::Value>()
             .map(move |msg| {
                 let schema = Arc::clone(&schema);
-                let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(format!(
-                        "Unable to read message: {:?}",
-                        msg.err()
-                    )));
-                };
+                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
                 let json_str = match flatten_json {
                     Some(ref delimiter) => {
@@ -454,4 +449,25 @@ impl TableProvider for Kafka {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
     }
+}
+
+/// Returns `true` if the provided [`StreamError`] represents a Kafka poll interval error.
+/// This error occurs when the application's poll interval exceeds the maximum allowed by Kafka.
+/// It is generally nonfatal and often indicates that the consumer should retry or continue polling.
+#[must_use]
+pub fn is_max_poll_interval_err(err: &cdc::StreamError) -> bool {
+    let cdc::StreamError::Kafka(kafka_stream_err) = err else {
+        return false;
+    };
+
+    let Error::UnableToReceiveMessage { source } = kafka_stream_err else {
+        return false;
+    };
+
+    matches!(
+        source,
+        rdkafka::error::KafkaError::MessageConsumption(
+            rdkafka::types::RDKafkaErrorCode::PollExceeded
+        )
+    )
 }
