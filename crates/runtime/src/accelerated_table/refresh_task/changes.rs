@@ -141,7 +141,7 @@ impl RefreshTask {
                     // rdkafka will automatically recover from poll timeout errors, so we can continue.
                     // warning is logged to inform the user about potential performance or connectivity issues.
                     if data_components::kafka::is_max_poll_interval_err(&e) {
-                        tracing::warn!(
+                        tracing::debug!(
                             "Kafka poll interval exceeded for dataset '{dataset_name}': connection lost or consumer too slow. Retrying."
                         );
                         continue;
