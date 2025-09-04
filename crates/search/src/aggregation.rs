@@ -75,6 +75,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait CandidateAggregation: Sync + Send {
     /// Consumes `generation_results` and decides how to order the underlying [`SendableRecordBatchStream`] data into a single [`SendableRecordBatchStream`].
+    ///
+    /// Expect `data` to be non empty, and one [`VectorSearchGenerationResult::data`] to be non-empty.
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
