@@ -193,8 +193,10 @@ pub async fn write(index: &S3Vector, record: RecordBatch) -> Result<RecordBatch,
                 embedding_vectors_batches.push(next[mid..].to_vec());
                 embedding_vectors_batches.push(next[..mid].to_vec());
                 tracing::warn!(
-                    "Write to '{}' index failed due to conflicting writes. Splitting batch and retrying.",
-                    index.name()
+                    "Write to '{}' index failed due to conflicting writes. Splitting batch from {} to {}, and retrying.",
+                    index.name(),
+                    next_len,
+                    mid
                 );
             }
             Err(e) => Err(e).context(CannotWriteIndexSnafu {

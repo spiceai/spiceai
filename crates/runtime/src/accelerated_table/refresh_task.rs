@@ -76,6 +76,7 @@ use datafusion::{
 use super::refresh::Refresh;
 
 mod changes;
+// mod constraints;
 mod streaming_append;
 
 #[derive(Debug, Clone, Default)]
