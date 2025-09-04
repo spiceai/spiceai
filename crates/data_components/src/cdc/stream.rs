@@ -56,6 +56,7 @@ impl std::fmt::Display for StreamError {
 }
 
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
+pub type ChunkedChangesStream = BoxStream<'static, Result<Vec<ChangeEnvelope>, StreamError>>;
 
 #[derive(Debug, Snafu)]
 pub enum ChangeBatchError {
@@ -66,13 +67,16 @@ pub enum ChangeBatchError {
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
+    pub change_committer: Arc<dyn CommitChange + Send + Sync>,
     pub change_batch: ChangeBatch,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Arc<dyn CommitChange + Send + Sync>,
+        change_batch: ChangeBatch,
+    ) -> Self {
         Self {
             change_committer,
             change_batch,
@@ -84,13 +88,13 @@ impl ChangeEnvelope {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
+    pub fn into_parts(self) -> (Arc<dyn CommitChange + Send + Sync>, ChangeBatch) {
         (self.change_committer, self.change_batch)
     }
 
     #[must_use]
     pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
+        change_committer: Arc<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
     ) -> Self {
         Self {
@@ -121,9 +125,9 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
 #[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
-    op_idx: usize,
-    primary_keys_idx: usize,
-    data_idx: usize,
+    pub op_idx: usize,
+    pub primary_keys_idx: usize,
+    pub data_idx: usize,
 }
 
 pub enum ChangeOperation {
@@ -182,6 +186,10 @@ impl ChangeBatch {
             primary_keys_idx,
             data_idx,
         })
+    }
+
+    pub fn source_col(&self, col: usize) -> &ArrayRef {
+        self.record.column(col)
     }
 
     #[must_use]

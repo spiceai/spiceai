@@ -363,12 +363,12 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(federated_table);
+                return self.inner_connector.chunked_changes_stream(federated_table);
             };
 
             let (changes_stream, readiness) = self
                 .inner_connector
-                .changes_stream(underlying_federated_table)?;
+                .chunked_changes_stream(underlying_federated_table)?;
 
             let stream = Box::pin(
                 changes_stream
@@ -390,7 +390,7 @@ impl DataConnector for EmbeddingConnector {
 
         let (stream, readiness) = self
             .inner_connector
-            .changes_stream(underlying_federated_table)?;
+            .chunked_changes_stream(underlying_federated_table)?;
 
         let stream = Box::pin(
             stream

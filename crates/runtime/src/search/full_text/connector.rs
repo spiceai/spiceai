@@ -217,7 +217,7 @@ impl DataConnector for FullTextConnector {
             let underlying = indexed_table.get_underlying();
             let (changes_stream, readiness) = self
                 .inner_connector
-                .changes_stream(Arc::new(FederatedTable::Immediate(underlying)))?;
+                .chunked_changes_stream(Arc::new(FederatedTable::Immediate(underlying)))?;
             return Some((
                 flatten_change_envelope_stream(Box::pin(
                     changes_stream

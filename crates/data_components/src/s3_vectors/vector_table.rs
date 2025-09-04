@@ -503,7 +503,7 @@ impl S3VectorsTable {
         }
 
         tracing::info!(
-            "S3 Vectors Index updated; records={} records, duration={duration:?}",
+            "S3 Vectors Index updated for index '{index_name}'; records={} records, duration={duration:?}",
             vectors.len(),
             duration = start.elapsed()
         );
