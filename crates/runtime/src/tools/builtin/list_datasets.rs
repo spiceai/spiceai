@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
@@ -76,17 +77,31 @@ impl SpiceModelTool for ListDatasetsTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
-        let elements = get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
-            .await
-            .iter()
-            .map(serde_json::value::to_value)
-            .collect::<Result<Vec<Value>, _>>()
-            .boxed()?;
+        let result: Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> = async {
+            let elements =
+                get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
+                    .await
+                    .iter()
+                    .map(serde_json::value::to_value)
+                    .collect::<Result<Vec<Value>, _>>()
+                    .boxed()?;
 
-        let captured_output_json = serde_json::to_string(&elements).boxed()?;
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+            let captured_output_json = serde_json::to_string(&elements).boxed()?;
+            tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+            Ok(elements)
+        }.instrument(span.clone()).await;
 
-        Ok(Value::Array(elements))
+        match result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(Value::Array(value))
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
 
