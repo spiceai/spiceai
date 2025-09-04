@@ -191,9 +191,9 @@ fn create_response_stream(
 
         loop {
             tokio::select! {
-                () = sleep(Duration::from_secs(30)) => {
-                    tracing::error!("Timeout: no record batch received within 30 seconds");
-                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 30 seconds"));
+                () = sleep(Duration::from_secs(300)) => {
+                    tracing::error!("Timeout: no record batch received within 5 minutes");
+                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 5 minutes"));
                     break;
                 }
                 // Poll the writing task to check if it has completed with an error while processing the data
