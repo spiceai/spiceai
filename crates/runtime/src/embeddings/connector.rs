@@ -379,7 +379,7 @@ impl DataConnector for EmbeddingConnector {
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&indexed_table)?;
+                underlying_federated_table_for_indexed_table(&table_provider)?;
 
             let stream = self
                 .inner_connector
@@ -422,7 +422,7 @@ impl DataConnector for EmbeddingConnector {
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&indexed_table)?;
+                underlying_federated_table_for_indexed_table(&table_provider)?;
 
             let stream = self
                 .inner_connector
@@ -453,16 +453,26 @@ impl DataConnector for EmbeddingConnector {
 }
 
 fn underlying_federated_table_for_indexed_table(
-    indexed_table: &Arc<IndexedTableProvider>,
+    src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {
     #[cfg(feature = "s3_vectors")]
     {
-        let vector_scan = indexed_table
-            .underlying
+        if let Some(vector_scan) = src_table_provider
             .as_any()
-            .downcast_ref::<super::index::VectorScanTableProvider>()?;
+            .downcast_ref::<super::index::VectorScanTableProvider>()
+        {
+            return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
+        }
+
+        if let Some(indexed_scan) = src_table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+        {
+            return underlying_federated_table_for_indexed_table(&indexed_scan.underlying);
+        }
+
         Some(Arc::new(FederatedTable::Immediate(Arc::clone(
-            &vector_scan.table_provider,
+            src_table_provider,
         ))))
     }
     #[cfg(not(feature = "s3_vectors"))]
