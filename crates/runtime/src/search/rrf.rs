@@ -175,6 +175,7 @@ impl ReciprocalRankFusion {
             })
             .expect("Must have joined DF")
             .select(columns)?
+            .distinct()?
             .sort(vec![col("fused_score").sort(false, false)])
     }
 
