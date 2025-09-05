@@ -99,7 +99,11 @@ impl SpiceModelTool for DocumentSimilarityTool {
         .await;
 
         match tool_use_result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
