@@ -21,6 +21,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::component::dataset::FullTextSearchDatasetConfig;
+use crate::component::dataset::acceleration::Mode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::make_spice_data_sub_directory;
@@ -43,49 +45,47 @@ impl FullTextConnector {
         inner_table_provider: Arc<dyn TableProvider>,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let (search_fields, primary_key_overrides): (Vec<_>, Vec<_>) = dataset
-            .columns
-            .iter()
-            .filter_map(|c| {
-                if c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled) {
-                    let primary_key_overrides = c
-                        .full_text_search
-                        .as_ref()
-                        .and_then(|cfg| cfg.row_ids.clone());
-                    Some((c.name.clone(), primary_key_overrides))
-                } else {
-                    None
-                }
-            })
-            .unzip();
+        let Some(FullTextSearchDatasetConfig {
+            mode,
+            search_fields,
+            primary_key,
+        }) = dataset.full_text_search_config()
+        else {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                message: format!(
+                    "Attempted to add full text search functionality to '{}', but configuration not available",
+                    dataset.name
+                ),
+            });
+        };
 
-        if search_fields.is_empty() {
-            return Ok(inner_table_provider);
-        }
-
-        // Example `.spice/data/fts/catalog/schema/table/`.
-        let index_directory = make_spice_data_sub_directory(
-            [vec!["fts".to_string()], dataset.name.to_vec()]
-                .concat()
-                .as_slice(),
-        )
-        .boxed()
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: e,
-        })?;
+        let directory = if mode == Mode::File {
+            // Example `.spice/data/fts/catalog/schema/table/`.
+            Some(
+                make_spice_data_sub_directory(
+                    [vec!["fts".to_string()], dataset.name.to_vec()]
+                        .concat()
+                        .as_slice(),
+                )
+                .boxed()
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: dataset.source().to_string(),
+                    message: e.to_string(),
+                    connector_component: dataset.into(),
+                    source: e,
+                })?,
+            )
+        } else {
+            None
+        };
 
         let index = FullTextDatabaseIndex::try_new(
             Arc::clone(&inner_table_provider),
             search_fields.clone(),
-            Self::warn_different_primary_keys(
-                dataset.name.to_string().as_str(),
-                primary_key_overrides,
-                search_fields.as_slice(),
-            ),
-            Some(index_directory),
+            primary_key,
+            directory,
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {

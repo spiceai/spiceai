@@ -748,9 +748,9 @@ impl Dataset {
 
 ///
 pub struct FullTextSearchDatasetConfig {
-    mode: FtsMode,
-    search_fields: Vec<String>,
-    primary_key: Vec<String>,
+    pub mode: FtsMode,
+    pub search_fields: Vec<String>,
+    pub primary_key: Vec<String>,
 }
 
 impl AccelerationSource for Dataset {
