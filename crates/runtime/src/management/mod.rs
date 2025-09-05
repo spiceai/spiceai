@@ -231,7 +231,7 @@ impl Management {
                     return false;
                 }
 
-                tracing::warn!(
+                tracing::debug!(
                     "{}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds",
                     Error::UnableToExportTaskHistoryData {
                         source: Box::new(e)
@@ -247,7 +247,7 @@ impl Management {
         }
 
         if let Err(e) = write_task_history_records_to_remote(df, data).await {
-            tracing::warn!("{e}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds");
+            tracing::debug!("{e}. Retrying in {DEFAULT_EXPORT_INTERVAL_SECS} seconds");
             return false;
         }
 
