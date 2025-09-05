@@ -209,11 +209,12 @@ pub async fn embedding_columns_from_table(
     // embedding columns from [`IndexedTableProvider`].
     #[cfg(feature = "s3_vectors")]
     {
-        if let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)
-        {
-            use crate::embeddings::index::s3::S3Vector;
-            for index in indexed.get_indexes::<S3Vector>() {
-                embedding_columns.insert(index.embedded_column.clone());
+        use crate::embeddings::index::s3::S3Vector;
+        if let Some(indexes) = find_index_in_table_provider::<S3Vector>(&table_provider) {
+            for index in indexes {
+                use crate::embeddings::index::VectorIndex;
+
+                embedding_columns.insert(index.embedded_column());
             }
         }
     }
