@@ -100,41 +100,6 @@ impl FullTextConnector {
 
         Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
     }
-
-    // For all full text search columns, find the first with a non-null primary key override and
-    // if there are multiple, warn if they are different.
-    fn warn_different_primary_keys(
-        ds_name: &str,
-        sets: Vec<Option<Vec<String>>>,
-        fields: &[String],
-    ) -> Option<Vec<String>> {
-        let mut first: Option<Vec<String>> = None;
-        let cmp_idx = 0;
-        for (i, s) in sets.into_iter().enumerate() {
-            let Some(mut pks) = s else {
-                continue;
-            };
-            pks.sort();
-
-            // If not first primary key defined, check it matches previous. Otherwise set to be used for next comparison.
-            if let Some(ref f) = first {
-                if *pks != *f {
-                    tracing::warn!(
-                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
-                        ds_name,
-                        fields[cmp_idx],
-                        f.join(", "),
-                        fields[i],
-                        pks.join(", "),
-                    );
-                }
-            } else {
-                first = Some(pks.clone());
-            }
-        }
-
-        first
-    }
 }
 
 #[async_trait]

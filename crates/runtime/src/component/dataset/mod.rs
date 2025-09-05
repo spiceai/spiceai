@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, dataaccelerator::AccelerationSource};
+use crate::{
+    Runtime, component::dataset::acceleration::Mode as FtsMode, dataaccelerator::AccelerationSource,
+};
 use acceleration::{Acceleration, Engine};
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -31,7 +33,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::Column,
+    semantic::{Column, FullTextSearchConfig},
     vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
@@ -635,10 +637,77 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
-        self.columns
+    pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
+        let (search_fields, primary_key_overrides, modes): (
+            Vec<String>,
+            Vec<Option<Vec<String>>>,
+            Vec<FtsMode>,
+        ) = self
+            .columns
             .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+            .filter_map(|c| {
+                let Some(FullTextSearchConfig {
+                    enabled: true,
+                    row_ids,
+                    mode,
+                }) = &c.full_text_search
+                else {
+                    return None;
+                };
+                Some((c.name.clone(), row_ids.clone(), mode))
+            })
+            .unzip();
+
+        // No columns have full text search fields defined.
+        if search_fields.is_empty() {
+            return None;
+        }
+
+        // For all full text search columns, find the first with a non-null primary key override and
+        // if there are multiple, warn if they are different.
+        let mut first_pks: Option<Vec<String>> = None;
+        let mut first_search_field: Option<String> = None;
+        let cmp_idx = 0;
+        for (i, (search_field, pk_overrides)) in search_fields
+            .iter()
+            .zip(primary_key_overrides.iter())
+            .enumerate()
+        {
+            let Some(mut pks) = pk_overrides else {
+                continue;
+            };
+            pks.sort();
+
+            // If this is not the first FTS column that defined row ids, check if they match the previous.
+            // Otherwise set to be used for next comparison.
+            if let (Some(ref f), Some(ref s)) = (first_pks, first_search_field) {
+                if *pks != *f {
+                    tracing::warn!(
+                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
+                        self.name(),
+                        first_search_field,
+                        f.join(", "),
+                        search_field,
+                        pks.join(", "),
+                    );
+                }
+            } else {
+                first_pks = Some(pks.clone());
+                first_search_field = Some(search_field.clone());
+            }
+        }
+
+        let mode = if modes.iter().any(m == FtsMode::Memory) {
+            FtsMode::Memory
+        } else {
+            FtsMode::File
+        };
+
+        Some(FullTextSearchDatasetConfig {
+            mode,
+            search_fields,
+            primary_key: first_pks.unwrap_or_default(),
+        })
     }
 
     /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
@@ -675,6 +744,13 @@ impl Dataset {
 
         Some(primary_keys)
     }
+}
+
+///
+pub struct FullTextSearchDatasetConfig {
+    mode: FtsMode,
+    search_fields: Vec<String>,
+    primary_key: Vec<String>,
 }
 
 impl AccelerationSource for Dataset {

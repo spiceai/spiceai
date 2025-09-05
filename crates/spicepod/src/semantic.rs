@@ -22,7 +22,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::component::embeddings::EmbeddingChunkConfig;
+use crate::{acceleration::Mode, component::embeddings::EmbeddingChunkConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -152,6 +152,8 @@ pub struct FullTextSearchConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub row_ids: Option<Vec<String>>,
+
+    pub mode: Mode,
 }
 
 #[cfg(test)]
