@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{exec_err, DataFusionError, JoinType, Result, ScalarValue};
+use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,11 +24,13 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{coalesce, DataFrame, SessionContext};
-use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, sha224};
 use datafusion::sql::unparser::Unparser;
-use datafusion_expr::{col, lit, ExprFunctionExt, UserDefinedLogicalNode};
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion_expr::{ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode, col, lit};
 use futures::future::join_all;
+use itertools::Itertools;
+use logos::internal::CallbackResult;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
@@ -71,7 +73,7 @@ impl ReciprocalRankFusion {
     pub fn from_ctx(session_context: Arc<SessionContext>) -> Self {
         Self {
             session_context,
-            df: None
+            df: None,
         }
     }
 
@@ -105,9 +107,9 @@ impl ReciprocalRankFusion {
         let search_udtf_invocations: Vec<String> = args
             .iter()
             .filter_map(|expr| match expr {
-                // TODO: score is "Spice-standard", but id is not
                 e @ Expr::ScalarFunction(_) => unparser
                     .expr_to_sql(&e)
+                    // (unfortunately cannot use table API here, so must generate select query)
                     .map(|e| format!("select * from {e}"))
                     .ok(),
                 _ => None,
@@ -131,27 +133,24 @@ impl ReciprocalRankFusion {
                 .into_iter()
                 .collect::<Result<Vec<_>>>()
         })?
-            .into_iter()
-            .enumerate()
-            .map(|(i, df)| Self::ranked_and_aliased_df_projection(df, i))
-            .collect::<Result<Vec<_>>>()?;
+        .into_iter()
+        .enumerate()
+        .map(|(i, df)| {
+            Self::ranked_and_aliased_df_projection(df)
+                .and_then(Self::with_rrf_rowid)
+                .and_then(|df| df.alias(&format!("search_{i}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-        // TODO: assumes homogenous projections, and is frankly insane
-        let mut columns: Vec<_> = search_dfs[0].schema().columns().iter().filter_map(|c| match c.name.as_str() {
-            "id" | "rank" | "score" => None,
-            other if other.contains("embedding") => None,
-            other => Some(
-                coalesce((0..search_dfs.len()).map(|i| col(format!("search_{i}.{other}"))).collect())
-                    .alias(other)
-            ),
-        }).collect();
+        // Ensure that all projections have a score column
+        for (i, df) in search_dfs.iter().enumerate() {
+            if !df.schema().has_column_with_unqualified_name("score") {
+                return exec_err!(
+                    "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
+                );
+            }
+        }
 
-        let id_expr = coalesce(
-            (0..search_dfs.len())
-                .map(|i| col(format!("search_{i}.id")))
-                .collect(),
-        )
-            .alias("id");
         let score_expr = coalesce(
             (0..search_dfs.len())
                 .map(|i| {
@@ -162,31 +161,82 @@ impl ReciprocalRankFusion {
                 })
                 .collect(),
         )
-            .alias("fused_score");
+        .alias("fused_score");
 
-        columns.insert(0, id_expr);
-        columns.insert(1, score_expr);
+        // Create column expressions for final projection
+        let mut columns: Vec<Expr> = vec![score_expr];
+        columns.extend(search_dfs[0].schema().columns().iter().filter_map(|c| {
+            match c.name.as_str() {
+                "__spice_rrf_row_id" | "rank" | "score" => None,
+                // TODO: do we want the embedding in the final projection?
+                other if other.contains("embedding") => None,
+                other => Some(
+                    coalesce(
+                        (0..search_dfs.len())
+                            .map(|i| col(format!("search_{i}.{other}")))
+                            .collect(),
+                    )
+                    .alias(other),
+                ),
+            }
+        }));
 
+        // Join DFs together, apply final projection, and sort by the new fused score
         search_dfs
             .into_iter()
-            .reduce(|a, b| {
-                a.join(b, JoinType::Full, &["id"], &["id"], None)
-                    .expect("Must join")
-            })
+            .reduce(|a, b| Self::fold_join(a, b).unwrap())
             .expect("Must have joined DF")
             .select(columns)?
             .distinct()?
             .sort(vec![col("fused_score").sort(false, false)])
     }
 
-    fn ranked_and_aliased_df_projection(df: DataFrame, index: usize) -> Result<DataFrame> {
+    fn first_qualified_field(df: &DataFrame, name: &str) -> Result<String> {
+        df.schema()
+            .qualified_fields_with_unqualified_name(name)
+            .first()
+            .and_then(|(maybe_table_reference, f)| {
+                maybe_table_reference.map(|tr| format!("{}.{}", tr.table(), &f.name()))
+            })
+            .ok_or(DataFusionError::Execution(format!(
+                "{RRF_UDF_NAME}: Cannot resolve {name} when fusing results"
+            )))
+    }
+
+    // Reduces 2 or more search subquery DFs into a single one
+    fn fold_join(a: DataFrame, b: DataFrame) -> Result<DataFrame> {
+        let id_a = Self::first_qualified_field(&a, "__spice_rrf_row_id")?;
+        let id_b = Self::first_qualified_field(&b, "__spice_rrf_row_id")?;
+
+        a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
+    }
+
+    // Window and rank a DF representing a search subquery by its score
+    fn ranked_and_aliased_df_projection(df: DataFrame) -> Result<DataFrame> {
         let rank_expr = row_number()
             .order_by(vec![col("score").sort(false, false)])
             .build()?
             .alias("rank");
 
-        df.window(vec![rank_expr])?
-            .alias(&format!("search_{index}"))
+        df.window(vec![rank_expr])
+    }
+
+    // Create an internal row ID by hashing all pieces of the row
+    fn with_rrf_rowid(df: DataFrame) -> Result<DataFrame> {
+        let bin_columns: Vec<Expr> = df
+            .schema()
+            .columns()
+            .iter()
+            .sorted_by_key(|c| c.name())
+            .filter_map(|c| match c.name() {
+                "score" => None,
+                name if name.contains("embedding") => None,
+                name => Some(col(name).cast_to(&DataType::Utf8, df.schema())),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let rrf_row_id = sha224(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
+        df.with_column("__spice_rrf_row_id", rrf_row_id)
     }
 }
 
@@ -235,7 +285,13 @@ impl TableProvider for ReciprocalRankFusion {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(self.df.as_ref().expect("ReciprocalRankFusion must have a schema").schema().inner())
+        Arc::clone(
+            self.df
+                .as_ref()
+                .expect("ReciprocalRankFusion must have a schema")
+                .schema()
+                .inner(),
+        )
     }
 
     fn table_type(&self) -> TableType {
@@ -258,9 +314,9 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::udf::register_udfs;
-    use crate::Runtime;
     use std::sync::Arc;
 
     async fn test_runtime() -> datafusion::common::Result<Runtime> {
