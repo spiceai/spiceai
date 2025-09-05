@@ -527,7 +527,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
                     .chunks_timeout(10000, Duration::from_secs(1))
                     .then(move |chunk| async {
                         // TODO: validate the operations of the batched change envelopes
-                        let chunk = chunk.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+                        let chunk = chunk.into_iter().collect::<Result<Vec<_>, _>>()?;
                         let change_committer = chunk[0].change_committer.clone();
                         let op_idx = chunk[0].change_batch.op_idx;
                         let primary_keys_idx = chunk[0].change_batch.primary_keys_idx;
