@@ -1,4 +1,3 @@
-
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
