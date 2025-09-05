@@ -54,6 +54,13 @@ impl Embed for TaskEmbed {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_text_embedding(&request_context.to_dimensions());
 
+        let num_items = match &input {
+            EmbeddingInput::StringArray(arr) => arr.len(),
+            EmbeddingInput::ArrayOfIntegerArray(arr) => arr.len(),
+            EmbeddingInput::String(_) => 1,
+            EmbeddingInput::IntegerArray(arr) => arr.len(),
+        };
+
         let start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = to_truncated_string(&input));
 
@@ -67,6 +74,13 @@ impl Embed for TaskEmbed {
                 Err(e)
             }
         };
+
+        tracing::debug!(
+            "Embedded {num_items} records in {duration:?} using {name}",
+            duration = start.elapsed(),
+            name = self.name
+        );
+
         handle_metrics(
             start.elapsed(),
             result.is_err(),
