@@ -161,6 +161,7 @@ fn add_request_labels_to_span(req: &CreateEmbeddingRequest, span: &Span) {
     }
 }
 
+#[must_use]
 pub fn to_truncated_string(input: &EmbeddingInput) -> String {
     match input {
         EmbeddingInput::String(s) => serde_json::to_string(&s).unwrap_or_default(),
