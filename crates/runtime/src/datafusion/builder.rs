@@ -20,7 +20,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::search::rrf::optimizer::ReciprocalRankUDFRewriteRule;
 use crate::status;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -170,7 +169,6 @@ impl DataFusionBuilder {
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
-        ctx.add_analyzer_rule(Arc::new(ReciprocalRankUDFRewriteRule::default()));
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
