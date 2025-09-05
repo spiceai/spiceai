@@ -92,11 +92,11 @@ impl ReciprocalRankFusion {
     fn args_to_df(&self, args: &[Expr]) -> Result<DataFrame> {
         let args: Vec<_> = args.iter().cloned().collect();
         // Find user-provided smoothing param if provided
-        let k = if let Some(Expr::Literal(ScalarValue::UInt64(Some(k)), ..)) = args.last() {
+        let k = if let Some(Expr::Literal(ScalarValue::Float64(Some(k)), ..)) = args.last() {
             *k
         } else {
             // Supposedly the best magic number
-            60
+            60.0
         };
 
         // Unparse UDTF invocations
@@ -156,8 +156,8 @@ impl ReciprocalRankFusion {
             (0..search_dfs.len())
                 .map(|i| {
                     coalesce(vec![
-                        lit(1u64) / (lit(k) + col(format!("search_{}.rank", i))),
-                        lit(0u64),
+                        lit(1.0f64) / (lit(k) + col(format!("search_{}.rank", i))),
+                        lit(0.0f64),
                     ])
                 })
                 .collect(),
