@@ -327,7 +327,7 @@ async fn write_task_history_records_to_remote(
         update_type: UpdateType::Append,
     };
 
-    let _ = retry(retry_strategy(), || async {
+    retry(retry_strategy(), || async {
         df.write_data(&TASK_HISTORY_SINK_TABLE.into(), data_update.clone())
             .await
             .map_err(RetryError::transient)
