@@ -108,7 +108,7 @@ impl ReciprocalRankFusion {
                 // TODO: score is "Spice-standard", but id is not
                 e @ Expr::ScalarFunction(_) => unparser
                     .expr_to_sql(&e)
-                    .map(|e| format!("select id, score from {e}"))
+                    .map(|e| format!("select * from {e}"))
                     .ok(),
                 _ => None,
             })
@@ -136,6 +136,16 @@ impl ReciprocalRankFusion {
             .map(|(i, df)| Self::ranked_and_aliased_df_projection(df, i))
             .collect::<Result<Vec<_>>>()?;
 
+        // TODO: assumes homogenous projections, and is frankly insane
+        let mut columns: Vec<_> = search_dfs[0].schema().columns().iter().filter_map(|c| match c.name.as_str() {
+            "id" | "rank" | "score" => None,
+            other if other.contains("embedding") => None,
+            other => Some(
+                coalesce((0..search_dfs.len()).map(|i| col(format!("search_{i}.{other}"))).collect())
+                    .alias(other)
+            ),
+        }).collect();
+
         let id_expr = coalesce(
             (0..search_dfs.len())
                 .map(|i| col(format!("search_{i}.id")))
@@ -154,6 +164,9 @@ impl ReciprocalRankFusion {
         )
             .alias("fused_score");
 
+        columns.insert(0, id_expr);
+        columns.insert(1, score_expr);
+
         search_dfs
             .into_iter()
             .reduce(|a, b| {
@@ -161,13 +174,13 @@ impl ReciprocalRankFusion {
                     .expect("Must join")
             })
             .expect("Must have joined DF")
-            .select(vec![id_expr, score_expr])?
+            .select(columns)?
             .sort(vec![col("fused_score").sort(false, false)])
     }
 
     fn ranked_and_aliased_df_projection(df: DataFrame, index: usize) -> Result<DataFrame> {
         let rank_expr = row_number()
-            .order_by(vec![col("score").sort(false, true)])
+            .order_by(vec![col("score").sort(false, false)])
             .build()?
             .alias("rank");
 
