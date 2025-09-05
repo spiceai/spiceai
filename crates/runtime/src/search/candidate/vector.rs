@@ -353,13 +353,13 @@ impl CandidateGeneration for VectorGeneration {
         addition_projection: &[&Expr],
         limit: usize,
     ) -> search::generation::Result<SendableRecordBatchStream> {
-        let embedding = self
-            .embed_query(query.as_str())
-            .await
-            .boxed()
-            .map_err(|e| SearchGenerationError::InternalError { source: e })?;
-
         let query = if self.is_chunked {
+            let embedding = self
+                .embed_query(query.as_str())
+                .await
+                .boxed()
+                .map_err(|e| SearchGenerationError::InternalError { source: e })?;
+
             let query = self.chunked_sql(
                 addition_projection,
                 embedding.as_slice(),
