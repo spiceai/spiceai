@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,28 +25,13 @@ use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
-
-#[derive(Debug, Snafu)]
-pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
-    UnableToCommitChange {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-#[derive(Debug, Snafu)]
-pub enum ChangeBatchError {
-    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
-    SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
-    Arrow { source: ArrowError },
-}
+use crate::cdc::{CommitChange, CommitError};
+use crate::kafka;
 
 #[derive(Debug)]
 pub enum StreamError {
     /// Error from the Kafka client, such as failure to consume messages.
-    Kafka(String),
+    Kafka(kafka::Error),
     /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
     /// Error from Arrow Flight, such as failure during streaming or subscription.
@@ -71,19 +56,28 @@ impl std::fmt::Display for StreamError {
     }
 }
 
-/// Allows to commit a change that has been processed.
-pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
+pub type ChunkedChangesStream = BoxStream<'static, Result<Vec<ChangeEnvelope>, StreamError>>;
+
+#[derive(Debug, Snafu)]
+pub enum ChangeBatchError {
+    #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
+    SchemaMismatch { detail: String, schema: SchemaRef },
+    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    Arrow { source: ArrowError },
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
+    pub change_committer: Arc<dyn CommitChange + Send + Sync>,
     pub change_batch: ChangeBatch,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Arc<dyn CommitChange + Send + Sync>,
+        change_batch: ChangeBatch,
+    ) -> Self {
         Self {
             change_committer,
             change_batch,
@@ -95,13 +89,13 @@ impl ChangeEnvelope {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
+    pub fn into_parts(self) -> (Arc<dyn CommitChange + Send + Sync>, ChangeBatch) {
         (self.change_committer, self.change_batch)
     }
 
     #[must_use]
     pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
+        change_committer: Arc<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
     ) -> Self {
         Self {
@@ -132,9 +126,9 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
 #[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
-    op_idx: usize,
-    primary_keys_idx: usize,
-    data_idx: usize,
+    pub op_idx: usize,
+    pub primary_keys_idx: usize,
+    pub data_idx: usize,
 }
 
 pub enum ChangeOperation {
@@ -193,6 +187,10 @@ impl ChangeBatch {
             primary_keys_idx,
             data_idx,
         })
+    }
+
+    pub fn source_col(&self, col: usize) -> &ArrayRef {
+        self.record.column(col)
     }
 
     #[must_use]

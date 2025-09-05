@@ -50,7 +50,6 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 use std::cmp::min;
 use std::sync::LazyLock;
 use std::{
@@ -112,7 +111,7 @@ impl VectorSearchTableFuncArgs {
             ))),
             (None, _) => {
                 if embedded_columns.len() > 1 {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
                         embedded_columns.len()
@@ -121,7 +120,7 @@ impl VectorSearchTableFuncArgs {
                 if let Some((col, cfg)) = embedded_columns.iter().next() {
                     Ok((col.clone(), cfg.clone()))
                 } else {
-                    Err(DataFusionError::Internal(format!(
+                    Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has no associated full text search index.",
                         self.tbl,
                     )))
@@ -285,13 +284,11 @@ impl VectorSearchTableFunc {
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        // TODO: we might actually not want to recurse over accelerated table here.
-
-        use crate::embeddings::index::s3::S3Vector;
-        let Some(indexed) = find_concrete_table_provider::<IndexedTableProvider>(tbl) else {
+        use crate::{embeddings::index::s3::S3Vector, search::util::find_index_in_table_provider};
+        let Some(mut vector_indexes) = find_index_in_table_provider::<S3Vector>(tbl) else {
             return Ok(None);
         };
-        let mut vector_indexes = indexed.get_indexes::<S3Vector>();
+
         let vector_index_opt = if let Some(col) = &args.column {
             vector_indexes
                 .into_iter()

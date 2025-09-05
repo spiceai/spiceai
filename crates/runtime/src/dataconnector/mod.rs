@@ -28,8 +28,13 @@ use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
+use data_components::cdc::ChangeBatch;
+use data_components::cdc::ChangeEnvelope;
 use data_components::cdc::ChangesStream;
+use data_components::cdc::readiness::Readiness;
 use datafusion::common::Column;
+use datafusion::common::Constraint;
+use datafusion::common::Constraints;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::dataframe::DataFrame;
@@ -43,14 +48,19 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
+use datafusion_table_providers::util::constraints::UpsertOptions;
+use datafusion_table_providers::util::constraints::validate_batch_with_constraints;
 use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 
 use std::future::Future;
 
@@ -500,7 +510,126 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        None
+    }
+
+    fn chunked_changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
+        if let Some((changes_stream, readiness)) = self.changes_stream(federated_table) {
+            let stream = Box::pin(
+                changes_stream
+                    .chunks_timeout(10000, Duration::from_secs(1))
+                    .then(move |chunk| async {
+                        // TODO: validate the operations of the batched change envelopes
+                        let chunk = chunk.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        let change_committer = chunk[0].change_committer.clone();
+                        let op_idx = chunk[0].change_batch.op_idx;
+                        let primary_keys_idx = chunk[0].change_batch.primary_keys_idx;
+                        let schema = chunk[0].change_batch.data(0).schema();
+                        let chunk_primary_keys = chunk
+                            .iter()
+                            .map(|chunk| {
+                                chunk
+                                    .change_batch
+                                    .primary_keys(0)
+                                    .iter()
+                                    .map(|pk| schema.index_of(pk).unwrap())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<HashSet<_>>();
+
+                        // if chunk_primary_keys.len() != 1 {
+                        //     return Err(StreamError::External(format!(
+                        //         "Chunk contains {} different primary keys!",
+                        //         chunk_primary_keys.len()
+                        //     )));
+                        // }
+
+                        let constraints = chunk_primary_keys
+                            .into_iter()
+                            .map(|pks| Constraint::PrimaryKey(pks))
+                            .collect::<Vec<Constraint>>();
+
+                        let constraints = Constraints::new_unverified(constraints);
+
+                        let batches = chunk
+                            .iter()
+                            .map(|chunk| chunk.change_batch.data_batch())
+                            .collect::<Vec<_>>();
+
+                        let batches = validate_batch_with_constraints(
+                            batches,
+                            &constraints,
+                            &UpsertOptions::new()
+                                .with_remove_duplicates(true)
+                                .with_last_write_wins(true),
+                        )
+                        .await
+                        .unwrap();
+
+                        let concat_batch =
+                            arrow::compute::concat_batches(&schema, &batches).unwrap();
+
+                        // the record batch at this point is the unnested data
+                        // to build a change batch, we need to rebuild a record batch with the op, data and primary keys columns
+                        let op_col = chunk[0].change_batch.source_col(op_idx);
+                        let pk_col = chunk[0].change_batch.source_col(primary_keys_idx);
+
+                        // data col is now our new concatenated batch though
+                        let data_col = Arc::new(arrow::array::StructArray::from(concat_batch))
+                            as Arc<dyn arrow::array::Array>;
+
+                        // op and pk cols may not have the same length for the new concat batch
+                        // HACK: for now, just repeat them with the same data to match the length of the data col
+                        let op_col = arrow::compute::take(
+                            &op_col,
+                            &arrow::array::UInt32Array::from_iter_values(
+                                (0..data_col.len()).map(|_| 0u32),
+                            ),
+                            None,
+                        )
+                        .unwrap();
+                        let pk_col = arrow::compute::take(
+                            &pk_col,
+                            &arrow::array::UInt32Array::from_iter_values(
+                                (0..data_col.len()).map(|_| 0u32),
+                            ),
+                            None,
+                        )
+                        .unwrap();
+
+                        let output_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                            arrow_schema::Field::new("op", op_col.data_type().clone(), false),
+                            arrow_schema::Field::new(
+                                "primary_keys",
+                                pk_col.data_type().clone(),
+                                true,
+                            ),
+                            arrow_schema::Field::new("data", data_col.data_type().clone(), true),
+                        ]));
+                        let new_output_batch = arrow::record_batch::RecordBatch::try_new(
+                            Arc::clone(&output_schema),
+                            vec![Arc::clone(&op_col), Arc::clone(&pk_col), data_col],
+                        )
+                        .unwrap();
+
+                        let output_change_batch = ChangeBatch::try_new(new_output_batch).unwrap();
+                        let output_change_envelope =
+                            ChangeEnvelope::new(change_committer, output_change_batch);
+
+                        Ok(output_change_envelope)
+                    }),
+            );
+
+            return Some((stream, readiness));
+        }
+
         None
     }
 
@@ -508,7 +637,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+    ) -> Option<(ChangesStream, Readiness)> {
         None
     }
 

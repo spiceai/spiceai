@@ -1014,17 +1014,17 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
+            let changes_stream = source.chunked_changes_stream(Arc::clone(&source_table_provider));
 
-            if let Some(changes_stream) = changes_stream {
-                accelerated_table_builder.changes_stream(changes_stream);
+            if let Some((changes_stream, readiness)) = changes_stream {
+                accelerated_table_builder.changes_stream_and_readiness(changes_stream, readiness);
             }
         }
 
         if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
             let append_stream = source.append_stream(source_table_provider);
-            if let Some(append_stream) = append_stream {
-                accelerated_table_builder.append_stream(append_stream);
+            if let Some((append_stream, readiness)) = append_stream {
+                accelerated_table_builder.append_stream_and_readiness(append_stream, readiness);
             } else {
                 return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),

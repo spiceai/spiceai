@@ -26,12 +26,13 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionTokensDetails,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
+    PromptTokensDetails,
 };
 
 use async_trait::async_trait;
@@ -92,12 +93,12 @@ impl ToolUsingChat {
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if self.tools.iter().any(|t| t.name() == "list_datasets") {
-            // Add messages to start of message list to pretend it has already asked to list the available datasets.
-            let mut list_dataset_messages = self.create_list_dataset_messages().await?;
-            list_dataset_messages.extend_from_slice(req.messages.as_slice());
-            req.messages = list_dataset_messages;
+        if !self.tools.iter().any(|t| t.name() == "list_datasets") {
+            return Ok(req);
         }
+
+        let list_dataset_messages = self.create_list_dataset_messages().await?;
+        req.messages = insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
 
         Ok(req)
     }
@@ -540,6 +541,50 @@ pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+// Ensure that `tool_messages` have been added to `messages` after all initial developer/system messages and after initial user messages (i.e. not including user messages after assistant messages).
+fn insert_initial_tools(
+    messages: Vec<ChatCompletionRequestMessage>,
+    tool_name: &str,
+    tool_messages: &[ChatCompletionRequestMessage],
+) -> Vec<ChatCompletionRequestMessage> {
+    // Do not add `tool_messages` if already in `messages`.
+    if messages.iter().any(|m| {
+        let ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            tool_calls: Some(tools),
+            ..
+        }) = m
+        else {
+            return false;
+        };
+        tools.iter().any(|t| t.function.name == tool_name)
+    }) {
+        return messages;
+    }
+
+    // Find index to insert at
+    let idx = messages
+        .iter()
+        .enumerate()
+        .find_map(|(i, m)| {
+            if matches!(
+                m,
+                ChatCompletionRequestMessage::Assistant(_)
+                    | ChatCompletionRequestMessage::Tool(_)
+                    | ChatCompletionRequestMessage::Function(_)
+            ) {
+                return Some(i);
+            }
+            None
+        })
+        .unwrap_or(messages.len());
+
+    let Some((a, b)) = messages.split_at_checked(idx) else {
+        return messages;
+    };
+
+    [a, &tool_messages, b].concat()
 }
 
 struct CustomStream {

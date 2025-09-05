@@ -74,19 +74,11 @@ pub struct SearchRequestHTTPJson {
 pub struct SearchRequestAIJson {
     #[serde(flatten)]
     pub base: SearchRequestBaseJson,
-
-    /// At least one keyword should be supplied for a vector search. Keywords should be individual words.
-    /// Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.
-    /// Keywords should not contain column names, special characters, or other operators.
-    pub keywords: Vec<String>,
 }
 
 impl From<SearchRequestHTTPJson> for SearchRequestAIJson {
     fn from(req: SearchRequestHTTPJson) -> Self {
-        SearchRequestAIJson {
-            base: req.base,
-            keywords: req.keywords.unwrap_or_default(),
-        }
+        SearchRequestAIJson { base: req.base }
     }
 }
 
@@ -104,7 +96,7 @@ impl TryFrom<SearchRequestAIJson> for SearchRequest {
                 .transpose()?,
             SearchRequest::parse_additional_columns(&req.base.additional_columns)
                 .map_err(|e| e.to_string())?,
-            valid_keywords(&req.keywords).map_err(|e| e.to_string())?,
+            Vec::new(),
         ))
     }
 }
