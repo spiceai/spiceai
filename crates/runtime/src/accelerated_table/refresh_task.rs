@@ -21,7 +21,7 @@ use arrow::{
 };
 use arrow_schema::SchemaRef;
 use async_stream::stream;
-use datafusion::datasource::TableType;
+use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
@@ -72,7 +72,8 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
-
+use datafusion_expr::{ident, LogicalPlanBuilder, UNNAMED_TABLE};
+use data_components::poly::PolyTableProvider;
 use super::refresh::Refresh;
 
 mod changes;
@@ -659,8 +660,9 @@ impl RefreshTask {
         )
         .alias("a");
 
-        self.accelerator_df(&ctx)?
+        self.accelerator_df_new(&ctx)?
             .select(vec![expr])?
+            // .select(vec![col(format!(r#""{column}""#))])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
@@ -668,6 +670,31 @@ impl RefreshTask {
     fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
         // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
         ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
+    }
+
+    fn accelerator_df_new(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
+        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
+
+        let accelerator = match self.accelerator.as_any().downcast_ref::<PolyTableProvider>() {
+            Some(wrapper) => { Arc::clone(&wrapper.fed) }
+            None => { Arc::clone(&self.accelerator) }
+        };
+
+        let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
+
+        // Get the columns so we can add projection to the plan. This
+        // converts the plan to federated where the correct dialect is
+        // applied
+        let schema = accelerator.schema();
+        let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
+
+        let logical_plan = LogicalPlanBuilder::scan(UNNAMED_TABLE, table_source, None)
+            .map_err(find_datafusion_root)?
+            .project(columns)?
+            .build()
+            .map_err(find_datafusion_root)?;
+
+        Ok(DataFrame::new(ctx.state(), logical_plan))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -739,29 +766,34 @@ impl RefreshTask {
             .max_timestamp_df(ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
+
+        df.clone().explain(false, false).unwrap().show().await.unwrap();
+
+        println!("1");
+
         let result = &df
             .collect()
             .await
             .map_err(find_datafusion_root)
             .context(super::FailedToQueryLatestTimestampSnafu)?;
-
+        println!("2");
         let Some(result) = result.first() else {
             return Ok(None);
         };
-
+        println!("3");
         let array = result.column(0)
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
                 reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
-
+        println!("4");
         if array.is_empty() {
             return Ok(None);
         }
-
+        println!("5");
         let mut value = array.value(0) as u128;
-
+        println!("6: {value:?}");
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {

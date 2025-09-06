@@ -37,7 +37,7 @@ use crate::delete::DeletionTableProvider;
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn DeletionTableProvider>,
-    fed: Arc<dyn TableProvider>,
+    pub fed: Arc<dyn TableProvider>,
 }
 
 impl PolyTableProvider {
