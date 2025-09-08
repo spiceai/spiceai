@@ -428,7 +428,7 @@ impl TableProvider for VectorQueryTableProvider {
                 .await?
             {
                 underlying_filters.push(filter);
-            };
+            }
 
             let underlying_table_scan = self.underlying_table_scan(
                 underlying_filters.as_slice(),
