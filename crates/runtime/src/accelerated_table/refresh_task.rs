@@ -660,19 +660,13 @@ impl RefreshTask {
         )
         .alias("a");
 
-        self.accelerator_df_new(&ctx)?
+        self.accelerator_df(&ctx)?
             .select(vec![expr])?
-            // .select(vec![col(format!(r#""{column}""#))])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
 
     fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
-        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
-        ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
-    }
-
-    fn accelerator_df_new(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
         // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
 
         let accelerator = match self.accelerator.as_any().downcast_ref::<PolyTableProvider>() {
@@ -767,33 +761,29 @@ impl RefreshTask {
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
 
-        df.clone().explain(false, false).unwrap().show().await.unwrap();
-
-        println!("1");
-
         let result = &df
             .collect()
             .await
             .map_err(find_datafusion_root)
             .context(super::FailedToQueryLatestTimestampSnafu)?;
-        println!("2");
+
         let Some(result) = result.first() else {
             return Ok(None);
         };
-        println!("3");
+
         let array = result.column(0)
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
                 reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
-        println!("4");
+
         if array.is_empty() {
             return Ok(None);
         }
-        println!("5");
+
         let mut value = array.value(0) as u128;
-        println!("6: {value:?}");
+
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
