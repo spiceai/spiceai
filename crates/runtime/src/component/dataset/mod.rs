@@ -641,6 +641,7 @@ impl Dataset {
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
     }
 
+    #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
     #[must_use]
     pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
         let (search_fields_and_primary_key_overrides, modes): (
@@ -699,7 +700,7 @@ impl Dataset {
         }
 
         // Default memory. If any index is file, use file (but warn).
-        let any_file = modes.iter().any(|m| *m == FtsMode::File);
+        let any_file = modes.contains(&FtsMode::File);
         let all_file = modes.iter().all(|m| *m == FtsMode::File);
         let mode = match (any_file, all_file) {
             (true, true) => FtsMode::File,
