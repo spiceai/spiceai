@@ -183,8 +183,7 @@ impl BedrockConverse {
 
                                 let tool_input = serde_json::from_str(arguments)
                                     .ok()
-                                    .map(value_to_document)
-                                    .unwrap_or(Document::Object(HashMap::default()));
+                                    .map_or(Document::Object(HashMap::default()), value_to_document);
                                 Some(ContentBlock::ToolUse(
                                     ToolUseBlockBuilder::default()
                                         .set_tool_use_id(Some(id.clone()))
