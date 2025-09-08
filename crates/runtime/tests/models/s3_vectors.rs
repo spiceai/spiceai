@@ -517,7 +517,7 @@ mod search {
 
                 run_and_snapshot_query(
                     &rt,
-                    "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 3",
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 3",
                     "s3vector_kafka_sql_basic",
                 )
                 .await?;
