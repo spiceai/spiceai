@@ -63,7 +63,7 @@ Spice should use the same version of Arrow that DataFusion uses. If DataFusion u
 
 ## Core Dependency Upgrade
 
-- [ ]  Create a new branch in Spice for the upgrade process.
+- [ ]  Create a new branch in Spice for the upgrade process. A personal branch may be best until tests at the end are passing to avoid issues with protected branch names.
 - [ ]  Update the `datafusion` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ]  If Arrow needs updating, update the `arrow-rs` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ]  Update the `datafusion-federation` dependency in the root `Cargo.toml` to the new patched commit.
