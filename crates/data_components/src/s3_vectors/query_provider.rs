@@ -276,6 +276,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn query_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: S3VectorIdentifier,
@@ -356,6 +357,7 @@ async fn query_vector_stream(
                 .set_vector_bucket_name(bucket_name.clone())
                 .set_index_arn(arn.clone())
                 .set_index_name(index_name.clone())
+                .set_return_data(Some(true))
                 .build()
                 .boxed()
                 .map_err(DataFusionError::External)?,
@@ -377,7 +379,7 @@ async fn query_vector_stream(
     for query_vector in &mut query_vectors {
         for output_vector in &output_vectors {
             if query_vector.key == output_vector.key {
-                query_vector.data = output_vector.data.clone();
+                query_vector.data.clone_from(&output_vector.data);
                 break;
             }
         }
