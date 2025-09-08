@@ -306,7 +306,7 @@ impl VectorSearch {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().collect();
+            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 

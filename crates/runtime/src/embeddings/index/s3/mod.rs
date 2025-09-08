@@ -54,6 +54,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description(
             "The distance metric to be used for similarity search. One of: euclidean | cosine.",
         )
+        .one_of(&["euclidean", "cosine"])
         .secret(),
     ParameterSpec::component("arn")
         .description("The S3 Vectors bucket ARN to use for the S3 Vectors index.")

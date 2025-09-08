@@ -18,6 +18,9 @@ limitations under the License.
 
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+mod docker;
+#[cfg(feature = "kafka")]
+mod kafka;
 #[cfg(feature = "models")]
 mod models;
 mod utils;
@@ -25,7 +28,7 @@ mod utils;
 mod workers;
 
 pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
-    "runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
+    "integration_models=debug,runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
 );
 
 /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
