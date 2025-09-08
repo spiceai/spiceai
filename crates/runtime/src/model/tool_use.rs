@@ -650,9 +650,9 @@ fn make_a_stream(
                                 let tool_calls_to_process = {
                                     match tool_call_states_clone.lock() {
                                         Ok(states_lock) => states_lock
-                                            .iter()
-                                            .map(|(_key, tool_call)| tool_call.clone())
-                                            .collect::<Vec<_>>(),
+                                            .values()
+                                            .cloned()
+                                            .collect(),
                                         Err(e) => {
                                             tracing::error!(
                                                 "Failed to lock tool_call_states: {}",
