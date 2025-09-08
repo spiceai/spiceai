@@ -756,7 +756,7 @@ impl Dataset {
     }
 }
 
-///
+/// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
 pub struct FullTextSearchDatasetConfig {
     pub mode: FtsMode,
     pub search_fields: Vec<String>,
