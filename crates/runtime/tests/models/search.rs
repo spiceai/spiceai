@@ -566,10 +566,7 @@ async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
                     }],
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("id")),
                     description: None,
                     metadata: HashMap::new(),
                 }),
@@ -646,10 +643,7 @@ async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search:  Some(FullTextSearchConfig::with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -723,10 +717,7 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search:  Some(FullTextSearchConfig::with_row_id("id")),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -811,10 +802,7 @@ async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::E
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -847,20 +835,14 @@ async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["answer".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("answer").in_memory()),
                     metadata: HashMap::new(),
                 }),
             ))
@@ -891,6 +873,7 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["answer".to_string(), "id".to_string()]),
+                        mode: spicepod::semantic::Mode::Memory
                     }),
                     metadata: HashMap::new(),
                 }),
@@ -925,20 +908,14 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
                     name: "question".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("id".to_string()).in_memory()),
                     metadata: HashMap::new(),
                 }),
                 Some(Column {
                     name: "answer".to_string(),
                     embeddings: vec![],
                     description: None,
-                    full_text_search: Some(FullTextSearchConfig {
-                        enabled: true,
-                        row_ids: Some(vec!["id".to_string()]),
-                    }),
+                    full_text_search: Some(FullTextSearchConfig::with_row_id("id".to_string()).in_memory()),
                     metadata: HashMap::new(),
                 }),
             ))

@@ -15,14 +15,14 @@ limitations under the License.
 */
 //! Data types for semantic information about tables (datasets or views).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::{acceleration::Mode, component::embeddings::EmbeddingChunkConfig};
+use crate::component::embeddings::EmbeddingChunkConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -154,6 +154,37 @@ pub struct FullTextSearchConfig {
     pub row_ids: Option<Vec<String>>,
 
     pub mode: Mode,
+}
+
+impl FullTextSearchConfig {
+    pub fn with_row_id(id: String) -> Self {
+        Self {
+            enabled: true,
+            row_ids: Some(vec![id]),
+            mode: Mode::default(),
+        }
+    }
+    pub fn in_memory(mut self) -> Self {
+        self.mode = Mode::Memory;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum Mode {
+    Memory,
+    #[default]
+    File,
+}
+
+impl Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Mode::Memory => write!(f, "memory"),
+            Mode::File => write!(f, "file"),
+        }
+    }
 }
 
 #[cfg(test)]

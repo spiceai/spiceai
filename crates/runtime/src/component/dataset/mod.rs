@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{
-    Runtime, component::dataset::acceleration::Mode as FtsMode, dataaccelerator::AccelerationSource,
-};
+use crate::{Runtime, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -33,7 +31,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::{Column, FullTextSearchConfig},
+    semantic::{Column, FullTextSearchConfig, Mode as FtsMode},
     vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
@@ -637,10 +635,16 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn has_full_text_column(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+    }
+
+    #[must_use]
     pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
-        let (search_fields, primary_key_overrides, modes): (
-            Vec<String>,
-            Vec<Option<Vec<String>>>,
+        let (search_fields_and_primary_key_overrides, modes): (
+            Vec<(String, Option<Vec<String>>)>,
             Vec<FtsMode>,
         ) = self
             .columns
@@ -654,9 +658,11 @@ impl Dataset {
                 else {
                     return None;
                 };
-                Some((c.name.clone(), row_ids.clone(), mode))
+                Some(((c.name.clone(), row_ids.clone()), *mode))
             })
             .unzip();
+        let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
+            search_fields_and_primary_key_overrides.into_iter().unzip();
 
         // No columns have full text search fields defined.
         if search_fields.is_empty() {
@@ -667,25 +673,20 @@ impl Dataset {
         // if there are multiple, warn if they are different.
         let mut first_pks: Option<Vec<String>> = None;
         let mut first_search_field: Option<String> = None;
-        let cmp_idx = 0;
-        for (i, (search_field, pk_overrides)) in search_fields
-            .iter()
-            .zip(primary_key_overrides.iter())
-            .enumerate()
-        {
-            let Some(mut pks) = pk_overrides else {
+        for (search_field, pk_overrides) in search_fields.iter().zip(primary_key_overrides.iter()) {
+            let Some(mut pks) = pk_overrides.clone() else {
                 continue;
             };
             pks.sort();
 
             // If this is not the first FTS column that defined row ids, check if they match the previous.
             // Otherwise set to be used for next comparison.
-            if let (Some(ref f), Some(ref s)) = (first_pks, first_search_field) {
+            if let (Some(f), Some(s)) = (&first_pks, &first_search_field) {
                 if *pks != *f {
                     tracing::warn!(
                         "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
                         self.name(),
-                        first_search_field,
+                        s,
                         f.join(", "),
                         search_field,
                         pks.join(", "),
@@ -697,10 +698,19 @@ impl Dataset {
             }
         }
 
-        let mode = if modes.iter().any(m == FtsMode::Memory) {
-            FtsMode::Memory
-        } else {
-            FtsMode::File
+        // Default memory. If any index is file, use file (but warn).
+        let any_file = modes.iter().any(|m| *m == FtsMode::File);
+        let all_file = modes.iter().all(|m| *m == FtsMode::File);
+        let mode = match (any_file, all_file) {
+            (true, true) => FtsMode::File,
+            (true, false) => {
+                tracing::warn!(
+                    "For dataset '{}', full text search cannot currently be configured with both file and in-memory mode. Using file mode for all columns",
+                    self.name
+                );
+                FtsMode::File
+            }
+            _ => FtsMode::Memory,
         };
 
         Some(FullTextSearchDatasetConfig {

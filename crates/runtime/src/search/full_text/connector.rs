@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
+use spicepod::semantic::Mode;
 use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::FullTextSearchDatasetConfig;
-use crate::component::dataset::acceleration::Mode;
 use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::make_spice_data_sub_directory;
@@ -84,7 +84,7 @@ impl FullTextConnector {
         let index = FullTextDatabaseIndex::try_new(
             Arc::clone(&inner_table_provider),
             search_fields.clone(),
-            primary_key,
+            Some(primary_key),
             directory,
         )
         .await
