@@ -158,10 +158,10 @@ pub struct FullTextSearchConfig {
 
 impl FullTextSearchConfig {
     #[must_use]
-    pub fn with_row_id(id: String) -> Self {
+    pub fn with_row_id(id: impl Into<String>) -> Self {
         Self {
             enabled: true,
-            row_ids: Some(vec![id]),
+            row_ids: Some(vec![id.into()]),
             mode: Mode::default(),
         }
     }
