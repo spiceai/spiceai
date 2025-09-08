@@ -905,12 +905,10 @@ mod tests {
 
         let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
-        assert_eq!(result.len(), 2);
-        assert!(matches!(
-            result[0],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(result[1], ChatCompletionRequestMessage::Tool(_)));
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 
     #[test]
@@ -926,14 +924,10 @@ mod tests {
 
         let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
-        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
-        assert!(matches!(
-            result[2],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(result[3], ChatCompletionRequestMessage::Tool(_)));
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 
     #[test]
@@ -959,19 +953,10 @@ mod tests {
 
         let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
-        // Tool messages should be inserted before the existing assistant message
-        assert_eq!(result.len(), 5);
-        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
-        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
-        assert!(matches!(
-            result[2],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(result[3], ChatCompletionRequestMessage::Tool(_)));
-        assert!(matches!(
-            result[4],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 
     #[test]
@@ -989,9 +974,9 @@ mod tests {
 
         let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
 
-        // Should return original messages unchanged since tool already exists
-        assert_eq!(result, messages);
-        assert_eq!(result.len(), 3);
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]"
+        });
     }
 
     #[test]
@@ -1016,34 +1001,10 @@ mod tests {
 
         let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
-        // Tool messages should be inserted before the existing assistant message
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
-
-        let Some(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            tool_calls: Some(tool_calls),
-            ..
-        })) = result.get(1)
-        else {
-            panic!("")
-        };
-        assert_eq!(
-            tool_calls.first().expect("empty tool list").id,
-            "test_id".to_string()
-        );
-
-        assert!(matches!(result[2], ChatCompletionRequestMessage::Tool(_)));
-        let Some(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            tool_calls: Some(tool_calls),
-            ..
-        })) = result.get(3)
-        else {
-            panic!("")
-        };
-        assert_eq!(
-            tool_calls.first().expect("empty tool list").id,
-            "other_id".to_string()
-        );
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 
     #[test]
@@ -1060,15 +1021,9 @@ mod tests {
 
         let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
-        // Tool messages should be inserted at the end since there are no assistant/tool/function messages
-        assert_eq!(result.len(), 5);
-        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
-        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
-        assert!(matches!(result[2], ChatCompletionRequestMessage::User(_)));
-        assert!(matches!(
-            result[3],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(result[4], ChatCompletionRequestMessage::Tool(_)));
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 }
