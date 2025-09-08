@@ -63,6 +63,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::sync::{RwLock, Semaphore, oneshot};
 
+use super::refresh::Refresh;
+use data_components::poly::PolyTableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::{
     dataframe::DataFrame,
@@ -72,9 +74,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
-use datafusion_expr::{ident, LogicalPlanBuilder, UNNAMED_TABLE};
-use data_components::poly::PolyTableProvider;
-use super::refresh::Refresh;
+use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 
 mod changes;
 mod streaming_append;
@@ -667,21 +667,23 @@ impl RefreshTask {
     }
 
     fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
-        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
-
-        let accelerator = match self.accelerator.as_any().downcast_ref::<PolyTableProvider>() {
-            Some(wrapper) => { Arc::clone(&wrapper.fed) }
+        let accelerator = match self
+            .accelerator
+            .as_any()
+            .downcast_ref::<PolyTableProvider>()
+        {
+            Some(poly) => { poly.get_federated_table_provider() }
             None => { Arc::clone(&self.accelerator) }
         };
 
         let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
 
         // Get the columns so we can add projection to the plan. This
-        // converts the plan to federated where the correct dialect is
-        // applied
+        // converts the plan to federated where the correct dialect is applied
         let schema = accelerator.schema();
         let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
 
+        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
         let logical_plan = LogicalPlanBuilder::scan(UNNAMED_TABLE, table_source, None)
             .map_err(find_datafusion_root)?
             .project(columns)?

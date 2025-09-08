@@ -37,7 +37,7 @@ use crate::delete::DeletionTableProvider;
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn DeletionTableProvider>,
-    pub fed: Arc<dyn TableProvider>,
+    fed: Arc<dyn TableProvider>,
 }
 
 impl PolyTableProvider {
@@ -64,6 +64,10 @@ impl PolyTableProvider {
             .downcast_ref::<FederatedTableProviderAdaptor>();
 
         adaptor.map(|f| Arc::clone(&f.source))
+    }
+
+    pub fn get_federated_table_provider(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.fed)
     }
 }
 
