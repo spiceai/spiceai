@@ -14,6 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
+mimalloc = { version = "0.1.47", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -30,53 +31,52 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = { version = "0.3.6" }
-mimalloc = { version = "0.1.47", optional = true }
-tikv-jemallocator = { version = "0.6.0", optional = true }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
+tikv-jemallocator = { version = "0.6.0", optional = true }
 tokio.workspace = true
 tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+util = { path = "../../crates/util" }
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
-alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
-alloc-system = []
+alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
+alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
-kafka = ["runtime/kafka"]
 default = [
-  "duckdb",
-  "postgres",
-  "sqlite",
-  "mysql",
-  "flightsql",
-  "delta_lake",
-  "databricks",
-  "dremio",
-  "clickhouse",
-  "sharepoint",
-  "snowflake",
-  "spark",
-  "ftp",
-  "debezium",
-  "kafka",
-  "anonymous_telemetry",
-  "mssql",
-  "dynamodb",
-  "imap",
-  "alloc-snmalloc",
-  "oracle",
-  "runtime/s3_vectors",
-  "mongodb",
+    "duckdb",
+    "postgres",
+    "sqlite",
+    "mysql",
+    "flightsql",
+    "delta_lake",
+    "databricks",
+    "dremio",
+    "clickhouse",
+    "sharepoint",
+    "snowflake",
+    "spark",
+    "ftp",
+    "debezium",
+    "kafka",
+    "anonymous_telemetry",
+    "mssql",
+    "dynamodb",
+    "imap",
+    "alloc-snmalloc",
+    "oracle",
+    "runtime/s3_vectors",
+    "mongodb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -86,6 +86,7 @@ dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
 imap = ["runtime/imap"]
+kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]

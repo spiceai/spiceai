@@ -1,0 +1,7 @@
+[
+    {"id":1,"question":"$7-5=$ since $+5=7$.","answer":"$7-5=2$ since $2+5=7$.","subject":"math","reference_answer":"2","source":"textbook_reasoning"},
+    {"id":2,"question":"(3):**  \nProve that if \\( H \\) is an \\( n \\times n \\) Hadamard matrix, then \\( \\det(H) = \\pm n^{n/2} \\).","answer":"(3):**  \nFrom the previous result, \\( \\det(H)^2 = n^n \\), so:\n\\[\n\\det(H) = \\pm n^{n/2}.\n\\]","subject":"math","reference_answer":"$\\det(H) = \\pm n^{n/2}$","source":"textbook_reasoning"},
+    {"id":3,"question":"(Problem 12):**  \nIf \\(p = \\sqrt{d}\\), then express \\(d\\) in terms of \\(p\\).","answer":"(Problem 12):**  \nIf \\(p = \\sqrt{d}\\), then squaring both sides gives \\(d = p^2\\).  \nThus, \\(d = \\boxed{p^2}\\).","subject":"math","reference_answer":"p^2","source":"textbook_reasoning"},
+    {"id":4,"question":"17. Evaluate the function \\( F(x) = 4x \\) at \\( x = 3 \\), \\( x = -4 \\), and \\( x = 0 \\).","answer":"17. \n- \\( F(3) = 4(3) = \\boxed{12} \\)\n- \\( F(-4) = 4(-4) = \\boxed{-16} \\)\n- \\( F(0) = 4(0) = \\boxed{0} \\)","subject":"math","reference_answer":"0","source":"textbook_reasoning"},
+    {"id":5,"question":"46.** $63 - 1.03$","answer":"To compute $63 - 1.03$, subtract the two numbers directly:\n\\[\n63.00 - 1.03 = 61.97\n\\]\nThus, the result is $\\boxed{61.97}$.","subject":"math","reference_answer":"61.97","source":"textbook_reasoning"}
+]

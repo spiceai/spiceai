@@ -53,10 +53,12 @@ impl RunningContainer<'_> {
         remove(&self.docker, self.name).await
     }
 
+    #[allow(dead_code)]
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         stop(&self.docker, self.name).await
     }
 
+    #[allow(dead_code)]
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         start(&self.docker, self.name).await
     }
@@ -154,6 +156,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self

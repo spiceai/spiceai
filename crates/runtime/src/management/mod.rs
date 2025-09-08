@@ -40,6 +40,11 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::management::Management as SpicepodManagement;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use util::{
+    RetryError,
+    fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder},
+    retry,
+};
 
 use crate::{
     Runtime,
@@ -322,10 +327,14 @@ async fn write_task_history_records_to_remote(
         update_type: UpdateType::Append,
     };
 
-    df.write_data(&TASK_HISTORY_SINK_TABLE.into(), data_update)
-        .await
-        .boxed()
-        .context(UnableToExportTaskHistoryDataSnafu)?;
+    retry(retry_strategy(), || async {
+        df.write_data(&TASK_HISTORY_SINK_TABLE.into(), data_update.clone())
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+    .boxed()
+    .context(UnableToExportTaskHistoryDataSnafu)?;
 
     tracing::debug!("Exported {num_records} task history records");
 
@@ -389,4 +398,9 @@ async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretStri
     } else {
         SecretString::new(key.to_string().into())
     }
+}
+
+fn retry_strategy() -> FibonacciBackoff {
+    // Retry up to 10 times, with a maximum interval of 55 seconds between retries
+    FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
 }

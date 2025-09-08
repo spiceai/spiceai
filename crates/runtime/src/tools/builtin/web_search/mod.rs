@@ -20,6 +20,7 @@ use std::{
 };
 
 use llms::perplexity::PerplexitySonar;
+use perplexity::PerplexityWebSearchParams;
 use schemars::JsonSchema;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -101,13 +102,10 @@ impl SearchEngine {
     }
 }
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
-pub struct WebSearchParams {
-    /// The query to search the web for.
-    pub query: String,
-
-    /// The number of results to return. If None, the default limit from the search engine is used.
-    pub limit: Option<u32>,
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum WebSearchParams {
+    Perplexity(PerplexityWebSearchParams),
 }
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize, Default)]
