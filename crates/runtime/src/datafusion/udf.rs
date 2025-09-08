@@ -42,11 +42,9 @@ pub fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
-    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(Arc::clone(&runtime.df.ctx)).into());
+    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(&ctx).into());
     ctx.register_udtf(
         RRF_UDF_NAME,
-        Arc::new(rrf::ReciprocalRankFusion::from_ctx(Arc::clone(
-            &runtime.df.ctx,
-        ))),
+        Arc::new(rrf::ReciprocalRankFusion::from_ctx(&ctx)),
     );
 }

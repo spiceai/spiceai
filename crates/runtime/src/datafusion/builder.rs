@@ -168,7 +168,7 @@ impl DataFusionBuilder {
         }
 
         let ctx = SessionContext::new_with_state(state);
-        // ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+        ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();

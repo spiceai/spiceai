@@ -127,9 +127,9 @@ pub struct ReciprocalRankFusion {
 
 // TODO: DF support for nested UDTF calls without ScalarUDF "hack"
 impl ReciprocalRankFusion {
-    pub fn from_ctx(session_context: Arc<SessionContext>) -> Self {
+    pub fn from_ctx(session_context: &Arc<SessionContext>) -> Self {
         Self {
-            session_context,
+            session_context: Arc::clone(session_context),
             df: None,
         }
     }
@@ -322,8 +322,7 @@ impl TableFunctionImpl for ReciprocalRankFusion {
         let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
         let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
         Ok(Arc::new(
-            ReciprocalRankFusion::from_ctx(Arc::clone(&self.session_context))
-                .with_df(rerank_and_fuse_df),
+            ReciprocalRankFusion::from_ctx(&self.session_context).with_df(rerank_and_fuse_df),
         ))
     }
 }
@@ -366,14 +365,17 @@ impl TableProvider for ReciprocalRankFusion {
 mod tests {
     use crate::Runtime;
     use crate::builder::RuntimeBuilder;
+    use crate::datafusion::query::QueryBuilder;
     use crate::datafusion::udf::register_udfs;
     use crate::embeddings::table::EmbeddingColumnConfig;
     use crate::embeddings::table::EmbeddingTable;
+    use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
     use arrow::array::Int64Array;
     use arrow::array::StringArray;
     use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
     use arrow::record_batch::RecordBatch;
+    use async_graphql::futures_util::TryStreamExt;
     use async_openai::types::EmbeddingInput;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
@@ -397,6 +399,9 @@ mod tests {
             "apple fruit sweet red crispy",
         ]
     });
+
+    pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
+        LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![
@@ -467,15 +472,19 @@ mod tests {
 
     async fn make_test_runtime() -> Result<Runtime> {
         let rt = RuntimeBuilder::new().build().await;
-        register_udfs(&rt);
+        rt.df
+            .ctx
+            .state()
+            .config_mut()
+            .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
         let test_table = make_test_table()?;
-
         rt.df
             .ctx
             .register_table("foo", test_table)
             .expect("Failed to register foo table");
 
+        register_udfs(&rt);
         Ok(rt)
     }
 
@@ -485,12 +494,16 @@ mod tests {
             .await
             .expect("Failed to create test runtime");
 
-        // Should match row containing "apple"
         let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'))";
-        let ctx = Arc::clone(&runtime.df.ctx);
-
-        let df = ctx.sql(query).await.expect("Must parse query");
-        let results = df.collect().await.expect("Must collect results");
+        let query = QueryBuilder::new(query, runtime.datafusion()).build();
+        let results = query
+            .run()
+            .await
+            .expect("Must run query")
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .expect("Must collect results");
 
         let content = as_string_array(
             results[0]
