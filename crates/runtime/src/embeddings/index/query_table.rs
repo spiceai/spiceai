@@ -139,6 +139,9 @@ impl VectorQueryTableProvider {
 
             // Build struct values for each row
             let num_rows = arrays.first().map_or(0, |arr| arr.len());
+            if num_rows == 0 {
+                return Ok(None);
+            }
             for i in 0..num_rows {
                 let mut field_values: Vec<(&str, ScalarValue)> = vec![];
                 for (j, arr) in arrays.iter().enumerate() {
