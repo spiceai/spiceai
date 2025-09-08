@@ -157,6 +157,7 @@ pub struct FullTextSearchConfig {
 }
 
 impl FullTextSearchConfig {
+    #[must_use]
     pub fn with_row_id(id: String) -> Self {
         Self {
             enabled: true,
@@ -164,6 +165,7 @@ impl FullTextSearchConfig {
             mode: Mode::default(),
         }
     }
+    #[must_use]
     pub fn in_memory(mut self) -> Self {
         self.mode = Mode::Memory;
         self
