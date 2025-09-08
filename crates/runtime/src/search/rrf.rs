@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
+use datafusion::common::{exec_err, DataFusionError, JoinType, Result, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,11 +24,11 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, sha224};
+use datafusion::prelude::{coalesce, make_array, sha224, DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DefaultDialect;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode, col, lit};
+use datafusion::sql::unparser::Unparser;
+use datafusion_expr::{col, lit, ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode};
 use futures::future::join_all;
 use itertools::Itertools;
 use logos::internal::CallbackResult;
@@ -91,11 +91,14 @@ impl ReciprocalRankFusionArgs {
         let unparser = Unparser::new(&DefaultDialect {});
         let search_udtf_exprs: Vec<SqlExpr> = args
             .iter()
-            .map(|expr| match expr {
-                e @ Expr::ScalarFunction(_) => unparser.expr_to_sql(&e),
-                other_expr => Err(DataFusionError::NotImplemented(format!(
+            .filter_map(|expr| match expr {
+                e @ Expr::ScalarFunction(_) => Some(unparser.expr_to_sql(&e)),
+                // Leave the k-override literals alone
+                Expr::Literal(ScalarValue::Float64(_), ..) => None,
+                // Show a useful error for the rest
+                other_expr => Some(Err(DataFusionError::NotImplemented(format!(
                     "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
-                ))),
+                )))),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -362,20 +365,26 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
-    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::udf::register_udfs;
     use crate::embeddings::table::EmbeddingColumnConfig;
     use crate::embeddings::table::EmbeddingTable;
+    use crate::search::rrf::ReciprocalRankFusionArgs;
+    use crate::Runtime;
     use arrow::array::Int64Array;
     use arrow::array::StringArray;
-    use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
+    use arrow::array::{as_string_array, ArrayAccessor, FixedSizeListArray};
     use arrow::record_batch::RecordBatch;
     use async_openai::types::EmbeddingInput;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
+    use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    use datafusion::scalar::ScalarValue;
+    use datafusion_expr::expr::ScalarFunction;
     use llms::embeddings::Embed;
     use llms::model2vec::Model2Vec;
     use std::collections::HashMap;
@@ -490,5 +499,91 @@ mod tests {
                 .expect("Must have content column"),
         );
         assert_eq!(content.value(0), TEST_DATA[2]);
+    }
+
+    // fn extract_udtf_args_from_sqlexpr(udtf_name: &str, sql: &str) -> Option<TableFunctionArgs> {
+    //     use datafusion::sql::parser::{DFParser, DFParserBuilder};
+    //     use datafusion::sql::parser::{Statement};
+    //     use datafusion_expr::sqlparser::ast::{Statement as SQLStatement, SetExpr, TableFactor, TableFunctionArgs};
+    //     use datafusion::sql::sqlparser::dialect::GenericDialect;
+    //     use datafusion::sql::sqlparser::ast::{visit_expressions, visit_relations, visit_statements};
+    //     let mut parser = DFParserBuilder::new(sql).build().expect("Must parse query");
+    //     let statements = parser.parse_statements().expect("Must parse statements");
+    //
+    //     if let Statement::Statement(sql_statement) = &statements[0] {
+    //         if let SQLStatement::Query(query) = &**sql_statement {
+    //             if let SetExpr::Select(select) = &*query.body {
+    //
+    //                 match &select.from[0].relation {
+    //                     TableFactor::Table { name, args, .. } if name.to_string() == udtf_name => {
+    //                         return args.clone();
+    //                     }
+    //                     _ => None::<TableFunctionArgs>,
+    //                 };
+    //             };
+    //         };
+    //     };
+    //
+    //     None::<TableFunctionArgs>
+    // }
+
+    fn stub_scalar_function(name: &str) -> Expr {
+        let stub_udf = create_udf(
+            name,
+            vec![DataType::Utf8; 0],
+            DataType::Utf8,
+            Volatility::Stable,
+            Arc::new(|_| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                    "stub".to_string(),
+                ))))
+            }),
+        );
+
+        Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
+    }
+
+    #[test]
+    fn test_parse_argument_exprs() {
+        // Empty call
+        let empty_args = ReciprocalRankFusionArgs::from_udtf_exprs(&[]);
+        assert!(empty_args.is_err());
+        assert_eq!(
+            empty_args.err().unwrap().to_string(),
+            "Error during planning: rrf needs at least 2 search queries to fuse results."
+        );
+
+        // Call with at least 2 arguments, but one of them overrides k only
+        let one_search_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            stub_scalar_function("one_search_with_k"),
+            lit(1337.0f64),
+        ]);
+        assert!(one_search_with_k.is_err());
+        assert_eq!(
+            one_search_with_k.err().unwrap().to_string(),
+            "Error during planning: rrf needs at least 2 search queries to fuse results."
+        );
+
+        // Call with many searches
+        let mut many_search_exprs: Vec<_> = (0..100)
+            .map(|i| stub_scalar_function(&format!("fn_{i}")))
+            .collect::<Vec<_>>();
+
+        let many_searches = ReciprocalRankFusionArgs::from_udtf_exprs(
+            &many_search_exprs,
+        );
+        assert!(many_searches.is_ok());
+        assert_eq!(many_searches.unwrap().search_udtf_exprs.len(), 100);
+
+        // Call with many searches + k override
+        many_search_exprs.push(lit(1337.0f64));
+        let many_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(
+            &many_search_exprs,
+        );
+        assert!(many_with_k.is_ok());
+
+        let many_with_k = many_with_k.unwrap();
+        assert_eq!(many_with_k.search_udtf_exprs.len(), 100);
+        assert_eq!(many_with_k.k, 1337.0f64);
     }
 }
