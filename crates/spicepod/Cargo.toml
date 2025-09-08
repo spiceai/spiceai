@@ -24,9 +24,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-twox-hash = { workspace = true, optional = true }
 
 [features]
 default = []
 schemars = ["dep:schemars"]
-xx-hash = ["dep:twox-hash"]
+xx-hash = []
