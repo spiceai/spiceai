@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{exec_err, DataFusionError, JoinType, Result, ScalarValue};
+use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,14 +24,13 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{coalesce, make_array, sha224, DataFrame, SessionContext};
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, sha224};
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::Unparser;
-use datafusion_expr::{col, lit, ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode};
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion_expr::{ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode, col, lit};
 use futures::future::join_all;
 use itertools::Itertools;
-use logos::internal::CallbackResult;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
@@ -365,24 +364,24 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
+    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::udf::register_udfs;
     use crate::embeddings::table::EmbeddingColumnConfig;
     use crate::embeddings::table::EmbeddingTable;
     use crate::search::rrf::ReciprocalRankFusionArgs;
-    use crate::Runtime;
     use arrow::array::Int64Array;
     use arrow::array::StringArray;
-    use arrow::array::{as_string_array, ArrayAccessor, FixedSizeListArray};
+    use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
     use arrow::record_batch::RecordBatch;
     use async_openai::types::EmbeddingInput;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
-    use datafusion::logical_expr::lit;
     use datafusion::logical_expr::Expr;
-    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use llms::embeddings::Embed;
@@ -501,32 +500,6 @@ mod tests {
         assert_eq!(content.value(0), TEST_DATA[2]);
     }
 
-    // fn extract_udtf_args_from_sqlexpr(udtf_name: &str, sql: &str) -> Option<TableFunctionArgs> {
-    //     use datafusion::sql::parser::{DFParser, DFParserBuilder};
-    //     use datafusion::sql::parser::{Statement};
-    //     use datafusion_expr::sqlparser::ast::{Statement as SQLStatement, SetExpr, TableFactor, TableFunctionArgs};
-    //     use datafusion::sql::sqlparser::dialect::GenericDialect;
-    //     use datafusion::sql::sqlparser::ast::{visit_expressions, visit_relations, visit_statements};
-    //     let mut parser = DFParserBuilder::new(sql).build().expect("Must parse query");
-    //     let statements = parser.parse_statements().expect("Must parse statements");
-    //
-    //     if let Statement::Statement(sql_statement) = &statements[0] {
-    //         if let SQLStatement::Query(query) = &**sql_statement {
-    //             if let SetExpr::Select(select) = &*query.body {
-    //
-    //                 match &select.from[0].relation {
-    //                     TableFactor::Table { name, args, .. } if name.to_string() == udtf_name => {
-    //                         return args.clone();
-    //                     }
-    //                     _ => None::<TableFunctionArgs>,
-    //                 };
-    //             };
-    //         };
-    //     };
-    //
-    //     None::<TableFunctionArgs>
-    // }
-
     fn stub_scalar_function(name: &str) -> Expr {
         let stub_udf = create_udf(
             name,
@@ -569,17 +542,13 @@ mod tests {
             .map(|i| stub_scalar_function(&format!("fn_{i}")))
             .collect::<Vec<_>>();
 
-        let many_searches = ReciprocalRankFusionArgs::from_udtf_exprs(
-            &many_search_exprs,
-        );
+        let many_searches = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_searches.is_ok());
         assert_eq!(many_searches.unwrap().search_udtf_exprs.len(), 100);
 
         // Call with many searches + k override
         many_search_exprs.push(lit(1337.0f64));
-        let many_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(
-            &many_search_exprs,
-        );
+        let many_with_k = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
         assert!(many_with_k.is_ok());
 
         let many_with_k = many_with_k.unwrap();
