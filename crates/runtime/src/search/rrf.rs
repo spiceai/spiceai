@@ -365,23 +365,38 @@ mod tests {
     use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::udf::register_udfs;
-    use std::sync::Arc;
+    use crate::embeddings::table::EmbeddingColumnConfig;
+    use crate::embeddings::table::EmbeddingTable;
+    use arrow::array::Int64Array;
+    use arrow::array::StringArray;
+    use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
+    use arrow::record_batch::RecordBatch;
+    use async_openai::types::EmbeddingInput;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::Result;
+    use llms::embeddings::Embed;
+    use llms::model2vec::Model2Vec;
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock};
+    use tokio::sync::RwLock;
 
-    async fn test_runtime() -> datafusion::common::Result<Runtime> {
-        use crate::embeddings::table::EmbeddingTable;
-        use crate::model::EmbeddingModelStore;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::datasource::MemTable;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
+    pub static TEST_DATA: LazyLock<Vec<&str>> = LazyLock::new(|| {
+        vec![
+            "banana yellow curved fruit",
+            "orange citrus round juicy",
+            "apple fruit sweet red crispy",
+        ]
+    });
 
+    fn make_test_table() -> Result<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("content", DataType::Utf8, false),
             Field::new(
                 "content_embedding",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 32),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 64),
                 true,
             ),
         ]));
@@ -389,44 +404,91 @@ mod tests {
         let mut embedded_columns = HashMap::new();
         embedded_columns.insert(
             "content".to_string(),
-            crate::embeddings::table::EmbeddingColumnConfig {
+            EmbeddingColumnConfig {
                 model_name: "test_model".to_string(),
-                vector_size: 32,
+                vector_size: 64,
                 in_base_table: true,
                 chunker: None,
             },
         );
 
-        let mem_table = Arc::new(MemTable::try_new(schema, vec![])?);
-        let embedding_table = Arc::new(EmbeddingTable {
+        let embedding_model = Arc::new(
+            Model2Vec::from_params(
+                "minishlab/potion-base-2M",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("Must make embedding model"),
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values((0i64..TEST_DATA.len() as i64))),
+                Arc::new(StringArray::from_iter_values(TEST_DATA.iter())),
+                Arc::new(FixedSizeListArray::from_iter_primitive::<
+                    arrow::datatypes::Float32Type,
+                    _,
+                    _,
+                >(
+                    TEST_DATA.iter().map(|s| {
+                        embedding_model
+                            .embed_sync(EmbeddingInput::String(s.to_string()))
+                            .map(|e| e[0].iter().map(|f| Some(*f)).collect::<Vec<Option<_>>>())
+                            .ok()
+                    }),
+                    64,
+                )),
+            ],
+        )?;
+
+        let mem_table = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+        let mut embedding_model_store: HashMap<String, Arc<dyn Embed>> = HashMap::new();
+        embedding_model_store.insert("test_model".to_string(), embedding_model);
+
+        Ok(Arc::new(EmbeddingTable {
             base_table: mem_table,
             embedded_columns,
-            embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
-        });
+            embedding_models: Arc::new(RwLock::new(embedding_model_store)),
+        }))
+    }
 
+    async fn make_test_runtime() -> Result<Runtime> {
         let rt = RuntimeBuilder::new().build().await;
         register_udfs(&rt);
 
+        let test_table = make_test_table()?;
+
         rt.df
             .ctx
-            .register_table("foo", embedding_table)
+            .register_table("foo", test_table)
             .expect("Failed to register foo table");
 
         Ok(rt)
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_rrf_rewriting() {
-        let runtime = test_runtime().await.expect("Failed to create test runtime");
-        let query = "select * from rrf(vector_search(foo, 'bar'), vector_search(foo, 'bar'))";
+    async fn test_fuse_queries() {
+        let runtime = make_test_runtime()
+            .await
+            .expect("Failed to create test runtime");
+
+        // Should match row containing "apple"
+        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'))";
         let ctx = Arc::clone(&runtime.df.ctx);
 
         let df = ctx.sql(query).await.expect("Must parse query");
-        let df_schema = Arc::clone(&df.schema().inner());
-        let plan = df.into_optimized_plan().unwrap();
+        let results = df.collect().await.expect("Must collect results");
 
-        println!("plan: {plan}");
-        println!("plan schema {}", plan.schema());
-        println!("df schema {}", *df_schema);
+        let content = as_string_array(
+            results[0]
+                .column_by_name("content")
+                .expect("Must have content column"),
+        );
+        assert_eq!(content.value(0), TEST_DATA[2]);
     }
 }
