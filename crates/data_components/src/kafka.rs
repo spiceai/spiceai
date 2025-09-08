@@ -452,24 +452,3 @@ impl TableProvider for Kafka {
         Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
     }
 }
-
-/// Returns `true` if the provided [`StreamError`] represents a Kafka poll interval error.
-/// This error occurs when the application's poll interval exceeds the maximum allowed by Kafka.
-/// It is generally nonfatal and often indicates that the consumer should retry or continue polling.
-#[must_use]
-pub fn is_max_poll_interval_err(err: &cdc::StreamError) -> bool {
-    let cdc::StreamError::Kafka(kafka_stream_err) = err else {
-        return false;
-    };
-
-    let Error::UnableToReceiveMessage { source } = kafka_stream_err else {
-        return false;
-    };
-
-    matches!(
-        source,
-        rdkafka::error::KafkaError::MessageConsumption(
-            rdkafka::types::RDKafkaErrorCode::PollExceeded
-        )
-    )
-}
