@@ -16,7 +16,8 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use secrecy::SecretString;
+use itertools::Itertools;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -126,6 +127,26 @@ impl Parameters {
             }
         }
 
+        // If `ParameterSpec` requires the value to one of a set list, verify it is.
+        for parameter in all_params {
+            let Some(one_of) = parameter.one_of else {
+                continue;
+            };
+            if let Some((_, value_secret)) = params.iter().find(|p| p.0 == parameter.name) {
+                let value = value_secret.expose_secret();
+                if !one_of.contains(&value) {
+                    return Err(Box::new(Error::InvalidConfigurationNoSource {
+                        component: component_name.to_string(),
+                        message: format!(
+                            "'{}' parameter must be one of: {}. Found {value}.",
+                            parameter.display_name(prefix),
+                            one_of.iter().join(", ")
+                        ),
+                    }));
+                }
+            }
+        }
+
         // Check if all required parameters are present
         for parameter in all_params {
             // If the parameter is missing and has a default value, add it to the params
@@ -138,15 +159,12 @@ impl Parameters {
             }
 
             if parameter.required && missing {
-                let param = if parameter.r#type.is_prefixed() {
-                    format!("{prefix}_{}", parameter.name)
-                } else {
-                    parameter.name.to_string()
-                };
-
                 return Err(Box::new(Error::InvalidConfigurationNoSource {
                     component: component_name.to_string(),
-                    message: format!("Missing required parameter: {param}"),
+                    message: format!(
+                        "Missing required parameter: {}",
+                        parameter.display_name(prefix)
+                    ),
                 }));
             }
         }
@@ -350,6 +368,7 @@ pub struct ParameterSpec {
     pub description: &'static str,
     pub help_link: &'static str,
     pub examples: &'static [&'static str],
+    pub one_of: Option<&'static [&'static str]>,
     pub deprecation_message: Option<&'static str>,
     pub r#type: ParameterType,
 }
@@ -367,6 +386,7 @@ impl ParameterSpec {
             examples: &[],
             deprecation_message: None,
             r#type: ParameterType::Component,
+            one_of: None,
         }
     }
 
@@ -382,6 +402,7 @@ impl ParameterSpec {
             examples: &[],
             deprecation_message: None,
             r#type: ParameterType::Runtime,
+            one_of: None,
         }
     }
 
@@ -425,6 +446,27 @@ impl ParameterSpec {
     pub const fn deprecated(mut self, deprecation_message: &'static str) -> Self {
         self.deprecation_message = Some(deprecation_message);
         self
+    }
+
+    #[must_use]
+    pub const fn one_of(mut self, options: &'static [&'static str]) -> Self {
+        self.one_of = Some(options);
+        self
+    }
+
+    #[must_use]
+    pub const fn is_boolean(mut self) -> Self {
+        self = self.one_of(&["true", "false"]);
+        self
+    }
+
+    #[must_use]
+    pub fn display_name(&self, prefix: &str) -> String {
+        if self.r#type.is_prefixed() {
+            format!("{prefix}_{}", self.name)
+        } else {
+            self.name.to_string()
+        }
     }
 }
 

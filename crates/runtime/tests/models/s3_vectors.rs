@@ -458,6 +458,84 @@ mod search {
         Ok(())
     }
 
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn s3_vectors_kafka_stream() -> Result<(), anyhow::Error> {
+        use crate::utils::test_request_context;
+
+        const KAFKA_PORT: u16 = 19193;
+
+        let _tracing: tracing::subscriber::DefaultGuard =
+            crate::init_tracing(DEFAULT_TRACING_MODELS);
+
+        test_request_context()
+            .scope(async {
+                let (running_container, producer) =
+                    crate::kafka::bootstrap::start_kafka_docker_container(
+                        KAFKA_PORT,
+                        &["megascience"],
+                    )
+                    .await?;
+
+                tracing::debug!("Container started");
+
+                // Load test data for orders representing the simple case where all fields are present in the first topic message
+                let test_data: Vec<serde_json::Value> =
+                    serde_json::from_str(include_str!("./test_data/mega-science-sample.json"))?;
+                crate::kafka::bootstrap::send_messages_to_kafka(&producer, "megascience", &test_data).await?;
+
+                let mut ds = crate::kafka::bootstrap::make_kafka_dataset(
+                    "megascience",
+                    "qs",
+                    KAFKA_PORT,
+                    None,
+                );
+
+                let bucket_name = "spice-ci-tests-s3-vectors-kafka-stream";
+                let vector_store = init_vector_store(bucket_name, true).await?;
+                ds.vectors = Some(vector_store);
+                ds.columns = vec![
+                    Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".to_string(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }])];
+
+                let app = AppBuilder::new("search_app")
+                    .with_dataset(ds)
+                    .with_embedding(get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ))
+                    .build();
+
+                let rt = start_app(app).await?;
+
+                // Ensure all messages are processed/including embeddings calculation
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+                run_and_snapshot_query(
+                    &rt,
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 3",
+                    "s3vector_kafka_sql_basic",
+                )
+                .await?;
+
+                rt.shutdown().await;
+                drop(rt);
+
+                // Clean up container after test
+                running_container.remove().await.map_err(|e| {
+                    tracing::error!("running_container.remove: {e}");
+                    anyhow::Error::msg(e.to_string())
+                })?;
+
+                Ok(())
+            })
+            .await
+    }
+
     async fn init_vector_store(
         bucket_name: &str,
         predelete_index: bool,
