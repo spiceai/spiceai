@@ -42,8 +42,8 @@ use datafusion::{
     prelude::Expr,
 };
 use s3_vectors::{
-    Document, QueryOutputVector, QueryVectorsInput, QueryVectorsOutput, S3Vectors, SdkError,
-    VectorData,
+    Document, GetVectorsInput, GetVectorsOutput, QueryOutputVector, QueryVectorsInput,
+    QueryVectorsOutput, S3Vectors, SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::{convert_datafusion_filters_to_s3_vectors, document_to_json_map};
 use snafu::ResultExt;
@@ -293,7 +293,10 @@ async fn query_vector_stream(
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
 
-    let QueryVectorsOutput { vectors, .. } = client
+    let QueryVectorsOutput {
+        vectors: mut query_vectors,
+        ..
+    } = client
         .query_vectors(
             QueryVectorsInput::builder()
                 .query_vector(VectorData::Float32(query))
@@ -302,7 +305,6 @@ async fn query_vector_stream(
                 .set_filter(s3_filter.clone())
                 .set_vector_bucket_name(bucket_name.clone())
                 .set_index_arn(arn.clone())
-                .set_return_data(Some(true))
                 .set_index_name(index_name.clone())
                 .return_metadata(true)
                 .build()
@@ -340,9 +342,48 @@ async fn query_vector_stream(
             )
         })?;
 
-    let num_vectors = vectors.len();
+    let num_vectors = query_vectors.len();
 
-    let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
+    // Get the vector data for each output using GetVectors API.
+    let keys = query_vectors.iter().map(|v| v.key.clone()).collect();
+    let GetVectorsOutput {
+        vectors: output_vectors,
+        ..
+    } = client
+        .get_vectors(
+            GetVectorsInput::builder()
+                .set_keys(Some(keys))
+                .set_vector_bucket_name(bucket_name.clone())
+                .set_index_arn(arn.clone())
+                .set_index_name(index_name.clone())
+                .build()
+                .boxed()
+                .map_err(DataFusionError::External)?,
+        )
+        .await
+        .map_err(|e| {
+            DataFusionError::External(
+                Error::S3VectorGetVectorsError {
+                    source: e.into_service_error(),
+                }
+                .into(),
+            )
+        })?;
+
+    // Put the vector data in the query_vectors
+
+    // Would be nice to zip these to avoid the nested loop and clone but don't know that they come back in the same order
+    // for (query_vector, output_vector) in query_vectors.iter_mut().zip(output_vectors) {
+    for query_vector in &mut query_vectors {
+        for output_vector in &output_vectors {
+            if query_vector.key == output_vector.key {
+                query_vector.data = output_vector.data.clone();
+                break;
+            }
+        }
+    }
+
+    let rows: Vec<_> = query_vectors.into_iter().map(to_flat_value).collect();
     decoder.serialize(rows.as_slice()).map_err(|e| {
         DataFusionError::ArrowError(
             e,
