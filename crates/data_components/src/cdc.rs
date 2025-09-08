@@ -25,8 +25,6 @@ use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-use crate::kafka;
-
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
 #[derive(Debug, Snafu)]
@@ -47,8 +45,9 @@ pub enum ChangeBatchError {
 
 #[derive(Debug)]
 pub enum StreamError {
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
     /// Error from the Kafka client, such as failure to consume messages.
-    Kafka(kafka::Error),
+    Kafka(crate::kafka::Error),
     /// Error from Serde JSON, such as failure to serialize or deserialize data.
     SerdeJsonError(String),
     /// Error from Arrow Flight, such as failure during streaming or subscription.
@@ -64,6 +63,7 @@ impl std::error::Error for StreamError {}
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(any(feature = "debezium", feature = "kafka"))]
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),

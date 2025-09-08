@@ -23,9 +23,11 @@ use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
-use data_components::kafka::Error as KafkaError;
-use data_components::kafka::rdkafka::error::KafkaError as RdKafkaError;
-use data_components::kafka::rdkafka::types::RDKafkaErrorCode;
+#[cfg(any(feature = "debezium", feature = "kafka"))]
+use data_components::kafka::{
+    Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
+    rdkafka::types::RDKafkaErrorCode,
+};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
@@ -126,9 +128,9 @@ impl RefreshTask {
                     }
                 }
                 Err(e) => {
-                    // Error classification during tracing returns whether the error is auto-recoverable (e.g., poll timeout errors).
+                    // Error classification during tracing returns whether the error is auto-recoverable (e.g., Kafka poll timeout errors).
                     // If so, log a warning and continue; otherwise, set refresh status to Error.
-                    if trace_kafka_stream_err(&e, &dataset_name) {
+                    if trace_stream_err(&e, &dataset_name) {
                         continue;
                     }
 
@@ -290,7 +292,8 @@ impl RefreshTask {
 /// Returns `true` if the error is transient and the stream can continue normally.
 /// These errors are generally nonfatal and often indicate that the consumer should retry or continue polling.
 #[must_use]
-pub fn trace_kafka_stream_err(err: &cdc::StreamError, dataset_name: &TableReference) -> bool {
+pub fn trace_stream_err(err: &cdc::StreamError, dataset_name: &TableReference) -> bool {
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
     if let cdc::StreamError::Kafka(KafkaError::UnableToReceiveMessage { source }) = err {
         // MessageConsumption errors are recoverable and non-fatal. There is MessageConsumptionFatal, indicating a non-recoverable error.
         match source {
