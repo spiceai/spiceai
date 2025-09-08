@@ -19,7 +19,6 @@ description: "Query: tpch_simple_q4"
 |               |             AggregateExec: mode=Partial, gby=[l_linenumber@0 as l_linenumber, l_quantity@1 as l_quantity], aggr=[avg(lineitem.l_tax)]    |
 |               |               BytesProcessedExec                                                                                                         |
 |               |                 SchemaCastScanExec                                                                                                       |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                  |
-|               |                     DataSourceExec: partitions=1, partition_sizes=[733]                                                                  |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 45, 45, 45]        |
 |               |                                                                                                                                          |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------+

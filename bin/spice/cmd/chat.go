@@ -108,6 +108,51 @@ type ChatCompletion struct {
 	Usage             *Usage   `json:"usage"`
 }
 
+type ResponsesRequestBody struct {
+	Model  string `json:"model"`
+	Input  string `json:"input"`
+	Stream *bool  `json:"stream,omitempty"`
+}
+
+func NewResponsesRequestBody(model string, input string, stream bool) *ResponsesRequestBody {
+	return &ResponsesRequestBody{
+		Model:  model,
+		Input:  input,
+		Stream: &stream,
+	}
+}
+
+type ResponseOutput struct {
+	Type    string                 `json:"type"`
+	ID      string                 `json:"id"`
+	Status  string                 `json:"status"`
+	Role    string                 `json:"role"`
+	Content []ResponseContentBlock `json:"content"`
+}
+
+type ResponseContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type ResponseUsage struct {
+	InputTokens         int `json:"input_tokens"`
+	InputTokensDetails  any `json:"input_tokens_details"`
+	OutputTokens        int `json:"output_tokens"`
+	OutputTokensDetails any `json:"output_tokens_details"`
+	TotalTokens         int `json:"total_tokens"`
+}
+
+type ResponsesAPIResponse struct {
+	ID        string           `json:"id"`
+	Object    string           `json:"object"`
+	CreatedAt int64            `json:"created_at"`
+	Status    string           `json:"status"`
+	Model     string           `json:"model"`
+	Output    []ResponseOutput `json:"output"`
+	Usage     *ResponseUsage   `json:"usage"`
+}
+
 type Usage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	PromptTokens     int `json:"prompt_tokens"`
@@ -120,6 +165,269 @@ type OpenAIError struct {
 
 type OpenAIErrorResponse struct {
 	Error OpenAIError `json:"error"`
+}
+
+type ResponsesAPIErrorResponse struct {
+	Type  string      `json:"type"`
+	Error OpenAIError `json:"error"`
+}
+
+type ResponseStreamEvent struct {
+	Type           string                `json:"type"`
+	ItemID         string                `json:"item_id,omitempty"`
+	OutputIndex    int                   `json:"output_index,omitempty"`
+	ContentIndex   int                   `json:"content_index,omitempty"`
+	Delta          string                `json:"delta,omitempty"`
+	SequenceNumber int                   `json:"sequence_number,omitempty"`
+	Usage          *ResponseUsage        `json:"usage,omitempty"`
+	Response       *ResponsesAPIResponse `json:"response,omitempty"`
+}
+
+func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+	input := messagesToInput(messages)
+
+	// Show spinner if requested
+	var done chan bool
+	var doneLoading bool
+
+	if useSpinner {
+		done = make(chan bool)
+		doneLoading = false
+		go func() {
+			util.ShowSpinner(done)
+		}()
+	}
+
+	body := NewResponsesRequestBody(model, input, true)
+
+	var timeAtCompletion time.Time
+	var timeAtFirstToken time.Time
+	startTime := time.Now()
+	response, err := sendResponsesRequest(rtcontext, body)
+	if err != nil {
+		if useSpinner {
+			done <- true
+		}
+		slog.Error("failed to send responses request to spiced", "error", err)
+		return messages, fmt.Errorf("failed to send responses request: %w", err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("failed to close response body", "error", err)
+		}
+	}()
+
+	scanner := bufio.NewScanner(response.Body)
+	var responseMessage = ""
+
+	var usage ResponseUsage
+
+	if useSpinner {
+		doneLoading = false
+	}
+
+	for scanner.Scan() {
+		chunk := scanner.Text()
+		if timeAtFirstToken.IsZero() {
+			timeAtFirstToken = time.Now()
+		}
+
+		if !strings.HasPrefix(chunk, "data: ") {
+			continue
+		}
+		chunk = strings.TrimPrefix(chunk, "data: ")
+
+		if isEndOfStream(chunk) {
+			break
+		}
+
+		responsesAPIError, err := maybeResponsesAPIErrorEvent(chunk)
+		if err != nil {
+			slog.Error("failed to decode responses API error event", "error", err)
+			continue
+		}
+
+		if responsesAPIError != nil {
+			slog.Error("responses request failed", "message", responsesAPIError.Error.Message)
+			break
+		}
+
+		var streamEvent = ResponseStreamEvent{}
+		err = json.Unmarshal([]byte(chunk), &streamEvent)
+		if err != nil {
+			slog.Error("failed to unmarshal responses stream event", "error", err)
+			continue
+		}
+
+		if streamEvent.Usage != nil {
+			usage = *streamEvent.Usage
+			timeAtCompletion = time.Now()
+		}
+
+		if streamEvent.Type == "response.output_text.delta" {
+			token := streamEvent.Delta
+
+			// Stop spinner on first non-empty text delta
+			if useSpinner && !doneLoading && token != "" {
+				done <- true
+				doneLoading = true
+			}
+
+			cmd.Printf("%s", token)
+			responseMessage = responseMessage + token
+		}
+
+		if streamEvent.Type == "response.completed" && streamEvent.Response != nil {
+			if streamEvent.Response.Usage != nil {
+				usage = *streamEvent.Response.Usage
+				timeAtCompletion = time.Now()
+			}
+		}
+
+		if streamEvent.Type == "response.done" {
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("error occurred while processing the response stream", "error", err)
+	}
+
+	if useSpinner && !doneLoading {
+		done <- true
+	}
+
+	if responseMessage != "" {
+		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+	}
+
+	// Show usage information
+	if usage != (ResponseUsage{}) {
+		// If timeAtCompletion wasn't set, use current time
+		if timeAtCompletion.IsZero() {
+			timeAtCompletion = time.Now()
+		}
+		cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
+			&usage,
+			timeAtFirstToken.Sub(startTime).Abs(),
+			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+		))
+	} else {
+		cmd.Print("\n\n")
+	}
+
+	return messages, nil
+}
+
+// handleChatCompletions handles streaming responses using the Chat Completions API
+func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+	// Only create these variables if using spinner
+	var done chan bool
+	var doneLoading bool
+
+	if useSpinner {
+		done = make(chan bool)
+		doneLoading = false
+		go func() {
+			util.ShowSpinner(done)
+		}()
+	}
+
+	body := NewChatRequestBody(messages, model, true, &StreamOptions{
+		IncludeUsage: true,
+	})
+	body, _ = ApplyChatOptions(body, cmd)
+
+	var timeAtCompletion time.Time
+	var timeAtFirstToken time.Time
+	startTime := time.Now()
+	response, err := sendChatRequest(rtcontext, body)
+	if err != nil {
+		slog.Error("failed to send chat request to spiced", "error", err)
+		return messages, fmt.Errorf("failed to send chat request: %w", err)
+	}
+
+	scanner := bufio.NewScanner(response.Body)
+	var responseMessage = ""
+
+	/// Usage for the entire stream, and related timing.
+	var usage Usage
+
+	if useSpinner {
+		doneLoading = false
+	}
+
+	for scanner.Scan() {
+		chunk := scanner.Text()
+		if timeAtFirstToken.IsZero() {
+			timeAtFirstToken = time.Now()
+		}
+
+		errorEvent, err := maybeErrorEvent(chunk, scanner)
+
+		if err != nil {
+			slog.Error("failed to decode error event", "error", err)
+			continue
+		}
+
+		if errorEvent != nil {
+			slog.Error("chat request failed", "error", errorEvent.Message)
+			break
+		}
+
+		if !strings.HasPrefix(chunk, "data: ") {
+			continue
+		}
+		chunk = strings.TrimPrefix(chunk, "data: ")
+
+		var chatResponse = ChatCompletion{}
+		err = json.Unmarshal([]byte(chunk), &chatResponse)
+		if err != nil {
+			slog.Error("failed to unmarshal chat response", "error", err)
+			continue
+		}
+
+		if useSpinner && !doneLoading {
+			done <- true
+			doneLoading = true
+		}
+
+		if chatResponse.Usage != nil {
+			usage = *chatResponse.Usage
+			timeAtCompletion = time.Now()
+		}
+
+		if len(chatResponse.Choices) == 0 {
+			continue
+		}
+
+		token := chatResponse.Choices[0].Delta.Content
+		cmd.Printf("%s", token)
+		responseMessage = responseMessage + token
+	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("error occurred while processing the response stream", "error", err)
+	}
+
+	if useSpinner && !doneLoading {
+		done <- true
+	}
+
+	if responseMessage != "" {
+		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+	}
+	if usage != (Usage{}) {
+		cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+			&usage,
+			timeAtFirstToken.Sub(startTime).Abs(),
+			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+		))
+	} else {
+		cmd.Print("\n\n")
+	}
+
+	return messages, nil
 }
 
 var chatCmd = &cobra.Command{
@@ -166,7 +474,7 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
-		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
+		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true&metadata_fields=supports_responses_api")
 		if err != nil {
 			slog.Error("could not list models", "error", err)
 			os.Exit(1)
@@ -177,10 +485,19 @@ spice chat --model <model> "What is Spice.ai?"
 			os.Exit(1)
 		}
 
+		// Check if responses API should be used
+		useResponsesAPI, err := cmd.Flags().GetBool("responses")
+		if err != nil {
+			slog.Error("could not get responses flag", "error", err)
+			os.Exit(1)
+		}
+
 		availableModels := []string{}
 		for _, model := range models.Data {
 			if model.Status == "Ready" {
-				availableModels = append(availableModels, model.Id)
+				if !useResponsesAPI || model.Metadata.SupportsResponsesAPI {
+					availableModels = append(availableModels, model.Id)
+				}
 			}
 		}
 
@@ -243,114 +560,16 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 		}
 
+		// Handler for Responses API - handled by standalone function
+
+		// Handler for Chat Completions API - handled by standalone function
+
+		// Main message handler that delegates to the appropriate API handler
 		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
-			// Only create these variables if using spinner
-			var done chan bool
-			var doneLoading bool
-
-			if useSpinner {
-				done = make(chan bool)
-				doneLoading = false
-				go func() {
-					util.ShowSpinner(done)
-				}()
+			if useResponsesAPI {
+				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner)
 			}
-
-			body := NewChatRequestBody(messages, model, true, &StreamOptions{
-				IncludeUsage: true,
-			})
-			body, _ = ApplyChatOptions(body, cmd)
-
-			var timeAtCompletion time.Time
-			var timeAtFirstToken time.Time
-			startTime := time.Now()
-			response, err := sendChatRequest(rtcontext, body)
-			if err != nil {
-				slog.Error("failed to send chat request to spiced", "error", err)
-				return messages, fmt.Errorf("failed to send chat request: %w", err)
-			}
-
-			scanner := bufio.NewScanner(response.Body)
-			var responseMessage = ""
-
-			/// Usage for the entire stream, and related timing.
-			var usage Usage
-
-			if useSpinner {
-				doneLoading = false
-			}
-
-			for scanner.Scan() {
-				chunk := scanner.Text()
-				if timeAtFirstToken.IsZero() {
-					timeAtFirstToken = time.Now()
-				}
-
-				errorEvent, err := maybeErrorEvent(chunk, scanner)
-
-				if err != nil {
-					slog.Error("failed to decode error event", "error", err)
-					continue
-				}
-
-				if errorEvent != nil {
-					slog.Error("chat request failed", "error", errorEvent.Message)
-					break
-				}
-
-				if !strings.HasPrefix(chunk, "data: ") {
-					continue
-				}
-				chunk = strings.TrimPrefix(chunk, "data: ")
-
-				var chatResponse = ChatCompletion{}
-				err = json.Unmarshal([]byte(chunk), &chatResponse)
-				if err != nil {
-					slog.Error("failed to unmarshal chat response", "error", err)
-					continue
-				}
-
-				if useSpinner && !doneLoading {
-					done <- true
-					doneLoading = true
-				}
-
-				if chatResponse.Usage != nil {
-					usage = *chatResponse.Usage
-					timeAtCompletion = time.Now()
-				}
-
-				if len(chatResponse.Choices) == 0 {
-					continue
-				}
-
-				token := chatResponse.Choices[0].Delta.Content
-				cmd.Printf("%s", token)
-				responseMessage = responseMessage + token
-			}
-
-			if err := scanner.Err(); err != nil {
-				slog.Error("error occurred while processing the response stream", "error", err)
-			}
-
-			if useSpinner && !doneLoading {
-				done <- true
-			}
-
-			if responseMessage != "" {
-				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
-			}
-			if usage != (Usage{}) {
-				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-					&usage,
-					timeAtFirstToken.Sub(startTime).Abs(),
-					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-				))
-			} else {
-				cmd.Print("\n\n")
-			}
-
-			return messages, nil
+			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner)
 		}
 
 		if len(args) > 0 {
@@ -427,6 +646,44 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	return rtcontext.Do("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
+func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequestBody) (*http.Response, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request body: %w", err)
+	}
+	return rtcontext.Do("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+}
+
+// messagesToInput converts a message history into a single input string for the Responses API
+func messagesToInput(messages []Message) string {
+	var parts []string
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user":
+			parts = append(parts, fmt.Sprintf("User: %s", msg.Content))
+		case "assistant":
+			parts = append(parts, fmt.Sprintf("Assistant: %s", msg.Content))
+		case "system":
+			parts = append(parts, fmt.Sprintf("System: %s", msg.Content))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// generateResponsesUsageMessage generates a usage message for Responses API statistics
+func generateResponsesUsageMessage(u *ResponseUsage, timeToFirst time.Duration, streamDuration time.Duration) string {
+	totalTime := (streamDuration + timeToFirst)
+	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
+	if u == nil {
+		return times
+	}
+
+	tps := float64(u.OutputTokens) / streamDuration.Seconds()
+	return fmt.Sprintf(
+		"%s Tokens: %d. Input: %d. Output: %d (%.2f/s).", times, u.TotalTokens, u.InputTokens, u.OutputTokens, tps,
+	)
+}
+
 func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
 	if strings.HasPrefix(chunk, "event: error") {
 		scanner.Scan() // read line with error message
@@ -445,9 +702,53 @@ func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error)
 	return nil, nil
 }
 
+func maybeResponsesAPIErrorEvent(chunk string) (*ResponsesAPIErrorResponse, error) {
+	var streamEvent ResponseStreamEvent
+	err := json.Unmarshal([]byte(chunk), &streamEvent)
+	if err != nil {
+		return nil, err
+	}
+
+	if streamEvent.Type == "error" {
+		var errorEvent ResponsesAPIErrorResponse
+		err := json.Unmarshal([]byte(chunk), &errorEvent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal responses API error: %w", err)
+		}
+		return &errorEvent, nil
+	}
+
+	return nil, nil
+}
+
+// End of Stream in the Responses API is indicated by an error event with text "stream ended" contained within it
+func isEndOfStream(chunk string) bool {
+	var streamEvent ResponseStreamEvent
+	err := json.Unmarshal([]byte(chunk), &streamEvent)
+	if err != nil {
+		return false
+	}
+
+	if streamEvent.Type == "error" {
+		var errorEvent ResponsesAPIErrorResponse
+		err := json.Unmarshal([]byte(chunk), &errorEvent)
+		if err != nil {
+			return false
+		}
+
+		if strings.Contains(strings.ToLower(errorEvent.Error.Message), "stream ended") {
+			return true
+		}
+
+	}
+
+	return false
+}
+
 func init() {
 	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
+	chatCmd.Flags().Bool("responses", false, "Whether to use the responses API for all completions")
 
 	RootCmd.AddCommand(chatCmd)
 }

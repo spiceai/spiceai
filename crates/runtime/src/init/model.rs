@@ -28,25 +28,25 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to load LLM: {name}.\n{source}"))]
+    #[snafu(display("Failed to load LLM: {name}. {source}"))]
     FailedToLoadLLM {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load runnable model: {name}.\n{source}"))]
+    #[snafu(display("Failed to load runnable model: {name}. {source}"))]
     FailedToLoadRunnableModel {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to load model {name} from spicepod.\nUnable to determine model type. Verify the model source and try again.\nFor details, visit https://spiceai.org/docs/components/models",
+        "Failed to load model {name} from spicepod. Unable to determine model type. Verify the model source and try again. For details, visit https://spiceai.org/docs/components/models",
     ))]
     UnableToDetermineModelType { name: String },
 
     #[snafu(display(
-        "Model {name} includes a non-existent path: {path}.\nVerify the model configuration and ensure all paths are correct.\nFor details, visit https://spiceai.org/docs/components/models",
+        "Model {name} includes a non-existent path: {path}. Verify the model configuration and ensure all paths are correct. For details, visit https://spiceai.org/docs/components/models",
     ))]
     ReferencedPathDoesNotExist { name: String, path: String },
 }
@@ -121,9 +121,17 @@ impl Runtime {
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
         let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
-                Ok(l) => {
-                    let mut llm_map = self.llms.write().await;
-                    llm_map.insert(m.name.clone(), l);
+                Ok((completions_model, Some(responses_model))) => {
+                    let mut llm_map = self.completion_llms.write().await;
+                    llm_map.insert(m.name.clone(), completions_model);
+                    drop(llm_map);
+                    let mut responses_llm_map = self.responses_llms.write().await;
+                    responses_llm_map.insert(m.name.clone(), responses_model);
+                    Ok(())
+                }
+                Ok((model, None)) => {
+                    let mut llm_map = self.completion_llms.write().await;
+                    llm_map.insert(m.name.clone(), model);
                     Ok(())
                 }
                 Err(e) => Err(Error::FailedToLoadLLM {
@@ -175,7 +183,7 @@ impl Runtime {
                 ml_map.remove(&m.name);
             }
             Some(ModelType::Llm) => {
-                let mut llm_map = self.llms.write().await;
+                let mut llm_map = self.completion_llms.write().await;
                 llm_map.remove(&m.name);
             }
             None => return,

@@ -72,7 +72,7 @@ pub enum Error {
     UrlParseNoSource,
 
     #[snafu(display(
-        "Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."
+        "Failed to connect to the S3 endpoint at '{url}'. Verify the S3 endpoint is accessible and try again."
     ))]
     FailedToConnectS3Endpoint { url: String },
 
@@ -143,7 +143,7 @@ impl IcebergCatalog {
     }
 }
 
-pub(crate) const ICEBERG_PARAM_LEN: usize = 16;
+pub(crate) const ICEBERG_PARAM_LEN: usize = 17;
 pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -171,6 +171,10 @@ pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
         .default("glue"),
+
+    // Glue like catalog options. Eg: Lakekeeper
+    ParameterSpec::component("warehouse")
+        .description("Name of the Iceberg warehouse."),
 
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
@@ -229,6 +233,7 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
             "client.assume-role.arn".to_string(),
             "rest.client.assume-role.arn".to_string(),
         ]),
+        "warehouse" => Some(vec!["warehouse".to_string()]),
         "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
         "signing_region" => Some(vec!["rest.signing-region".to_string()]),
         "signing_name" => Some(vec!["rest.signing-name".to_string()]),
@@ -252,7 +257,7 @@ impl CatalogConnector for IcebergCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "iceberg".into(),
-                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
+                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -326,7 +331,7 @@ impl CatalogConnector for IcebergCatalog {
                 return Err(super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
                     message: format!(
-                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"
+                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from {e}"
                     ),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),

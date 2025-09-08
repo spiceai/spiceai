@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::error::ArrowError;
 use s3_vectors::{
-    BuildError, CreateIndexError, CreateVectorBucketError, Document, GetIndexError,
+    BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
     GetVectorBucketError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
@@ -37,7 +37,7 @@ pub static S3_VECTOR_EMBEDDING_NAME: &str = "data";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to s3vector.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to s3vector. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -79,6 +79,26 @@ pub enum Error {
         "S3 vector does not exist, and cannot be created from an S3 vector ARN. Specify a s3 vector bucket and index name."
     ))]
     CreateIndexUsingArn,
+
+    #[snafu(display(
+        "Failed to load AWS credentials to connect to S3 Vectors. Verify the AWS credentials are available in the environment. For help configuring AWS authentication visit https://spiceai.org/docs/components/vectors/s3_vectors#authentication"
+    ))]
+    UnableToLoadCredentials { message: String },
+
+    #[snafu(display(
+        "Invalid distance metric specified for S3 vector index: '{distance_metric}'. Must be one of: {} or {}.",
+        DistanceMetric::Cosine,
+        DistanceMetric::Euclidean
+    ))]
+    InvalidDistanceMetric { distance_metric: DistanceMetric },
+
+    #[snafu(display(
+        "S3 vector index already exists with {exists} distance metric, but {specified} distance metric specified"
+    ))]
+    IncompatibleDistanceMetric {
+        exists: DistanceMetric,
+        specified: DistanceMetric,
+    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

@@ -24,6 +24,7 @@ use std::{
 use arrow::array::{AsArray, RecordBatch};
 use datafusion::{datasource::TableProvider, error::DataFusionError, sql::TableReference};
 use futures::{future::join_all, stream::TryStreamExt};
+use iceberg_datafusion::IcebergTableProvider;
 use opentelemetry::KeyValue;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
@@ -33,6 +34,7 @@ use crate::{
     component::dataset::{CheckAvailability, Dataset},
     datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
+    search::util::find_concrete_table_provider,
 };
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
@@ -43,7 +45,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the table.\n{source}"))]
+    #[snafu(display("Failed to read the table. {source}"))]
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -51,11 +53,11 @@ pub enum Error {
         source: crate::datafusion::query::Error,
     },
 
-    #[snafu(display("Failed to get recently access datasets.\n{source}"))]
+    #[snafu(display("Failed to get recently access datasets. {source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
     #[snafu(display(
-        "Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
+        "Spice received an unexpected data type from a `task_history` query: {data_type} This is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedDataType {
         data_type: arrow::datatypes::DataType,
@@ -133,6 +135,15 @@ impl DatasetsHealthMonitor {
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
         let table_provider = self.get_table_provider(dataset.name.clone()).await?;
+
+        // Don't enable health check for IcebergTableProvider until this is fixed:
+        // https://github.com/spiceai/spiceai/issues/6994
+        if find_concrete_table_provider::<IcebergTableProvider>(&table_provider).is_some() {
+            tracing::debug!(
+                "Availability monitoring skipped for dataset '{dataset_name}': Iceberg format unsupported. Support planned for future release.",
+            );
+            return Ok(());
+        }
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
@@ -328,7 +339,7 @@ async fn update_dataset_availability_info(
             report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Failed to verify the dataset {dataset_name} was available.\n{err}\n");
+            tracing::warn!("Failed to verify the dataset {dataset_name} was available. {err}");
             report_dataset_unavailable_time(dataset_name, Some(last_available_time));
         }
     }

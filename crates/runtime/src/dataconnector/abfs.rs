@@ -34,7 +34,7 @@ use url::Url;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\n{source}"
+        "The specified URL is not valid: {url}. Ensure the URL is valid and try again. {source}"
     ))]
     UnableToParseURL {
         url: String,
@@ -42,17 +42,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Multiple authentication methods were provided.\nSpecify only one of the following: access key, bearer token, or client credentials.\nUse skip_signature to disable all authentication."
+        "Multiple authentication methods were provided. Specify only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
     ))]
     InvalidKeyAuthCombination,
 
     #[snafu(display(
-        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nSpecify a valid HTTP/S URL."
+        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided. Specify a valid HTTP/S URL."
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
@@ -109,12 +109,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .secret(),
         ParameterSpec::component("use_emulator")
             .description("Use the Azure Storage emulator.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::component("use_fabric_endpoint")
             .description("Use the Azure Storage fabric endpoint.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::runtime("allow_http")
             .description("Allow insecure HTTP connections.")
+            .is_boolean()
             .default("false"),
         ParameterSpec::component("authority_host")
             .description("Sets an alternative authority host."),
@@ -142,11 +145,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("federated_token_file")
             .description("Sets a file path for acquiring Azure federated identity token in Kubernetes"),
         ParameterSpec::component("use_cli")
+            .is_boolean()
             .description("Set if the Azure CLI should be used for acquiring access tokens."),
         ParameterSpec::component("skip_signature")
-            .description("Skip fetching credentials and skip signing requests. Used for interacting with public containers."),
+            .description("Skip fetching credentials and skip signing requests. Used for interacting with public containers.")
+            .is_boolean(),
         ParameterSpec::component("disable_tagging")
-            .description("Ignore any tags provided to put_opts"),
+            .description("Ignore any tags provided to put_opts")
+            .is_boolean(),
 
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
@@ -258,7 +264,7 @@ impl ListingTableConnector for AzureBlobFS {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use datafusion::{
     execution::runtime_env::RuntimeEnvBuilder,
     prelude::{SessionConfig, SessionContext},
+    sql::TableReference,
 };
 use search::generation::{
     CandidateGeneration, post_apply::PostApplyCandidateGeneration,
@@ -27,6 +28,8 @@ use snafu::ResultExt;
 
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 
+use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
+
 pub mod connector;
 pub mod udtf;
 
@@ -35,6 +38,8 @@ pub mod udtf;
 /// `https://github.com/spiceai/spiceai/issues/6471` will move, like [`udtf::TextSearchTableFunc`] in favour of using [`search::generation::text_search::udtf::TextSearchIndexProvider`].
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
+    df: Arc<DataFusion>,
+    tbl: TableReference,
 ) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
     let mut generators = vec![];
     for search_field in database_index.search_fields.as_slice() {
@@ -43,9 +48,12 @@ pub async fn as_candidate_generations(
             .await
             .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
+        let candidate: TextSearchCandidate =
+            TextSearchCandidate::new(Arc::new(base), Arc::clone(&df), tbl.clone());
+
         let post_apply = PostApplyCandidateGeneration::new(
             Arc::clone(&database_index.base_table),
-            Arc::new(base),
+            Arc::new(candidate),
             database_index.primary_key.clone(),
         )
         .with_ctx(Arc::new(SessionContext::new_with_config_rt(

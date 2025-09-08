@@ -36,6 +36,7 @@ use app::App;
 use spicepod::component::caching::Caching;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::sync::{Mutex, RwLock};
+use util::in_tracing_context;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -176,9 +177,9 @@ impl RuntimeBuilder {
             .as_ref()
             .and_then(|app| app.runtime.results_cache.clone())
         {
-            crate::in_tracing_context(|| {
+            in_tracing_context(|| {
                 tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release.\nUse `caching.sql_results` instead.\nFor more information, visit: https://spiceai.org/docs/features/caching"
+                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
                 );
             });
             caching_config.sql_results = Some(results_cache.into());
@@ -242,7 +243,8 @@ impl RuntimeBuilder {
             app: Arc::new(RwLock::new(self.app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            llms: Arc::new(RwLock::new(HashMap::new())),
+            completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             evals: Arc::new(RwLock::new(evals)),
@@ -311,17 +313,17 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
-        crate::in_tracing_context(|| {
+        in_tracing_context(|| {
             tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
             );
         });
     }
 
     if memory_limit == Some(0) {
-        crate::in_tracing_context(|| {
+        in_tracing_context(|| {
             tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
             );
         });
         None

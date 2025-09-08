@@ -2,29 +2,28 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q9"
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                          |
-+---------------+---------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: u DESC NULLS FIRST, fetch=10                                                                            |
-|               |   Projection: hits.RegionID, count(alias1) AS u                                                               |
-|               |     Aggregate: groupBy=[[hits.RegionID]], aggr=[[count(alias1)]]                                              |
-|               |       Aggregate: groupBy=[[hits.RegionID, hits.UserID AS alias1]], aggr=[[]]                                  |
-|               |         BytesProcessedNode                                                                                    |
-|               |           TableScan: hits projection=[RegionID, UserID]                                                       |
-| physical_plan | SortPreservingMergeExec: [u@1 DESC], fetch=10                                                                 |
-|               |   SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[true]                                     |
-|               |     ProjectionExec: expr=[RegionID@0 as RegionID, count(alias1)@1 as u]                                       |
-|               |       AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]                |
-|               |         CoalesceBatchesExec: target_batch_size=8192                                                           |
-|               |           RepartitionExec: partitioning=Hash([RegionID@0], 16), input_partitions=16                           |
-|               |             AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]                   |
-|               |               AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID, alias1@1 as alias1], aggr=[] |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                   |
-|               |                   RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 16), input_partitions=16         |
-|               |                     AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID, UserID@1 as alias1], aggr=[]    |
-|               |                       BytesProcessedExec                                                                      |
-|               |                         SchemaCastScanExec                                                                    |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1               |
-|               |                             DataSourceExec: partitions=1, partition_sizes=[6109]                              |
-|               |                                                                                                               |
-+---------------+---------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                      |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: u DESC NULLS FIRST, fetch=10                                                                                                                        |
+|               |   Projection: hits.RegionID, count(alias1) AS u                                                                                                           |
+|               |     Aggregate: groupBy=[[hits.RegionID]], aggr=[[count(alias1)]]                                                                                          |
+|               |       Aggregate: groupBy=[[hits.RegionID, hits.UserID AS alias1]], aggr=[[]]                                                                              |
+|               |         BytesProcessedNode                                                                                                                                |
+|               |           TableScan: hits projection=[RegionID, UserID]                                                                                                   |
+| physical_plan | SortPreservingMergeExec: [u@1 DESC], fetch=10                                                                                                             |
+|               |   SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[true]                                                                                 |
+|               |     ProjectionExec: expr=[RegionID@0 as RegionID, count(alias1)@1 as u]                                                                                   |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]                                                            |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                       |
+|               |           RepartitionExec: partitioning=Hash([RegionID@0], 16), input_partitions=16                                                                       |
+|               |             AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]                                                               |
+|               |               AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID, alias1@1 as alias1], aggr=[]                                             |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                               |
+|               |                   RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 16), input_partitions=16                                                     |
+|               |                     AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID, UserID@1 as alias1], aggr=[]                                                |
+|               |                       BytesProcessedExec                                                                                                                  |
+|               |                         SchemaCastScanExec                                                                                                                |
+|               |                           DataSourceExec: partitions=16, partition_sizes=[382, 382, 382, 382, 382, 382, 382, 382, 381, 381, 381, 381, 381, 381, 381, 386] |
+|               |                                                                                                                                                           |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+

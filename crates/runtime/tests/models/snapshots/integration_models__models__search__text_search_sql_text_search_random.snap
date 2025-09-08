@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+---
+[
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  }
+]

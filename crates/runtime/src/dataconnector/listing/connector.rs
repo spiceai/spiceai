@@ -199,7 +199,7 @@ pub trait ListingTableConnector: DataConnector {
             (_, _) => Err(
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
-                        message: "The required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again.".to_string(),
+                        message: "The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again.".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source: "Missing file format".into(),
                     },
@@ -785,7 +785,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."
+                "Failed to find any files matching the extension '{extension}'. Spice could not find any files with extensions at the specified path. Check the path and try again."
             ),
         });
     }
@@ -802,7 +802,7 @@ async fn get_last_modified(
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
-                "Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+                "Failed to find any files matching the extension '{extension}'. Is your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
             ),
         })
     }
@@ -856,7 +856,7 @@ async fn verify_schema_source_path(
             // We've reached the limit of files to scan, but have not found any with the expected extension.
             // We do warning, not an error, as the dataset might have a large number of files.
             tracing::warn!(
-                "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
+                "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files. Ensure the `schema_source_path` is correct."
             );
             return Ok(None);
         }
@@ -866,7 +866,7 @@ async fn verify_schema_source_path(
         dataconnector: dataconnector.clone(),
         connector_component: ConnectorComponent::from(dataset),
         message: format!(
-            "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."
+            "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
         ),
     })
 }
@@ -1082,7 +1082,7 @@ mod tests {
             Ok(_) => panic!("Unexpected success"),
             Err(e) => assert_eq!(
                 e.to_string(),
-                "Cannot setup the dataset test (TestConnector) with an invalid configuration.\nThe required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again."
+                "Cannot setup the dataset test (TestConnector) with an invalid configuration. The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again."
             ),
         }
     }
@@ -1402,7 +1402,7 @@ mod tests {
             assert_eq!(
                 e.to_string(),
                 format!(
-                    "Cannot setup the dataset test (TestListingConnector) with an invalid configuration.\nFailed to find any files matching the extension '.parquet' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."
+                    "Cannot setup the dataset test (TestListingConnector) with an invalid configuration. Failed to find any files matching the extension '.parquet' at the specified path `{schema_source_path}`. Verify that `schema_source_path` is correct and try again."
                 )
             );
         }

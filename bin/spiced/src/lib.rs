@@ -36,13 +36,14 @@ use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
-use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory, in_tracing_context};
+use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
+use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -89,11 +90,11 @@ pub enum Error {
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 
-    #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`.\n{reason}"))]
+    #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`. {reason}"))]
     FailedToApplyOverridesGeneric { reason: String },
 
     #[snafu(display(
-        "Failed to apply the runtime override from `--set-runtime {path}={value}`.\n{reason}"
+        "Failed to apply the runtime override from `--set-runtime {path}={value}`. {reason}"
     ))]
     FailedToApplyOverride {
         path: String,
@@ -181,6 +182,7 @@ pub async fn run(args: Args) -> Result<()> {
         .spicepod
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+
     let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
@@ -371,7 +373,7 @@ fn apply_overrides(
         Ok(yaml) => yaml,
         Err(e) => {
             return FailedToApplyOverridesGenericSnafu {
-                reason: format!("Runtime configuration is invalid YAML.\n{e}"),
+                reason: format!("Runtime configuration is invalid YAML. {e}"),
             }
             .fail();
         }
@@ -398,7 +400,7 @@ fn apply_overrides(
         Err(e) => {
             FailedToApplyOverridesGenericSnafu {
                 reason: format!(
-                    "The runtime configuration after applying the overrides from `--set-runtime` is invalid.\n{e}"
+                    "The runtime configuration after applying the overrides from `--set-runtime` is invalid. {e}"
                 ),
             }
             .fail()

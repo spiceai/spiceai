@@ -17,6 +17,7 @@ arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { workspace = true, optional = true }
+aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 base64.workspace = true
@@ -27,6 +28,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
@@ -57,7 +59,7 @@ mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
-rdkafka = { version = "0.38.0", features = ["ssl-vendored"], optional = true }
+rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
@@ -85,12 +87,13 @@ util = { path = "../util" }
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-rdkafka = { version = "0.38.0", features = ["cmake-build"], optional = true }
+rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
+kafka = ["dep:rdkafka"]
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
     "dep:duckdb",
@@ -126,7 +129,7 @@ test_hadoop_catalog_docker = []
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
-ctor = "0.2.8"
+ctor = "0.5.0"
 iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
 insta = { version = "1.43" }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

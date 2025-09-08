@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use aws_config::{BehaviorVersion, Region};
+use aws_credential_types::Credentials;
+use s3_vectors::Client;
+use snafu::ResultExt;
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::Dataset,
@@ -24,12 +28,22 @@ use spicepod::{
 mod search {
     use crate::{
         configure_test_datafusion,
-        models::{hf::get_huggingface_embeddings, search::item_tpch_dataset_w_embeddings},
+        models::{
+            get_mega_science_dataset,
+            hf::get_huggingface_embeddings,
+            s3_vectors::{delete_index, vectors_filterable_col, vectors_nonfilterable_col},
+            search::{SearchTestCase, SearchTestType, run_search_w_explain},
+        },
         utils::verify_env_secret_exists,
     };
+
     use app::AppBuilder;
-    use spicepod::vector::VectorStore;
-    use std::sync::Arc;
+    use serde_json::json;
+    use spicepod::{
+        semantic::{Column, ColumnLevelEmbeddingConfig},
+        vector::VectorStore,
+    };
+    use std::{collections::HashMap, sync::Arc};
 
     use app::App;
     use futures::StreamExt;
@@ -40,69 +54,308 @@ mod search {
     use crate::utils::runtime_ready_check;
 
     #[tokio::test]
-    async fn s3_vectors_basic() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
-        let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
-
-        let mut test_dataset = item_tpch_dataset_w_embeddings(
-            "item",
-            "hf_minilm",
-            Some(vec!["i_item_sk".to_string()]),
+    async fn basic_functionality() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
             None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
         );
+        let bucket_name = "spice-ci-tests-s3-vectors-basic";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
 
-        // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
-
-        test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-tests-s3-vectors-basic",
-            &index_name,
-        ));
-
-        let app = AppBuilder::new("search_app")
-            .with_dataset(test_dataset)
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
-            ))
-            .build();
-
-        let rt = start_app(app).await?;
-
-        run_and_snapshot_query(
-            &rt,
-            "SELECT i_item_sk, i_item_desc, round(score, 1) FROM vector_search(item, 'Patient') where i_item_sk > 5 order by score desc LIMIT 4;",
-            "basic",
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "s3vectors_basic_basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_basic",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_projection",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_no_score",
+                    SearchTestType::Sql(
+                        "SELECT id, answer FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_random",
+                    SearchTestType::Sql(
+                        "SELECT subject FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vectors_basic_vector_search_sql_vectors",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, array_length(answer_embedding), round(score, 1) FROM vector_search(qs, 'second') order by score desc LIMIT 4;",
+                    ))
+            ],
+            true
         )
-        .await?;
+        .await
+    }
 
-        Ok(())
+    #[tokio::test]
+    async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string(), "question".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: HashMap::new(),
+            }),
+        );
+        let bucket_name = "spice-ci-tests-s3-vectors-compose-pk";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "s3vector_composite_basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_composite_additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["subject"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_composite_with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_composite_vector_search_sql_single_column",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+
+                SearchTestCase::new(
+                    "s3vector_composite_vector_search_sql_composite_key",
+                    SearchTestType::Sql(
+                        "SELECT id, question, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_composite_vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT question, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where id> 10 order by score desc LIMIT 4",
+                    ),
+                ),
+            ],
+            true
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn metadata_columns() -> Result<(), anyhow::Error> {
+        // Metadata columns: question, subject (filterable), answer
+        // Base columns:     reference_answer,source
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column {
+                name: "answer".to_string(),
+                embeddings: vec![ColumnLevelEmbeddingConfig {
+                    model: "hf_minilm".to_string(),
+                    row_ids: Some(vec!["id".to_string()]),
+                    chunking: None,
+                    vector_size: None,
+                }],
+                description: None,
+                full_text_search: None,
+                metadata: [(
+                    "vectors".to_string(),
+                    serde_json::Value::String("non-filterable".to_string()),
+                )]
+                .into(),
+            }),
+        );
+        ds.columns.extend([
+            vectors_nonfilterable_col("question"),
+            vectors_filterable_col("subject"),
+        ]);
+
+        let bucket_name = "spice-ci-tests-s3-vectors-metadata-columns";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+        ds.vectors = Some(vector_store);
+
+        run_search_w_explain(
+            AppBuilder::new("search_app")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_dataset(ds)
+                .build(),
+            vec![
+                SearchTestCase::new(
+                    "s3vector_metadata_basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_additional_columns_metadata",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["reference_answer", "source"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "source='textbook_reasoning'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_with_where_metadata",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_vector_search_sql_basic",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_vector_search_sql_projection",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, reference_answer, source, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_vector_search_sql_projection_metadata",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_vector_search_sql_filters_metadata",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+                    ),
+                ),
+                SearchTestCase::new(
+                    "s3vector_metadata_vector_search_sql_filters",
+                    SearchTestType::Sql(
+                        "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary') where source='textbook_reasoning' order by score desc LIMIT 4",
+                    ),
+                ),
+            ],
+            true
+        )
+        .await
     }
 
     #[tokio::test]
     async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
+        let bucket_name = "spice-ci-tests-s3-vectors-filters-pushdown";
+        let vector_store = init_vector_store(bucket_name, true).await?;
+
         let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
-
-        // Generate a unique index name for each test run
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
-
-        test_dataset.vectors = Some(new_s3_vector_store(
-            "spice-ci-tests-s3-vectors-filters-pushdown",
-            &index_name,
-        ));
+        test_dataset.vectors = Some(vector_store);
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
@@ -118,7 +371,24 @@ mod search {
         run_and_snapshot_query(
             &rt,
             r#"
-            SELECT 
+            explain SELECT
+                "message.body",
+                attempt_count, "message.status",
+                package_weight_kg,
+                round(score, 1)
+            FROM vector_search(delivery, 'wrong location')
+            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
+            ORDER BY package_weight_kg desc, score DESC
+            LIMIT 10;
+            "#,
+            "filters_pushdown_explain",
+        )
+        .await?;
+
+        run_and_snapshot_query(
+            &rt,
+            r#"
+            SELECT
               "message.body",
               attempt_count, "message.status",
               package_weight_kg,
@@ -132,20 +402,19 @@ mod search {
         )
         .await?;
 
+        // WHERE clause on non-filterable column should not pushdown filter to S3vector.
         run_and_snapshot_query(
             &rt,
             r#"
-            explain SELECT 
-              "message.body",
-              attempt_count, "message.status",
-              package_weight_kg,
+            explain SELECT
+              "event.id",
               round(score, 1)
             FROM vector_search(delivery, 'wrong location')
-            WHERE attempt_count > 1 AND package_weight_kg > 5.0 AND "message.status"='FAILED'
-            ORDER BY package_weight_kg desc, score DESC
+            WHERE "account.tier" = 'BUSINESS'
+            ORDER BY "event.id" desc, score DESC
             LIMIT 10;
             "#,
-            "filters_pushdown_explain",
+            "non_filters_pushdown_explain",
         )
         .await?;
 
@@ -154,27 +423,19 @@ mod search {
 
     #[tokio::test]
     async fn s3_vectors_data_update() -> Result<(), anyhow::Error> {
-        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-            verify_env_secret_exists(env_var)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
 
         // Generate a unique index name so the same test can be run in parallel
-        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+        let bucket_name = "spice-ci-tests-s3-vectors-overwrite";
 
         for (data_path, test_name) in [
             ("update/data_v1.json", "data_v1"),
             ("update/data_v2.json", "data_v2"),
         ] {
-            let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
+            let vector_store = init_vector_store(bucket_name, true).await?;
 
-            ds.vectors = Some(new_s3_vector_store(
-                "spice-ci-tests-s3-vectors-overwrite",
-                &index_name,
-            ));
+            let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
+            ds.vectors = Some(vector_store);
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
@@ -187,9 +448,9 @@ mod search {
             let rt = start_app(app).await?;
 
             run_and_snapshot_query(
-            &rt,
-            r#"SELECT "account.account_sid", "message.body", round(score, 1) as score, attempt_count, customer_note FROM vector_search(delivery, 'delivery issue') WHERE "event.id" = 'SM8856d9da23ab4a7c8b26'"#,
-            test_name,
+                &rt,
+                r#"SELECT "account.account_sid", "message.body", round(score, 1) as score, attempt_count, customer_note FROM vector_search(delivery, 'delivery issue') WHERE "event.id" = 'SM8856d9da23ab4a7c8b26'"#,
+                test_name,
             )
             .await?;
         }
@@ -197,8 +458,103 @@ mod search {
         Ok(())
     }
 
-    /// Creates a new S3 `VectorStore`.
-    fn new_s3_vector_store(bucket_name: &str, index_name: &str) -> VectorStore {
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn s3_vectors_kafka_stream() -> Result<(), anyhow::Error> {
+        use crate::utils::test_request_context;
+
+        const KAFKA_PORT: u16 = 19193;
+
+        let _tracing: tracing::subscriber::DefaultGuard =
+            crate::init_tracing(DEFAULT_TRACING_MODELS);
+
+        test_request_context()
+            .scope(async {
+                let (running_container, producer) =
+                    crate::kafka::bootstrap::start_kafka_docker_container(
+                        KAFKA_PORT,
+                        &["megascience"],
+                    )
+                    .await?;
+
+                tracing::debug!("Container started");
+
+                // Load test data for orders representing the simple case where all fields are present in the first topic message
+                let test_data: Vec<serde_json::Value> =
+                    serde_json::from_str(include_str!("./test_data/mega-science-sample.json"))?;
+                crate::kafka::bootstrap::send_messages_to_kafka(&producer, "megascience", &test_data).await?;
+
+                let mut ds = crate::kafka::bootstrap::make_kafka_dataset(
+                    "megascience",
+                    "qs",
+                    KAFKA_PORT,
+                    None,
+                );
+
+                let bucket_name = "spice-ci-tests-s3-vectors-kafka-stream";
+                let vector_store = init_vector_store(bucket_name, true).await?;
+                ds.vectors = Some(vector_store);
+                ds.columns = vec![
+                    Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
+                        model: "hf_minilm".to_string(),
+                        chunking: None,
+                        row_ids: Some(vec!["id".to_string()]),
+                        vector_size: None,
+                    }])];
+
+                let app = AppBuilder::new("search_app")
+                    .with_dataset(ds)
+                    .with_embedding(get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ))
+                    .build();
+
+                let rt = start_app(app).await?;
+
+                // Ensure all messages are processed/including embeddings calculation
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+                run_and_snapshot_query(
+                    &rt,
+                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'second') order by score desc LIMIT 3",
+                    "s3vector_kafka_sql_basic",
+                )
+                .await?;
+
+                rt.shutdown().await;
+                drop(rt);
+
+                // Clean up container after test
+                running_container.remove().await.map_err(|e| {
+                    tracing::error!("running_container.remove: {e}");
+                    anyhow::Error::msg(e.to_string())
+                })?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    async fn init_vector_store(
+        bucket_name: &str,
+        predelete_index: bool,
+    ) -> Result<VectorStore, anyhow::Error> {
+        for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+            verify_env_secret_exists(env_var)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        let index_name = format!("test-index-{}", rand::random::<u8>() % 11);
+        if predelete_index {
+            let _ = delete_index(bucket_name, index_name.as_str())
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+                });
+        }
+
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -217,11 +573,11 @@ mod search {
             .collect(),
         );
 
-        VectorStore {
+        Ok(VectorStore {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
-        }
+        })
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
@@ -314,7 +670,7 @@ pub fn get_package_delivery_dataset(
         }]),
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),
-        vectors_filterable_col("account.tier"),
+        vectors_nonfilterable_col("account.tier"),
         vectors_filterable_col("account.account_sid"),
         vectors_filterable_col("package_weight_kg"),
         vectors_filterable_col("attempt_count"),
@@ -323,11 +679,51 @@ pub fn get_package_delivery_dataset(
     dataset
 }
 
+async fn delete_index(
+    bucket_name: &str,
+    index_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+        .region(Region::from_static("us-east-2"))
+        .credentials_provider(Credentials::new(
+            std::env::var("AWS_S3_VECTORS_KEY").ok().unwrap_or_default(),
+            std::env::var("AWS_S3_VECTORS_SECRET")
+                .ok()
+                .unwrap_or_default(),
+            None,
+            None,
+            "S3Vectors",
+        ))
+        .load()
+        .await;
+
+    let s3_vector_client = Client::new(&config);
+    s3_vector_client
+        .delete_index()
+        .set_index_name(Some(index_name.to_string()))
+        .set_vector_bucket_name(Some(bucket_name.to_string()))
+        .send()
+        .await
+        .boxed()?;
+
+    Ok(())
+}
+
 fn vectors_filterable_col(name: &str) -> Column {
     Column::new(name).with_metadata(
         [(
             "vectors".to_string(),
             serde_json::Value::String("filterable".to_string()),
+        )]
+        .into(),
+    )
+}
+
+fn vectors_nonfilterable_col(name: &str) -> Column {
+    Column::new(name).with_metadata(
+        [(
+            "vectors".to_string(),
+            serde_json::Value::String("non-filterable".to_string()),
         )]
         .into(),
     )

@@ -32,6 +32,7 @@ schemars.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+spicepod = { path = "../spicepod" }
 tokenizers = "0.21.2"
 tokio.workspace = true
 tracing.workspace = true
@@ -67,8 +68,10 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "dd0beab3810aebacb716d4ab6d38455e74499d13", optional = true }
+
 [dev-dependencies]
-anyhow = "1.0.86"
+anyhow = "1.0.99"
 aws-credential-types.workspace = true
 dotenvy.workspace = true
 insta.workspace = true
@@ -92,6 +95,7 @@ local_embed = [
     "dep:tei_backend_core",
     "dep:tei_candle",
     "dep:tei_core",
+    "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
 metal = [

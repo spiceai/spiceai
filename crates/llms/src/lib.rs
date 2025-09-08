@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 pub mod accumulate;
 pub mod anthropic;
 pub mod bedrock;
@@ -21,9 +22,11 @@ pub mod chunking;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
+pub mod model2vec;
 pub mod openai;
 pub mod perplexity;
 pub mod progress;
+pub mod responses;
 pub mod xai;
 
 pub enum HealthCheck {

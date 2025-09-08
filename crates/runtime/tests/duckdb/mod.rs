@@ -28,6 +28,7 @@ use runtime::Runtime;
 use scopeguard::defer;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
+use tempfile::NamedTempFile;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
@@ -235,6 +236,132 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .map_err(|e| format!("ORDER BY rand() query execution failed: {e}"))?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn duckdb_regexp() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/regions.csv");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
+                .expect("failed to write sample file");
+
+            let mut other_dataset = make_duckdb_acceleration_dataset(
+                "csv_test_arrow",
+                "csv",
+                &format!("'{}'", temp_file.path().display()),
+            );
+            other_dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                ..Default::default()
+            });
+
+            let app = AppBuilder::new("duckdb_regexp_test")
+                .with_dataset(make_duckdb_acceleration_dataset(
+                    "csv_test",
+                    "csv",
+                    &format!("'{}'", temp_file.path().display()),
+                ))
+                .with_dataset(other_dataset)
+                .build();
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let cases = vec![
+                (
+                    "test_regexp_like_is_case_sensitive",
+                    "SELECT * FROM csv_test WHERE regexp_like(region, 'america')",
+                ),
+                (
+                    "test_regexp_like_with_case_insensitive_flag",
+                    "SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')",
+                ),
+                // disabled until github.com/spiceai/spiceai/issues/6964 is addressed
+                // (
+                //     "test_regexp_match",
+                //     "SELECT regexp_match(region, 'AMERICA') FROM csv_test",
+                // ),
+                (
+                    "test_regexp_count",
+                    "SELECT regexp_count(region, 'AMERICA') FROM csv_test",
+                ),
+                (
+                    "test_regexp_replace",
+                    "SELECT regexp_replace(region, 'AMERICA', 'AUSTRALIA') FROM csv_test",
+                ),
+                (
+                    "test_regexp_replace_case_insensitive",
+                    "SELECT regexp_replace(region, 'america', 'australia', 'i') FROM csv_test",
+                ),
+                (
+                    "test_regexp_results_match",
+                    "WITH duckdb_regexp_like AS (
+                        SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')
+                    ), arrow_regexp_like AS (
+                        SELECT * FROM csv_test_arrow WHERE regexp_like(region, 'america', 'i')
+                    )
+
+                    SELECT * FROM duckdb_regexp_like d JOIN arrow_regexp_like a ON d.region = a.region",
+                ),
+            ];
+
+            for (name, query) in cases {
+                let result: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .expect("query is successful")
+                    .data
+                    .try_collect()
+                    .await
+                    .expect("collects results");
+
+                let pretty = arrow::util::pretty::pretty_format_batches(&result)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_results"), pretty);
+
+                let explain_plan = rt
+                    .datafusion()
+                    .query_builder(&format!("EXPLAIN {query}"))
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+            }
 
             Ok(())
         })

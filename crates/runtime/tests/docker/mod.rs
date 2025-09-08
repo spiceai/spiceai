@@ -23,15 +23,17 @@ use std::{
 use bollard::{
     Docker,
     container::{
-        Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+        Config, CreateContainerOptions, ListContainersOptions, LogOutput, RemoveContainerOptions,
         StartContainerOptions,
     },
+    exec::{CreateExecOptions, StartExecResults},
     image::CreateImageOptions,
     secret::{
         ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum,
         HostConfig, PortBinding,
     },
 };
+
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 
@@ -51,12 +53,53 @@ impl RunningContainer<'_> {
         remove(&self.docker, self.name).await
     }
 
+    #[allow(dead_code)]
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         stop(&self.docker, self.name).await
     }
 
+    #[allow(dead_code)]
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         start(&self.docker, self.name).await
+    }
+
+    pub async fn exec_cmd(&self, cmd: &str) -> Result<String, anyhow::Error> {
+        let cmd_vec: Vec<String> = cmd
+            .split_whitespace()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let exec = self
+            .docker
+            .create_exec(
+                self.name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(cmd_vec.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let exec_result = self.docker.start_exec(&exec.id, None).await?;
+        let mut output_str = String::new();
+
+        if let StartExecResults::Attached { mut output, .. } = exec_result {
+            while let Some(Ok(log)) = output.next().await {
+                match log {
+                    LogOutput::StdOut { message } => {
+                        output_str.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    LogOutput::StdErr { message } => {
+                        return Err(anyhow::anyhow!(
+                            String::from_utf8_lossy(&message).to_string()
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(output_str)
     }
 }
 
@@ -88,6 +131,7 @@ pub struct ContainerRunnerBuilder<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    command: Option<Vec<String>>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -98,6 +142,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: Vec::new(),
             env_vars: Vec::new(),
             healthcheck: None,
+            command: None,
         }
     }
 
@@ -111,6 +156,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self
@@ -118,6 +164,15 @@ impl<'a> ContainerRunnerBuilder<'a> {
 
     pub fn healthcheck(mut self, healthcheck: HealthConfig) -> Self {
         self.healthcheck = Some(healthcheck);
+        self
+    }
+
+    pub fn command<I, S>(mut self, cmd: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.command = Some(cmd.into_iter().map(Into::into).collect());
         self
     }
 
@@ -132,6 +187,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             port_bindings: self.port_bindings,
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
+            command: self.command,
         })
     }
 }
@@ -143,6 +199,7 @@ pub struct ContainerRunner<'a> {
     port_bindings: Vec<(u16, u16)>,
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
+    command: Option<Vec<String>>,
 }
 
 impl<'a> ContainerRunner<'a> {
@@ -212,6 +269,10 @@ impl<'a> ContainerRunner<'a> {
             host_config,
             healthcheck: self.healthcheck,
             exposed_ports,
+            cmd: self
+                .command
+                .as_ref()
+                .map(|v| v.iter().map(String::as_str).collect()),
             ..Default::default()
         };
 

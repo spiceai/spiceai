@@ -59,7 +59,7 @@ impl Runtime {
         let cloned_worker = Arc::clone(&worker);
 
         if let Some(model) = Arc::clone(&worker).as_model() {
-            let mut llm_registry = self.llms.write().await;
+            let mut llm_registry = self.completion_llms.write().await;
             llm_registry.insert(cfg.name.clone(), model);
             drop(llm_registry);
         }
@@ -85,7 +85,7 @@ impl Runtime {
     }
 
     async fn remove_worker(self: Arc<Self>, cfg: &spicepod::component::worker::Worker) {
-        let mut llm_registry = self.llms.write().await;
+        let mut llm_registry = self.completion_llms.write().await;
         llm_registry.remove(&cfg.name);
 
         if let Err(e) = Arc::clone(&self)

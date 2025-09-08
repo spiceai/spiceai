@@ -67,6 +67,7 @@ pub struct NotStarted {
     validate: bool,
     disable_caching: bool,
     scale_factor: f64,
+    http_client: bool,
 }
 
 impl NotStarted {
@@ -109,6 +110,12 @@ impl NotStarted {
     #[must_use]
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
         self.scale_factor = scale_factor;
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_client(mut self, http_client: bool) -> Self {
+        self.http_client = http_client;
         self
     }
 }
@@ -180,9 +187,11 @@ impl SpiceTest<NotStarted> {
             .spice_client(self.api_key.clone(), self.state.disable_caching)
             .await?;
 
+        let http_client = self.get_spiced()?.http_client()?;
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
-                let worker = SpiceTestQueryWorker::new(
+                let mut worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.query_set.clone(),
                     self.state.end_condition,
@@ -195,10 +204,14 @@ impl SpiceTest<NotStarted> {
                 .with_scale_factor(self.state.scale_factor);
 
                 if let Some(multi) = &multi {
-                    worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
-                } else {
-                    worker
+                    worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
                 }
+
+                if self.state.http_client {
+                    worker = worker.with_http_client(http_client.clone());
+                }
+
+                worker
             })
             .map(SpiceTestQueryWorker::start)
             .collect();

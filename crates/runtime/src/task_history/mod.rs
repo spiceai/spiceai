@@ -28,6 +28,7 @@ use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
@@ -106,7 +107,7 @@ impl TaskSpan {
         let acceleration_settings = Acceleration::default().with_on_conflict(
             [(
                 ColumnReference::new(vec!["span_id".to_string()]),
-                OnConflictBehavior::Upsert,
+                OnConflictBehavior::Upsert(UpsertOptions::default()),
             )]
             .into(),
         );
@@ -137,12 +138,12 @@ impl TaskSpan {
             Field::new("captured_output", DataType::Utf8, true),
             Field::new(
                 "start_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 false,
             ), // Note: Used for time column of Retention
             Field::new(
                 "end_time",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 false,
             ),
             Field::new("execution_duration_ms", DataType::Float64, false),

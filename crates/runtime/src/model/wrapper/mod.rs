@@ -45,6 +45,7 @@ use std::task::{Context, Poll};
 use super::metrics::request_labels;
 
 mod ast;
+pub mod responses;
 
 pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| {

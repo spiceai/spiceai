@@ -82,13 +82,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db")
         .description("Database name to connect to. Defaults to 'default' if not specified."),
     ParameterSpec::component("sslmode")
-        .description("TLS/SSL mode for the connection. Supported values: 'disabled', 'required', 'preferred'. Defaults to 'required'. 'preferred' allows invalid certificates/hostnames."),
+        .description("TLS/SSL mode for the connection. Supported values: 'disabled', 'required', 'preferred'. Defaults to 'required'. 'preferred' allows invalid certificates/hostnames.")
+        .one_of(&["disabled", "required", "preferred"]),
     ParameterSpec::component("sslrootcert")
         .description("Path to a CA root certificate file to use for TLS verification. Optional; if not provided, system defaults are used."),
     ParameterSpec::component("auth_source")
         .description("Authentication source database. Overrides the default auth source in the connection string."),
     ParameterSpec::component("direct_connection")
-        .description("Whether to connect directly to a single MongoDB host instead of discovering the topology. Accepts 'true' or 'false'."),
+        .description("Whether to connect directly to a single MongoDB host instead of discovering the topology. Accepts 'true' or 'false'.")
+        .is_boolean(),
     ParameterSpec::component("time_zone")
         .description("Time zone to use for interpreting and returning timestamp values (e.g., 'UTC', 'America/Los_Angeles')."),
     ParameterSpec::component("unnest_depth")

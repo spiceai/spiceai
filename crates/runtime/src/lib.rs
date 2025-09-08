@@ -27,11 +27,11 @@ use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
-use tracing::subscriber;
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::model::LLMResponsesModelStore;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -51,7 +51,7 @@ use futures::Stream;
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
-use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
+use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
@@ -121,7 +121,7 @@ pub enum Error {
     UnableToStartHttpServer { source: http::Error },
 
     #[snafu(display(
-        "Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Task execution failed: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToExecuteTask { source: tokio::task::JoinError },
 
@@ -175,17 +175,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
     ))]
     UnknownDataConnector { data_connector: String },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
     ))]
     UnknownCatalogConnector { catalog_connector: String },
 
     #[snafu(display(
-        "The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled,
 
@@ -203,7 +203,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to setup the {connector_component} ({data_connector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
         connector_component: ConnectorComponent,
@@ -240,7 +240,7 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
-        "An accelerated table has invalid configuration: {source}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -351,22 +351,22 @@ pub enum Error {
     ForceTerminated,
 
     #[snafu(display(
-        "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
+        "Configuration of '{view_name}' view is invalid: {reason}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
     AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
 
     #[snafu(display(
-        "Failed to start scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to start scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToStartScheduler { source: scheduler::Error },
 
     #[snafu(display(
-        "Failed to build scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to build scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToBuildScheduler { source: scheduler::Error },
 
     #[snafu(display(
-        "Failed to add schedule '{name}' to the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to add schedule '{name}' to the '{scheduler}' scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToAddSchedule {
         source: scheduler::Error,
@@ -375,7 +375,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create a cron schedule from the provided expression: '{cron}'\n{source}\nEnsure the cron expression is valid and try again."
+        "Failed to create a cron schedule from the provided expression: '{cron}' {source} Ensure the cron expression is valid and try again."
     ))]
     FailedToCreateCronChannel {
         cron: String,
@@ -383,7 +383,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToRemoveSchedule {
         source: scheduler::Error,
@@ -392,7 +392,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to infer the worker type for the worker '{name}'.\nEnsure the worker has a valid configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/workers"
+        "Failed to infer the worker type for the worker '{name}'. Ensure the worker has a valid configuration, and try again. For details, visit: https://spiceai.org/docs/components/workers"
     ))]
     FailedToInferWorkerType { name: String },
 }
@@ -417,7 +417,9 @@ pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<LLMModelStore>>,
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    // LLMs that support the OpenAI Responses API
+    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -1077,14 +1079,4 @@ pub fn spice_data_base_path() -> String {
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
-}
-
-pub fn in_tracing_context<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
 }

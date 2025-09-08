@@ -18,10 +18,11 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
-use super::util::user_tables_with_embeddings;
+use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+use crate::search::FormattingSnafu;
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -84,13 +85,16 @@ impl VectorSearch {
     async fn model_from_vector_index(
         &self,
         tbl: &Arc<dyn TableProvider>,
+        embedding_column: &str,
     ) -> Option<Arc<dyn Embed>> {
-        let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::S3Vector;
-            if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
-                return s3_vector.embedding_model().await;
+            use crate::embeddings::index::s3::S3Vector;
+            let index = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
+            for s3v in index.get_indexes::<S3Vector>() {
+                if s3v.embedded_column == embedding_column {
+                    return s3v.embedding_model().await;
+                }
             }
             None
         }
@@ -113,8 +117,9 @@ impl VectorSearch {
                 data_source: vec![tbl.clone()],
             })?;
 
-        let (model, is_chunked) = if let Some(model) =
-            self.model_from_vector_index(&table_provider).await
+        let (model, is_chunked) = if let Some(model) = self
+            .model_from_vector_index(&table_provider, embedding_column)
+            .await
         {
             (model, false)
         } else {
@@ -245,11 +250,11 @@ impl VectorSearch {
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
-            None => user_tables_with_embeddings(&self.df).await?,
+            None => user_tables_that_can_search(&self.df).await?,
         };
 
         if tables.is_empty() {
-            return Err(Error::NoTablesWithEmbeddingsFound {});
+            return Err(Error::NoTablesWithSearchFound {});
         }
 
         let span = match Span::current() {
@@ -301,7 +306,7 @@ impl VectorSearch {
 
                     Ok((tbl.clone(), agg_result))
                 }
-            }).collect::<Vec<_>>()).await?.into_iter().collect();
+            }).collect::<Vec<_>>()).await?.into_iter().filter_map(|(tbl, result)| Some((tbl, result?))).collect();
 
             Ok(response)
 
@@ -309,7 +314,14 @@ impl VectorSearch {
 
         match vector_search_result {
             Ok(result) => {
-                tracing::info!(target: "task_history", captured_output = ?result);
+                let displayable: HashMap<String, serde_json::Value> = result
+                    .iter()
+                    .map(|(tbl, agg_result)| (tbl.to_string(), agg_result.display_json()))
+                    .collect();
+                let captured_output_json = serde_json::to_string(&displayable)
+                    .boxed()
+                    .context(FormattingSnafu)?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(result)
             }
             Err(e) => {

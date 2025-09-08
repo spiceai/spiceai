@@ -153,7 +153,7 @@ impl OracleTableProvider {
             ),
         };
 
-        tracing::debug!("Executing schema query for dataset {table}:\n{columns_meta_query}");
+        tracing::debug!("Executing schema query for dataset {table}: {columns_meta_query}");
 
         let conn = conn.get().await?;
 
@@ -278,7 +278,7 @@ fn is_datetime_related_expr(expr: &Expr) -> bool {
                     | DataType::Timestamp(_, _)
             )
         }
-        Expr::Literal(literal) => {
+        Expr::Literal(literal, _) => {
             matches!(
                 literal.data_type(),
                 DataType::Time32(_)

@@ -47,7 +47,7 @@ impl Runtime {
         }
 
         // Load all LLMs as [`ModelGradedScorer`]
-        let model_lock = self.llms.read().await;
+        let model_lock = self.completion_llms.read().await;
         for (model_name, model) in model_lock.iter() {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(

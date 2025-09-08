@@ -44,6 +44,7 @@ data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
@@ -67,7 +68,7 @@ graphql-parser.workspace = true
 headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.3"
-hyper = "1.6.0"
+hyper = "1.7.0"
 hyper-util = { version = "0.1.16", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-glue.workspace = true
@@ -89,7 +90,7 @@ model_components = { path = "../model_components" }
 moka.workspace = true
 mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
-notify = "8.0.0"
+notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
@@ -112,6 +113,7 @@ prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
 rand.workspace = true
+rayon = "1.11.0"
 regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
@@ -175,10 +177,10 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
-anyhow = "1.0.86"
+anyhow = "1.0.99"
 async-graphql = "7.0.16"
 async-graphql-axum = "7.0.16"
-azure_core = "0.26.0"
+azure_core = "0.27.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
@@ -192,10 +194,13 @@ paste.workspace = true
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
+spiceai.workspace = true
 test-framework = { path = "../test-framework" }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+rdkafka = { workspace = true, features = ["ssl-vendored"] }
 
 [features]
 aws-secrets-manager = [
@@ -213,6 +218,7 @@ clickhouse = [
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
+kafka = ["data_components/kafka"]
 default = [
     "keyring-secret-store",
     "aws-secrets-manager",

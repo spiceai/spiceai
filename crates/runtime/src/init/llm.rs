@@ -17,11 +17,26 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{Result, Runtime, UnableToInitializeLlmSnafu, model::try_to_chat_model};
-use llms::chat::{Chat, try_map_boxed_error_to_box};
+use crate::{
+    Result, Runtime, UnableToInitializeLlmSnafu,
+    model::{try_to_chat_model, try_to_responses_model},
+};
+use llms::{
+    chat::{Chat, try_map_boxed_error_to_box},
+    responses::Responses,
+};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
+
+fn supports_responses_api(params: &HashMap<String, SecretString>) -> bool {
+    params
+        .get("responses_api")
+        .map(secrecy::ExposeSecret::expose_secret)
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("enabled")
+}
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -29,18 +44,38 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<Arc<dyn Chat>> {
-        let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
+    ) -> Result<(Arc<dyn Chat>, Option<Arc<dyn Responses>>)> {
+        let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        l.health()
+        completions_model
+            .health()
             .await
             .boxed()
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
-        Ok(l)
+
+        let mut responses_model = if supports_responses_api(&params) {
+            try_to_responses_model(&m, &params, Arc::new(self.clone()))
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        if let Some(model) = &responses_model {
+            if model.health().await.is_err() {
+                tracing::warn!(
+                    "Failed to load Responses API endpoint for model '{}'. Verify the Spicepod configuration and try again.",
+                    m.name.clone()
+                );
+                responses_model = None;
+            }
+        }
+
+        Ok((completions_model, responses_model))
     }
 }

@@ -31,13 +31,13 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
-    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
+    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
     DataSourceNotFound { table: TableReference },
 
     #[snafu(display(
-        "Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."
+        "Vector search failed: No tables with embeddings or full text search indexes are available. Ensure embeddings or full text search indexes are configured and try again."
     ))]
-    NoTablesWithEmbeddingsFound {},
+    NoTablesWithSearchFound {},
 
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },

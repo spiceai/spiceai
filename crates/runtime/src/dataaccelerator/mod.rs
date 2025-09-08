@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
-use crate::dataaccelerator::void::VoidAccelerator;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
@@ -29,6 +28,7 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -50,8 +50,6 @@ use self::postgres::PostgresAccelerator;
 use self::sqlite::SqliteAccelerator;
 
 pub mod arrow;
-pub mod behaviors;
-use behaviors::Behaviors;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "duckdb")]
@@ -60,7 +58,6 @@ pub mod partitioned_duckdb;
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-pub mod void;
 
 pub mod spice_sys;
 
@@ -132,8 +129,6 @@ impl AcceleratorEngineRegistry {
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
             .await;
-        self.register_accelerator_engine(Engine::Void, Arc::new(VoidAccelerator::new()))
-            .await;
     }
 
     pub async fn unregister_all(&self) {
@@ -151,7 +146,7 @@ impl AcceleratorEngineRegistry {
         secrets: Arc<RwLock<Secrets>>,
         source: Option<&dyn AccelerationSource>,
         ctx: Arc<SessionContext>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors)> {
+    ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
 
         let accelerator = self
@@ -216,8 +211,10 @@ impl AcceleratorEngineRegistry {
                 external_table_builder = external_table_builder.constraints(constraints.clone());
                 let primary_keys: Vec<String> =
                     get_primary_keys_from_constraints(constraints, &schema);
-                external_table_builder = external_table_builder
-                    .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+                external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
+                    ColumnReference::new(primary_keys),
+                    UpsertOptions::default(),
+                ));
             }
         }
 
@@ -282,7 +279,7 @@ pub trait DataAccelerator: Send + Sync {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Option<PartitionBy>,
-    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;
