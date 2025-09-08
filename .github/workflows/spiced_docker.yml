@@ -27,7 +27,7 @@ jobs:
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -42,7 +42,7 @@ jobs:
     needs: setup
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -124,7 +124,7 @@ jobs:
       IMAGE_TAG: default
       CARGO_FEATURES: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install docker
         run: |
@@ -217,7 +217,7 @@ jobs:
     needs: setup
     runs-on: 'ubuntu-gpu-t4-4-core'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install docker
         run: |
