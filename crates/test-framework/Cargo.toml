@@ -27,7 +27,7 @@ duckdb = { optional = true, workspace = true, features = [
 ]}
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-indicatif = "0.17.9"
+indicatif = "0.18.0"
 insta.workspace = true
 octocrab = "0.44.1"
 opentelemetry.workspace = true
