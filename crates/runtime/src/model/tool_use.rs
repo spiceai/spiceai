@@ -853,7 +853,7 @@ mod tests {
         ChatCompletionRequestSystemMessageArgs::default()
             .content(content)
             .build()
-            .unwrap()
+            .expect("couldn't create system message")
             .into()
     }
 
@@ -861,7 +861,7 @@ mod tests {
         ChatCompletionRequestUserMessageArgs::default()
             .content(content)
             .build()
-            .unwrap()
+            .expect("couldn't create user message")
             .into()
     }
 
@@ -871,7 +871,7 @@ mod tests {
         ChatCompletionRequestAssistantMessageArgs::default()
             .tool_calls(tool_calls)
             .build()
-            .unwrap()
+            .expect("couldn't create assistant message w. tools")
             .into()
     }
 
@@ -880,7 +880,7 @@ mod tests {
             .tool_call_id(tool_call_id)
             .content(content)
             .build()
-            .unwrap()
+            .expect("couldn't create tool message")
             .into()
     }
 
