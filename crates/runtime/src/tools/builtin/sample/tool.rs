@@ -90,7 +90,7 @@ impl SpiceModelTool for SampleDataTool {
         let params = self.method.parse_args(arg).boxed()?;
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 
-        async {
+        let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let mut batch = params.sample(Arc::clone(&self.df)).await?;
 
             // truncate large text fields
@@ -98,10 +98,21 @@ impl SpiceModelTool for SampleDataTool {
             batch = truncate_numeric_column_length(&batch, 8)?;
 
             let serial = pretty_format_batches(&[batch]).boxed()?;
-
             Ok(Value::String(format!("{serial}")))
         }
         .instrument(span.clone())
-        .await
+        .await;
+
+        match tool_use_result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
