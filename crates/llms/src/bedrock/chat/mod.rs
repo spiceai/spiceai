@@ -59,6 +59,7 @@ use aws_sdk_bedrockruntime::types::{
     MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
     ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
+use aws_smithy_types::Document;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use serde_json::{Value, json};
