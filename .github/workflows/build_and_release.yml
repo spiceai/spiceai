@@ -133,7 +133,7 @@ jobs:
       - name: Set up Go
         # CLI is only built on the same runners as the default spiced binary
         if: contains(matrix.target.tags, 'default')
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
 
