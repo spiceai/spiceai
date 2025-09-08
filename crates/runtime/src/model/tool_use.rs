@@ -839,3 +839,236 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionToolType, FunctionCall,
+    };
+
+    fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(content)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn create_user_message(content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(content)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn create_assistant_message_with_tool_calls(
+        tool_calls: Vec<ChatCompletionMessageToolCall>,
+    ) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(tool_calls)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn create_tool_message(tool_call_id: &str, content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestToolMessageArgs::default()
+            .tool_call_id(tool_call_id)
+            .content(content)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn create_list_datasets_tool_call() -> ChatCompletionMessageToolCall {
+        ChatCompletionMessageToolCall {
+            id: "test_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "list_datasets".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_insert_initial_tools_empty_messages() {
+        let messages = vec![];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(
+            result[0],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(result[1], ChatCompletionRequestMessage::Tool(_)));
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_system_and_user_messages() {
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        assert_eq!(result.len(), 4);
+        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
+        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
+        assert!(matches!(
+            result[2],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(result[3], ChatCompletionRequestMessage::Tool(_)));
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_existing_assistant_message() {
+        let existing_tool_call = ChatCompletionMessageToolCall {
+            id: "existing_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "other_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        // Tool messages should be inserted before the existing assistant message
+        assert_eq!(result.len(), 5);
+        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
+        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
+        assert!(matches!(
+            result[2],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(result[3], ChatCompletionRequestMessage::Tool(_)));
+        assert!(matches!(
+            result[4],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+    }
+
+    #[test]
+    fn test_insert_initial_tools_skips_if_tool_already_exists() {
+        let existing_list_datasets_call = create_list_datasets_tool_call();
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+            create_assistant_message_with_tool_calls(vec![existing_list_datasets_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
+
+        // Should return original messages unchanged since tool already exists
+        assert_eq!(result, messages);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_different_tool_name() {
+        let existing_tool_call = ChatCompletionMessageToolCall {
+            id: "other_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "other_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        // Tool messages should be inserted before the existing assistant message
+        assert_eq!(result.len(), 4);
+        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
+
+        let Some(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            tool_calls: Some(tool_calls),
+            ..
+        })) = result.get(1)
+        else {
+            panic!("")
+        };
+        assert_eq!(
+            tool_calls.first().expect("empty tool list").id,
+            "test_id".to_string()
+        );
+
+        assert!(matches!(result[2], ChatCompletionRequestMessage::Tool(_)));
+        let Some(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            tool_calls: Some(tool_calls),
+            ..
+        })) = result.get(3)
+        else {
+            panic!("")
+        };
+        assert_eq!(
+            tool_calls.first().expect("empty tool list").id,
+            "other_id".to_string()
+        );
+    }
+
+    #[test]
+    fn test_insert_initial_tools_insertion_point_end_of_messages() {
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("What datasets are available?"),
+            create_user_message("And what about tables?"),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        // Tool messages should be inserted at the end since there are no assistant/tool/function messages
+        assert_eq!(result.len(), 5);
+        assert!(matches!(result[0], ChatCompletionRequestMessage::System(_)));
+        assert!(matches!(result[1], ChatCompletionRequestMessage::User(_)));
+        assert!(matches!(result[2], ChatCompletionRequestMessage::User(_)));
+        assert!(matches!(
+            result[3],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(result[4], ChatCompletionRequestMessage::Tool(_)));
+    }
+}
