@@ -48,13 +48,13 @@ graph TD
 ## Forked Dependency Upgrades
 
 The following forked dependencies use DataFusion and need to be upgraded in lockstep. This typically involves pulling the latest changes from the upstream repository, resolving conflicts, and updating the commit hash in `Cargo.toml` (See [Core Dependency Upgrade](#core-dependency-upgrade)).
-- [ ]  **datafusion-federation**: Update the fork to be compatible with the new DataFusion version.
-- [ ]  **datafusion-table-providers**: Update the fork to be compatible with the new DataFusion version.
+- [ ]  **[datafusion-federation](https://github.com/spiceai/datafusion-federation)**: Update the fork to be compatible with the new DataFusion version.
+- [ ]  **[datafusion-table-providers](https://github.com/datafusion-contrib/datafusion-table-providers)**: Update the fork to be compatible with the new DataFusion version.
   - Do not merge the into the `spiceai` branch until the main Spice OSS PR is ready to be merged. Merging sooner can block other PRs.
-- [ ]  **iceberg-rust**: The `iceberg-datafusion` crate within this forked repository needs to be updated.
+- [ ]  **[iceberg-rust](https://github.com/spiceai/iceberg-rust.git)**: The `iceberg-datafusion` crate within this forked repository needs to be updated.
 
 ## Arrow Updates (if necessary)
-Spice should use the same version of Arrow that DataFusion uses. If DataFusion upgraded Arrow, then the following steps should be performed.
+Spice should use the same version of Arrow that DataFusion uses. If DataFusion upgraded Arrow, then the following crates should be upgraded.
 
 - [ ]  **arrow-rs**: 
 - [ ]  **snowflake-rs**: 
@@ -63,7 +63,7 @@ Spice should use the same version of Arrow that DataFusion uses. If DataFusion u
 
 ## Core Dependency Upgrade
 
-- [ ]  Create a new branch for the upgrade process.
+- [ ]  Create a new branch in Spice for the upgrade process.
 - [ ]  Update the `datafusion` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ]  If Arrow needs updating, update the `arrow-rs` dependency in the root `Cargo.toml` to the new patched commit.
 - [ ]  Update the `datafusion-federation` dependency in the root `Cargo.toml` to the new patched commit.
@@ -75,3 +75,4 @@ Spice should use the same version of Arrow that DataFusion uses. If DataFusion u
 - [ ]  Create a pull request with the changes.
 - [ ]  Ensure all CI checks pass.
 - [ ]  Build the branch version and test with test operator, updating snapshots if needed.
+- [ ]  Merge PR. 🎉
