@@ -3,7 +3,7 @@ module github.com/spiceai/spiceai
 go 1.24.2
 
 require (
-	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1
+	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a
 	github.com/hashicorp/go-retryablehttp v0.7.8

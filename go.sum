@@ -1,5 +1,5 @@
-github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1 h1:8BKxhZZLX/WosEeoCvWysmKUscfa9v8LIPEEU0JjE2o=
-github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
+github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0 h1:XkkQbfMyuH2jTSjQjSoihryI8GINRcs4xp8lNawg0FI=
+github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0/go.mod h1:HKpQxkWaGLJ+D/5H8QRpyQXA1eKjxkFlOMwck5+33Jk=
 github.com/bradleyjkemp/cupaloy v2.3.0+incompatible h1:UafIjBvWQmS9i/xRg+CamMrnLTKNzo+bdmT/oH34c2Y=
 github.com/bradleyjkemp/cupaloy v2.3.0+incompatible/go.mod h1:Au1Xw1sgaJ5iSFktEhYsS0dbQiS1B0/XMXl+42y9Ilk=
 github.com/chzyer/logex v1.1.10 h1:Swpa1K6QvQznwJRcfTfQJmTE72DqScAa40E+fbHEXEE=
