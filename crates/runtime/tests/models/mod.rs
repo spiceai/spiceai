@@ -523,46 +523,6 @@ async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     .expect("value is a JSON string")
 }
 
-#[allow(clippy::expect_used)]
-async fn sql_to_json_values(rt: &Arc<Runtime>, query: &str) -> Vec<Value> {
-    let data = rt
-        .datafusion()
-        .query_builder(query)
-        .build()
-        .run()
-        .await
-        .boxed()
-        .expect("Failed to collect data")
-        .data
-        .try_collect::<Vec<_>>()
-        .await
-        .boxed()
-        .expect("Failed to collect data");
-
-    // Data may be split into multiple batches, so we need to concatenate them
-    let concat_data = if data.len() > 1 {
-        concat_batches(&data[0].schema(), &data).expect("Failed to concatenate batches")
-    } else {
-        data[0].clone()
-    };
-
-    let mut json_values: Vec<Value> = Vec::new();
-
-    let string_column = concat_data
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("column is a StringArray");
-
-    for row_idx in 0..concat_data.num_rows() {
-        let json_str = string_column.value(row_idx);
-        let json_val = serde_json::from_str(json_str).expect("value is a JSON string");
-
-        json_values.push(json_val);
-    }
-    json_values
-}
-
 async fn get_params_with_secrets_value(
     params: &HashMap<String, Value>,
     rt: &Runtime,

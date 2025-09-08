@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::{sort_json_keys, sql_to_display, sql_to_json_values, sql_to_single_json_value};
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing,
     models::{
@@ -483,7 +483,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
-            verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+            verify_similarity_search_chat_completion(Arc::clone(&rt)).await?;
 
             Ok(())
         })
@@ -1008,10 +1008,7 @@ async fn verify_sql_query_chat_completion(
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
 #[allow(clippy::expect_used)]
-async fn verify_similarity_search_chat_completion(
-    rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
-) -> Result<(), anyhow::Error> {
+async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
 
@@ -1025,7 +1022,6 @@ async fn verify_similarity_search_chat_completion(
             .into()])
         .build()?;
 
-    let task_start_time = std::time::SystemTime::now();
     let response = model.chat_request(req).await?;
 
     // Verify Response
