@@ -762,7 +762,6 @@ impl RefreshTask {
             .max_timestamp_df(ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
-
         let result = &df
             .collect()
             .await
