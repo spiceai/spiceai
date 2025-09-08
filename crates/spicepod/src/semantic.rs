@@ -153,7 +153,8 @@ pub struct FullTextSearchConfig {
     )]
     pub row_ids: Option<Vec<String>>,
 
-    pub mode: Mode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
 }
 
 impl FullTextSearchConfig {
@@ -162,12 +163,12 @@ impl FullTextSearchConfig {
         Self {
             enabled: true,
             row_ids: Some(vec![id.into()]),
-            mode: Mode::default(),
+            mode: None,
         }
     }
     #[must_use]
     pub fn in_memory(mut self) -> Self {
-        self.mode = Mode::Memory;
+        self.mode = Some(Mode::Memory);
         self
     }
 }

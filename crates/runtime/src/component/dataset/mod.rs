@@ -646,7 +646,7 @@ impl Dataset {
     pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
         let (search_fields_and_primary_key_overrides, modes): (
             Vec<(String, Option<Vec<String>>)>,
-            Vec<FtsMode>,
+            Vec<Option<FtsMode>>,
         ) = self
             .columns
             .iter()
@@ -699,19 +699,26 @@ impl Dataset {
             }
         }
 
-        // Default memory. If any index is file, use file (but warn).
-        let any_file = modes.contains(&FtsMode::File);
-        let all_file = modes.iter().all(|m| *m == FtsMode::File);
-        let mode = match (any_file, all_file) {
-            (true, true) => FtsMode::File,
-            (true, false) => {
+        let mode = match (
+            modes.contains(&Some(FtsMode::File)),
+            modes.contains(&Some(FtsMode::Memory)),
+        ) {
+            (true, false) => FtsMode::File,
+            (false, true) => FtsMode::Memory,
+            (true, true) => {
                 tracing::warn!(
                     "For dataset '{}', full text search cannot currently be configured with both file and in-memory mode. Using file mode for all columns",
                     self.name
                 );
                 FtsMode::File
             }
-            _ => FtsMode::Memory,
+            (false, false) => {
+                tracing::warn!(
+                    "For dataset '{}', full text search will default to using file-based mode",
+                    self.name
+                );
+                FtsMode::File
+            }
         };
 
         Some(FullTextSearchDatasetConfig {

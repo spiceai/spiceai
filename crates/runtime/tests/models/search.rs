@@ -873,7 +873,7 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
                     full_text_search: Some(FullTextSearchConfig {
                         enabled: true,
                         row_ids: Some(vec!["answer".to_string(), "id".to_string()]),
-                        mode: spicepod::semantic::Mode::Memory
+                        mode: Some(spicepod::semantic::Mode::Memory)
                     }),
                     metadata: HashMap::new(),
                 }),
