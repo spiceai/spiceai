@@ -672,8 +672,8 @@ impl RefreshTask {
             .as_any()
             .downcast_ref::<PolyTableProvider>()
         {
-            Some(poly) => { poly.get_federated_table_provider() }
-            None => { Arc::clone(&self.accelerator) }
+            Some(poly) => poly.get_federated_table_provider(),
+            None => Arc::clone(&self.accelerator),
         };
 
         let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
