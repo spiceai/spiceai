@@ -25,6 +25,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, sha224};
+use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode, col, lit};
@@ -57,10 +58,58 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentati
 pub static SIGNATURE: LazyLock<Signature> =
     LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
-/// A no-op UDTF detected by an Optimizer that subsequently implements RRF using plain SQL
-pub struct ReciprocalRankFusion {
-    pub session_context: Arc<SessionContext>,
-    df: Option<DataFrame>,
+#[derive(Debug, Default)]
+struct ReciprocalRankFusionArgs {
+    pub search_udtf_exprs: Vec<SqlExpr>,
+    pub k: f64,
+}
+
+impl ReciprocalRankFusionArgs {
+    /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a TableScan node
+    /// that looks like this...
+    /// ```
+    /// TableScan: rrf(text_search(wiki_a_potion, Utf8("apple")), vector_search(wiki_a_potion, Utf8("apple")))
+    /// ```
+    /// ...into a neat struct of subquery expressions and an optional user-provided smoothing parameter.
+    ///
+    /// # Arguments
+    /// * `args` - A slice of `Expr` containing search UDTF invocations and an optional `k` parameter
+    ///
+    /// # Returns
+    /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
+    /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
+    pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
+        // Find user-provided smoothing param if provided
+        let k = if let Some(Expr::Literal(ScalarValue::Float64(Some(k)), ..)) = args.last() {
+            *k
+        } else {
+            // The original RRF paper uses 60 as its default smoothing parameter
+            60.0
+        };
+
+        // Unparse UDTF invocations
+        let unparser = Unparser::new(&DefaultDialect {});
+        let search_udtf_exprs: Vec<SqlExpr> = args
+            .iter()
+            .map(|expr| match expr {
+                e @ Expr::ScalarFunction(_) => unparser.expr_to_sql(&e),
+                other_expr => Err(DataFusionError::NotImplemented(format!(
+                    "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if search_udtf_exprs.len() < 2 {
+            return Err(DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} needs at least 2 search queries to fuse results."
+            )));
+        }
+
+        Ok(Self {
+            search_udtf_exprs,
+            k,
+        })
+    }
 }
 
 impl Debug for ReciprocalRankFusion {
@@ -69,6 +118,12 @@ impl Debug for ReciprocalRankFusion {
     }
 }
 
+pub struct ReciprocalRankFusion {
+    pub session_context: Arc<SessionContext>,
+    df: Option<DataFrame>,
+}
+
+// TODO: DF support for nested UDTF calls without ScalarUDF "hack"
 impl ReciprocalRankFusion {
     pub fn from_ctx(session_context: Arc<SessionContext>) -> Self {
         Self {
@@ -87,42 +142,69 @@ impl ReciprocalRankFusion {
         self
     }
 
-    fn default_error<T>() -> Result<T, DataFusionError> {
-        exec_err!("This is a bug! {RRF_UDF_NAME} should be rewritten by an optimizer rule.")
+    fn scalar_stub_error<T>() -> Result<T, DataFusionError> {
+        exec_err!(
+            "{RRF_UDF_NAME} is a table function with a scalar stub. Please call as a table function."
+        )
     }
 
-    fn args_to_df(&self, args: &[Expr]) -> Result<DataFrame> {
-        let args: Vec<_> = args.iter().cloned().collect();
-        // Find user-provided smoothing param if provided
-        let k = if let Some(Expr::Literal(ScalarValue::Float64(Some(k)), ..)) = args.last() {
-            *k
-        } else {
-            // Supposedly the best magic number
-            60.0
-        };
+    // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
+    // then finally re-rank and sort fused results
+    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
+        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
 
-        // Unparse UDTF invocations
-        // TODO: DF support for nested UDTF calls without ScalarUDF "hack"
-        let unparser = Unparser::new(&DefaultDialect {});
-        let search_udtf_invocations: Vec<String> = args
+        let score_expr = coalesce(
+            (0..subquery_dfs.len())
+                .map(|i| {
+                    lit(1.0f64)
+                        / (lit(args.k)
+                            + coalesce(vec![col(format!("search_{}.rank", i)), lit(f64::INFINITY)]))
+                })
+                .collect(),
+        )
+        .alias("fused_score");
+
+        // Create column expressions for final projection
+        let mut columns: Vec<Expr> = vec![score_expr];
+        columns.extend(subquery_dfs[0].schema().columns().iter().filter_map(|c| {
+            match c.name.as_str() {
+                "__spice_rrf_row_id" | "rank" | "score" => None,
+                // TODO: do we want the embedding in the final projection?
+                other if other.contains("embedding") => None,
+                other => Some(
+                    coalesce(
+                        (0..subquery_dfs.len())
+                            .map(|i| col(format!("search_{i}.{other}")))
+                            .collect(),
+                    )
+                    .alias(other),
+                ),
+            }
+        }));
+
+        // Join DFs together, apply final projection, and sort by the new fused score
+        subquery_dfs
+            .into_iter()
+            .reduce(|a, b| Self::fold_join(a, b).unwrap())
+            .expect("Must have joined DF")
+            .select(columns)?
+            .distinct()?
+            .sort(vec![col("fused_score").sort(false, false)])
+    }
+
+    // Given RRF args with unparsed search udtf exprs, turn each subquery into a DF,
+    // add a hashed row ID, rank it, then give it an alias of `search_{i_in_argv}`
+    fn prepare_and_execute_subqueries(
+        &self,
+        args: &ReciprocalRankFusionArgs,
+    ) -> Result<Vec<DataFrame>> {
+        let search_df_queries: Vec<_> = args
+            .search_udtf_exprs
             .iter()
-            .filter_map(|expr| match expr {
-                e @ Expr::ScalarFunction(_) => unparser
-                    .expr_to_sql(&e)
-                    // (unfortunately cannot use table API here, so must generate select query)
-                    .map(|e| format!("select * from {e}"))
-                    .ok(),
-                _ => None,
-            })
-            .collect();
+            .map(|sqlexpr| format!("select * from {}", sqlexpr.to_string()))
+            .collect::<Vec<_>>();
 
-        if search_udtf_invocations.len() < 2 {
-            return Err(DataFusionError::Plan(format!(
-                "{RRF_UDF_NAME} called with less than 2 search queries."
-            )));
-        }
-
-        let search_df_futures: Vec<_> = search_udtf_invocations
+        let search_df_futures: Vec<_> = search_df_queries
             .iter()
             .map(|sql| self.session_context.sql(sql))
             .collect();
@@ -136,8 +218,8 @@ impl ReciprocalRankFusion {
         .into_iter()
         .enumerate()
         .map(|(i, df)| {
-            Self::ranked_and_aliased_df_projection(df)
-                .and_then(Self::with_rrf_rowid)
+            Self::with_rrf_rowid(df)
+                .and_then(Self::with_rank)
                 .and_then(|df| df.alias(&format!("search_{i}")))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -151,46 +233,11 @@ impl ReciprocalRankFusion {
             }
         }
 
-        let score_expr = coalesce(
-            (0..search_dfs.len())
-                .map(|i| {
-                    coalesce(vec![
-                        lit(1.0f64) / (lit(k) + col(format!("search_{}.rank", i))),
-                        lit(0.0f64),
-                    ])
-                })
-                .collect(),
-        )
-        .alias("fused_score");
-
-        // Create column expressions for final projection
-        let mut columns: Vec<Expr> = vec![score_expr];
-        columns.extend(search_dfs[0].schema().columns().iter().filter_map(|c| {
-            match c.name.as_str() {
-                "__spice_rrf_row_id" | "rank" | "score" => None,
-                // TODO: do we want the embedding in the final projection?
-                other if other.contains("embedding") => None,
-                other => Some(
-                    coalesce(
-                        (0..search_dfs.len())
-                            .map(|i| col(format!("search_{i}.{other}")))
-                            .collect(),
-                    )
-                    .alias(other),
-                ),
-            }
-        }));
-
-        // Join DFs together, apply final projection, and sort by the new fused score
-        search_dfs
-            .into_iter()
-            .reduce(|a, b| Self::fold_join(a, b).unwrap())
-            .expect("Must have joined DF")
-            .select(columns)?
-            .distinct()?
-            .sort(vec![col("fused_score").sort(false, false)])
+        Ok(search_dfs)
     }
 
+    // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
+    // are equivalent, return the first (arbitrary) qualified name.
     fn first_qualified_field(df: &DataFrame, name: &str) -> Result<String> {
         df.schema()
             .qualified_fields_with_unqualified_name(name)
@@ -211,8 +258,8 @@ impl ReciprocalRankFusion {
         a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
     }
 
-    // Window and rank a DF representing a search subquery by its score
-    fn ranked_and_aliased_df_projection(df: DataFrame) -> Result<DataFrame> {
+    // Window and rank a search subquery by its `score` field, exposing a `rank` column
+    fn with_rank(df: DataFrame) -> Result<DataFrame> {
         let rank_expr = row_number()
             .order_by(vec![col("score").sort(false, false)])
             .build()?
@@ -228,6 +275,7 @@ impl ReciprocalRankFusion {
             .columns()
             .iter()
             .sorted_by_key(|c| c.name())
+            // Don't hash embeddings or scores
             .filter_map(|c| match c.name() {
                 "score" => None,
                 name if name.contains("embedding") => None,
@@ -255,14 +303,11 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
-        Self::default_error()
+        Self::scalar_stub_error()
     }
 
-    fn invoke_with_args(
-        &self,
-        _args: ScalarFunctionArgs,
-    ) -> datafusion::common::Result<ColumnarValue> {
-        Self::default_error()
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        Self::scalar_stub_error()
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -272,9 +317,12 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
 impl TableFunctionImpl for ReciprocalRankFusion {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let rrf = ReciprocalRankFusion::from_ctx(Arc::clone(&self.session_context));
-        let df = rrf.args_to_df(args)?;
-        Ok(Arc::new(rrf.with_df(df)))
+        let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
+        let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
+        Ok(Arc::new(
+            ReciprocalRankFusion::from_ctx(Arc::clone(&self.session_context))
+                .with_df(rerank_and_fuse_df),
+        ))
     }
 }
 
