@@ -35,32 +35,14 @@ pub enum HashingAlgorithm {
     #[default]
     Siphash,
     Ahash,
-    // #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xx-hash")]
     XxHash3,
-    // #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xx-hash")]
     XxHash32,
-    // #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xx-hash")]
     XxHash64,
-    // #[cfg(feature = "xx-hash")]
+    #[cfg(feature = "xx-hash")]
     XxHash128,
-}
-
-impl HashingAlgorithm {
-    pub fn validate(&self) -> Result<(), String> {
-        match self {
-            HashingAlgorithm::Siphash | HashingAlgorithm::Ahash => Ok(()),
-            HashingAlgorithm::XxHash3
-            | HashingAlgorithm::XxHash32
-            | HashingAlgorithm::XxHash64
-            | HashingAlgorithm::XxHash128 => {
-                // Only allow these if the feature is enabled
-                #[cfg(feature = "xx-hash")]
-                { Ok(()) }
-                #[cfg(not(feature = "xx-hash"))]
-                { Err(format!("Selected hashing algorithm {:?} requires the 'xx-hash' feature.", self)) }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

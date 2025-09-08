@@ -27,5 +27,5 @@ url.workspace = true
 
 [features]
 default = []
-schemars = ["dep:schemars"]
+schemars = ["dep:schemars", "xx-hash"]
 xx-hash = []
