@@ -584,7 +584,7 @@ fn insert_initial_tools(
         return messages;
     };
 
-    [a, &tool_messages, b].concat()
+    [a, tool_messages, b].concat()
 }
 
 struct CustomStream {
