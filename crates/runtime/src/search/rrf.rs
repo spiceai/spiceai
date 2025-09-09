@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{exec_err, DataFusionError, JoinType, Result, ScalarValue};
+use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,11 +24,11 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{coalesce, make_array, md5, DataFrame, SessionContext};
+use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, md5};
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::Unparser;
-use datafusion_expr::{col, lit, ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode};
+use datafusion::sql::unparser::dialect::DefaultDialect;
+use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
 use futures::future::join_all;
 use itertools::Itertools;
 use std::any::Any;
@@ -61,6 +61,7 @@ pub static SIGNATURE: LazyLock<Signature> =
 struct ReciprocalRankFusionArgs {
     pub search_udtf_exprs: Vec<SqlExpr>,
     pub k: f64,
+    pub join_key: Option<Expr>,
 }
 
 impl ReciprocalRankFusionArgs {
@@ -78,28 +79,29 @@ impl ReciprocalRankFusionArgs {
     /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
     /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
-        // Find user-provided smoothing param if provided
-        let k = if let Some(Expr::Literal(ScalarValue::Float64(Some(k)), ..)) = args.last() {
-            *k
-        } else {
-            // The original RRF paper uses 60 as its default smoothing parameter
-            60.0
-        };
-
         // Unparse UDTF invocations
         let unparser = Unparser::new(&DefaultDialect {});
-        let search_udtf_exprs: Vec<SqlExpr> = args
-            .iter()
-            .filter_map(|expr| match expr {
-                e @ Expr::ScalarFunction(_) => Some(unparser.expr_to_sql(&e)),
-                // Leave the k-override literals alone
-                Expr::Literal(ScalarValue::Float64(_), ..) => None,
+        let mut search_udtf_exprs: Vec<SqlExpr> = vec![];
+        let mut k_argument: Option<f64> = None;
+        let mut join_pk_argument: Option<Expr> = None;
+
+        for expr in args {
+            match expr {
+                e @ Expr::ScalarFunction(_) => search_udtf_exprs.push(unparser.expr_to_sql(&e)?),
+                Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
+                    k_argument = Some(*k)
+                }
+                Expr::Column(c) if join_pk_argument.is_none() => {
+                    join_pk_argument = Some(col(c.name.clone()))
+                }
                 // Show a useful error for the rest
-                other_expr => Some(Err(DataFusionError::NotImplemented(format!(
-                    "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
-                )))),
-            })
-            .collect::<Result<Vec<_>>>()?;
+                other_expr => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "{RRF_UDF_NAME} does not yet support {other_expr} arguments."
+                    )));
+                }
+            }
+        }
 
         if search_udtf_exprs.len() < 2 {
             return Err(DataFusionError::Plan(format!(
@@ -109,7 +111,8 @@ impl ReciprocalRankFusionArgs {
 
         Ok(Self {
             search_udtf_exprs,
-            k,
+            k: k_argument.unwrap_or(60.0),
+            join_key: join_pk_argument,
         })
     }
 }
@@ -185,13 +188,23 @@ impl ReciprocalRankFusion {
         }));
 
         // Join DFs together, apply final projection, and sort by the new fused score
-        subquery_dfs
-            .into_iter()
-            .reduce(|a, b| Self::fold_join(a, b).unwrap())
-            .expect("Must have joined DF")
-            .select(columns)?
-            .distinct()?
-            .sort(vec![col("fused_score").sort(false, false)])
+        let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
+            let joined = match args.join_key.clone().map(|e| e.qualified_name()) {
+                Some((_, join_key)) => Self::fold_join(a, b, &join_key),
+                None => Self::fold_join(a, b, "__spice_rrf_row_id"),
+            };
+
+            joined.expect("Must join DF")
+        });
+
+        if let Some(joined) = maybe_joined {
+            joined
+                .select(columns)?
+                .distinct()?
+                .sort(vec![col("fused_score").sort(false, false)])
+        } else {
+            exec_err!("{RRF_UDF_NAME}: Unable to join result sets")
+        }
     }
 
     // Given RRF args with unparsed search udtf exprs, turn each subquery into a DF,
@@ -220,7 +233,12 @@ impl ReciprocalRankFusion {
         .into_iter()
         .enumerate()
         .map(|(i, df)| {
-            Self::with_rrf_rowid(df)
+            let df_with_id = match args.join_key {
+                Some(_) => Ok(df),
+                None => Self::with_rrf_rowid(df),
+            };
+
+            df_with_id
                 .and_then(Self::with_rank)
                 .and_then(|df| df.alias(&format!("search_{i}")))
         })
@@ -248,14 +266,14 @@ impl ReciprocalRankFusion {
                 maybe_table_reference.map(|tr| format!("{}.{}", tr.table(), &f.name()))
             })
             .ok_or(DataFusionError::Execution(format!(
-                "{RRF_UDF_NAME}: Cannot resolve {name} when fusing results"
+                "{RRF_UDF_NAME}: Cannot resolve column {name} when fusing results"
             )))
     }
 
     // Reduces 2 or more search subquery DFs into a single one
-    fn fold_join(a: DataFrame, b: DataFrame) -> Result<DataFrame> {
-        let id_a = Self::first_qualified_field(&a, "__spice_rrf_row_id")?;
-        let id_b = Self::first_qualified_field(&b, "__spice_rrf_row_id")?;
+    fn fold_join(a: DataFrame, b: DataFrame, join_key: &str) -> Result<DataFrame> {
+        let id_a = Self::first_qualified_field(&a, join_key)?;
+        let id_b = Self::first_qualified_field(&b, join_key)?;
 
         a.join(b, JoinType::Full, &[&id_a], &[&id_b], None)
     }
@@ -354,15 +372,17 @@ impl TableProvider for ReciprocalRankFusion {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        match self.df {
-            Some(ref df) => df.clone().create_physical_plan().await,
-            None => exec_err!("ReciprocalRankFusion could not create physical plan"),
+        if let Some(ref df) = self.df {
+            df.clone().create_physical_plan().await
+        } else {
+            exec_err!("ReciprocalRankFusion could not create physical plan")
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::query::QueryBuilder;
     use crate::datafusion::udf::register_udfs;
@@ -370,10 +390,9 @@ mod tests {
     use crate::embeddings::table::EmbeddingTable;
     use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
-    use crate::Runtime;
     use arrow::array::Int64Array;
     use arrow::array::StringArray;
-    use arrow::array::{as_string_array, ArrayAccessor, FixedSizeListArray};
+    use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
     use arrow::record_batch::RecordBatch;
     use async_graphql::futures_util::TryStreamExt;
     use async_openai::types::EmbeddingInput;
@@ -381,9 +400,10 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
-    use datafusion::logical_expr::lit;
     use datafusion::logical_expr::Expr;
-    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    use datafusion::logical_expr::col;
+    use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use llms::embeddings::Embed;
@@ -494,7 +514,7 @@ mod tests {
             .await
             .expect("Failed to create test runtime");
 
-        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'))";
+        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), id, 600.0)";
         let query = QueryBuilder::new(query, runtime.datafusion()).build();
         let results = query
             .run()
@@ -567,5 +587,15 @@ mod tests {
         let many_with_k = many_with_k.unwrap();
         assert_eq!(many_with_k.search_udtf_exprs.len(), 100);
         assert_eq!(many_with_k.k, 1337.0f64);
+
+        // Call with many searches + k override + join key specified
+        many_search_exprs.push(col("hello"));
+        let many_with_k_and_column = ReciprocalRankFusionArgs::from_udtf_exprs(&many_search_exprs);
+        assert!(many_with_k_and_column.is_ok());
+
+        let many_with_k_and_column = many_with_k_and_column.unwrap();
+        assert_eq!(many_with_k_and_column.search_udtf_exprs.len(), 100);
+        assert_eq!(many_with_k_and_column.k, 1337.0f64);
+        assert_eq!(many_with_k_and_column.join_key, Some(col("hello")));
     }
 }
