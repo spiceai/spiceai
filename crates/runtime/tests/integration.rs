@@ -80,6 +80,7 @@ mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod ready_state;
+mod refresh_max_timestamp_df;
 mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
