@@ -74,7 +74,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, TableSource, UNNAMED_TABLE, ident};
+use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::FederatedTableProviderAdaptor;
 
 mod changes;
@@ -1010,15 +1010,15 @@ pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<d
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
         {
-            None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
             Some(FederatedTableProviderAdaptor {
                 source,
                 table_provider: Some(table_provider),
             }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
                 Arc::clone(source),
-                Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
+                Arc::new(EnsureSchema::new(Arc::clone(table_provider))),
             )) as Arc<dyn TableProvider>,
-            Some(FederatedTableProviderAdaptor {
+            None
+            | Some(FederatedTableProviderAdaptor {
                 source: _,
                 table_provider: None,
             }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
