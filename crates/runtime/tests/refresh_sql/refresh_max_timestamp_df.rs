@@ -32,13 +32,16 @@ use runtime_object_store::registry::default_runtime_env;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// This test verifies:
+///   *  `DataAccelerator::create_external_table` returns `PolyTableProvider`
+///   *  `max_timestamp_df` returns DataFrame which can be properly federated
 #[tokio::test]
-async fn test_sqlite_accelerator_df() -> anyhow::Result<()> {
+async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
     let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
-            let app = AppBuilder::new("test_sqlite_accelerator_df").build();
+            let app = AppBuilder::new("test_refresh_max_timestamp_df").build();
 
             let mut rt = Runtime::builder()
                 .with_app(app)
@@ -108,19 +111,16 @@ async fn test_sqlite_accelerator_df() -> anyhow::Result<()> {
 
             let ctx = SessionContext::new_with_state(state);
 
-            let df = max_timestamp_df(accelerated_table, ctx, "time_in_string")?;
+            let df = max_timestamp_df(&accelerated_table, ctx, "time_in_string")?;
 
             let explain_plan = arrow::util::pretty::pretty_format_batches(
                 &df.clone().explain(false, false)?.collect().await?,
             )?;
 
-            insta::with_settings!({
-                description => format!("Explain Plan for max_timestamp_df"),
-                omit_expression => true,
-                snapshot_path => "../snapshots"
-            }, {
-                insta::assert_snapshot!(format!("max_timestamp_df_explain_plan"), explain_plan);
-            });
+            insta::assert_snapshot!(
+                format!("refresh_max_timestamp_df_explain_plan"),
+                explain_plan
+            );
 
             Ok(())
         })

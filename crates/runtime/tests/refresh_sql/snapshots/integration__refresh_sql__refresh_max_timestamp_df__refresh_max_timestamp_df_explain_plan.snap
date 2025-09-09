@@ -1,6 +1,6 @@
 ---
-source: crates/runtime/tests/refresh_max_timestamp_df/mod.rs
-description: Explain Plan for max_timestamp_df
+source: crates/runtime/tests/refresh_sql/refresh_max_timestamp_df.rs
+expression: explain_plan
 ---
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                                                                            |

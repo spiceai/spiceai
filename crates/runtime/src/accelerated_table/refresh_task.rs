@@ -665,7 +665,7 @@ impl RefreshTask {
         let federated_provider = self.federated.table_provider().await;
 
         let existing_records = accelerator_df(
-            Arc::clone(&self.accelerator),
+            &Arc::clone(&self.accelerator),
             &self.refresh_df_context(Arc::clone(&federated_provider)),
         )
         .map_err(find_datafusion_root)
@@ -716,7 +716,7 @@ impl RefreshTask {
                 "Failed to get the latest timestamp. The `time_column` parameter must be specified.",
         })?;
 
-        let df = max_timestamp_df(Arc::clone(&self.accelerator), ctx, &column)
+        let df = max_timestamp_df(&Arc::clone(&self.accelerator), ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
@@ -961,7 +961,7 @@ impl DataLoadTracing {
 // This function is moved from RefreshTask for the testing.
 #[allow(clippy::needless_pass_by_value)]
 pub fn max_timestamp_df(
-    accelerator: Arc<dyn TableProvider>,
+    accelerator: &Arc<dyn TableProvider>,
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
@@ -978,38 +978,34 @@ pub fn max_timestamp_df(
 }
 
 fn accelerator_df(
-    accelerator: Arc<dyn TableProvider>,
+    accelerator: &Arc<dyn TableProvider>,
     ctx: &SessionContext,
 ) -> Result<DataFrame, DataFusionError> {
     // The purpose behind this logic is:
-    // 1. Extract FederatedTableProviderAdaptor from PolyTableProvider
-    // 2. Make sure the top-level table provider is a FederatedTableProviderAdaptor (needed by datafusion-federation)
-    // 3. Inside FederatedTableProviderAdaptor is an EnsureSchema
-
+    // 1. If possible, extract FederatedTableProviderAdaptor from PolyTableProvider and make it the top-level table provider (needed by datafusion-federation)
+    // 2. Make sure EnsureSchema is present (either on top-level or under FederatedTableProviderAdaptor)
     let accelerator: Arc<dyn TableProvider> =
         match accelerator.as_any().downcast_ref::<PolyTableProvider>() {
-            Some(poly) => {
-                match poly
-                    .get_federated_table_provider()
-                    .as_any()
-                    .downcast_ref::<FederatedTableProviderAdaptor>()
-                {
-                    None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
-                    Some(FederatedTableProviderAdaptor {
-                        source,
-                        table_provider,
-                    }) => match table_provider {
-                        Some(table_provider) => {
-                            Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-                                source.clone(),
-                                Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
-                            )) as Arc<dyn TableProvider>
-                        }
-                        None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
-                    },
-                }
-            }
-            None => Arc::new(EnsureSchema::new(Arc::clone(&accelerator))),
+            Some(poly) => match poly
+                .get_federated_table_provider()
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+            {
+                None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+                Some(FederatedTableProviderAdaptor {
+                    source,
+                    table_provider: Some(table_provider),
+                }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                    Arc::clone(source),
+                    // Arc::new(EnsureSchema::new(Arc::new(table_provider.clone()))),
+                    Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
+                )) as Arc<dyn TableProvider>,
+                Some(FederatedTableProviderAdaptor {
+                    source: _,
+                    table_provider: None,
+                }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+            },
+            None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
         };
 
     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
