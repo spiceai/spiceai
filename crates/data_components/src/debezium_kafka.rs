@@ -97,12 +97,8 @@ impl DebeziumKafka {
             .map(move |msg| {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();
-                let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(format!(
-                        "Unable to read message: {:?}",
-                        msg.err()
-                    )));
-                };
+
+                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
                 let val = msg.value();
                 changes::to_change_batch(&schema, &pk, val)

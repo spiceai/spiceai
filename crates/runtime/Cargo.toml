@@ -187,7 +187,7 @@ bollard = "0.18.1"
 dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta = { workspace = true, features = ["json"] }
+insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true

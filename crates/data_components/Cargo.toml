@@ -60,7 +60,7 @@ object_store = { workspace = true }
 opendal = "0.53.0"
 oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
-regex = "1.10.4"
+regex = "1.11.2"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -132,4 +132,4 @@ arrow-array = { workspace = true }
 ctor = "0.5.0"
 iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
 insta = { version = "1.43" }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
