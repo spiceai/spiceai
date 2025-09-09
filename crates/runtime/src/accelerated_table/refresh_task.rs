@@ -75,6 +75,7 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
+use datafusion_federation::FederatedTableProviderAdaptor;
 
 mod changes;
 mod streaming_append;
@@ -667,13 +668,38 @@ impl RefreshTask {
     }
 
     fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
-        let accelerator = match self
+        // The purpose behind this logic is:
+        // 1. Extract FederatedTableProviderAdaptor from PolyTableProvider
+        // 2. Make sure the top-level table provider is a FederatedTableProviderAdaptor (needed by datafusion-federation)
+        // 3. Inside FederatedTableProviderAdaptor is an EnsureSchema
+
+        let accelerator: Arc<dyn TableProvider> = match self
             .accelerator
             .as_any()
             .downcast_ref::<PolyTableProvider>()
         {
-            Some(poly) => poly.get_federated_table_provider(),
-            None => Arc::clone(&self.accelerator),
+            Some(poly) => {
+                match poly
+                    .get_federated_table_provider()
+                    .as_any()
+                    .downcast_ref::<FederatedTableProviderAdaptor>()
+                {
+                    None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+                    Some(FederatedTableProviderAdaptor {
+                        source,
+                        table_provider,
+                    }) => match table_provider {
+                        Some(table_provider) => {
+                            Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                                source.clone(),
+                                Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
+                            )) as Arc<dyn TableProvider>
+                        }
+                        None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+                    },
+                }
+            }
+            None => Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
         };
 
         let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
@@ -762,6 +788,12 @@ impl RefreshTask {
             .max_timestamp_df(ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
+        df.clone()
+            .explain(false, false)
+            .unwrap()
+            .show()
+            .await
+            .unwrap();
         let result = &df
             .collect()
             .await
