@@ -109,6 +109,8 @@ pub struct BenchArgs {
     pub scale_factor: Option<f64>,
 }
 
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::ref_option)]
 fn serialize_scale_factor<S>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
