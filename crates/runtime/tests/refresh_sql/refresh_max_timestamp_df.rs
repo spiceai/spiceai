@@ -22,11 +22,13 @@ use datafusion::common::{Constraints, TableReference, ToDFSchema};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::CreateExternalTable;
+use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime::Runtime;
-use runtime::accelerated_table::refresh_task::max_timestamp_df;
+use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::get_analyzer_rules;
 use runtime::datafusion::extension::SpiceQueryPlanner;
+use runtime::execution_plan::schema_cast::EnsureSchema;
 use runtime_datafusion_index::analyzer::IndexTableScanOptimizerRule;
 use runtime_object_store::registry::default_runtime_env;
 use std::collections::HashMap;
@@ -121,6 +123,88 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 format!("refresh_max_timestamp_df_explain_plan"),
                 explain_plan
             );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_accelerator_table_provider() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("test_accelerator_table_provider").build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let registry = rt.datafusion().accelerator_engine_registry();
+            let engine = registry
+                .get_accelerator_engine(Engine::Sqlite)
+                .await
+                .expect("No engine");
+
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "time_in_string",
+                DataType::Utf8,
+                false,
+            )]));
+
+            let cmd = CreateExternalTable {
+                schema: ToDFSchema::to_dfschema_ref(Arc::clone(&schema))?,
+                name: TableReference::bare("test_table"),
+                location: String::new(),
+                file_type: String::new(),
+                table_partition_cols: vec![],
+                if_not_exists: true,
+                definition: None,
+                order_exprs: vec![],
+                unbounded: false,
+                options: HashMap::new(),
+                constraints: Constraints::empty(),
+                column_defaults: HashMap::default(),
+                temporary: false,
+            };
+            let accelerated_table = engine
+                .create_external_table(cmd, None, None)
+                .await
+                .expect("Failed to create external table");
+
+            accelerated_table
+                .as_any()
+                .downcast_ref::<PolyTableProvider>()
+                .expect("Expected PolyTableProvider");
+
+            let table_provider = accelerator_table_provider(&accelerated_table);
+
+            let federated_table_adaptor = table_provider
+                .as_any()
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+                .expect("Expected FederatedTableProviderAdaptor");
+
+            let ensure_schema_adaptor = federated_table_adaptor
+                .table_provider
+                .as_ref()
+                .expect("Expected table provider")
+                .as_any()
+                .downcast_ref::<EnsureSchema>()
+                .expect("Expected EnsureSchema");
 
             Ok(())
         })

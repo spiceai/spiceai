@@ -74,7 +74,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
-use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
+use datafusion_expr::{LogicalPlanBuilder, TableSource, UNNAMED_TABLE, ident};
 use datafusion_federation::FederatedTableProviderAdaptor;
 
 mod changes;
@@ -984,29 +984,7 @@ fn accelerator_df(
     // The purpose behind this logic is:
     // 1. If possible, extract FederatedTableProviderAdaptor from PolyTableProvider and make it the top-level table provider (needed by datafusion-federation)
     // 2. Make sure EnsureSchema is present (either on top-level or under FederatedTableProviderAdaptor)
-    let accelerator: Arc<dyn TableProvider> =
-        match accelerator.as_any().downcast_ref::<PolyTableProvider>() {
-            Some(poly) => match poly
-                .get_federated_table_provider()
-                .as_any()
-                .downcast_ref::<FederatedTableProviderAdaptor>()
-            {
-                None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
-                Some(FederatedTableProviderAdaptor {
-                    source,
-                    table_provider: Some(table_provider),
-                }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-                    Arc::clone(source),
-                    // Arc::new(EnsureSchema::new(Arc::new(table_provider.clone()))),
-                    Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
-                )) as Arc<dyn TableProvider>,
-                Some(FederatedTableProviderAdaptor {
-                    source: _,
-                    table_provider: None,
-                }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
-            },
-            None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
-        };
+    let accelerator: Arc<dyn TableProvider> = accelerator_table_provider(accelerator);
 
     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&accelerator)));
 
@@ -1023,6 +1001,30 @@ fn accelerator_df(
         .map_err(find_datafusion_root)?;
 
     Ok(DataFrame::new(ctx.state(), logical_plan))
+}
+
+pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+    match accelerator.as_any().downcast_ref::<PolyTableProvider>() {
+        Some(poly) => match poly
+            .get_federated_table_provider()
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            None => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+            Some(FederatedTableProviderAdaptor {
+                source,
+                table_provider: Some(table_provider),
+            }) => Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                Arc::clone(source),
+                Arc::new(EnsureSchema::new(Arc::clone(&table_provider))),
+            )) as Arc<dyn TableProvider>,
+            Some(FederatedTableProviderAdaptor {
+                source: _,
+                table_provider: None,
+            }) => Arc::new(EnsureSchema::new(Arc::new(poly.clone()))),
+        },
+        None => Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
+    }
 }
 
 fn include_source_to_table_name(name: &TableReference, source: Option<&str>) -> String {
