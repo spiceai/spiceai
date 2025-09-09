@@ -77,7 +77,7 @@ impl Runtime {
                 caching = caching.with_plans_cache(plans_cache_provider);
             }
             Err(e) => {
-                crate::in_tracing_context(|| {
+                in_tracing_context(|| {
                     tracing::error!("Failed to initialize plans cache: {e}");
                 });
             }
