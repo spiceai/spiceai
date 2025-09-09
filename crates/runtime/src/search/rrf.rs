@@ -16,7 +16,7 @@ limitations under the License.
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
+use datafusion::common::{exec_err, DataFusionError, JoinType, Result, ScalarValue};
 use datafusion::datasource::TableType;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::{
@@ -24,11 +24,11 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, sha224};
+use datafusion::prelude::{coalesce, make_array, md5, DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DefaultDialect;
-use datafusion_expr::{ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode, col, lit};
+use datafusion::sql::unparser::Unparser;
+use datafusion_expr::{col, lit, ExprFunctionExt, ExprSchemable, UserDefinedLogicalNode};
 use futures::future::join_all;
 use itertools::Itertools;
 use std::any::Any;
@@ -285,7 +285,7 @@ impl ReciprocalRankFusion {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let rrf_row_id = sha224(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
+        let rrf_row_id = md5(make_array(bin_columns).cast_to(&DataType::Utf8, df.schema())?);
         df.with_column("__spice_rrf_row_id", rrf_row_id)
     }
 }
@@ -363,7 +363,6 @@ impl TableProvider for ReciprocalRankFusion {
 
 #[cfg(test)]
 mod tests {
-    use crate::Runtime;
     use crate::builder::RuntimeBuilder;
     use crate::datafusion::query::QueryBuilder;
     use crate::datafusion::udf::register_udfs;
@@ -371,9 +370,10 @@ mod tests {
     use crate::embeddings::table::EmbeddingTable;
     use crate::request::{Protocol, RequestContext};
     use crate::search::rrf::ReciprocalRankFusionArgs;
+    use crate::Runtime;
     use arrow::array::Int64Array;
     use arrow::array::StringArray;
-    use arrow::array::{ArrayAccessor, FixedSizeListArray, as_string_array};
+    use arrow::array::{as_string_array, ArrayAccessor, FixedSizeListArray};
     use arrow::record_batch::RecordBatch;
     use async_graphql::futures_util::TryStreamExt;
     use async_openai::types::EmbeddingInput;
@@ -381,9 +381,9 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::catalog::TableProvider;
     use datafusion::common::Result;
-    use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::lit;
-    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    use datafusion::logical_expr::Expr;
+    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use llms::embeddings::Embed;
