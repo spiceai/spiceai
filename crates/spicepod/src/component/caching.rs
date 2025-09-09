@@ -35,13 +35,9 @@ pub enum HashingAlgorithm {
     #[default]
     Siphash,
     Ahash,
-    #[cfg(feature = "xx-hash")]
     XxHash3,
-    #[cfg(feature = "xx-hash")]
     XxHash32,
-    #[cfg(feature = "xx-hash")]
     XxHash64,
-    #[cfg(feature = "xx-hash")]
     XxHash128,
 }
 

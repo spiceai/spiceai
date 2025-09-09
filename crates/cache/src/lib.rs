@@ -64,6 +64,11 @@ pub enum Error {
 
     #[snafu(display("Cache invalidation failed with error: {source}."))]
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
+
+    #[snafu(display(
+        "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
+    ))]
+    InvalidHashingAlgorithm,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -105,6 +110,64 @@ pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
     fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
+}
+
+#[derive(Clone)]
+pub enum HashBuilder {
+    Ahash(ahash::RandomState),
+    Siphash(std::hash::RandomState),
+    #[cfg(feature = "xx-hash")]
+    XxHash3(twox_hash::xxh3::RandomHashBuilder64),
+    #[cfg(feature = "xx-hash")]
+    XxHash32(twox_hash::RandomXxHashBuilder32),
+    #[cfg(feature = "xx-hash")]
+    XxHash64(twox_hash::RandomXxHashBuilder64),
+    #[cfg(feature = "xx-hash")]
+    XxHash128(twox_hash::xxh3::RandomHashBuilder128),
+}
+
+impl std::hash::BuildHasher for HashBuilder {
+    type Hasher = Box<dyn Hasher>;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        match self {
+            HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
+            HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xx-hash")]
+            HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xx-hash")]
+            HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xx-hash")]
+            HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xx-hash")]
+            HashBuilder::XxHash128(builder) => Box::new(builder.build_hasher()),
+        }
+    }
+}
+
+pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuilder, Error> {
+    match hashing_algorithm {
+        HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
+        HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
+        #[cfg(feature = "xx-hash")]
+        HashingAlgorithm::XxHash3 => Ok(HashBuilder::XxHash3(
+            twox_hash::xxh3::RandomHashBuilder64::default(),
+        )),
+        #[cfg(feature = "xx-hash")]
+        HashingAlgorithm::XxHash32 => Ok(HashBuilder::XxHash32(
+            twox_hash::RandomXxHashBuilder32::default(),
+        )),
+        #[cfg(feature = "xx-hash")]
+        HashingAlgorithm::XxHash64 => Ok(HashBuilder::XxHash64(
+            twox_hash::RandomXxHashBuilder64::default(),
+        )),
+        #[cfg(feature = "xx-hash")]
+        HashingAlgorithm::XxHash128 => Ok(HashBuilder::XxHash128(
+            twox_hash::xxh3::RandomHashBuilder128::default(),
+        )),
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::InvalidHashingAlgorithm),
+    }
 }
 
 #[derive(Default)]
@@ -214,43 +277,11 @@ impl QueryResultsCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
+        let hash_builder = get_hash_builder(config.hashing_algorithm)?;
+        let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
+
         let cache_provider = QueryResultsCacheProvider {
-            cache: match config.hashing_algorithm {
-                HashingAlgorithm::Ahash => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    ahash::RandomState::default(),
-                )),
-                HashingAlgorithm::Siphash => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    std::hash::RandomState::default(),
-                )),
-                #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash3 => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    twox_hash::xxh3::RandomHashBuilder64::default(),
-                )),
-                #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash32 => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    twox_hash::RandomXxHashBuilder32::default(),
-                )),
-                #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash64 => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    twox_hash::RandomXxHashBuilder64::default(),
-                )),
-                #[cfg(feature = "xx-hash")]
-                HashingAlgorithm::XxHash128 => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    twox_hash::xxh3::RandomHashBuilder128::default(),
-                )),
-            },
+            cache,
             cache_max_size,
             ttl,
             ignore_schemas,
