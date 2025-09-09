@@ -41,7 +41,7 @@ use tokio::task;
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
-    description: "Merge and re-rank several search queries into one result set".to_string(),
+    description: "Merge and rank several search queries into a single result set solely considering the order and not score of the input search queries".to_string(),
     syntax_example: "rrf(query_1, query_2, ..., k)".to_string(),
     sql_example: None,
     arguments: Some(vec![
