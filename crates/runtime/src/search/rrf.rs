@@ -13,7 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::{DataType, SchemaRef};
+use arrow::array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, JoinType, Result, ScalarValue, exec_err};
@@ -153,6 +154,15 @@ impl ReciprocalRankFusion {
         )
     }
 
+    fn empty_df(&self) -> DataFrame {
+        let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
+
+        let empty_batch = RecordBatch::new_empty(Arc::new(schema));
+        self.session_context
+            .read_batch(empty_batch)
+            .expect("Must produce empty DF")
+    }
+
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
     fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
@@ -188,14 +198,26 @@ impl ReciprocalRankFusion {
         }));
 
         // Join DFs together, apply final projection, and sort by the new fused score
+        let mut join_err: Option<DataFusionError> = None;
         let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
             let joined = match args.join_key.clone().map(|e| e.qualified_name()) {
                 Some((_, join_key)) => Self::fold_join(a, b, &join_key),
                 None => Self::fold_join(a, b, "__spice_rrf_row_id"),
             };
 
-            joined.expect("Must join DF")
+            // No way to short circuit reduce, so we will surface the error at the end
+            match joined {
+                Ok(joined) => joined,
+                Err(e) => {
+                    join_err = Some(e);
+                    self.empty_df()
+                }
+            }
         });
+
+        if let Some(error) = join_err {
+            return Err(error);
+        }
 
         if let Some(joined) = maybe_joined {
             joined
@@ -514,7 +536,8 @@ mod tests {
             .await
             .expect("Failed to create test runtime");
 
-        let query = "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), id, 600.0)";
+        let query =
+            "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), id, 600.0)";
         let query = QueryBuilder::new(query, runtime.datafusion()).build();
         let results = query
             .run()
