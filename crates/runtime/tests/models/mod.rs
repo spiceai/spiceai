@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, compute::concat_batches, util::pretty::pretty_format_batches};
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
