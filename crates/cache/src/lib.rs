@@ -150,19 +150,19 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
         #[cfg(feature = "xx-hash")]
-        HashingAlgorithm::XxHash3 => Ok(HashBuilder::XxHash3(
+        HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(
             twox_hash::xxh3::RandomHashBuilder64::default(),
         )),
         #[cfg(feature = "xx-hash")]
-        HashingAlgorithm::XxHash32 => Ok(HashBuilder::XxHash32(
+        HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(
             twox_hash::RandomXxHashBuilder32::default(),
         )),
         #[cfg(feature = "xx-hash")]
-        HashingAlgorithm::XxHash64 => Ok(HashBuilder::XxHash64(
+        HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(
             twox_hash::RandomXxHashBuilder64::default(),
         )),
         #[cfg(feature = "xx-hash")]
-        HashingAlgorithm::XxHash128 => Ok(HashBuilder::XxHash128(
+        HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128(
             twox_hash::xxh3::RandomHashBuilder128::default(),
         )),
         #[allow(unreachable_patterns)]
