@@ -128,9 +128,8 @@ impl RefreshTask {
                     }
                 }
                 Err(e) => {
-                    // Error classification during tracing returns whether the error is auto-recoverable (e.g., Kafka poll timeout errors).
-                    // If so, log a warning and continue; otherwise, set refresh status to Error.
-                    if trace_stream_err(&e, &dataset_name) {
+                    // If the error is transient (e.g., Kafka poll timeout), continue without changing the refresh status to Error
+                    if handle_stream_error(&e, &self.dataset_name) == StreamErrorType::Transient {
                         continue;
                     }
 
@@ -288,32 +287,42 @@ impl RefreshTask {
     }
 }
 
+#[derive(PartialEq)]
+enum StreamErrorType {
+    Transient,
+    Fatal,
+}
+
 /// Logs and classifies [`StreamError`] errors for a dataset.
 /// Returns `true` if the error is transient and the stream can continue normally.
 /// These errors are generally nonfatal and often indicate that the consumer should retry or continue polling.
-#[must_use]
-pub fn trace_stream_err(err: &cdc::StreamError, dataset_name: &TableReference) -> bool {
+fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) -> StreamErrorType {
     #[cfg(any(feature = "debezium", feature = "kafka"))]
     if let cdc::StreamError::Kafka(KafkaError::UnableToReceiveMessage { source }) = err {
-        // MessageConsumption errors are recoverable and non-fatal. There is MessageConsumptionFatal, indicating a non-recoverable error.
         match source {
             RdKafkaError::MessageConsumption(RDKafkaErrorCode::PollExceeded) => {
                 tracing::warn!(
                     "Kafka poll interval exceeded for dataset '{dataset_name}': connection lost or consumer too slow. Retrying."
                 );
-                return true;
+                return StreamErrorType::Transient;
             }
             RdKafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure) => {
                 tracing::warn!(
                     "Connection to Kafka broker for dataset '{dataset_name}' was lost or is invalid. Retrying."
                 );
-                return true;
+                return StreamErrorType::Transient;
+            }
+            RdKafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut) => {
+                tracing::error!(
+                    "Kafka operation timed out while retrieving message for dataset '{dataset_name}'. Retrying."
+                );
+                return StreamErrorType::Transient;
             }
             RdKafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown) => {
                 tracing::warn!(
                     "All Kafka brokers are down for dataset '{dataset_name}'. Check broker status and network connectivity. Retrying."
                 );
-                return true;
+                return StreamErrorType::Transient;
             }
             RdKafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition) => {
                 tracing::error!(
@@ -326,9 +335,9 @@ pub fn trace_stream_err(err: &cdc::StreamError, dataset_name: &TableReference) -
                 );
             }
         }
-        return false;
+        return StreamErrorType::Fatal;
     }
 
     tracing::error!("Changes stream error for {dataset_name}: {err}");
-    false
+    StreamErrorType::Fatal
 }
