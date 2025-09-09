@@ -24,6 +24,7 @@ use datafusion::logical_expr::LogicalPlan;
 use spicepod::component::caching::{
     CacheConfig, Caching as CachingConfig, HashingAlgorithm, SQLResultsCacheConfig,
 };
+use util::in_tracing_context;
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
@@ -53,13 +54,13 @@ impl Runtime {
                 Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
             ) {
                 Ok(cache_provider) => {
-                    crate::in_tracing_context(|| {
+                    in_tracing_context(|| {
                         tracing::info!("Initialized results cache; {cache_provider}");
                     });
                     caching = caching.with_results_cache(Arc::new(cache_provider));
                 }
                 Err(e) => {
-                    crate::in_tracing_context(|| {
+                    in_tracing_context(|| {
                         tracing::error!("Failed to initialize results cache: {e}");
                     });
                 }
@@ -85,13 +86,13 @@ impl Runtime {
         if search_results_config.enabled {
             match lru_cache::build_from_config(&search_results_config) {
                 Ok(cache_provider) => {
-                    crate::in_tracing_context(|| {
+                    in_tracing_context(|| {
                         tracing::info!("Initialized search results cache;"); // TODO: update to include max size and ttl. https://github.com/spiceai/spiceai/issues/6019
                     });
                     caching = caching.with_search_cache(cache_provider);
                 }
                 Err(e) => {
-                    crate::in_tracing_context(|| {
+                    in_tracing_context(|| {
                         tracing::error!("Failed to initialize search results cache: {e}");
                     });
                 }

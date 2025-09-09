@@ -261,11 +261,10 @@ fn reciprocal_rank_fusion_sql(
     // ```sql
     //    my_tbl AS (
     //      SELECT *,
-    //             ROW_NUMBER() OVER (ORDER BY doc_id, section) AS rank
+    //             ROW_NUMBER() OVER (ORDER BY score) AS rank
     //      FROM my_tbl
     //    ),
     // ```
-    let pk_list = primary_key.join(", ");
     let cte_defs: String = tables
         .iter()
         .map(|tbl| {
@@ -273,7 +272,7 @@ fn reciprocal_rank_fusion_sql(
                 "{tbl} AS (\n    \
                     SELECT\n    \
                         *,\n    \
-                        ROW_NUMBER() OVER (ORDER BY {pk_list}) AS rank\n    \
+                        ROW_NUMBER() OVER (ORDER BY {SEARCH_SCORE_COLUMN_NAME}) AS rank\n    \
                     FROM {tbl}\n\
                 )"
             )

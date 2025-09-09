@@ -1112,7 +1112,7 @@ async fn verify_similarity_search_chat_completion(
     Ok(())
 }
 
-fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
+pub(crate) fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
     model.params.insert(
         "openai_api_key".to_string(),

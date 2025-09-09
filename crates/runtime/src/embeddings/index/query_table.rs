@@ -81,12 +81,14 @@ impl VectorQueryTableProvider {
     /// Execute the given physical plan of a vector index query, extract the primary key columns and convert the values: {(`v1_1`, `v1_2`, ...), (`v2_1`, `v2_2`, ...), ..., (`vn_1`, `vn_2`, ...)} into a filter predicate: `WHERE (primary_key_col1, primary_key_col2, ...) IN ((v1_1, v1_2, ...), (v2_1, v2_2, ...), ...)`.
     ///
     /// When `primary_key_fields.len() == 1`, use a simplified expression `WHERE primary_key_col1 IN (v1_1, v2_1, ...)`.
+    ///
+    /// If no primary-keys/rows are produced from the `physical_plan`, returns `Ok(None)`.
     async fn base_table_query_filter(
         &self,
         state: &dyn Session,
         physical_plan: Arc<dyn ExecutionPlan>,
         primary_key_fields: &[Field],
-    ) -> DataFusionResult<Expr> {
+    ) -> DataFusionResult<Option<Expr>> {
         if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution(
                 "No primary key columns provided".to_string(),
@@ -106,11 +108,11 @@ impl VectorQueryTableProvider {
                     }
                 }
             }
-            return Ok(Expr::InList(InList::new(
+            return Ok(Some(Expr::InList(InList::new(
                 Box::new(Expr::Column(Column::from_name(primary_key_column.name()))),
                 expr,
                 false,
-            )));
+            ))));
         }
 
         // For composite primary keys, collect struct values for IN expression
@@ -137,6 +139,9 @@ impl VectorQueryTableProvider {
 
             // Build struct values for each row
             let num_rows = arrays.first().map_or(0, |arr| arr.len());
+            if num_rows == 0 {
+                return Ok(None);
+            }
             for i in 0..num_rows {
                 let mut field_values: Vec<(&str, ScalarValue)> = vec![];
                 for (j, arr) in arrays.iter().enumerate() {
@@ -160,11 +165,11 @@ impl VectorQueryTableProvider {
             primary_key_fields.iter().map(|f| col(f.name())).collect(),
         ));
 
-        Ok(Expr::InList(InList::new(
+        Ok(Some(Expr::InList(InList::new(
             Box::new(struct_expr),
             struct_exprs,
             false,
-        )))
+        ))))
     }
 
     fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
@@ -414,14 +419,16 @@ impl TableProvider for VectorQueryTableProvider {
             // Add these primary keys as a filter to the underlying table.
             // Add primary_key as filter `WHERE primary_key_column in ('a_pk', 'another one',...)`.
             let mut underlying_filters = filters.to_vec();
-            underlying_filters.push(
-                self.base_table_query_filter(
+            if let Some(filter) = self
+                .base_table_query_filter(
                     state,
                     state.create_physical_plan(&vector_index_table).await?,
                     &primary_key_fields,
                 )
-                .await?,
-            );
+                .await?
+            {
+                underlying_filters.push(filter);
+            }
 
             let underlying_table_scan = self.underlying_table_scan(
                 underlying_filters.as_slice(),

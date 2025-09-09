@@ -1,0 +1,23 @@
+---
+source: crates/runtime/tests/models/models_http_endpoint.rs
+expression: "&models_response"
+---
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "responses_model",
+      "object": "model",
+      "owned_by": "openai:gpt-4o-mini",
+      "datasets": null,
+      "status": "Ready"
+    },
+    {
+      "id": "chat_model",
+      "object": "model",
+      "owned_by": "openai:gpt-4o-mini",
+      "datasets": null,
+      "status": "Ready"
+    }
+  ]
+}

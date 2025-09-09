@@ -16,60 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::{functions::math::random::RandomFunc, prelude::SessionContext};
-use runtime_datafusion_udfs::{alias, bucket, cosine_distance, truncate};
+use datafusion::functions::math::random::RandomFunc;
+use runtime_datafusion_udfs::{alias, bucket, cosine_distance, embed, truncate};
 
-// UDFs that need a reference to [`crate::datafusion::DataFusion`] must be defined in [`crate::builder::RuntimeBuilder::build`].
-pub fn register_udfs(ctx: &SessionContext) {
+pub fn register_udfs(runtime: &crate::Runtime) {
+    let ctx = &runtime.df.ctx;
     ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(bucket::Bucket::new().into());
     ctx.register_udf(cosine_distance::CosineDistance::new().into());
     ctx.register_udf(truncate::Truncate::new().into());
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::{
-        array::{Float64Array, Int64Array, RecordBatch},
-        datatypes::{Field, Schema},
-    };
-    use arrow_schema::DataType;
-    use datafusion::{assert_batches_eq, datasource::MemTable, prelude::SessionContext};
-
-    #[tokio::test]
-    async fn test_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Float64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(Float64Array::from(vec![0.9, 2.1, 3.0])),
-            ],
-        )?;
-        let table = MemTable::try_new(schema, vec![vec![batch]])?;
-        ctx.register_table("t1", Arc::new(table))?;
-        let sql = "SELECT greatest(a, 2), least(a, 2), greatest(a, b), least(a, b), greatest(a, b, 2), least(a, b, 2) from t1";
-        let actual = ctx.sql(sql).await?.collect().await?;
-
-        assert_batches_eq!(
-            &[
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-                "| greatest(t1.a,Int64(2)) | least(t1.a,Int64(2)) | greatest(t1.a,t1.b) | least(t1.a,t1.b) | greatest(t1.a,t1.b,Int64(2)) | least(t1.a,t1.b,Int64(2)) |",
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-                "| 2                       | 1                    | 1.0                 | 0.9              | 2.0                          | 0.9                       |",
-                "| 2                       | 2                    | 2.1                 | 2.0              | 2.1                          | 2.0                       |",
-                "| 3                       | 2                    | 3.0                 | 3.0              | 3.0                          | 2.0                       |",
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-            ],
-            &actual
-        );
-        Ok(())
-    }
+    ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
 }

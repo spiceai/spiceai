@@ -6,7 +6,7 @@ snapshot_kind: text
 WITH bm25 AS (
     SELECT
     *,
-    ROW_NUMBER() OVER (ORDER BY doc_id) AS rank
+    ROW_NUMBER() OVER (ORDER BY score) AS rank
     FROM bm25
 )
 SELECT

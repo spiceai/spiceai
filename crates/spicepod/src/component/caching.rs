@@ -37,7 +37,7 @@ pub enum HashingAlgorithm {
     Ahash,
     #[serde(rename = "XXH3")]
     XXH3,
-    #[serde(rename = "XXH33")]
+    #[serde(rename = "XXH32")]
     XXH32,
     #[serde(rename = "XXH64")]
     XXH64,
