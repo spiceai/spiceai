@@ -368,7 +368,7 @@ pub(crate) async fn run_search_w_explain(
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6815
+#[ignore = "bug issue"] // https://github.com/spiceai/spiceai/issues/6815
 async fn test_multi_column_search() -> Result<(), anyhow::Error> {
     let mut ds = catalog_page_tpcds_dataset_w_embeddings(
         "multi_column_search",
@@ -1006,7 +1006,7 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 
 #[cfg(feature = "flightsql")]
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/6816
+#[ignore = "bug issue"] // https://github.com/spiceai/spiceai/issues/6816
 async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
     use spicepod::{acceleration::Acceleration, param::Params};
 

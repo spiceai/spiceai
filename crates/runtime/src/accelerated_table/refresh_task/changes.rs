@@ -21,12 +21,18 @@ use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use cache::Caching;
-use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
+use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
+#[cfg(any(feature = "debezium", feature = "kafka"))]
+use data_components::kafka::{
+    Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
+    rdkafka::types::RDKafkaErrorCode,
+};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use snafu::{OptionExt, ResultExt};
@@ -122,7 +128,12 @@ impl RefreshTask {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Changes stream error for {dataset_name}: {e}");
+                    // Error classification during tracing returns whether the error is auto-recoverable (e.g., Kafka poll timeout errors).
+                    // If so, log a warning and continue; otherwise, set refresh status to Error.
+                    if trace_stream_err(&e, &dataset_name) {
+                        continue;
+                    }
+
                     self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),
                         status::ComponentStatus::Error,
@@ -275,4 +286,49 @@ impl RefreshTask {
             .fail(),
         }
     }
+}
+
+/// Logs and classifies [`StreamError`] errors for a dataset.
+/// Returns `true` if the error is transient and the stream can continue normally.
+/// These errors are generally nonfatal and often indicate that the consumer should retry or continue polling.
+#[must_use]
+pub fn trace_stream_err(err: &cdc::StreamError, dataset_name: &TableReference) -> bool {
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
+    if let cdc::StreamError::Kafka(KafkaError::UnableToReceiveMessage { source }) = err {
+        // MessageConsumption errors are recoverable and non-fatal. There is MessageConsumptionFatal, indicating a non-recoverable error.
+        match source {
+            RdKafkaError::MessageConsumption(RDKafkaErrorCode::PollExceeded) => {
+                tracing::warn!(
+                    "Kafka poll interval exceeded for dataset '{dataset_name}': connection lost or consumer too slow. Retrying."
+                );
+                return true;
+            }
+            RdKafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure) => {
+                tracing::warn!(
+                    "Connection to Kafka broker for dataset '{dataset_name}' was lost or is invalid. Retrying."
+                );
+                return true;
+            }
+            RdKafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown) => {
+                tracing::warn!(
+                    "All Kafka brokers are down for dataset '{dataset_name}'. Check broker status and network connectivity. Retrying."
+                );
+                return true;
+            }
+            RdKafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition) => {
+                tracing::error!(
+                    "Kafka topic not found for dataset '{dataset_name}': check if the topic exists and is spelled correctly."
+                );
+            }
+            _ => {
+                tracing::error!(
+                    "A Kafka error occurred for dataset '{dataset_name}': {source}. Check your Kafka broker and network connectivity."
+                );
+            }
+        }
+        return false;
+    }
+
+    tracing::error!("Changes stream error for {dataset_name}: {err}");
+    false
 }
