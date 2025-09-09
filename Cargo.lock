@@ -12106,11 +12106,9 @@ dependencies = [
  "ahash 0.8.12",
  "arrow",
  "arrow-schema",
- "async-trait",
  "datafusion",
  "insta",
  "snafu",
- "tokio",
  "tracing",
  "tract-core",
 ]
