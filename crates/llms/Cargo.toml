@@ -68,7 +68,7 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { version = "0.1.2", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "dd0beab3810aebacb716d4ab6d38455e74499d13", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.99"
@@ -95,7 +95,7 @@ local_embed = [
     "dep:tei_backend_core",
     "dep:tei_candle",
     "dep:tei_core",
-    "dep:model2vec-rs"
+    "dep:model2vec-rs",
 ]
 local_llm = ["dep:mistralrs", "dep:mistralrs-core"]
 metal = [

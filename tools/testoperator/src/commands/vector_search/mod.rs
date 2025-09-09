@@ -40,7 +40,14 @@ pub(crate) async fn run(args: &VectorSearchTestArgs) -> anyhow::Result<()> {
 
     match args.benchmark_dataset.as_deref() {
         Some("quora_retrieval") => {
-            mteb_quora::prepare_dataset(&start_request.get_tempdir_path()).await?;
+            mteb_quora::prepare_dataset(
+                &args
+                    .common
+                    .data_dir
+                    .clone()
+                    .unwrap_or(start_request.get_tempdir_path()),
+            )
+            .await?;
         }
         Some(ds) => {
             return Err(anyhow::anyhow!("Unsupported benchmark-dataset: {ds}"));
