@@ -301,13 +301,12 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        let search_index = Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>;
-        Ok(Some(Arc::new(SearchQueryProvider {
-            query: args.query.clone(),
-            table_provider: indexed,
-            search_index,
-            pre_limit: args.limit,
-        })))
+        Ok(Some(Arc::new(SearchQueryProvider::new(
+            Arc::new(vector_index.clone()) as Arc<dyn SearchIndex>,
+            Arc::clone(tbl),
+            args.query.clone(),
+            args.limit,
+        ))))
     }
 }
 

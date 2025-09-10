@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -23,12 +27,14 @@ use datafusion::{
     common::{Column, DFSchema, JoinConstraint, JoinType},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
-    logical_expr::{Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableScan},
+    logical_expr::{
+        Filter, Join, LogicalPlan, Projection, Sort, SortExpr, TableProviderFilterPushDown,
+        TableScan,
+    },
     physical_plan::ExecutionPlan,
     prelude::Expr,
     sql::TableReference,
 };
-use runtime_datafusion_index::IndexedTableProvider;
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 
@@ -37,7 +43,7 @@ use crate::{SEARCH_SCORE_COLUMN_NAME, index::SearchIndex};
 #[derive(Debug, Clone)]
 pub struct SearchQueryProvider {
     pub search_index: Arc<dyn SearchIndex>,
-    pub table_provider: Arc<IndexedTableProvider>,
+    pub table_provider: Arc<dyn TableProvider>,
     pub query: String,
     pub pre_limit: Option<usize>,
 }
@@ -45,7 +51,7 @@ pub struct SearchQueryProvider {
 impl SearchQueryProvider {
     pub fn new(
         search_index: Arc<dyn SearchIndex>,
-        table_provider: Arc<IndexedTableProvider>,
+        table_provider: Arc<dyn TableProvider>,
         query: String,
         limit: Option<usize>,
     ) -> Self {
@@ -112,16 +118,18 @@ impl SearchQueryProvider {
     /// Build the underlying table scan, removing search index metadata columns from projection
     fn underlying_table_scan(
         &self,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         all_metadata_columns: &[String],
     ) -> Result<LogicalPlan, DataFusionError> {
-        // Remove all metadata columns (including any search-specific columns) from projection
-        let base_proj =
-            (0..self.table_provider.get_underlying().schema().fields().len()).collect::<Vec<_>>();
         let base_proj = projection_without_columns(
             &self.schema().fields,
-            all_metadata_columns,
-            Some(&base_proj),
+            &[
+                all_metadata_columns,
+                &[SEARCH_SCORE_COLUMN_NAME.to_string()],
+            ]
+            .concat(),
+            projection,
         );
 
         // Get filters that can be pushed down to the base table
@@ -238,6 +246,50 @@ impl TableProvider for SearchQueryProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        let base_table = self.table_provider.supports_filters_pushdown(filters)?;
+
+        // For vector index, any filter that is only on vector index will be marked as support (if not supported by engine, we will manually apply thereafter).
+        let search_index_columns: HashSet<String> = self
+            .search_index
+            .metadata_columns()
+            .filterable()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let search_index: Vec<_> = filters
+            .iter()
+            .map(|f| {
+                let filter_columns = f
+                    .column_refs()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect();
+                if search_index_columns.is_superset(&filter_columns) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect();
+
+        // If one of the two has a pushdown threshold, it can be used.
+        Ok(base_table
+            .iter()
+            .zip(search_index.iter())
+            .map(|(a, b)| match (a, b) {
+                (TableProviderFilterPushDown::Exact, _)
+                | (_, TableProviderFilterPushDown::Exact) => TableProviderFilterPushDown::Exact,
+                (TableProviderFilterPushDown::Inexact, _)
+                | (_, TableProviderFilterPushDown::Inexact) => TableProviderFilterPushDown::Inexact,
+                _ => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -245,8 +297,9 @@ impl TableProvider for SearchQueryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let primary_key_fields = self.search_index.primary_fields();
         // Check primary key constraints
-        if self.search_index.primary_fields().is_empty() {
+        if primary_key_fields.is_empty() {
             return Err(DataFusionError::Execution(
                 "The search index was created successfully without a primary key.\n\
                 Ensure a primary key is available in the dataset source, or specified in the column configuration."
@@ -268,7 +321,7 @@ impl TableProvider for SearchQueryProvider {
             } else {
                 // Need to join with base table
                 let underlying_table_scan =
-                    self.underlying_table_scan(filters, &self.all_metadata_columns())?;
+                    self.underlying_table_scan(projection, filters, &self.all_metadata_columns())?;
 
                 // Build join conditions based on primary keys
                 let join_conditions: Vec<(Column, Column)> = self
@@ -299,15 +352,18 @@ impl TableProvider for SearchQueryProvider {
                     .schema()
                     .join(underlying_table_scan.schema())?;
 
-                // Separate filters for pre-join and post-join
-                let search_index_columns: std::collections::HashSet<String> = search_index_table
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().to_string())
-                    .collect();
+                let primary_key_column_names: std::collections::HashSet<String> =
+                    primary_key_fields
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
 
-                let pre_join_filters = self.search_index_filters(&search_index_columns, filters);
+                let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
+                    filters.iter().cloned().partition(|f| {
+                        f.column_refs()
+                            .iter()
+                            .any(|col| primary_key_column_names.contains(col.name()))
+                    });
 
                 let join = LogicalPlan::Join(Join {
                     left: Arc::new(search_index_table),
@@ -322,20 +378,29 @@ impl TableProvider for SearchQueryProvider {
 
                 // For now, use the join schema directly
                 // TODO: Implement proper deduplication of primary key columns
-                let deduped_schema = join.schema().clone();
-
-                LogicalPlan::Projection(Projection::try_new(
-                    deduped_schema
+                let deduped_schema = DFSchema::new_with_metadata(
+                    join.schema()
                         .iter()
-                        .map(|(tbl, f)| match tbl {
-                            Some(tbl_ref) => {
-                                Expr::Column(Column::new(Some(tbl_ref.clone()), f.name()))
-                            }
-                            None => Expr::Column(Column::new_unqualified(f.name())),
+                        .filter(|(tbl, f)| {
+                            !(primary_key_column_names.contains(f.name())
+                                && tbl
+                                    .is_some_and(|t| *t == TableReference::parse_str("base_table")))
                         })
+                        .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
                         .collect(),
-                    Arc::new(join),
-                )?)
+                    HashMap::default(),
+                )?;
+
+                let proj = LogicalPlan::Projection(Projection::new_from_schema(
+                    join.into(),
+                    deduped_schema.into(),
+                ));
+
+                if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+                    LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+                } else {
+                    proj
+                }
             };
 
         // Add sorting by search score (descending)
