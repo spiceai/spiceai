@@ -2,16 +2,17 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q21"
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                 |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                   |
-|               |   Federated                                                                                                                                          |
-|               |  Projection: count(Int64(1)) AS count(*)                                                                                                             |
-|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                  |
-|               |     TableScan: hits projection=[], full_filters=[hits.URL LIKE Utf8("%google%")]                                                                     |
-| physical_plan | BytesProcessedExec                                                                                                                                   |
-|               |   SchemaCastScanExec                                                                                                                                 |
-|               |     VirtualExecutionPlan name=sqlite compute_context=memory initial_sql=SELECT count(1) AS `count(*)` FROM `hits` WHERE `hits`.`URL` LIKE '%google%' |
-|               |                                                                                                                                                      |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                   |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                     |
+|               |   Federated                                                                                                                                            |
+|               |  Projection: count(Int64(1)) AS count(*)                                                                                                               |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                    |
+|               |     TableScan: hits projection=[], full_filters=[hits.URL LIKE Utf8("%google%")]                                                                       |
+| physical_plan | BytesProcessedExec                                                                                                                                     |
+|               |   SchemaCastScanExec                                                                                                                                   |
+|               |     CooperativeExec                                                                                                                                    |
+|               |       VirtualExecutionPlan name=sqlite compute_context=memory initial_sql=SELECT count(1) AS `count(*)` FROM `hits` WHERE `hits`.`URL` LIKE '%google%' |
+|               |                                                                                                                                                        |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
