@@ -24,6 +24,7 @@ pub mod generation;
 pub mod index;
 pub mod metadata;
 pub mod pipeline;
+pub mod provider;
 
 pub static SEARCH_SCORE_COLUMN_NAME: &str = "score";
 pub static SEARCH_VALUE_COLUMN_NAME: &str = "value";
