@@ -26,17 +26,11 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext, coalesce, make_array, md5};
-use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
-use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion_expr::{ExprFunctionExt, ExprSchemable, col, lit};
-use futures::future::join_all;
 use itertools::Itertools;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
-use tokio::runtime::Handle;
-use tokio::task;
 
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
@@ -60,7 +54,7 @@ pub static SIGNATURE: LazyLock<Signature> =
 
 #[derive(Debug, Default)]
 struct ReciprocalRankFusionArgs {
-    pub search_udtf_exprs: Vec<SqlExpr>,
+    pub search_udtf_exprs: Vec<Expr>,
     pub k: f64,
     pub join_key: Option<Expr>,
 }
@@ -80,15 +74,13 @@ impl ReciprocalRankFusionArgs {
     /// * `Ok(ReciprocalRankFusionArgs)` - Successfully parsed arguments
     /// * `Err` - If fewer than 2 search queries are provided or if unparsing fails
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
-        // Unparse UDTF invocations
-        let unparser = Unparser::new(&DefaultDialect {});
-        let mut search_udtf_exprs: Vec<SqlExpr> = vec![];
+        let mut search_udtfs: Vec<Expr> = vec![];
         let mut k_argument: Option<f64> = None;
         let mut join_pk_argument: Option<Expr> = None;
 
         for expr in args {
             match expr {
-                e @ Expr::ScalarFunction(_) => search_udtf_exprs.push(unparser.expr_to_sql(&e)?),
+                e @ Expr::ScalarFunction(_) => search_udtfs.push(e.clone()),
                 Expr::Literal(ScalarValue::Float64(Some(k)), ..) if k_argument.is_none() => {
                     k_argument = Some(*k)
                 }
@@ -104,14 +96,14 @@ impl ReciprocalRankFusionArgs {
             }
         }
 
-        if search_udtf_exprs.len() < 2 {
+        if search_udtfs.len() < 2 {
             return Err(DataFusionError::Plan(format!(
                 "{RRF_UDF_NAME} needs at least 2 search queries to fuse results."
             )));
         }
 
         Ok(Self {
-            search_udtf_exprs,
+            search_udtf_exprs: search_udtfs,
             k: k_argument.unwrap_or(60.0),
             join_key: join_pk_argument,
         })
@@ -235,39 +227,37 @@ impl ReciprocalRankFusion {
         &self,
         args: &ReciprocalRankFusionArgs,
     ) -> Result<Vec<DataFrame>> {
-        let search_df_queries: Vec<_> = args
+        let search_dfs: Vec<DataFrame> = args
             .search_udtf_exprs
             .iter()
-            .map(|sqlexpr| format!("select * from {}", sqlexpr.to_string()))
-            .collect::<Vec<_>>();
+            .map(|expr| {
+                let Expr::ScalarFunction(sf) = expr else {
+                    unreachable!("Must be a scalar function node")
+                };
+                self.session_context
+                    .table_function(sf.name())
+                    .and_then(|udtf| udtf.create_table_provider(&sf.args))
+                    .and_then(|provider| self.session_context.read_table(provider))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let search_df_futures: Vec<_> = search_df_queries
-            .iter()
-            .map(|sql| self.session_context.sql(sql))
-            .collect();
+        let prepared_dfs: Vec<DataFrame> = search_dfs
+            .into_iter()
+            .enumerate()
+            .map(|(i, df)| {
+                let df_with_id = match args.join_key {
+                    Some(_) => Ok(df),
+                    None => Self::with_rrf_rowid(df),
+                };
 
-        let search_dfs: Vec<DataFrame> = task::block_in_place(move || {
-            Handle::current()
-                .block_on(join_all(search_df_futures))
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-        })?
-        .into_iter()
-        .enumerate()
-        .map(|(i, df)| {
-            let df_with_id = match args.join_key {
-                Some(_) => Ok(df),
-                None => Self::with_rrf_rowid(df),
-            };
-
-            df_with_id
-                .and_then(Self::with_rank)
-                .and_then(|df| df.alias(&format!("search_{i}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                df_with_id
+                    .and_then(Self::with_rank)
+                    .and_then(|df| df.alias(&format!("search_{i}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Ensure that all projections have a score column
-        for (i, df) in search_dfs.iter().enumerate() {
+        for (i, df) in prepared_dfs.iter().enumerate() {
             if !df.schema().has_column_with_unqualified_name("score") {
                 return exec_err!(
                     "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
@@ -275,7 +265,7 @@ impl ReciprocalRankFusion {
             }
         }
 
-        Ok(search_dfs)
+        Ok(prepared_dfs)
     }
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
