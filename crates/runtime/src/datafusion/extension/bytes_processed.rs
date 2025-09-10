@@ -368,6 +368,8 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
+    #[allow(clippy::similar_names)]
+    #[allow(clippy::unwrap_used)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
         let runtime: Runtime = RuntimeBuilder::new().build().await;
