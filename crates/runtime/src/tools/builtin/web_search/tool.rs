@@ -16,7 +16,11 @@ limitations under the License.
 
 use std::{borrow::Cow, collections::HashMap};
 
-use crate::tools::{SpiceModelTool, utils::parameters};
+use crate::tools::{
+    SpiceModelTool,
+    builtin::web_search::{SearchEngineType, perplexity::PerplexityWebSearchParams},
+    utils::parameters,
+};
 use async_trait::async_trait;
 use secrecy::SecretString;
 use serde_json::Value;
@@ -63,7 +67,9 @@ impl SpiceModelTool for WebSearchTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        parameters::<WebSearchParams>()
+        match self.engine.engine_type() {
+            SearchEngineType::Perplexity => parameters::<PerplexityWebSearchParams>(),
+        }
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -78,7 +84,11 @@ impl SpiceModelTool for WebSearchTool {
         .await;
 
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(value)
+            }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)

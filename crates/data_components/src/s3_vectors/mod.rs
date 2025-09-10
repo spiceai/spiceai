@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::error::ArrowError;
 use s3_vectors::{
-    BuildError, CreateIndexError, CreateVectorBucketError, Document, GetIndexError,
+    BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
     GetVectorBucketError, PutVectorsError, QueryVectorsError,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
@@ -84,6 +84,21 @@ pub enum Error {
         "Failed to load AWS credentials to connect to S3 Vectors. Verify the AWS credentials are available in the environment. For help configuring AWS authentication visit https://spiceai.org/docs/components/vectors/s3_vectors#authentication"
     ))]
     UnableToLoadCredentials { message: String },
+
+    #[snafu(display(
+        "Invalid distance metric specified for S3 vector index: '{distance_metric}'. Must be one of: {} or {}.",
+        DistanceMetric::Cosine,
+        DistanceMetric::Euclidean
+    ))]
+    InvalidDistanceMetric { distance_metric: DistanceMetric },
+
+    #[snafu(display(
+        "S3 vector index already exists with {exists} distance metric, but {specified} distance metric specified"
+    ))]
+    IncompatibleDistanceMetric {
+        exists: DistanceMetric,
+        specified: DistanceMetric,
+    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

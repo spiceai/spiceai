@@ -13,7 +13,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use crate::embeddings::Error::UnsupportedSyncInvocation;
 use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector, EncodingFormat,
@@ -21,7 +20,9 @@ use async_openai::types::{
 use async_trait::async_trait;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
-use std::{any, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
+use tokio::runtime::Handle;
+use tokio::task;
 
 pub mod candle;
 
@@ -116,9 +117,6 @@ pub enum Error {
 
     #[snafu(display("Unsupported embedding input for {model}: {message}"))]
     UnsupportedEmbeddingInput { model: String, message: String },
-
-    #[snafu(display("Model {model} does not support sync invocations."))]
-    UnsupportedSyncInvocation { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,11 +136,8 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
-    fn embed_sync(&self, _input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-        let name = any::type_name::<Self>();
-        Err(UnsupportedSyncInvocation {
-            model: name.to_string(),
-        })
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        task::block_in_place(move || Handle::current().block_on(self.embed(input)))
     }
 
     fn supports_sync_embeddings(&self) -> bool {

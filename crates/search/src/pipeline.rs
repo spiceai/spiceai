@@ -26,7 +26,7 @@ use snafu::{ResultExt, Snafu};
 
 use crate::{
     VectorSearchGenerationResult,
-    aggregation::{self, AggregationResult, CandidateAggregation},
+    aggregation::{self, AggregationResult, CandidateAggregation, Error as AggregationError},
     generation::{self, CandidateGeneration},
 };
 
@@ -75,7 +75,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         primary_keys: Vec<String>,
         keywords: Vec<String>,
         limit: usize,
-    ) -> std::result::Result<AggregationResult, Error> {
+    ) -> std::result::Result<Option<AggregationResult>, Error> {
         let proj_ref: &[&Expr] = &addition_projection.iter().collect::<Vec<_>>();
 
         let generation_results: Vec<VectorSearchGenerationResult> =
@@ -110,10 +110,15 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
             }))
             .await?;
 
-        self.aggregator
+        match self
+            .aggregator
             .aggregate(generation_results, primary_keys, limit)
             .await
-            .context(CandidateAggregationSnafu)
+        {
+            Ok(a) => Ok(Some(a)),
+            Err(AggregationError::NoCandidatesGenerated) => Ok(None),
+            Err(e) => Err(e).context(CandidateAggregationSnafu),
+        }
     }
 }
 

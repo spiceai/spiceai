@@ -38,6 +38,8 @@ use tonic::async_trait;
 
 use crate::cdc::{self, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 
+pub use rdkafka;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Kafka consumer: {source}"))]
@@ -396,12 +398,7 @@ impl Kafka {
             .stream_json::<serde_json::Value, serde_json::Value>()
             .map(move |msg| {
                 let schema = Arc::clone(&schema);
-                let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(format!(
-                        "Unable to read message: {:?}",
-                        msg.err()
-                    )));
-                };
+                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
                 let json_str = match flatten_json {
                     Some(ref delimiter) => {

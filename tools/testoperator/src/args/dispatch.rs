@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use clap::{ArgAction, Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
 use test_framework::{TestType, queries::QuerySet};
 
@@ -102,8 +102,30 @@ pub struct BenchArgs {
     pub update_snapshots: Option<UpdateSnapshots>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validate_results: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_scale_factor"
+    )]
     pub scale_factor: Option<f64>,
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::ref_option)]
+fn serialize_scale_factor<S>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match x {
+        Some(v) => {
+            if v.fract() == 0.0 {
+                // no fractional part → serialize as integer
+                s.serialize_i64(*v as i64)
+            } else {
+                s.serialize_f64(*v)
+            }
+        }
+        None => s.serialize_none(),
+    }
 }
 
 impl BenchArgs {

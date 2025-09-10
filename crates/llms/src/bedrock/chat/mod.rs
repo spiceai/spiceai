@@ -59,6 +59,7 @@ use aws_sdk_bedrockruntime::types::{
     MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
     ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
+use aws_smithy_types::Document;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use serde_json::{Value, json};
@@ -180,13 +181,15 @@ impl BedrockConverse {
                                     ..
                                 } = t;
 
-                                let tool_input =
-                                    serde_json::from_str(arguments).ok().map(value_to_document);
+                                let tool_input = serde_json::from_str(arguments).ok().map_or(
+                                    Document::Object(HashMap::default()),
+                                    value_to_document,
+                                );
                                 Some(ContentBlock::ToolUse(
                                     ToolUseBlockBuilder::default()
                                         .set_tool_use_id(Some(id.clone()))
                                         .set_name(Some(name.clone()))
-                                        .set_input(tool_input)
+                                        .set_input(Some(tool_input))
                                         .build()
                                         .ok()?,
                                 ))

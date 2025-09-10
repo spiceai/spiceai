@@ -67,7 +67,7 @@ jobs:
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
 
-          FEATURES="flightsql,models,metal,s3_vectors"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka"
            if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
              FEATURES="${FEATURES},bedrock,extended_tests"
              echo "Including extended_tests"

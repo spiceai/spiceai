@@ -305,9 +305,9 @@ async fn test_do_put_read_timeout() -> Result<(), Box<dyn std::error::Error>> {
 
     let first_batch =
         stream::once(async { Ok(record_batch_1) as Result<RecordBatch, FlightError> });
-    // batch with 40s delay
+    // batch with 130s delay
     let second_batch = stream::once(async {
-        sleep(Duration::from_secs(40)).await;
+        sleep(Duration::from_secs(130)).await;
         Ok(record_batch_2) as Result<RecordBatch, FlightError>
     });
     let third_batch =
